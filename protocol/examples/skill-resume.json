@@ -1,0 +1,15 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.resume",
+  "messageId": "msg-skill-resume-001",
+  "correlationId": "msg-execute-water-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 6,
+  "worldRevision": 12,
+  "sentAt": "2026-08-24T00:00:15Z",
+  "payload": {
+    "commandId": "command-water-001"
+  }
+}

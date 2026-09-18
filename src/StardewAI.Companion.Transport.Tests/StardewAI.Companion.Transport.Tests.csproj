@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <StardewGamePath Condition="'$(StardewGamePath)' == ''">$(STARDEW_GAME_PATH)</StardewGamePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.7.2" />
+    <PackageReference Include="xunit" Version="2.5.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.0">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <!-- Standalone linked-source inclusion of owned Transport files only (isolated from concurrent mechanics edits) -->
+  <ItemGroup>
+    <Compile Include="..\StardewAI.Companion.Mod\Transport\*.cs" Link="Transport\%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="StardewModdingAPI" Condition="Exists('$(StardewGamePath)\StardewModdingAPI.dll')">
+      <HintPath>$(StardewGamePath)\StardewModdingAPI.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Stardew Valley" Condition="Exists('$(StardewGamePath)\Stardew Valley.dll')">
+      <HintPath>$(StardewGamePath)\Stardew Valley.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

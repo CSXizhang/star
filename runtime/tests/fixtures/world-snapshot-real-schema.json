@@ -1,0 +1,86 @@
+{
+  "protocolVersion": "1.0",
+  "messageType": "world.snapshot",
+  "messageId": "msg-fixture-0001",
+  "senderInstanceId": "mod-fixture",
+  "sequenceNumber": 7,
+  "worldRevision": 42,
+  "saveId": "ExampleFarm_12345",
+  "gameSessionId": "fixture-game-session",
+  "payload": {
+    "capturedRevision": 42,
+    "world": {
+      "currentLocation": "Farm",
+      "timeOfDay": 610,
+      "season": "spring",
+      "dayOfMonth": 6,
+      "isRaining": false,
+      "year": 1,
+      "weatherIcon": "0",
+      "farmWork": {
+        "tilledUnwateredTiles": [{"x": 61, "y": 21}, {"x": 62, "y": 21}],
+        "tilledUnwateredCount": 2,
+        "isTruncated": false,
+        "matureCropCount": 0,
+        "matureCrops": []
+      }
+    },
+    "companion": {
+      "locationId": "Farm",
+      "tileX": 61,
+      "tileY": 17,
+      "facingDirection": 2,
+      "stamina": 210.5,
+      "maxStamina": 270,
+      "waterCanLevel": 33,
+      "maxWaterCanLevel": 40,
+      "hasWateringCan": true,
+      "activity": "idle",
+      "availableMoney": 1250,
+      "moneyStatus": "ok"
+    },
+    "inventory": {
+      "capacity": 24,
+      "freeSlots": 5,
+      "slots": [
+        {"index": 0, "itemId": "(O)472", "name": "Parsnip Seeds", "stack": 7, "quality": 0},
+        {"index": 1, "itemId": "(T)Hoe", "name": "Hoe", "stack": 1, "quality": 0, "isTool": true},
+        {"index": 2, "itemId": "(T)WateringCan", "name": "Watering Can", "stack": 1, "quality": 0, "isTool": true}
+      ]
+    },
+    "chests": {
+      "truncated": false,
+      "items": [
+        {
+          "tile": {"x": 66, "y": 20},
+          "capacity": 36,
+          "freeSlots": 30,
+          "contents": [
+            {"slot": 0, "itemId": "(O)472", "name": "Parsnip Seeds", "stack": 12, "quality": 0, "isSeed": true}
+          ]
+        }
+      ]
+    },
+    "shop": {
+      "shopId": "SeedShop",
+      "status": "ok",
+      "isOpen": true,
+      "ownerPresent": true,
+      "owners": ["Pierre"],
+      "currency": 0,
+      "availableMoney": 1250,
+      "moneyStatus": "ok",
+      "itemsCount": 1,
+      "items": [
+        {
+          "itemId": "(O)472",
+          "name": "Parsnip Seeds",
+          "price": 20,
+          "stock": 2147483647,
+          "isInfiniteStock": true,
+          "isSeed": true
+        }
+      ]
+    }
+  }
+}

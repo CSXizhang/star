@@ -1,0 +1,18 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.cancel",
+  "messageId": "msg-skill-cancel-001",
+  "correlationId": "msg-execute-water-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 4,
+  "worldRevision": 12,
+  "sentAt": "2026-08-24T00:00:10Z",
+  "payload": {
+    "commandId": "command-water-001",
+    "reason": "Player requested cancel",
+    "requestedByPlayer": true,
+    "cancelPolicy": "safe-point"
+  }
+}

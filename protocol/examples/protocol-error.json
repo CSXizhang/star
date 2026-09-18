@@ -1,0 +1,15 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "protocol.error",
+  "messageId": "msg-err-001",
+  "correlationId": "msg-bad-001",
+  "senderInstanceId": "mod-instance-001",
+  "sequenceNumber": 7,
+  "worldRevision": 12,
+  "sentAt": "2026-08-24T00:00:16Z",
+  "payload": {
+    "code": "IDEMPOTENCY_CONFLICT",
+    "message": "Idempotency key reused with different parameters",
+    "details": "Original parameters hash did not match"
+  }
+}

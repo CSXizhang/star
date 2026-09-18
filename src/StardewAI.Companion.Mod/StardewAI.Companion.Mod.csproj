@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>StardewAI.Companion.Mod</AssemblyName>
+    <RootNamespace>StardewAI.Companion.Mod</RootNamespace>
+    <PlatformTarget>x64</PlatformTarget>
+    <StardewGamePath Condition="'$(StardewGamePath)' == ''">$(STARDEW_GAME_PATH)</StardewGamePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>$(StardewGamePath)\smapi-internal\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewModdingAPI" Condition="Exists('$(StardewGamePath)\StardewModdingAPI.dll')">
+      <HintPath>$(StardewGamePath)\StardewModdingAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Stardew Valley" Condition="Exists('$(StardewGamePath)\Stardew Valley.dll')">
+      <HintPath>$(StardewGamePath)\Stardew Valley.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoGame.Framework" Condition="Exists('$(StardewGamePath)\MonoGame.Framework.dll')">
+      <HintPath>$(StardewGamePath)\MonoGame.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="xTile" Condition="Exists('$(StardewGamePath)\xTile.dll')">
+      <HintPath>$(StardewGamePath)\xTile.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewValley.GameData" Condition="Exists('$(StardewGamePath)\StardewValley.GameData.dll')">
+      <HintPath>$(StardewGamePath)\StardewValley.GameData.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <None Update="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="ValidateStardewGamePath" BeforeTargets="ResolveReferences" Condition="'$(DesignTimeBuild)' != 'true' and !Exists('$(StardewGamePath)\StardewModdingAPI.dll')">
+    <Error Text="STARDEW_GAME_PATH must point to a Stardew Valley installation containing StardewModdingAPI.dll." />
+  </Target>
+</Project>

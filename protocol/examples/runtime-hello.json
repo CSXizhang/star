@@ -1,0 +1,20 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "runtime.hello",
+  "messageId": "msg-runtime-hello-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 0,
+  "worldRevision": 0,
+  "sentAt": "2026-08-24T00:00:00Z",
+  "payload": {
+    "supportedProtocolVersions": ["0.1"],
+    "runtimeVersion": "0.1.0",
+    "sessionToken": null,
+    "features": {
+      "planner": false,
+      "memory": false,
+      "voice": false,
+      "mcp": false
+    }
+  }
+}

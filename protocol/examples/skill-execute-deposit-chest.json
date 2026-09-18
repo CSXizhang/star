@@ -1,0 +1,36 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.execute",
+  "messageId": "msg-execute-deposit-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 5,
+  "worldRevision": 16,
+  "sentAt": "2026-08-24T00:01:20Z",
+  "expiresAt": "2026-08-24T00:01:50Z",
+  "idempotencyKey": "save-hash-example:task-deposit-001:attempt-001",
+  "payload": {
+    "commandId": "command-deposit-001",
+    "taskId": "task-deposit-001",
+    "skillId": "deposit-chest",
+    "skillVersion": "0.1",
+    "expectedWorldRevision": 16,
+    "parameters": {
+      "locationId": "Farm",
+      "chestTile": { "x": 70, "y": 12 },
+      "itemIds": [
+        "(O)24",
+        "(O)188",
+        "(O)192"
+      ]
+    },
+    "budgets": {
+      "maxGameMinutes": 60,
+      "maxStamina": 50.0,
+      "maxWater": 20
+    },
+    "cancelPolicy": "safe-point",
+    "policyDecisionId": "policy-decision-deposit-001"
+  }
+}

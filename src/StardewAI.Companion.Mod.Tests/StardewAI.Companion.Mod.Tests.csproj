@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <StardewGamePath Condition="'$(StardewGamePath)' == ''">$(STARDEW_GAME_PATH)</StardewGamePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.7.2" />
+    <PackageReference Include="xunit" Version="2.5.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.0">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>$(StardewGamePath)\smapi-internal\0Harmony.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="MonoMod.Common">
+      <HintPath>$(StardewGamePath)\smapi-internal\MonoMod.Common.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Mono.Cecil">
+      <HintPath>$(StardewGamePath)\smapi-internal\Mono.Cecil.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <ProjectReference Include="..\StardewAI.Companion.Mod\StardewAI.Companion.Mod.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="StardewModdingAPI" Condition="Exists('$(StardewGamePath)\StardewModdingAPI.dll')">
+      <HintPath>$(StardewGamePath)\StardewModdingAPI.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Stardew Valley" Condition="Exists('$(StardewGamePath)\Stardew Valley.dll')">
+      <HintPath>$(StardewGamePath)\Stardew Valley.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="MonoGame.Framework" Condition="Exists('$(StardewGamePath)\MonoGame.Framework.dll')">
+      <HintPath>$(StardewGamePath)\MonoGame.Framework.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="xTile" Condition="Exists('$(StardewGamePath)\xTile.dll')">
+      <HintPath>$(StardewGamePath)\xTile.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="StardewValley.GameData" Condition="Exists('$(StardewGamePath)\StardewValley.GameData.dll')">
+      <HintPath>$(StardewGamePath)\StardewValley.GameData.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

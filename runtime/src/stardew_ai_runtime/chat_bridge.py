@@ -1,0 +1,2679 @@
+"""Chat Bridge connecting in-game chat UI to a configured agent backend and MCP tools.
+
+Architecture:
+  Stardew Valley Mod (F8 CompanionCommandMenu)
+     |
+     | WebSocket (/chat)
+     v
+  ChatBridge (stardew_ai_runtime.chat_bridge)
+     |
+     | Subprocess: configured agy or Kimi CLI backend
+     v
+  Agent CLI
+     |
+     | stdio MCP
+     v
+  stardew-companion MCP server -> Mod Mechanics -> Game World
+"""
+
+from __future__ import annotations
+
+from stardew_ai_runtime.job_feedback import compact_job_feedback
+import argparse
+import asyncio
+import contextlib
+import datetime
+import json
+import logging
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from stardew_ai_runtime.agent_backends import AgyBackend, KimiBackend
+from stardew_ai_runtime.autonomy import AutonomyController
+from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
+from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
+from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
+from stardew_ai_runtime.plan_executor import PlanExecutor, StepExecution
+from stardew_ai_runtime.protocol import (
+    Envelope,
+)
+from stardew_ai_runtime.scheduler import DiscoveryError, resolve_discovery
+from stardew_ai_runtime.websocket_client import (
+    ConnectionClosed,
+    WebSocketClient,
+    WebSocketError,
+)
+from stardew_ai_runtime.work_state import WorkStore
+
+logger = logging.getLogger("stardew_ai_runtime.chat_bridge")
+
+
+def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+    res = 0
+    shift = 0
+    while offset < len(data):
+        b = data[offset]
+        offset += 1
+        res |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return res, offset
+        shift += 7
+    return res, offset
+
+
+def _parse_protobuf(data: bytes) -> dict[int, list[tuple[int, Any]]]:
+    offset = 0
+    fields: dict[int, list[tuple[int, Any]]] = {}
+    while offset < len(data):
+        try:
+            tag_val, offset = _decode_varint(data, offset)
+        except Exception:
+            break
+        tag = tag_val >> 3
+        wire = tag_val & 7
+        if wire == 0:
+            val, offset = _decode_varint(data, offset)
+        elif wire == 2:
+            length, offset = _decode_varint(data, offset)
+            val = data[offset : offset + length]
+            offset += length
+        elif wire == 1:
+            val = data[offset : offset + 8]
+            offset += 8
+        elif wire == 5:
+            val = data[offset : offset + 4]
+            offset += 4
+        else:
+            break
+        fields.setdefault(tag, []).append((wire, val))
+    return fields
+
+
+def _parse_usage_from_gen_metadata(data: bytes) -> dict[str, int]:
+    usage = {
+        "prompt_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "thinking_tokens": 0,
+        "total_tokens": 0,
+    }
+    if not data:
+        return usage
+    f = _parse_protobuf(data)
+    if 1 not in f:
+        return usage
+    wire, val = f[1][0]
+    if wire != 2 or not isinstance(val, bytes):
+        return usage
+    gen_meta = _parse_protobuf(val)
+    if 4 not in gen_meta:
+        return usage
+    wire4, val4 = gen_meta[4][0]
+    if wire4 != 2 or not isinstance(val4, bytes):
+        return usage
+    u = _parse_protobuf(val4)
+    usage["prompt_tokens"] = u.get(1, [(0, 0)])[0][1]
+    usage["input_tokens"] = u.get(2, [(0, 0)])[0][1]
+    usage["output_tokens"] = u.get(3, [(0, 0)])[0][1]
+    usage["cache_read_tokens"] = u.get(5, [(0, 0)])[0][1]
+    usage["thinking_tokens"] = u.get(9, [(0, 0)])[0][1]
+    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    return usage
+
+
+def get_conversation_db_path(conversation_id: str) -> Path:
+    return (
+        Path.home()
+        / ".gemini"
+        / "antigravity-cli"
+        / "conversations"
+        / f"{conversation_id}.db"
+    )
+
+
+def get_max_gen_idx(conversation_id: str | None) -> int:
+    """Returns the maximum gen_metadata.idx recorded for conversation_id, or -1 if none."""
+    if not conversation_id:
+        return -1
+    db_path = get_conversation_db_path(conversation_id)
+    if not db_path.is_file():
+        return -1
+    try:
+        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        cur = con.cursor()
+        cur.execute("SELECT MAX(idx) FROM gen_metadata")
+        row = cur.fetchone()
+        con.close()
+        return row[0] if (row and row[0] is not None) else -1
+    except Exception as ex:
+        logger.debug("Failed getting max gen idx for %s: %s", conversation_id, ex)
+        return -1
+
+
+def get_command_usage_delta(conversation_id: str | None, start_idx: int) -> dict[str, Any] | None:
+    """Calculates exact usage delta for generations strictly after start_idx."""
+    if not conversation_id:
+        return None
+    db_path = get_conversation_db_path(conversation_id)
+    if not db_path.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx",
+            (start_idx,),
+        )
+        rows = cur.fetchall()
+        con.close()
+        if not rows:
+            return None
+
+        inp = 0
+        out = 0
+        cache = 0
+        thinking = 0
+        for _, data in rows:
+            u = _parse_usage_from_gen_metadata(data)
+            inp += u.get("input_tokens", 0)
+            out += u.get("output_tokens", 0)
+            cache += u.get("cache_read_tokens", 0)
+            thinking += u.get("thinking_tokens", 0)
+
+        return {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cache_read_tokens": cache,
+            "thinking_tokens": thinking,
+            "total_tokens": inp + out,
+            "generations_count": len(rows),
+            "start_idx": start_idx + 1,
+            "end_idx": rows[-1][0],
+            "source": "db_gen_metadata_delta",
+        }
+    except Exception as ex:
+        logger.warning(
+            "Failed calculating usage delta for %s (start_idx=%d): %s",
+            conversation_id,
+            start_idx,
+            ex,
+        )
+        return None
+
+
+def get_max_step_idx(conversation_id: str | None) -> int:
+    """Returns the maximum steps.idx recorded for conversation_id, or -1 if none."""
+    if not conversation_id:
+        return -1
+    db_path = get_conversation_db_path(conversation_id)
+    if not db_path.is_file():
+        return -1
+    try:
+        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        cur = con.cursor()
+        cur.execute("SELECT coalesce(max(idx), -1) FROM steps")
+        row = cur.fetchone()
+        con.close()
+        return row[0] if (row and row[0] is not None) else -1
+    except Exception as ex:
+        logger.debug("Failed getting max step idx for %s: %s", conversation_id, ex)
+        return -1
+
+
+def check_new_quota_error(conversation_id: str | None, start_step_idx: int) -> tuple[bool, str]:
+    """Checks if any new step with idx > start_step_idx and step_type == 17 has RESOURCE_EXHAUSTED."""
+    if not conversation_id:
+        return False, ""
+    db_path = get_conversation_db_path(conversation_id)
+    if not db_path.is_file():
+        return False, ""
+    try:
+        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT idx, step_payload FROM steps WHERE idx > ? AND step_type = 17 ORDER BY idx",
+            (start_step_idx,),
+        )
+        rows = cur.fetchall()
+        con.close()
+        for _idx, payload in rows:
+            text = (
+                payload.decode("utf-8", errors="replace")
+                if isinstance(payload, bytes)
+                else str(payload)
+            )
+            if (
+                "RESOURCE_EXHAUSTED" in text
+                or "Individual quota reached" in text
+                or "quota exceeded" in text
+            ):
+                return True, text
+        return False, ""
+    except Exception as ex:
+        logger.debug("Failed checking new steps for quota error: %s", ex)
+        return False, ""
+
+
+class InternalMcpPlanClient:
+    """Persistent internal MCP client the bridge owns for plan execution.
+
+    It speaks to the *same* MCP server implementation the model uses (spawned
+    with the harness-only ``--surface internal`` — the light game surface plus the
+    read-only reconcile tool — and the same ``--run-dir``), so the worker path uses
+    the same policy/budget/chest checks and the same real scheduler code as a
+    normal tool call — it is not a second independent scheduler socket next to a
+    provider.
+
+    The Mod transport accepts a single command socket and answers a concurrent
+    connection with 409 Conflict, so ownership is serialized: the bridge closes
+    this client before starting a provider turn and reopens it afterwards.
+
+    The stdio session lives in one dedicated asyncio task that opens, calls and
+    closes it in the same task context (the only supported usage for
+    ``stdio_client``'s cancel scopes).
+    """
+
+    def __init__(
+        self,
+        run_dir: str | Path | None,
+        *,
+        python_executable: str | None = None,
+        timeout_seconds: float = 120.0,
+    ):
+        self.run_dir = Path(run_dir) if run_dir else None
+        self.python_executable = python_executable or sys.executable
+        self.timeout_seconds = timeout_seconds
+        self._task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._requests: asyncio.Queue | None = None
+        self._ready: asyncio.Future | None = None
+        self._closed = False
+        self._live_session: Any | None = None
+
+    @property
+    def connected(self) -> bool:
+        return bool(self._ready and self._ready.done() and not self._ready.cancelled())
+
+    def build_command(self) -> list[str]:
+        if self.run_dir is None:
+            raise RuntimeError("internal plan client requires a run directory")
+        return [
+            self.python_executable,
+            "-m",
+            "stardew_ai_runtime.mcp_server",
+            "--run-dir",
+            str(self.run_dir),
+            "--surface",
+            "internal",
+        ]
+
+    async def open(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._loop = asyncio.get_running_loop()
+        self._requests = asyncio.Queue()
+        self._ready = self._loop.create_future()
+        self._closed = False
+        self._task = self._loop.create_task(self._session_loop())
+        await asyncio.wait_for(asyncio.shield(self._ready), timeout=self.timeout_seconds)
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+        if self._task is None or self._task.done():
+            await self.open()
+        # Native cancel must reach the existing scheduler while a long native
+        # operation is awaiting its terminal result, not queue behind that job.
+        if name == "dispatch_plan_operation" and (arguments or {}).get("operation") in {"cancel_task", "pause_task"} and self._live_session is not None:
+            result = await asyncio.wait_for(self._live_session.call_tool(name, arguments or {}), timeout=10)
+            if getattr(result, "isError", False):
+                raise RuntimeError(f"Native control rejected: {_tool_result_payload(result)}")
+            return _tool_result_payload(result)
+        return await self._command(("call", name, arguments or {}))
+
+    async def current_save_id(self) -> str | None:
+        try:
+            status = await self.call_tool("get_status", {"detail": False})
+        except Exception:
+            logger.debug("Unable to read save id for plan worker", exc_info=True)
+            return None
+        save_id = status.get("saveId") if isinstance(status, dict) else None
+        if not save_id or save_id == "unknown":
+            return None
+        return str(save_id)
+
+    async def reconcile(self, command_id: str) -> Any:
+        """Ask the same server to reconcile a persisted command id (read-only)."""
+        return await self.call_tool("reconcile_plan_command", {"command_id": command_id})
+
+    async def close(self) -> None:
+        """Release the internal execution socket so a provider turn can own it."""
+        if self._task is None:
+            return
+        try:
+            await self._command(("close", None, None))
+        except Exception:
+            logger.debug("Internal MCP client close command failed", exc_info=True)
+        task, self._task = self._task, None
+        if not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
+            except Exception:
+                logger.debug("Internal MCP session task ended with error", exc_info=True)
+        self._requests = None
+        self._ready = None
+
+    # ------------------------------------------------------------- internals
+    async def _command(self, command: tuple[str, Any, Any]) -> Any:
+        if self._requests is None or self._loop is None:
+            raise RuntimeError("internal MCP client is not open")
+        future: asyncio.Future = self._loop.create_future()
+        self._requests.put_nowait((command, future))
+        return await future
+
+    async def _session_loop(self) -> None:
+        """Own the stdio session for its whole lifetime in one task."""
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        cmd = self.build_command()
+        env = {**os.environ, "STARDEW_MCP_SURFACE": "internal"}
+        try:
+            async with stdio_client(
+                StdioServerParameters(command=cmd[0], args=cmd[1:], env=env)
+            ) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    self._live_session = session
+                    self._resolve_ready(None)
+                    try:
+                        await self._serve(session)
+                    finally:
+                        self._live_session = None
+        except BaseException as ex:  # noqa: BLE001 - reported to the awaiting caller
+            self._resolve_ready(ex)
+            if not isinstance(ex, (asyncio.CancelledError, GeneratorExit)):
+                logger.warning("Internal MCP session ended: %s", ex)
+
+    def _resolve_ready(self, error: BaseException | None) -> None:
+        ready = self._ready
+        if ready is not None and not ready.done():
+            if error is None:
+                ready.set_result(True)
+            else:
+                ready.set_exception(error)
+
+    async def _serve(self, session: Any) -> None:
+        queue = self._requests
+        if queue is None:
+            return
+        while True:
+            command, future = await queue.get()
+            kind, name, arguments = command
+            if kind == "close":
+                if not future.done():
+                    future.set_result(None)
+                return
+            try:
+                result = await asyncio.wait_for(
+                    session.call_tool(name, arguments or {}),
+                    timeout=self.timeout_seconds,
+                )
+                if getattr(result, "isError", False):
+                    raise RuntimeError(
+                        f"internal MCP tool '{name}' failed: {_tool_result_payload(result)}"
+                    )
+                payload = _tool_result_payload(result)
+            except Exception as ex:
+                if not future.done():
+                    future.set_exception(ex)
+            else:
+                if not future.done():
+                    future.set_result(payload)
+
+    # Kept for explicit teardown paths (bridge shutdown) where awaiting is unsafe.
+    def terminate_sync(self) -> None:
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+
+def _tool_result_payload(result: Any) -> Any:
+    """Normalise an MCP CallToolResult to its structured JSON payload."""
+    structured = getattr(result, "structuredContent", None)
+    if isinstance(structured, dict):
+        if set(structured) == {"result"}:
+            return structured["result"]
+        return structured
+    content = getattr(result, "content", None)
+    if isinstance(content, list):
+        for item in content:
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    return text
+    return None
+
+
+class PlanWorker:
+    """Advances committed short plans without one model turn per step.
+
+    Wakes on new native snapshots, after provider turns, and after new player
+    instructions. It claims ready steps through the shared ``PlanExecutor`` (same
+    store, same commit discipline as the MCP ``run_next_step`` tool), chains
+    successful steps without any LLM call, and only reports a model wake when a
+    step deviates (partial/unknown), when a dependency is blocked, or when a
+    waiting condition requires a decision.
+    """
+
+    def __init__(
+        self,
+        store: WorkStore,
+        client: Any,
+        *,
+        worker_id: str | None = None,
+        idle_seconds: float = 5.0,
+        step_limit: int = 200,
+    ):
+        self.store = store
+        self.client = client
+        self.worker_id = worker_id or f"bridge-{uuid.uuid4().hex[:8]}"
+        self.idle_seconds = idle_seconds
+        self.step_limit = step_limit
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._dirty = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._provider_active = False
+        self.supplied_save_id: str | None = None
+        self.last_result: StepExecution | None = None
+        self.progress_callback = None
+        self.completed_steps = 0
+        self.attempted_steps = 0
+        self.pending_reasons: list[str] = []
+        self.pending_decisions: list[dict[str, Any]] = []
+        # Latest native snapshot used to gate explicit waiting conditions. The
+        # bridge refreshes it on every world.snapshot; the worker never invents it.
+        self.snapshot_provider: Any | None = None
+
+    def _fresh_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if self.snapshot_provider is None:
+            return None, None
+        try:
+            return self.snapshot_provider()
+        except Exception:
+            logger.debug("Plan worker snapshot provider failed", exc_info=True)
+            return None, None
+
+    # ----------------------------------------------------------- lifecycle
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._loop = asyncio.get_running_loop()
+            self._task = asyncio.create_task(self._run())
+
+    def notify(self, *, dirty: bool = True) -> None:
+        """Signal new potential work (snapshot, provider turn end, player input)."""
+        if dirty:
+            self._dirty = True
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._wake.set)
+                return
+            except RuntimeError:
+                pass
+        self._wake.set()
+
+    def set_provider_active(self, active: bool) -> None:
+        self._provider_active = active
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # -------------------------------------------------------------- work
+    async def _run(self) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=self.idle_seconds)
+            except TimeoutError:
+                pass
+            self._wake.clear()
+            if self._provider_active:
+                continue
+            try:
+                await self.evaluate()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Plan worker evaluation failed", exc_info=True)
+
+    async def evaluate(self) -> list[StepExecution]:
+        """Run ready steps until none remain (or a deviation needs the model)."""
+        self._dirty = False
+        executions: list[StepExecution] = []
+        for _ in range(self.step_limit):
+            if self._provider_active:
+                break
+            save_id = await self._resolve_save_id()
+            if not save_id:
+                break
+            # Read-only readiness check against the shared store; it never touches
+            # the Mod, so an idle plan costs no provider and no LLM call. Waiting
+            # steps stay parked until their explicit native condition is met.
+            try:
+                snapshot, game_date = self._fresh_state()
+                if not self.store.has_ready_step(save_id, snapshot=snapshot, game_date=game_date):
+                    break
+            except Exception:
+                break
+            executor = PlanExecutor(
+                self.store,
+                dispatch=self._dispatch,
+                reconcile=self._reconcile,
+                snapshot_provider=self._fresh_state,
+            )
+            execution = await executor.run_once(save_id, self.worker_id)
+            if execution.status == "idle":
+                break
+            executions.append(execution)
+            self.last_result = execution
+            if self.progress_callback:
+                await self.progress_callback(execution)
+            # ``completed_steps`` counts only steps the harness actually confirmed
+            # complete. A parked (waiting) or failed/unknown dispatch is NOT
+            # progress: counting it was the round6 false-progress bug that let the
+            # acceptance script report a failed plan as multi-step success.
+            self.attempted_steps += 1
+            if execution.status == "executed" and execution.outcome == "completed":
+                self.completed_steps += 1
+            if execution.recovery_decisions:
+                self.pending_decisions.extend(execution.recovery_decisions)
+            if execution.task_status == "completed" or execution.needs_model or execution.outcome in {"failed", "partial", "unknown", "rejected", "cancelled"} or (execution.outcome == "waiting" and (execution.result or {}).get("waitCondition", {}).get("type") != "transportRetry"):
+                completed_task = next((t for t in self.store.state(save_id).tasks if t.id == execution.task_id), None)
+                all_effects = [effect for step in completed_task.steps for effect in step.effects] if completed_task else execution.effects
+                feedback = compact_job_feedback({**(execution.result or {}), "effects": all_effects, "reasonCode": execution.reason_code, "commandId": execution.command_id, "message": execution.message}, operation=execution.operation or "", status=execution.outcome)
+                feedback["effectCount"] = len(all_effects)
+                feedback["stepsCompleted"] = sum(step.status == "completed" for step in completed_task.steps) if completed_task else 0
+                self.store.finish_job(save_id, feedback, task_id=execution.task_id)
+                self.pending_reasons.append("SHORT_JOB_TERMINAL")
+                break
+            if execution.needs_model:
+                # A deviation (partial/unknown) or a refused dispatch needs one
+                # decision; do not spin on it and do not re-dispatch blindly.
+                self.pending_reasons.append(
+                    execution.reason_code or execution.outcome or "STEP_DEVIATION"
+                )
+                break
+        if executions:
+            # Re-check on the next tick: a completed step may unlock the next one.
+            self._dirty = True
+        return executions
+
+    async def _dispatch(self, operation: str, params: dict[str, Any], command_id: str) -> Any:
+        # The harness-only internal tool runs the identical validated plan
+        # operation implementation ``run_next_step`` uses and forwards the stable
+        # persisted command id to the real scheduler/native command. It must not go
+        # through ``call_capability``: that model-facing schema has no
+        # ``command_id`` and rejected the step (round6 STEP_DISPATCH_FAILED).
+        if self.progress_callback:
+            state = self.store.state(self.supplied_save_id or await self._resolve_save_id())
+            task = next((t for t in state.tasks if any(s.command_id == command_id for s in t.steps)), None)
+            await self.progress_callback(StepExecution(status="dispatching", task_id=task.id if task else None,
+                operation=operation, command_id=command_id, outcome="running"))
+        return await self.client.call_tool(
+            "dispatch_plan_operation",
+            {"operation": operation, "params": dict(params), "command_id": command_id},
+        )
+
+    async def _reconcile(self, command_id: str) -> Any:
+        reconcile = getattr(self.client, "reconcile", None)
+        if callable(reconcile):
+            return await reconcile(command_id)
+        return None
+
+    async def _resolve_save_id(self) -> str | None:
+        if self.supplied_save_id:
+            return self.supplied_save_id
+        resolver = getattr(self.client, "current_save_id", None)
+        if callable(resolver):
+            try:
+                return await resolver()
+            except Exception:
+                logger.debug("Plan worker could not resolve a save id", exc_info=True)
+        return None
+
+@dataclass
+class ActiveChatTask:
+    request_id: str
+    save_id: str
+    prompt: str = ""
+    start_max_idx: int = -1
+    start_max_step_idx: int = -1
+    wire_start_offset: int = 0
+    process: subprocess.Popen | None = None
+    async_task: asyncio.Task | None = None
+    cancelled: bool = False
+    abort_reason: str | None = None
+    start_time: float = field(default_factory=time.monotonic)
+    recorded: bool = False
+
+
+class ChatBridge:
+    """Bridges WebSocket /chat messages to agy CLI executions with lifecycle and cancel management."""
+
+    def __init__(
+        self,
+        run_dir: str | Path | None = None,
+        model: str | None = None,
+        effort: str = "medium",
+        sessions_file: Path | None = None,
+        commands_file: Path | None = None,
+        instance_id: str | None = None,
+        agy_cmd: str | None = None,
+        backend: str | None = None,
+        backend_model: str | None = None,
+        kimi_cmd: str | None = None,
+        internal_plan_client: Any | None = None,
+        enable_plan_worker: bool = True,
+    ):
+        self.run_dir = Path(run_dir) if run_dir else None
+        configured = load_chat_backend_config()
+        self.backend_name = backend or configured["backend"]
+        self.model = backend_model or model or (configured["model"] if self.backend_name == "kimi" else "gemini-3.8-flash")
+        self.effort = effort
+        self.instance_id = instance_id or f"chat-bridge-{uuid.uuid4().hex[:8]}"
+        self.agy_cmd = agy_cmd or "agy.exe"
+        self.kimi_cmd = kimi_cmd or "kimi.exe"
+        # Game-only Kimi agent profile (new sessions only; resumed sessions keep theirs).
+        self.agent = configured.get("agent")
+        configured_agent_file = configured.get("agentFile")
+        self.agent_file: Path | None = None
+        if configured_agent_file:
+            candidate = Path(configured_agent_file)
+            resolved = candidate if candidate.is_absolute() else project_root() / candidate
+            # Only bind a profile that actually exists; otherwise fall back to the
+            # default agent rather than failing the whole turn.
+            self.agent_file = resolved if resolved.is_file() else None
+            if self.agent_file is None:
+                logger.warning("Configured Kimi agentFile not found: %s", resolved)
+        self._backend = None
+        self._busy_lock = asyncio.Lock()
+        self._active_task: ActiveChatTask | None = None
+        self._sessions_file = sessions_file or self._default_sessions_file()
+        self._commands_file = commands_file or self._default_commands_file()
+        self._sessions: dict[str, str] = self._load_sessions()
+        self._autonomy: AutonomyController | None = None
+        self._autonomy_requests: dict[str, str] = {}
+        self._current_game_day_key: str | None = None
+        # Latest native snapshot the chat channel received; the compact decision
+        # context is rebuilt from it for every model decision.
+        self._latest_snapshot_payload: dict[str, Any] | None = None
+        self._latest_snapshot_revision: int | None = None
+        # Provider-session rotation bookkeeping (day change / context budget).
+        self._session_history: dict[str, list[str]] = {}
+        self._session_token_totals: dict[str, int] = {}
+        # Input-context policy: the game value is the *latest single request's*
+        # input context (inputOther + cacheRead + cacheCreation), never the sum
+        # across requests. 100k is a configurable engineering policy ceiling, not
+        # a claim about the provider's physical window.
+        self._session_requests: dict[str, int] = {}
+        self._session_context_state: dict[str, dict[str, Any]] = {}
+        # Set when the provider session was rotated because the configured
+        # profile/tool surface changed; surfaced to F8 and then cleared.
+        self._profile_rotation_note: str | None = None
+        try:
+            self._session_token_budget = int(
+                os.getenv("STARDEW_SESSION_CONTEXT_BUDGET")
+                # Legacy name from the first round; still honoured so an existing
+                # deployment keeps working, but it now means input context, not a
+                # cumulative token sum.
+                or os.getenv("STARDEW_SESSION_TOKEN_BUDGET")
+                or "100000"
+            )
+        except ValueError:
+            self._session_token_budget = 100000
+        try:
+            self._session_request_checkpoint = int(
+                os.getenv("STARDEW_SESSION_REQUEST_CHECKPOINT", "20") or 0
+            )
+        except ValueError:
+            self._session_request_checkpoint = 20
+        self._last_day_settlement: dict[str, Any] | None = None
+        self._autonomy_generation = 0
+        self._autonomy_last_snapshot_at: dict[str, float] = {}
+        self._autonomy_pending_snapshot: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
+        self._autonomy_debounce_tasks: dict[str, asyncio.Task] = {}
+        self._bind_autonomy_store()
+        # Durable per-save goals/tasks/todos; bound once a run dir is known
+        # (explicit --run-dir or discovered from the running Mod).
+        self._work_store: WorkStore | None = None
+        self._plan_worker: PlanWorker | None = None
+        # Serializes native command-socket ownership between the provider turn and
+        # the internal plan worker (the Mod transport accepts one command client).
+        self._execution_lock = asyncio.Lock()
+        self._internal_plan_client_override = internal_plan_client
+        self._enable_plan_worker = enable_plan_worker
+        self._bind_work_store()
+
+    @property
+    def provider(self) -> str:
+        return self.backend_name
+
+    def _get_backend(self):
+        if self._backend is None:
+            if self.backend_name == "agy":
+                self._backend = AgyBackend(self._execute_agy_turn)
+            elif self.backend_name == "kimi":
+                self._backend = KimiBackend(
+                    model=self.model or "kimi-code/k3", command=self.kimi_cmd,
+                    cwd=project_root(), auto=False,
+                    progress=getattr(self, "_backend_progress_callback", None),
+                    agent=self.agent, agent_file=self.agent_file,
+                )
+            else:
+                raise ValueError(f"Unsupported chat backend: {self.backend_name}")
+        return self._backend
+
+    def _notify_backend_failure(self, code: str) -> None:
+        """Notify the runtime that the provider returned a closing failure code.
+
+        The chat runtime maps this (quota / rate limit / auth) to a temporary
+        autonomy close so the loop backs off instead of hot-retrying.
+        """
+        callback = getattr(self, "_backend_failure_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(code)
+        except Exception:
+            logger.debug("Backend failure callback raised for %s", code, exc_info=True)
+
+    def _notify_terminal(self, status: str) -> None:
+        callback = getattr(self, "_terminal_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(status)
+        except Exception:
+            logger.debug("Terminal callback raised for %s", status, exc_info=True)
+
+    def _configure_backend_progress(
+        self, ws: WebSocketClient | None, request_id: str, save_id: str | None
+    ) -> None:
+        loop = asyncio.get_running_loop()
+
+        def callback(event: Any) -> None:
+            if event.kind != "tool_started" or not event.tool_name:
+                return
+            reply = Envelope.create_chat_reply(
+                sender_instance_id=self.instance_id,
+                request_id=request_id,
+                status="processing",
+                reply_text=f"{event.message}：{event.tool_name}",
+                save_id=save_id,
+                provider=self.backend_name,
+            )
+            asyncio.run_coroutine_threadsafe(self._send_reply(ws, reply), loop)
+
+        self._backend_progress_callback = callback
+
+    def _bind_autonomy_store(self) -> None:
+        """Use the same run-dir state file as MCP, including after auto-discovery."""
+        if self.run_dir is not None:
+            self._autonomy = AutonomyController(self.run_dir / "data" / "autonomy-state.json")
+
+    def _bind_work_store(self) -> None:
+        """Bind durable work state and the internal plan worker.
+
+        Called from ``__init__`` and again after auto-discovery resolves the Mod
+        dir, so a Bridge started with zero arguments also gets persistent
+        goals/plans and the no-model-turn plan worker (not only an explicit
+        ``--run-dir``).
+        """
+        if self.run_dir is None:
+            return
+        store = WorkStore(self.run_dir / "data" / "work-state.json")
+        self._work_store = store
+        if not self._enable_plan_worker:
+            return
+        if self._plan_worker is not None:
+            self._plan_worker.store = store
+            self._plan_worker.snapshot_provider = self._plan_snapshot_state
+            return
+        client = self._internal_plan_client_override
+        if client is None:
+            client = InternalMcpPlanClient(self.run_dir)
+        self._plan_worker = PlanWorker(store, client)
+        self._plan_worker.progress_callback = self._publish_job_progress
+        self._plan_worker.snapshot_provider = self._plan_snapshot_state
+
+    def _plan_snapshot_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """(latest world.snapshot payload, native game date) for wait evaluation."""
+        payload = self._latest_snapshot_payload
+        if not isinstance(payload, dict):
+            return None, None
+        world = payload.get("world") if isinstance(payload.get("world"), dict) else {}
+        game_date = {
+            "year": world.get("year"),
+            "season": world.get("season"),
+            "day": world.get("dayOfMonth"),
+        }
+        if all(value is None for value in game_date.values()):
+            game_date = None
+        return payload, game_date
+
+    # ------------------------------------------- execution ownership (worker)
+    async def _claim_execution(
+        self, save_id: str | None = None, *, recover: bool = True
+    ) -> bool:
+        """Park the plan worker and close its MCP session before a provider turn.
+
+        The Mod transport serves a single command socket and rejects a concurrent
+        connection with 409 Conflict, so the provider and the internal worker must
+        never hold one at the same time.
+        """
+        worker = self._plan_worker
+        if worker is None:
+            return False
+        worker.set_provider_active(True)
+        await self._execution_lock.acquire()
+        client = getattr(worker, "client", None)
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                logger.warning("Could not release internal MCP session", exc_info=True)
+        if recover and save_id and self._work_store is not None:
+            try:
+                await asyncio.to_thread(self._work_store.recover, save_id)
+            except Exception:
+                logger.debug("Work store recovery before provider turn failed", exc_info=True)
+        return True
+
+    async def _release_execution(self, save_id: str | None = None) -> None:
+        """Hand execution ownership back to the plan worker and wake it."""
+        if self._execution_lock.locked():
+            self._execution_lock.release()
+        worker = self._plan_worker
+        if worker is None:
+            return
+        if save_id:
+            worker.supplied_save_id = save_id
+        worker.set_provider_active(False)
+        worker.notify()
+
+    def _notify_plan_worker(self, save_id: str | None = None) -> None:
+        worker = self._plan_worker
+        if worker is None:
+            return
+        if save_id:
+            worker.supplied_save_id = save_id
+        worker.notify()
+
+    def _default_sessions_file(self) -> Path:
+        base = (
+            self.run_dir
+            if self.run_dir
+            else Path.home() / ".gemini" / "antigravity-cli"
+        )
+        return base / "chat_sessions.json"
+
+    def _default_commands_file(self) -> Path:
+        base = (
+            self.run_dir
+            if self.run_dir
+            else Path.home() / ".gemini" / "antigravity-cli"
+        )
+        return base / "chat_commands.jsonl"
+
+    def _load_sessions(self) -> dict[str, str]:
+        if self._sessions_file.is_file():
+            try:
+                data = json.loads(self._sessions_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items()}
+            except Exception as ex:
+                logger.warning("Failed to load chat sessions from %s: %s", self._sessions_file, ex)
+        return {}
+
+    def _save_sessions(self) -> None:
+        try:
+            self._sessions_file.parent.mkdir(parents=True, exist_ok=True)
+            self._sessions_file.write_text(
+                json.dumps(self._sessions, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as ex:
+            logger.warning("Failed to save chat sessions to %s: %s", self._sessions_file, ex)
+
+    def _record_command(
+        self,
+        request_id: str,
+        save_id: str | None,
+        conversation_id: str | None,
+        prompt: str,
+        status: str,
+        start_idx: int,
+        end_idx: int,
+        usage: dict[str, Any] | None,
+        missing_reason: str | None = None,
+        error: str | None = None,
+        duration: float = 0.0,
+    ) -> None:
+        """Persists a command execution record into chat_commands.jsonl."""
+        is_test_env = bool(
+            os.getenv("PYTEST_CURRENT_TEST")
+            or os.getenv("STARDEW_TEST_ENVIRONMENT")
+        )
+        record = {
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            "requestId": request_id,
+            "saveId": save_id or "",
+            "conversationId": conversation_id,
+            "prompt": prompt,
+            "status": status,
+            "startGenIdx": start_idx,
+            "endGenIdx": end_idx,
+            "usage": usage,
+            "missingReason": missing_reason,
+            "error": error,
+            "durationSeconds": round(duration, 2),
+            "source": "test" if is_test_env else "production",
+            "provider": self.backend_name,
+            "model": self.model,
+        }
+        targets = [self._commands_file]
+        central_override = os.getenv("STARDEW_CENTRAL_COMMANDS_FILE")
+        if central_override is not None:
+            if central_override.strip().lower() not in ("none", "false", "0", ""):
+                central_target = Path(central_override.strip()).resolve()
+                if central_target != self._commands_file:
+                    targets.append(central_target)
+        elif not is_test_env:
+            central_file = Path.home() / ".gemini" / "antigravity-cli" / "chat_commands.jsonl"
+            if central_file != self._commands_file:
+                targets.append(central_file)
+
+
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        for target in targets:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception as ex:
+                logger.warning("Failed writing command record to %s: %s", target, ex)
+        logger.info("Recorded command [%s] (status=%s, usage=%s)", request_id, status, "yes" if usage else "none")
+
+    def get_conversation_id(self, save_id: str | None) -> str | None:
+        if not save_id:
+            return None
+        # Provider-qualified keys prevent an old agy conversation from ever
+        # being passed to Kimi (and retain compatibility with old agy files).
+        return self._sessions.get(f"{self.backend_name}:{save_id}") if self.backend_name == "kimi" else self._sessions.get(save_id) or self._sessions.get(f"agy:{save_id}")
+
+    def record_conversation_id(self, save_id: str | None, conversation_id: str) -> None:
+        if not save_id or not conversation_id:
+            return
+        key = f"{self.backend_name}:{save_id}"
+        self._sessions[key] = conversation_id
+        if self.backend_name == "agy":
+            self._sessions[save_id] = conversation_id
+        self._save_sessions()
+
+    def abort_active_task(self, reason: str = "aborted") -> None:
+        """Kills only the active provider child process and cancels its task."""
+        if self._active_task is not None:
+            logger.info("Aborting active chat task [%s] (%s)", self._active_task.request_id, reason)
+            self._active_task.cancelled = True
+            self._active_task.abort_reason = reason
+            proc = self._active_task.process
+            if proc and proc.poll() is None:
+                try:
+                    backend = self._backend
+                    terminate = getattr(backend, "terminate", None)
+                    if callable(terminate):
+                        terminate(proc)
+                    else:
+                        proc.kill()
+                    logger.info("Killed %s CLI subprocess (pid=%s)", self.backend_name, proc.pid)
+                except Exception as ex:
+                    logger.debug("Error killing process: %s", ex)
+            if self._active_task.async_task and not self._active_task.async_task.done():
+                self._active_task.async_task.cancel()
+
+    def _preempt_autonomy_for_player(self, request_id: str) -> bool:
+        """Invalidate an autonomous generation before accepting player work."""
+        if self._active_task is None or not self._active_task.request_id.startswith("autonomy-"):
+            return False
+        if request_id.startswith("autonomy-"):
+            return False
+        self._autonomy_generation += 1
+        self.abort_active_task("player request preempted autonomy")
+        self._active_task = None
+        return True
+
+    async def run(self, stop_event: asyncio.Event | None = None) -> None:
+        """Main lifecycle loop with auto-reconnect."""
+        logger.info(
+            "Starting ChatBridge (run_dir=%s, provider=%s, model=%s, effort=%s)",
+            self.run_dir or "auto-discovery",
+            self.backend_name,
+            self.model,
+            self.effort,
+        )
+
+        last_wait_log = 0.0
+
+        while stop_event is None or not stop_event.is_set():
+            try:
+                # 1. Discover game endpoint
+                try:
+                    disc = resolve_discovery(self.run_dir, timeout_seconds=1.0)
+                except DiscoveryError as ex:
+                    now = time.monotonic()
+                    if now - last_wait_log > 15.0:
+                        logger.info("等待星露谷游戏启动并载入存档... (%s)", ex)
+                        last_wait_log = now
+                    await asyncio.sleep(2.0)
+                    continue
+
+                host = disc["host"]
+                port = disc["port"]
+                token = disc["sessionToken"]
+                save_id = disc.get("saveId")
+                mod_dir = disc.get("modDir")
+                if not self.run_dir and mod_dir:
+                    self.run_dir = Path(mod_dir)
+                    self._bind_autonomy_store()
+                    self._bind_work_store()
+
+                # Guard against save switch while task was running
+                if self._active_task and self._active_task.save_id != save_id:
+                    self.abort_active_task(f"Save switched from {self._active_task.save_id} to {save_id}")
+
+                logger.info("Found game endpoint ws://%s:%d/chat (saveId=%s)", host, port, save_id)
+                if self._plan_worker is None and self.run_dir is not None:
+                    self._bind_work_store()
+                if self._plan_worker is not None:
+                    if save_id and self._work_store is not None:
+                        self._work_store.revoke_decision(str(save_id))
+                    self._plan_worker.supplied_save_id = str(save_id) if save_id else None
+                    self._plan_worker.start()
+                    self._notify_plan_worker(str(save_id) if save_id else None)
+
+                headers = {"Authorization": f"Bearer {token}"}
+                ws = await WebSocketClient.connect(
+                    host=host,
+                    port=port,
+                    path="/chat",
+                    headers=headers,
+                    timeout=5.0,
+                )
+
+                logger.info("Successfully connected to game chat channel at ws://%s:%d/chat", host, port)
+                last_wait_log = 0.0
+
+                try:
+                    await self._receive_loop(ws, save_id, stop_event)
+                finally:
+                    self.abort_active_task("WebSocket disconnected")
+                    await ws.close()
+
+            except (WebSocketError, ConnectionClosed, OSError) as ex:
+                logger.debug("Chat WebSocket connection lost: %s. Reconnecting in 2s...", ex)
+                self.abort_active_task("Connection lost")
+                await asyncio.sleep(2.0)
+            except asyncio.CancelledError:
+                self.abort_active_task("ChatBridge cancelled")
+                break
+            except Exception as ex:
+                logger.error("Unexpected error in ChatBridge loop: %s", ex, exc_info=True)
+                self.abort_active_task("Bridge loop exception")
+                await asyncio.sleep(3.0)
+
+        if self._plan_worker is not None:
+            await self._plan_worker.stop()
+
+    async def _receive_loop(
+        self,
+        ws: WebSocketClient | None,
+        active_save_id: str | None,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        tracked_tasks: set[asyncio.Task] = set()
+        latest_snapshot: Envelope | None = None
+
+        async def run_submit(request_id: str, text: str, save_id: str) -> None:
+            generation = self._autonomy_generation
+            try:
+                await self.handle_chat_submit(ws, request_id, text, save_id)
+            finally:
+                # A snapshot received while the agent was busy is evaluated now,
+                # after the existing agent has reached a terminal state.
+                if latest_snapshot is not None and generation == self._autonomy_generation:
+                    await self._maybe_schedule_autonomy(latest_snapshot, active_save_id, tracked_tasks, ws)
+
+        try:
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    raw_text = await ws.receive_text(timeout=2.0)
+                except TimeoutError:
+                    tracked_tasks = {t for t in tracked_tasks if not t.done()}
+                    await self._stop_autonomy_if_disabled(ws, active_save_id)
+                    if latest_snapshot is not None:
+                        await self._maybe_schedule_autonomy(latest_snapshot, active_save_id, tracked_tasks, ws)
+                    continue
+
+                try:
+                    data = json.loads(raw_text)
+                except Exception as ex:
+                    logger.warning("Received invalid JSON on chat channel: %s", ex)
+                    continue
+
+                msg_type = data.get("messageType")
+                await self._stop_autonomy_if_disabled(ws, active_save_id)
+                if msg_type == "world.snapshot":
+                    envelope = Envelope.from_mapping(data)
+                    if envelope.save_id and active_save_id and envelope.save_id != active_save_id:
+                        self.abort_active_task("Save switched while chat connection was open")
+                        break
+                    latest_snapshot = envelope
+                    self._latest_snapshot_payload = (
+                        envelope.payload if isinstance(envelope.payload, dict) else None
+                    )
+                    self._latest_snapshot_revision = envelope.world_revision
+                    world = envelope.payload.get("world") if isinstance(envelope.payload.get("world"), dict) else {}
+                    if world.get("dayOfMonth") is not None:
+                        day_key = f"{world.get('year', 'unknown')}:{world.get('season', 'unknown')}:{world['dayOfMonth']}"
+                        previous_day_key = self._current_game_day_key
+                        self._current_game_day_key = day_key
+                        # The day rollover is driven only by a real, complete native
+                        # date advance; a first snapshot or a reloaded old save is
+                        # not a new day (the store makes this idempotent). The first
+                        # observation still teaches the store which day it is so the
+                        # next advance can settle.
+                        if day_key != previous_day_key:
+                            await self._settle_day_advance(active_save_id, world)
+                    # A fresh native snapshot is also the trigger for the plan
+                    # worker to advance ready steps (and to re-evaluate waiting
+                    # todos) without any model turn.
+                    self._notify_plan_worker(active_save_id)
+                    await self._maybe_schedule_autonomy(envelope, active_save_id, tracked_tasks, ws)
+                    continue
+
+                if msg_type == "autonomy.control":
+                    envelope = Envelope.from_mapping(data)
+                    await self._handle_autonomy_control(ws, envelope, active_save_id)
+                    self._notify_plan_worker(active_save_id)
+                    if latest_snapshot is not None:
+                        await self._maybe_schedule_autonomy(latest_snapshot, active_save_id, tracked_tasks, ws, force=True)
+                    continue
+
+                if msg_type == "chat.cancel":
+                    payload_data = data.get("payload", {})
+                    req_id = payload_data.get("requestId")
+                    reason = payload_data.get("reason", "player_cancelled")
+                    await self.handle_chat_cancel(ws, req_id, reason, active_save_id)
+                    continue
+
+                if msg_type == "chat.submit":
+                    payload_data = data.get("payload", {})
+                    req_id = str(payload_data.get("requestId", ""))
+                    text = str(payload_data.get("text", ""))
+                    save_id = str(payload_data.get("saveId") or active_save_id or "")
+                elif "requestId" in data and "text" in data:
+                    req_id = str(data["requestId"])
+                    text = str(data["text"])
+                    save_id = str(data.get("saveId") or active_save_id or "")
+                else:
+                    continue
+                if req_id and text.strip():
+                    task = asyncio.create_task(run_submit(req_id, text, save_id))
+                    tracked_tasks.add(task)
+        finally:
+            self.abort_active_task("Chat channel stopped")
+            for debounce in list(self._autonomy_debounce_tasks.values()):
+                debounce.cancel()
+            self._autonomy_debounce_tasks.clear()
+            self._autonomy_pending_snapshot.clear()
+            for task in list(tracked_tasks):
+                if task is not asyncio.current_task() and not task.done():
+                    task.cancel()
+            if tracked_tasks:
+                await asyncio.gather(*tracked_tasks, return_exceptions=True)
+
+    async def _maybe_schedule_autonomy(
+        self, envelope: Envelope, save_id: str | None, tracked_tasks: set[asyncio.Task], ws: WebSocketClient | None,
+        *, force: bool = False
+    ) -> None:
+        """Evaluate the latest native snapshot through the chat channel only."""
+        if not save_id or self._autonomy is None or envelope.message_type != "world.snapshot":
+            return
+        now = time.monotonic()
+        previous = self._autonomy_last_snapshot_at.get(save_id)
+        self._autonomy_last_snapshot_at[save_id] = now
+        if not force and previous is not None and now - previous < 1.0:
+            self._autonomy_pending_snapshot[save_id] = (envelope, tracked_tasks, ws)
+            if save_id not in self._autonomy_debounce_tasks:
+                async def flush() -> None:
+                    await asyncio.sleep(max(0.0, 1.0 - (time.monotonic() - now)))
+                    pending = self._autonomy_pending_snapshot.pop(save_id, None)
+                    self._autonomy_debounce_tasks.pop(save_id, None)
+                    if pending:
+                        await self._maybe_schedule_autonomy(pending[0], save_id, pending[1], pending[2], force=True)
+                self._autonomy_debounce_tasks[save_id] = asyncio.create_task(flush())
+            return
+        state = self._autonomy.state(save_id)
+        if not state.enabled or state.paused or self._active_task is not None or self._busy_lock.locked():
+            return
+        snapshot = envelope.payload or {}
+        if self._work_store is not None:
+            job_state = self._work_store.state(save_id)
+            decision = job_state.decision
+            if decision.get("selected") and not decision.get("finished"):
+                return
+            last_job = job_state.last_job
+            if last_job and last_job.get("decisionId") != getattr(self, "_last_job_wake", None):
+                self._last_job_wake = last_job.get("decisionId")
+                self._autonomy.request_job_decision(save_id)
+        candidate = self._autonomy.next_candidate(save_id, snapshot)
+        if candidate is None:
+            return
+        fingerprint = self._autonomy.fingerprint(save_id, snapshot, candidate, state)
+        if not self._autonomy.record_world_event(save_id, fingerprint, envelope.world_revision):
+            return
+        remaining_budget = max(0, (state.budget_limit or 0) - state.daily_spend - sum(state.spend_reservations.values()))
+        compact = build_decision_context(
+            {"payload": snapshot, "worldRevision": envelope.world_revision},
+            work=self._work_context(save_id),
+            origin="free-mode",
+        )
+        compact["remainingBudget"] = remaining_budget
+        compact["boxRange"] = state.box_preference or "none"
+        compact["lastResult"] = self._work_store.state(save_id).last_job if self._work_store else state.last_event_key or "none"
+        compact["wakeReason"] = candidate.get("reason", "state-change")
+        compact["objective"] = state.goal or "由当前状态决定"
+        prompt = (
+            "自由模式自主安排。依据以下紧凑实时上下文选择并执行一项有用短任务："
+            f"{render_decision_context(compact)}。"
+            "固定规则：自主照料农场，原子动作只能经 MCP；遵守预算与箱子范围；不保存睡觉；"
+            "原生事实优先，知识不足才 query_wiki；无合适工作就说明待命，不为待命查 wiki。"
+            "长期目标或待办用remember_intent，它们不是执行授权；本次用submit_plan选择一个语义短作业，允许内部导航和同一业务范围的多步操作。完成后信任工具精简终态，不重复查询。下一业务由下一次模型决策选择，不预排存箱或出售。"
+            f"已保存目标：{state.goal or '由当前状态决定'}。"
+        )
+        # Unique per-request identity: a worldRevision may repeat (revision reset /
+        # same-revision decisions) and must never collide across epochs.
+        request_id = f"autonomy-{uuid.uuid4().hex}"
+        self._autonomy_requests[request_id] = fingerprint
+        task = asyncio.create_task(self.handle_chat_submit(ws, request_id, prompt, save_id))
+        tracked_tasks.add(task)
+
+    def _apply_work_control(self, save_id: str, action: str, params: dict[str, Any]) -> None:
+        """Keep durable work scheduling in step with F8 pause/resume/cancel controls."""
+        store = self._work_store
+        if store is None:
+            return
+        try:
+            if action == "pause":
+                store.set_paused(save_id, True)
+            elif action == "resume":
+                store.set_paused(save_id, False)
+            elif action == "cancel":
+                store.set_paused(save_id, True)
+            elif action == "set_mode":
+                store.set_paused(save_id, str(params.get("mode")) != "free")
+            elif action == "set_preferences":
+                goal = str(params.get("goal") or "").strip()
+                already = any(
+                    g["text"] == goal and g["status"] == "active" for g in store.list_goals(save_id)
+                )
+                if goal and not already:
+                    # This control comes from the player's F8 settings, so it is a user goal.
+                    store.add_goal(save_id, goal, source="user")
+        except Exception:
+            logger.warning("Unable to update work state for control %s", action, exc_info=True)
+
+    def _work_context(self, save_id: str) -> dict[str, Any] | None:
+        """Relevant-only work memory for the autonomy prompt (goals/next step/anomalies)."""
+        if self._work_store is None:
+            return None
+        try:
+            snapshot, game_date = self._plan_snapshot_state()
+            overview = self._work_store.overview(
+                save_id, snapshot=snapshot, game_date=game_date
+            )
+        except Exception:
+            return None
+        return {
+            "goals": [
+                {"text": g["text"], "source": g["source"]} for g in overview.get("goals", [])[:3]
+            ],
+            "nextStep": overview.get("nextStep"),
+            "anomalies": overview.get("anomalies", [])[:3],
+            "waitingFor": [
+                {"taskId": t.get("id"), "title": t.get("title")}
+                for t in overview.get("tasks", [])
+                if isinstance(t, dict) and t.get("status") == "waiting"
+            ][:3],
+            "waitingConditions": overview.get("waitingConditions", [])[:3],
+            "lastSettledDay": overview.get("lastSettledDay"),
+            "lastJob": overview.get("lastJob"),
+            "paused": overview.get("paused", False),
+            "decision": overview.get("decision", {}),
+        }
+
+    def _decision_context(self, save_id: str | None, *, origin: str = "chat") -> dict[str, Any]:
+        """Compact live context for one decision, rebuilt from the latest snapshot.
+
+        Nothing is accumulated across turns, so an old snapshot never grows the
+        prompt without bound; missing native fields render as ``unknown``.
+        """
+        snapshot: dict[str, Any] = {}
+        if self._latest_snapshot_payload is not None:
+            snapshot = {
+                "payload": self._latest_snapshot_payload,
+                "worldRevision": self._latest_snapshot_revision,
+            }
+        work = self._latest_work_overview(save_id)
+        return build_decision_context(snapshot, work=work, origin=origin)
+
+    def _latest_work_overview(self, save_id: str | None) -> dict[str, Any] | None:
+        if self._work_store is None or not save_id:
+            return None
+        try:
+            snapshot, game_date = self._plan_snapshot_state()
+            return self._work_store.overview(save_id, snapshot=snapshot, game_date=game_date)
+        except Exception:
+            return None
+
+    # -------------------------------------------------- session rotation
+    def _session_history_path(self) -> Path:
+        base = self.run_dir if self.run_dir else Path.home() / ".gemini" / "antigravity-cli"
+        return Path(base) / "chat_session_history.json"
+
+    # -------------------------------------------------- profile fingerprint
+    def _profile_fingerprint_path(self) -> Path:
+        if self.run_dir:
+            return Path(self.run_dir) / "chat_profile_fingerprints.json"
+        # Keep the fingerprint beside the configured session file, so bridges that
+        # are constructed with an explicit sessions_file (tests, alternate run
+        # dirs) persist and read the same record.
+        return Path(self._sessions_file).parent / "chat_profile_fingerprints.json"
+
+    def profile_fingerprint(self) -> str:
+        """Fingerprint of the provider profile + tool surface bound to a session.
+
+        A resumed provider session keeps whatever profile/tool surface it was
+        created with, so reconfiguring the agent file (or the game tool surface)
+        must start a fresh session instead of silently continuing the old one.
+        """
+        import hashlib
+
+        agent_file_digest: str | None = None
+        if self.agent_file is not None:
+            try:
+                agent_file_digest = hashlib.sha256(self.agent_file.read_bytes()).hexdigest()[:16]
+            except Exception:
+                agent_file_digest = "unreadable"
+        material = json.dumps(
+            {
+                "backend": self.backend_name,
+                "model": self.model,
+                "agent": self.agent,
+                "agentFile": agent_file_digest,
+                "surface": os.getenv("STARDEW_MCP_SURFACE", ""),
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+    def _load_profile_fingerprints(self) -> dict[str, str]:
+        path = self._profile_fingerprint_path()
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            logger.debug("Failed to load profile fingerprints", exc_info=True)
+        return {}
+
+    def _save_profile_fingerprints(self, fingerprints: dict[str, str]) -> None:
+        try:
+            path = self._profile_fingerprint_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(fingerprints, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.debug("Failed to save profile fingerprints", exc_info=True)
+
+    def _ensure_session_matches_profile(
+        self, save_id: str | None, conversation_id: str | None
+    ) -> str | None:
+        """Return the session to resume, or None when a fresh one must start.
+
+        Rotation happens when the profile fingerprint changed since the session
+        was created, and also for a legacy session that has no fingerprint at all
+        (its tool surface cannot be verified, so it is not resumed). The previous
+        session id is always kept in ``chat_session_history.json`` and durable
+        goals/tasks/todos stay in WorkStore, so nothing is deleted and no
+        in-progress work is lost.
+        """
+        if not save_id:
+            return conversation_id
+        fingerprints = self._load_profile_fingerprints()
+        key = f"{self.backend_name}:{save_id}"
+        current = self.profile_fingerprint()
+        recorded = fingerprints.get(key)
+        self._profile_rotation_note: str | None = None
+        if conversation_id and recorded != current:
+            reason = "profile-changed" if recorded else "missing-fingerprint"
+            self._rotate_provider_session(save_id, reason=reason)
+            self._profile_rotation_note = (
+                "伙伴配置或工具范围已变化，已安全新建会话（旧会话与历史记录保留，"
+                f"原因：{reason}）。"
+            )
+            logger.info(
+                "Profile fingerprint changed for save %s (recorded=%s current=%s); "
+                "started a new session and kept the old one in history.",
+                save_id,
+                recorded,
+                current,
+            )
+            conversation_id = None
+        fingerprints[key] = current
+        self._save_profile_fingerprints(fingerprints)
+        return conversation_id
+
+    def consume_profile_rotation_note(self) -> str | None:
+        note = getattr(self, "_profile_rotation_note", None)
+        self._profile_rotation_note = None
+        return note
+
+    def _load_session_history(self) -> None:
+        if self._session_history:
+            return
+        path = self._session_history_path()
+        if not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._session_history = {
+                    str(k): [str(v) for v in vals]
+                    for k, vals in data.items()
+                    if isinstance(vals, list)
+                }
+        except Exception:
+            logger.debug("Failed to load session history", exc_info=True)
+
+    def _save_session_history(self) -> None:
+        try:
+            path = self._session_history_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._session_history, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.debug("Failed to save session history", exc_info=True)
+
+    def _rotate_provider_session(self, save_id: str | None, *, reason: str) -> str | None:
+        """End the current provider session, keeping the old id in history.
+
+        The next turn starts a fresh session and carries the saved goals, the
+        unfinished/waiting tasks and the live context, so rotation never loses
+        in-progress work. Old session ids stay in ``chat_session_history.json`` so
+        their billing records remain attributable.
+        """
+        if not save_id:
+            return None
+        cid = self.get_conversation_id(save_id)
+        if not cid:
+            return None
+        self._load_session_history()
+        key = f"{self.backend_name}:{save_id}"
+        history = self._session_history.setdefault(key, [])
+        if cid not in history:
+            history.append(cid)
+        self._session_history[key] = history[-20:]
+        self._sessions.pop(key, None)
+        if self.backend_name == "agy":
+            self._sessions.pop(save_id, None)
+        self._save_sessions()
+        self._save_session_history()
+        self._session_token_totals[save_id] = 0
+        self._session_requests[save_id] = 0
+        self._session_context_state[save_id] = {
+            "latestInputContext": None,
+            "maxInputContext": None,
+            "measured": False,
+        }
+        logger.info("Rotated provider session for %s (%s); previous=%s", save_id, reason, cid)
+        return cid
+
+    @staticmethod
+    def _request_input_context(usage: dict[str, Any] | None) -> int | None:
+        """Input-side size of the newest request, or None when unmeasured.
+
+        Only the input side counts: summing ``total_tokens`` across requests
+        double-counts replayed/cached context and includes output, so it can
+        never be used as a context length.
+        """
+        if not isinstance(usage, dict):
+            return None
+        latest = usage.get("latestRequestInputContext")
+        if isinstance(latest, int) and latest >= 0:
+            return latest
+        if usage.get("input_context_measured") is False:
+            return None
+        # Non-Kimi sources (agy DB delta) have no per-request split; fall back to
+        # that request's input-side counters when the source is a single request.
+        generations = usage.get("generations_count")
+        if generations not in (1, None):
+            return None
+        input_other = usage.get("inputOther")
+        if input_other is None:
+            input_other = usage.get("input_tokens")
+        cache_read = usage.get("inputCacheRead")
+        if cache_read is None:
+            cache_read = usage.get("cache_read_tokens")
+        cache_creation = usage.get("inputCacheCreation")
+        if cache_creation is None:
+            cache_creation = usage.get("cache_creation_tokens")
+        parts = [value for value in (input_other, cache_read, cache_creation) if isinstance(value, int)]
+        if not parts:
+            return None
+        return sum(parts)
+
+    def _note_session_context(
+        self,
+        save_id: str | None,
+        usage: dict[str, Any] | None,
+        *,
+        request_count: int | None = None,
+    ) -> str | None:
+        """Track this session's input context; return a rotation reason or None.
+
+        Two independent gates:
+
+        * the measured latest-request input context reaching the configured
+          budget (default 100000 tokens, an engineering policy, not a provider
+          claim) — ``SESSION_CONTEXT_BUDGET``;
+        * a bounded request-count checkpoint (default 20) used only while the
+          provider gives no usable per-request measurement, and clearly labelled
+          as a fallback — ``SESSION_REQUEST_CHECKPOINT``.
+
+        The game-day rotation is separate and unchanged.
+        """
+        if not save_id:
+            return None
+        state = self._session_context_state.setdefault(
+            save_id,
+            {"latestInputContext": None, "maxInputContext": None, "measured": False},
+        )
+        if request_count is not None and request_count > 0:
+            self._session_requests[save_id] = self._session_requests.get(save_id, 0) + request_count
+        else:
+            generations = usage.get("generations_count") if isinstance(usage, dict) else None
+            self._session_requests[save_id] = self._session_requests.get(save_id, 0) + (
+                generations if isinstance(generations, int) and generations > 0 else 1
+            )
+
+        context_tokens = self._request_input_context(usage)
+        if context_tokens is None:
+            # Unknown measurement: never invent a context length, use the bounded
+            # request-count checkpoint instead (explicitly labelled by reason).
+            if self._session_request_checkpoint and (
+                self._session_requests.get(save_id, 0) >= self._session_request_checkpoint
+            ):
+                return "SESSION_REQUEST_CHECKPOINT"
+            return None
+
+        state["measured"] = True
+        state["latestInputContext"] = context_tokens
+        previous_max = state.get("maxInputContext")
+        state["maxInputContext"] = (
+            context_tokens if not isinstance(previous_max, int) else max(previous_max, context_tokens)
+        )
+        if self._session_token_budget and context_tokens >= self._session_token_budget:
+            return "SESSION_CONTEXT_BUDGET"
+        return None
+
+    def _note_session_tokens(self, save_id: str | None, usage: dict[str, Any] | None) -> bool:
+        """Backwards-compatible wrapper: True when the context policy says rotate."""
+        return self._note_session_context(save_id, usage) is not None
+
+    async def _settle_day_advance(self, save_id: str | None, world: dict[str, Any]) -> None:
+        """Settle a real native day advance, then rotate the provider session."""
+        if not save_id:
+            return
+        settlement: dict[str, Any] | None = None
+        if self._work_store is not None:
+            try:
+                settlement = await asyncio.to_thread(
+                    self._work_store.settle_game_day,
+                    save_id,
+                    year=world.get("year"),
+                    season=world.get("season"),
+                    day=world.get("dayOfMonth"),
+                )
+            except Exception:
+                logger.warning("Day settlement failed for %s", save_id, exc_info=True)
+        if settlement and settlement.get("settled"):
+            logger.info(
+                "Settled game day for %s: %s -> %s (archived=%s, carried=%s)",
+                save_id,
+                settlement.get("fromDay"),
+                settlement.get("day"),
+                settlement.get("archivedCount"),
+                len(settlement.get("carriedTaskIds") or []),
+            )
+        self._last_day_settlement = settlement
+        # Rotate only after a real settlement; a first observation, a reloaded old
+        # save or a repeated day must not churn the provider session.
+        if settlement and settlement.get("settled"):
+            self._rotate_provider_session(save_id, reason="game-day-advanced")
+
+    async def _publish_job_progress(self, execution: StepExecution) -> None:
+        binding = getattr(self, "_job_reply_binding", None)
+        if not binding or binding[2] != execution.task_id:
+            return
+        request_id, save_id, _, ws = binding
+        phase = "job-running" if execution.status == "dispatching" else (
+            "job-waiting" if execution.outcome == "waiting" else
+            "job-completed" if execution.task_status == "completed" and execution.outcome == "completed" else
+            "job-failed" if execution.outcome in {"partial", "unknown", "cancelled"} or execution.status == "deferred" else "job-running")
+        labels = {"job-running": "原生作业执行", "job-waiting": "作业等待", "job-completed": "作业已完成", "job-failed": "作业未完成"}
+        detail = execution.message or execution.reason_code or ""
+        if execution.result and isinstance(execution.result, dict):
+            detail = detail or str(execution.result.get("error") or execution.result.get("message") or "")
+        await self._send_reply(ws, Envelope.create_chat_reply(self.instance_id, request_id,
+            status=phase, reply_text=f"{labels[phase]}：{execution.operation or ''} {detail[:400]}", save_id=save_id))
+
+    def _plan_status_line(self) -> str | None:
+        """Short F8-visible line: last plan action and the current wait reason."""
+        worker = self._plan_worker
+        if worker is None:
+            return None
+        parts: list[str] = []
+        last = worker.last_result
+        if last is not None and last.status == "executed":
+            parts.append(
+                f"动作 {last.operation}（{last.outcome or 'unknown'}）"
+            )
+        if worker.pending_reasons:
+            parts.append(f"等待原因 {worker.pending_reasons[-1]}")
+        if not parts and self._last_day_settlement:
+            parts.append(f"日结 {self._last_day_settlement.get('reasonCode')}")
+        if not parts:
+            return None
+        return "计划状态：" + "；".join(parts)
+
+    def _autonomy_state_payload(self, save_id: str, state: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "mode": state.mode, "paused": state.paused,
+            "preferences": {"goal": state.goal, "dailySpendLimit": state.budget_limit or 0,
+                             "boxPreference": state.box_preference or "none"},
+            "preferencesRevision": state.preferences_revision,
+            "decisionEpoch": state.decision_epoch,
+            "gameDate": state.game_date, "dailySpend": state.daily_spend,
+        }
+        # F8 visibility: the last plan action and why the worker is waiting.
+        worker = self._plan_worker
+        if worker is not None:
+            last = worker.last_result
+            payload["lastPlanAction"] = last.as_dict() if last is not None else None
+            payload["planWaitReason"] = (
+                worker.pending_reasons[-1] if worker.pending_reasons else None
+            )
+        overview = self._latest_work_overview(save_id)
+        if overview is not None:
+            payload["lastSettledDay"] = overview.get("lastSettledDay")
+            payload["hasExecutableWork"] = overview.get("hasExecutableWork")
+            # Wire contract: list of WorkStore wait-condition objects, consumed by
+            # C# WaitingConditionPayload. Do not stringify the model's structured context.
+            payload["waitingConditions"] = overview.get("waitingConditions", [])[:5]
+        if self._last_day_settlement is not None:
+            payload["lastDaySettlement"] = self._last_day_settlement
+        return payload
+
+    async def _handle_autonomy_control(
+        self, ws: WebSocketClient | None, envelope: Envelope, active_save_id: str | None
+    ) -> None:
+        """Apply controls synchronously and acknowledge only the active save."""
+        save_id = str(envelope.payload.get("saveId") or envelope.save_id or "")
+        request_id = str(envelope.payload.get("requestId") or envelope.message_id)
+        if not save_id or not active_save_id or save_id != active_save_id or self._autonomy is None:
+            return
+        action = str(envelope.payload.get("action", ""))
+        params = envelope.payload.get("parameters") or {}
+        try:
+            if save_id and action in {"pause", "cancel", "set_mode"}:
+                await self._interrupt_short_job(save_id)
+            state = self._autonomy.control(save_id, action, **params)
+            if self._work_store is not None:
+                self._apply_work_control(save_id, action, params)
+            if action in {"pause", "cancel", "set_mode"} and self._active_task is not None:
+                if self._active_task.request_id.startswith("autonomy-"):
+                    self._autonomy_generation += 1
+                    self.abort_active_task(f"autonomy control: {action}")
+                    self._active_task = None
+            status, reason = "confirmed", None
+        except (TypeError, ValueError) as ex:
+            state, status, reason = self._autonomy.state(save_id), "rejected", str(ex)
+        reply = Envelope.create_autonomy_state(
+            self.instance_id, request_id, save_id, self._autonomy_state_payload(save_id, state), status, reason
+        )
+        await self._send_reply(ws, reply)
+
+    async def _stop_autonomy_if_disabled(
+        self, ws: WebSocketClient | None, save_id: str | None
+    ) -> None:
+        """Apply a shared disable immediately on every chat event, not only timeout."""
+        if self._autonomy is None or not save_id:
+            return
+        if (
+            not self._autonomy.state(save_id).enabled
+            and self._active_task is not None
+            and self._active_task.request_id.startswith("autonomy-")
+        ):
+            await self.handle_chat_cancel(ws, self._active_task.request_id, "autonomy disabled", save_id)
+
+    async def handle_chat_cancel(
+        self,
+        ws: WebSocketClient | None,
+        request_id: str | None,
+        reason: str,
+        save_id: str | None,
+    ) -> None:
+        """Handles immediate cancellation: kills active agy subprocess, records command, and notifies game."""
+        await self._interrupt_short_job(save_id)
+        task = self._active_task
+        if self._autonomy is not None and save_id:
+            self._autonomy.set_enabled(save_id, False)
+        if task is not None:
+            active_req = task.request_id
+            active_save = task.save_id or save_id or ""
+            active_prompt = task.prompt
+            start_idx = task.start_max_idx
+
+            self.abort_active_task(f"Cancel requested: {reason}")
+
+            # Resolve conversation id and compute any usage produced before cancellation
+            cid = self.get_conversation_id(active_save)
+            usage_delta = None
+            if self.backend_name == "kimi":
+                end_idx = -1
+                # Cancellation still settles: read whatever the wire recorded so far.
+                usage_delta = read_usage_since(
+                    cid, task.wire_start_offset, cwd=project_root()
+                )
+            else:
+                end_idx = get_max_gen_idx(cid) if cid else -1
+                if cid and end_idx > start_idx:
+                    usage_delta = get_command_usage_delta(cid, start_idx)
+
+            missing_reason = None
+            if not usage_delta:
+                missing_reason = (
+                    "cancelled_before_generations_produced"
+                    if cid
+                    else "cancelled_before_conversation_established"
+                )
+
+            self._record_command(
+                request_id=request_id or active_req,
+                save_id=active_save,
+                conversation_id=cid,
+                prompt=active_prompt,
+                status="cancelled",
+                start_idx=start_idx,
+                end_idx=end_idx,
+                usage=usage_delta,
+                missing_reason=missing_reason,
+                error="PLAYER_CANCELLED",
+                duration=0.0,
+            )
+            task.recorded = True
+
+            reply = Envelope.create_chat_reply(
+                sender_instance_id=self.instance_id,
+                request_id=request_id or active_req,
+                status="cancelled",
+                reply_text="任务已由玩家取消。",
+                save_id=active_save,
+                tokens_used=usage_delta["total_tokens"] if usage_delta else None,
+                prompt_tokens=usage_delta["input_tokens"] if usage_delta else None,
+                output_tokens=usage_delta["output_tokens"] if usage_delta else None,
+                cached_tokens=usage_delta["cache_read_tokens"] if usage_delta else None,
+                conversation_id=cid,
+                error="PLAYER_CANCELLED",
+                usage_source="db_gen_metadata_delta_cancelled" if usage_delta else "cancelled",
+            )
+            await self._send_reply(ws, reply)
+            self._active_task = None
+            # The cancelled provider turn no longer owns the command socket; hand
+            # it back so the worker can settle its own epoch-checked bookkeeping.
+            await self._release_execution(active_save or save_id)
+        else:
+            logger.info("chat.cancel received but no task was actively running.")
+
+    async def _interrupt_short_job(self, save_id: str | None) -> None:
+        if not save_id or self._work_store is None:
+            return
+        d = self._work_store.state(save_id).decision
+        self._work_store.revoke_decision(save_id)
+        if d.get("selected") and not d.get("finished") and self._plan_worker:
+            try:
+                await self._plan_worker.client.call_tool("dispatch_plan_operation", {
+                    "operation": "cancel_task", "params": {}, "command_id": "interrupt-" + uuid.uuid4().hex})
+            except Exception:
+                logger.warning("Native cancellation not confirmed; old job authority revoked")
+
+    async def handle_chat_submit(
+        self,
+        ws: WebSocketClient | None,
+        request_id: str,
+        text: str,
+        save_id: str | None,
+    ) -> None:
+        """Processes a user chat submit message."""
+        logger.info("Processing chat submit [%s]: %s (saveId=%s)", request_id, text, save_id)
+        if self._active_task and self._active_task.request_id == request_id:
+            # Transport replay must not cancel and restart the same decision.
+            return
+        if self._autonomy is not None and save_id:
+            self._autonomy.record_event(save_id, f"chat-submit:{request_id}", "chat.submit")
+
+        # A player request always wins over a pending autonomous request.
+        # Invalidate the old generation before entering the busy guard so its
+        # finally callback cannot schedule another autonomous turn.
+        self._preempt_autonomy_for_player(request_id)
+        if request_id not in self._autonomy_requests:
+            if self._work_store is not None and save_id:
+                try:
+                    if self._work_store.state(save_id).paused:
+                        self._work_store.set_paused(save_id, False)
+                        logger.info("Player chat submit resumed paused work state for save %s [%s]", save_id, request_id)
+                except Exception:
+                    logger.warning("Failed to resume paused work state for player chat submit [%s]", request_id, exc_info=True)
+            await self._interrupt_short_job(save_id)
+            if self._active_task and not self._active_task.cancelled:
+                was_free = bool(self._autonomy and save_id and self._autonomy.state(save_id).enabled)
+                await self.handle_chat_cancel(ws, self._active_task.request_id, "Superseded by player", save_id)
+                if was_free:
+                    self._autonomy.set_enabled(save_id, True)
+                async with self._busy_lock:
+                    pass
+
+        # 1. Concurrency deduplication guard
+        if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
+            logger.warning("Chat submit [%s] rejected (companion busy)", request_id)
+            busy_reply = Envelope.create_chat_reply(
+                sender_instance_id=self.instance_id,
+                request_id=request_id,
+                status="failed",
+                reply_text="伙伴正在执行上一条任务，请稍候或点击[取消]后再试。",
+                save_id=save_id,
+                error="BUSY_CONCURRENT_COMMAND",
+            )
+            await self._send_reply(ws, busy_reply)
+            return
+
+        async with self._busy_lock:
+            # A changed profile/tool surface (or a legacy session without a
+            # recorded fingerprint) must not reuse the old provider session.
+            existing_cid = self._ensure_session_matches_profile(
+                save_id, self.get_conversation_id(save_id)
+            )
+            previous_cid = existing_cid
+            prompt = self._format_agent_prompt(text, save_id)
+            is_kimi = self.backend_name == "kimi"
+            # The agy SQLite bill is agy-only; Kimi usage comes from the provider
+            # wire file. Capture the byte offset now so this turn's records are
+            # attributable even on a resumed (cumulative) session.
+            start_max_idx = -1 if is_kimi else get_max_gen_idx(existing_cid)
+            start_max_step_idx = -1 if is_kimi else get_max_step_idx(existing_cid)
+            wire_start_offset = wire_offset(existing_cid, cwd=project_root()) if is_kimi else 0
+
+            # Create active task record with prompt and starting boundary
+            active_task = ActiveChatTask(
+                request_id=request_id,
+                save_id=save_id or "",
+                prompt=text,
+                start_max_idx=start_max_idx,
+                start_max_step_idx=start_max_step_idx,
+                wire_start_offset=wire_start_offset,
+                async_task=asyncio.current_task(),
+            )
+            self._active_task = active_task
+            # Park the internal plan worker and release its MCP session: the Mod
+            # serves one command socket and the provider turn now owns it.
+            await self._claim_execution(save_id)
+
+            try:
+                # 2. Immediate progress notification (includes a profile/session
+                # rotation note when one just happened, so F8 never silently
+                # continues an old tool surface).
+                rotation_note = self.consume_profile_rotation_note()
+                prog_reply = Envelope.create_chat_reply(
+                    sender_instance_id=self.instance_id,
+                    request_id=request_id,
+                    status="processing",
+                    reply_text=rotation_note or "正在思考与执行...",
+                    save_id=save_id,
+                )
+                await self._send_reply(ws, prog_reply)
+                self._configure_backend_progress(ws, request_id, save_id)
+
+                logger.info(
+                    "Starting command [%s] for save [%s]. Existing CID: %s, start_max_idx: %d",
+                    request_id,
+                    save_id,
+                    existing_cid,
+                    start_max_idx,
+                )
+
+                # 4. Invoke agy CLI in executor
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    self._execute_turn,
+                    active_task, existing_cid, prompt,
+                )
+
+                # If task was cancelled during execution, handle_chat_cancel already handled reply & record
+                if active_task.cancelled:
+                    logger.info("Task [%s] was cancelled during execution; cancel handler finished.", request_id)
+                    if not getattr(active_task, "recorded", False):
+                        duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
+                        cid = self.get_conversation_id(save_id)
+                        self._record_command(
+                            request_id=request_id,
+                            save_id=save_id,
+                            conversation_id=cid,
+                            prompt=text,
+                            status="interrupted",
+                            start_idx=start_max_idx,
+                            end_idx=-1,
+                            usage=None,
+                            missing_reason="interrupted",
+                            error=getattr(active_task, "abort_reason", None) or "INTERRUPTED",
+                            duration=duration,
+                        )
+                        active_task.recorded = True
+                    return
+
+                # 5. Handle output & token usage
+                if result.get("status") == "interrupted":
+                    status = "interrupted"
+                else:
+                    status = "completed" if result.get("success") else "failed"
+                new_session_established = previous_cid is None
+                self._notify_terminal(status)
+                reply_text = result.get("response", "")
+                cid = result.get("conversation_id") or existing_cid
+                if cid and existing_cid and cid != existing_cid:
+                    start_max_idx = -1
+                if new_session_established and cid:
+                    logger.info("New Kimi session established [%s]; game agent profile bound.", cid)
+                err = result.get("error")
+                duration = result.get("duration", 0.0)
+
+                if not result.get("success"):
+                    if err == "RESOURCE_EXHAUSTED":
+                        reply_text = "AI 模型额度已用尽，本次任务已停止。自由模式已暂停，请处理额度后手动继续。"
+                        if self._autonomy is not None and save_id:
+                            try:
+                                self._autonomy.control(save_id, "pause")
+                            except (TypeError, ValueError):
+                                logger.warning("Unable to pause free mode after quota exhaustion for %s", save_id)
+                    elif err == "AUTHENTICATION_REQUIRED":
+                        reply_text = "Kimi 登录或认证已失效，请完成登录后再试。"
+                    elif err == "RATE_LIMIT_EXCEEDED":
+                        reply_text = "Kimi 请求过于频繁，请稍后重试。"
+
+                if cid and save_id:
+                    self.record_conversation_id(save_id, cid)
+
+                end_max_idx = get_max_gen_idx(cid) if (cid and not is_kimi) else -1
+
+                missing_reason = None
+                tokens_used = None
+                prompt_tokens = None
+                output_tokens = None
+                cached_tokens = None
+                cache_read_tokens = None
+                cache_write_tokens = None
+                model_calls = None
+                usage = None
+                usage_delta = None
+
+                if is_kimi:
+                    # Provider-specific metering: sum the wire's usage.record lines
+                    # produced after this turn started. Unknown stays unknown; never 0.
+                    usage = read_usage_since(
+                        cid, active_task.wire_start_offset, cwd=project_root()
+                    )
+                    if usage is None:
+                        usage_source = "unknown"
+                        missing_reason = "kimi_wire_usage_unavailable"
+                    else:
+                        usage_source = usage.get("source", "kimi_wire_usage_record")
+                        if usage.get("unknown"):
+                            missing_reason = "kimi_wire_usage_partial_unknown"
+                else:
+                    # Authoritative agy delta from the conversation DB (agy only).
+                    usage_delta = get_command_usage_delta(cid, start_max_idx) if cid else None
+                    if usage_delta:
+                        usage = usage_delta
+                        usage_source = "db_gen_metadata_delta"
+                        logger.info(
+                            "Extracted command usage from DB delta: total=%d, in=%d, out=%d, cache=%d, think=%d (gens=%d)",
+                            usage["total_tokens"],
+                            usage["input_tokens"],
+                            usage["output_tokens"],
+                            usage["cache_read_tokens"],
+                            usage["thinking_tokens"],
+                            usage["generations_count"],
+                        )
+                    elif existing_cid is None and cid:
+                        # Brand new session: CLI usage is session-local to this first turn
+                        cli_usage = result.get("usage")
+                        if cli_usage and isinstance(cli_usage, dict):
+                            usage = dict(cli_usage)
+                            usage["source"] = "cli_direct_new_session"
+                            usage_source = "cli_direct_new_session"
+                        else:
+                            usage = None
+                            usage_source = "unknown"
+                            missing_reason = "new_session_no_usage_available"
+                    else:
+                        # Resumed session: CLI usage is cumulative across the entire session!
+                        # DO NOT pass cumulative session tokens as this turn's usage!
+                        usage = None
+                        usage_source = "unavailable_in_resume"
+                        missing_reason = "db_delta_unavailable_resumed_session_cumulative_ignored"
+                        logger.warning(
+                            "Resumed session [%s] DB delta unavailable; omitted cumulative CLI usage to avoid displaying session total.",
+                            cid,
+                        )
+
+                if usage:
+                    tokens_used = usage.get("total_tokens")
+                    prompt_tokens = usage.get("input_tokens")
+                    if prompt_tokens is None:
+                        prompt_tokens = usage.get("prompt_tokens")
+                    output_tokens = usage.get("output_tokens")
+                    cached_tokens = usage.get("cache_read_tokens")
+                    # Explicit split: cache read and cache write are different
+                    # counters and must not be merged into one "cache" number.
+                    cache_read_tokens = usage.get("cache_read_tokens")
+                    cache_write_tokens = usage.get("cache_creation_tokens")
+                    # Number of provider model calls aggregated for this turn
+                    # (usage.record lines already de-duplicated by the wire reader).
+                    model_calls = usage.get("generations_count")
+
+                # Persist command record into chat_commands.jsonl (success and failure)
+                self._record_command(
+                    request_id=request_id,
+                    save_id=save_id,
+                    conversation_id=cid,
+                    prompt=text,
+                    status=status,
+                    start_idx=start_max_idx,
+                    end_idx=end_max_idx,
+                    usage=usage,
+                    missing_reason=missing_reason,
+                    error=err,
+                    duration=duration,
+                )
+                active_task.recorded = True
+
+                plan_line = self._plan_status_line()
+                if plan_line:
+                    reply_text = (reply_text + "\n" + plan_line) if reply_text else plan_line
+                reply_status = status
+                if status == "completed" and self._work_store and save_id:
+                    selected = self._work_store.state(save_id).decision
+                    if selected.get("selected") and not selected.get("finished"):
+                        reply_status = "selected"
+                        self._job_reply_binding = (request_id, save_id, selected.get("taskId"), ws)
+                        reply_text = "已选择短作业，等待原生执行。\n" + (reply_text or "")
+                    else:
+                        reply_status = "decision-completed"
+                final_reply = Envelope.create_chat_reply(
+                    sender_instance_id=self.instance_id,
+                    request_id=request_id,
+                    status=reply_status,
+                    reply_text=reply_text or ("任务未能成功执行。" if status == "failed" else "任务执行完毕。"),
+                    save_id=save_id,
+                    tokens_used=tokens_used,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    model_calls=model_calls,
+                    conversation_id=cid,
+                    error=err,
+                    usage_source=usage_source,
+                    provider=self.backend_name,
+                )
+                await self._send_reply(ws, final_reply)
+                if self._autonomy is not None and save_id:
+                    self._autonomy.record_event(save_id, f"chat-terminal:{request_id}:{status}", f"chat.{status}")
+                    autonomy_fingerprint = self._autonomy_requests.pop(request_id, None)
+                    if autonomy_fingerprint:
+                        self._autonomy.record_action_result(save_id, autonomy_fingerprint, status == "completed")
+                    self._autonomy.record_usage(
+                        save_id,
+                        self._current_game_day_key or "unknown",
+                        usage_delta or usage,
+                    )
+                    # If the provider has no usable context replacement (the game
+                    # backend session just grows), rotate on the configured input
+                    # context policy so the next turn carries goals/tasks/state
+                    # into a fresh session. Latest-request context only, never a
+                    # cumulative token sum.
+                    rotation_reason = self._note_session_context(save_id, usage_delta or usage)
+                    if rotation_reason:
+                        logger.info(
+                            "Session context policy hit for %s (%s): latestInputContext=%s requests=%s",
+                            save_id,
+                            rotation_reason,
+                            self._session_context_state.get(save_id, {}).get("latestInputContext"),
+                            self._session_requests.get(save_id),
+                        )
+                        self._rotate_provider_session(save_id, reason=rotation_reason)
+                logger.info(
+                    "Completed chat submit [%s] with status=%s, tokens=%s (source=%s)",
+                    request_id,
+                    status,
+                    tokens_used,
+                    usage.get("source", "none") if usage else (usage_source or "none"),
+                )
+
+            except asyncio.CancelledError:
+                logger.info("handle_chat_submit [%s] cancelled.", request_id)
+                if not getattr(active_task, "recorded", False):
+                    duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
+                    cid = self.get_conversation_id(save_id)
+                    self._record_command(
+                        request_id=request_id,
+                        save_id=save_id,
+                        conversation_id=cid,
+                        prompt=text,
+                        status="interrupted",
+                        start_idx=start_max_idx,
+                        end_idx=-1,
+                        usage=None,
+                        missing_reason="interrupted",
+                        error=getattr(active_task, "abort_reason", None) or "INTERRUPTED",
+                        duration=duration,
+                    )
+                    active_task.recorded = True
+            except Exception as ex:
+                logger.error("Error in handle_chat_submit [%s]: %s", request_id, ex, exc_info=True)
+                err_reply = Envelope.create_chat_reply(
+                    sender_instance_id=self.instance_id,
+                    request_id=request_id,
+                    status="failed",
+                    reply_text=f"执行发生系统错误：{ex}",
+                    save_id=save_id,
+                    error=str(ex),
+                )
+                await self._send_reply(ws, err_reply)
+            finally:
+                if self._active_task is active_task:
+                    self._active_task = None
+                # Hand the command socket back and let the worker advance any plan
+                # the provider just committed (no model turn per step).
+                await self._release_execution(save_id)
+
+    def _format_agent_prompt(self, user_text: str, save_id: str | None = None) -> str:
+        context = render_decision_context(self._decision_context(save_id, origin="chat"))
+        return (
+            "你是星露谷伙伴智能体，请直接通过已接入的 stardew-companion MCP 工具操作游戏，完成玩家的指令。\n"
+            "每次请求都会附带以下紧凑实时上下文（字段缺失为 unknown）；工具结果是执行后的最新事实，"
+            "不要为了确认再重复查询。\n"
+            f"实时上下文：{context}\n"
+            "用submit_plan选择本次唯一语义短作业；内部导航和同一业务的多步操作由运行时执行。"
+            "remember_intent记录目标与待办，它们不是执行授权。不要预排第二种业务；"
+            "下一业务须下一次模型决策。job-selected仅表示已选择，未执行成功；"
+            "下一次输入lastResult是实际终态，信任它，不重复核查。\n"
+            "自主执行，不要向玩家询问坐标或请求额外确认。不要读写代码文件或执行终端命令。\n"
+            "任务完成后，向玩家简短汇报完成情况与剩余工作。\n\n"
+            f"玩家指令：{user_text}"
+        )
+
+    def _execute_turn(
+        self,
+        active_task: ActiveChatTask,
+        conversation_id: str | None,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Dispatch one turn to the configured provider adapter."""
+        # Preserve the legacy test/integration seam when callers explicitly
+        # replace _execute_agy_turn; normal production dispatch remains solely
+        # controlled by backend_name.
+        if self.backend_name == "kimi" and type(self._execute_agy_turn).__module__.startswith("unittest.mock"):
+            return self._execute_agy_turn(active_task, conversation_id, prompt)
+        from stardew_ai_runtime.compatibility import assert_native_compatible
+        assert_native_compatible(self.run_dir)
+        token = uuid.uuid4().hex
+        save_id = active_task.save_id
+        if save_id and self._work_store is not None:
+            self._work_store.begin_decision(save_id, token)
+        previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
+        os.environ["STARDEW_DECISION_TOKEN"] = token
+        try:
+            backend = self._get_backend()
+            if isinstance(backend, KimiBackend):
+                backend.progress = getattr(self, "_backend_progress_callback", None)
+            return backend.run(active_task, conversation_id, prompt)
+        finally:
+            if previous_token is None:
+                os.environ.pop("STARDEW_DECISION_TOKEN", None)
+            else:
+                os.environ["STARDEW_DECISION_TOKEN"] = previous_token
+
+    def _execute_agy_turn(
+        self,
+        active_task: ActiveChatTask,
+        conversation_id: str | None,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Executes agy CLI command synchronously in background thread with cancellation support."""
+        cmd = [self.agy_cmd]
+
+        # DO NOT re-supply --model when resuming an existing conversation
+        if conversation_id:
+            cmd.extend(["--conversation", conversation_id])
+        else:
+            if self.model:
+                cmd.extend(["--model", self.model])
+
+        # Support --effort
+        if self.effort:
+            cmd.extend(["--effort", self.effort])
+
+        cmd.extend([
+            "--mode", "accept-edits",
+            "--dangerously-skip-permissions",
+            "--print-timeout", "10m",
+            "--output-format", "json",
+            "--print", prompt,
+        ])
+
+        logger.info("Executing agy CLI: %s", " ".join(cmd[:6]) + " ...")
+        start_time = time.monotonic()
+
+        # Check BEFORE spawn (cancel race condition guard)
+        if active_task.cancelled:
+            logger.info("Task [%s] was cancelled before Popen spawn.", active_task.request_id)
+            return {
+                "success": False,
+                "response": "任务已取消。",
+                "error": "CANCELLED",
+                "conversation_id": conversation_id,
+                "duration": 0.0,
+            }
+
+        try:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                active_task.process = proc
+            except Exception as ex:
+                logger.error("Failed to execute agy CLI: %s", ex, exc_info=True)
+                return {
+                    "success": False,
+                    "response": f"调用后台 AI 服务发生异常：{ex}",
+                    "error": str(ex),
+                    "conversation_id": conversation_id,
+                }
+
+            # Check AFTER spawn (cancel race condition guard)
+            if active_task.cancelled:
+                logger.info(
+                    "Task [%s] was cancelled immediately after Popen spawn; killing proc PID %d.",
+                    active_task.request_id,
+                    proc.pid,
+                )
+                try:
+                    proc.kill()
+                except Exception as ex:
+                    logger.debug("Error killing process on post-spawn cancel: %s", ex)
+                return {
+                    "success": False,
+                    "response": "任务已取消。",
+                    "error": "CANCELLED",
+                    "conversation_id": conversation_id,
+                    "duration": time.monotonic() - start_time,
+                    "status": "interrupted",
+                }
+
+            try:
+                stdout, stderr = proc.communicate(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                logger.error("agy CLI timed out after 600s")
+                return {
+                    "success": False,
+                    "response": "执行超时 (10分钟)，操作已中止。",
+                    "error": "TIMEOUT",
+                    "conversation_id": conversation_id,
+                    "duration": time.monotonic() - start_time,
+                    "status": "interrupted",
+                }
+
+            duration = time.monotonic() - start_time
+            stdout = stdout or ""
+            stderr = stderr or ""
+
+            if active_task.cancelled:
+                return {
+                    "success": False,
+                    "response": "任务已取消。",
+                    "error": "CANCELLED",
+                    "conversation_id": conversation_id,
+                    "duration": duration,
+                    "status": "interrupted",
+                }
+
+            # Parse JSON output if available
+            parsed = None
+            try:
+                parsed = json.loads(stdout)
+            except Exception:
+                # Try finding JSON block in stdout if CLI emitted header/history text
+                first_brace = stdout.find("{")
+                last_brace = stdout.rfind("}")
+                if first_brace != -1 and last_brace > first_brace:
+                    candidate = stdout[first_brace:last_brace + 1]
+                    try:
+                        p = json.loads(candidate)
+                        if isinstance(p, dict):
+                            parsed = p
+                    except Exception:
+                        pass
+                if parsed is None:
+                    # Try line by line backwards
+                    for line in reversed(stdout.splitlines()):
+                        line = line.strip()
+                        if line.startswith("{") and line.endswith("}"):
+                            try:
+                                p = json.loads(line)
+                                if isinstance(p, dict):
+                                    parsed = p
+                                    break
+                            except Exception:
+                                pass
+
+            cid = (parsed.get("conversation_id") if parsed else None) or conversation_id
+            op_status = parsed.get("status") if parsed else None
+            raw_response = parsed.get("response", "") if parsed else ""
+            response_text = raw_response.strip() if isinstance(raw_response, str) else ""
+            usage = parsed.get("usage") if parsed else None
+
+            # Quota / Rate limit error checking using authoritative new steps baseline
+            # Check for genuine fresh quota evidence:
+            # 1. Authoritative DB steps check: new step_type=17 with idx > start_max_step_idx
+            # Reset step baseline if agy established a new session / changed conversation_id
+            step_baseline = -1 if (cid and conversation_id and cid != conversation_id) else active_task.start_max_step_idx
+            is_new_quota_step, step_err_text = check_new_quota_error(
+                cid, step_baseline
+            )
+            if is_new_quota_step:
+                logger.error(
+                    "Genuine Quota Exhausted detected in new step_type=17 step for [%s]: %s",
+                    cid,
+                    step_err_text[:300],
+                )
+                return {
+                    "success": False,
+                    "response": "AI 模型额度已用尽，任务已停止。请稍后或联系管理员补充额度。",
+                    "error": "RESOURCE_EXHAUSTED",
+                    "conversation_id": cid,
+                    "duration": duration,
+                }
+
+            # 2. Check current process stderr (process-local, never cumulative)
+            hard_quota_pattern = re.compile(
+                r"(RESOURCE_EXHAUSTED|Resource has been exhausted|quota exceeded|Individual quota reached)",
+                re.IGNORECASE,
+            )
+            rate_limit_pattern = re.compile(
+                r"(429 Too Many Requests|rate limit exceeded|rate_limit)",
+                re.IGNORECASE,
+            )
+
+            if stderr and hard_quota_pattern.search(stderr):
+                logger.error("Genuine Quota Exhausted detected in stderr: %s", stderr[:300])
+                self._notify_backend_failure("RESOURCE_EXHAUSTED")
+                return {
+                    "success": False,
+                    "response": "AI 模型额度已用尽，任务已停止。请稍后或联系管理员补充额度。",
+                    "error": "RESOURCE_EXHAUSTED",
+                    "conversation_id": cid,
+                    "duration": duration,
+                }
+
+            if stderr and rate_limit_pattern.search(stderr):
+                logger.warning("Transient Rate Limit detected in stderr: %s", stderr[:300])
+                self._notify_backend_failure("RATE_LIMIT_EXCEEDED")
+                return {
+                    "success": False,
+                    "response": "AI 请求过于频繁 (Rate Limit)，请稍候重试。",
+                    "error": "RATE_LIMIT_EXCEEDED",
+                    "conversation_id": cid,
+                    "duration": duration,
+                }
+
+            # 3. For new conversation only (not resumed), parsed.get("error") is fresh evidence
+            is_new_session = conversation_id is None
+            if is_new_session and parsed and parsed.get("error"):
+                new_session_err = str(parsed.get("error"))
+                if hard_quota_pattern.search(new_session_err):
+                    logger.error("Quota Exhausted in new session error: %s", new_session_err[:300])
+                    self._notify_backend_failure("RESOURCE_EXHAUSTED")
+                    return {
+                        "success": False,
+                        "response": "AI 模型额度已用尽，任务已停止。请稍后或联系管理员补充额度。",
+                        "error": "RESOURCE_EXHAUSTED",
+                        "conversation_id": cid,
+                        "duration": duration,
+                    }
+                elif rate_limit_pattern.search(new_session_err):
+                    self._notify_backend_failure("RATE_LIMIT_EXCEEDED")
+                    return {
+                        "success": False,
+                        "response": "AI 请求过于频繁 (Rate Limit)，请稍候重试。",
+                        "error": "RATE_LIMIT_EXCEEDED",
+                        "conversation_id": cid,
+                        "duration": duration,
+                    }
+
+            # 4. If op_status is SUCCESS and response_text exists, current turn succeeded!
+            # (Ignore any old cumulative error carried in parsed JSON)
+            if op_status == "SUCCESS":
+                if response_text:
+                    return {
+                        "success": True,
+                        "response": response_text,
+                        "conversation_id": cid,
+                        "usage": usage,
+                        "duration": duration,
+                    }
+                else:
+                    logger.warning("agy returned SUCCESS but response was empty.")
+                    return {
+                        "success": False,
+                        "response": "模型已执行但未返回具体汇报说明。",
+                        "error": "EMPTY_MODEL_RESPONSE",
+                        "conversation_id": cid,
+                        "usage": usage,
+                        "duration": duration,
+                    }
+
+            # 5. Non-zero exit code or failed status
+            is_error = (proc.returncode != 0) or (op_status not in ("SUCCESS", None))
+            if is_error:
+                cli_err = (parsed.get("error") or "") if is_new_session else ""
+                err_text = f"{stderr}\n{cli_err}".strip()
+                if err_text:
+                    err_marker = err_text[:200]
+                    resp = response_text if response_text else f"AI 执行出错 (退出码 {proc.returncode})：{err_text[:200]}"
+                else:
+                    err_marker = f"AGY_EXIT_{proc.returncode}" if proc.returncode != 0 else f"AGY_STATUS_{op_status}"
+                    resp = response_text if response_text else f"AI 执行出错 (退出码 {proc.returncode})"
+                logger.error("agy exited with error: code=%d, status=%s, err=%s", proc.returncode, op_status, err_text[:300] or err_marker)
+                return {
+                    "success": False,
+                    "response": resp,
+                    "error": err_marker,
+                    "conversation_id": cid,
+                    "duration": duration,
+                }
+
+            # Plain text output fallback if proc.returncode == 0
+            clean_stdout = stdout.strip()
+            if proc.returncode == 0 and clean_stdout:
+                return {
+                    "success": True,
+                    "response": clean_stdout,
+                    "conversation_id": conversation_id,
+                    "duration": duration,
+                }
+
+            return {
+                "success": False,
+                "response": f"AI 未能正常生成回复 (code {proc.returncode})",
+                "error": "NO_OUTPUT",
+                "conversation_id": conversation_id,
+                "duration": duration,
+            }
+        except Exception as ex:
+            logger.error("Failed to execute agy CLI: %s", ex, exc_info=True)
+            return {
+                "success": False,
+                "response": f"调用后台 AI 服务发生异常：{ex}",
+                "error": str(ex),
+                "conversation_id": conversation_id,
+            }
+        finally:
+            active_task.process = None
+
+    async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> None:
+        if ws is None:
+            return
+        try:
+            json_text = json.dumps(reply.to_mapping(), ensure_ascii=False)
+            await ws.send_text(json_text)
+        except Exception as ex:
+            logger.warning("Failed to send chat reply to WebSocket: %s", ex)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="stardew-chat-bridge",
+        description="Background Chat Bridge connecting in-game UI to agy AI agent",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=os.getenv("STARDEW_RUN_DIR"),
+        help="Path to run directory containing transport-discovery.json (or set STARDEW_RUN_DIR)",
+    )
+    parser.add_argument(
+        "--backend", type=str, choices=["agy", "kimi"], default=None,
+        help="Chat provider (overrides config/chat-backend.json)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Provider model (overrides config/chat-backend.json)",
+    )
+    parser.add_argument(
+        "--effort",
+        type=str,
+        default="medium",
+        choices=["low", "medium", "high"],
+        help="Reasoning effort level for agy CLI session (default: medium)",
+    )
+    parser.add_argument(
+        "--agy-cmd",
+        type=str,
+        default="agy.exe",
+        help="Path or name of the agy CLI binary",
+    )
+    parser.add_argument("--kimi-cmd", type=str, default="kimi.exe", help="Path or name of Kimi CLI")
+
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    bridge = ChatBridge(
+        run_dir=args.run_dir,
+        model=args.model,
+        effort=args.effort,
+        agy_cmd=args.agy_cmd,
+        backend=args.backend,
+        kimi_cmd=args.kimi_cmd,
+    )
+
+    print("================================================================")
+    print(">>> 星露谷伙伴后台对话服务 (Stardew Chat Bridge) 已就绪 <<<")
+    print(f"运行目录: {args.run_dir or '自动发现 (优先使用设置向导已配置的正常游戏Mod路径)'}")
+    print(f"实际后端: {bridge.provider} | 模型标识: {bridge.model}")
+    if bridge.provider == "agy":
+        print(f"agy 思考强度: {args.effort}")
+    print("在游戏中按 F8 开启伙伴窗口，输入中文指令即可直接交互！")
+    print("================================================================")
+
+    try:
+        asyncio.run(bridge.run())
+    except KeyboardInterrupt:
+        print("\n服务已由用户退出。")
+
+
+if __name__ == "__main__":
+    main()

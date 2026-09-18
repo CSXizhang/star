@@ -1,0 +1,20 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "mod.welcome",
+  "messageId": "msg-mod-welcome-001",
+  "correlationId": "msg-runtime-hello-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "mod-instance-001",
+  "sequenceNumber": 0,
+  "worldRevision": 1,
+  "sentAt": "2026-08-24T00:00:01Z",
+  "payload": {
+    "selectedProtocolVersion": "0.1",
+    "modVersion": "0.1.0",
+    "gameVersion": "1.6.15",
+    "smapiVersion": "4.2.1",
+    "lifecycleState": "syncing",
+    "skills": []
+  }
+}

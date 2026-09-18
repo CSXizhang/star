@@ -1,0 +1,34 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.result",
+  "messageId": "msg-skill-result-001",
+  "correlationId": "msg-execute-water-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "mod-instance-001",
+  "sequenceNumber": 5,
+  "worldRevision": 15,
+  "sentAt": "2026-08-24T00:00:20Z",
+  "payload": {
+    "commandId": "command-water-001",
+    "taskId": "task-water-001",
+    "terminalState": "succeeded",
+    "completedCount": 3,
+    "skippedCount": 0,
+    "failedCount": 0,
+    "finalWorldRevision": 15,
+    "effects": [
+      { "tile": { "x": 64, "y": 15 }, "state": "watered" },
+      { "tile": { "x": 64, "y": 16 }, "state": "watered" },
+      { "tile": { "x": 65, "y": 15 }, "state": "watered" }
+    ],
+    "resources": {
+      "staminaUsed": 6.0,
+      "waterUsed": 3,
+      "gameMinutesElapsed": 12
+    },
+    "error": null,
+    "retryRecommended": false,
+    "playerActionRequired": false
+  }
+}

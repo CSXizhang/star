@@ -1,0 +1,665 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stardew-ai.local/protocol/v0.1/schema.json",
+  "title": "Stardew AI Companion Protocol v0.1",
+  "oneOf": [
+    { "$ref": "#/$defs/runtimeHello" },
+    { "$ref": "#/$defs/modWelcome" },
+    { "$ref": "#/$defs/worldSnapshot" },
+    { "$ref": "#/$defs/skillExecute" },
+    { "$ref": "#/$defs/skillCancel" },
+    { "$ref": "#/$defs/skillPause" },
+    { "$ref": "#/$defs/skillResume" },
+    { "$ref": "#/$defs/skillResult" },
+    { "$ref": "#/$defs/autonomyControl" },
+    { "$ref": "#/$defs/autonomyState" },
+    { "$ref": "#/$defs/protocolError" }
+  ],
+  "$defs": {
+    "tileCoord": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "integer" },
+        "y": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "animalSnapshot": {
+      "type": "object",
+      "required": ["name", "animalType", "produceReady"],
+      "properties": {
+        "name": { "type": "string" },
+        "animalType": { "type": "string" },
+        "displayType": { "type": "string" },
+        "age": { "type": "integer", "minimum": 0 },
+        "happiness": { "type": "integer" },
+        "fullness": { "type": "integer" },
+        "friendship": { "type": "integer" },
+        "produceReady": { "type": "boolean" },
+        "currentProduceId": { "type": ["string", "null"] },
+        "harvestType": { "type": ["string", "null"] },
+        "requiredTool": { "type": ["string", "null"] },
+        "buildingType": { "type": ["string", "null"] },
+        "location": { "type": ["string", "null"] },
+        "tile": { "anyOf": [{ "$ref": "#/$defs/tileCoord" }, { "type": "null" }] },
+        "wasPetToday": { "type": "boolean" },
+        "wasAutoPetToday": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "protocolVersion",
+        "messageType",
+        "messageId",
+        "senderInstanceId",
+        "sequenceNumber",
+        "worldRevision",
+        "sentAt",
+        "payload"
+      ],
+      "properties": {
+        "protocolVersion": { "const": "0.1" },
+        "messageType": { "type": "string", "minLength": 1 },
+        "messageId": { "type": "string", "minLength": 1 },
+        "correlationId": { "type": ["string", "null"] },
+        "saveId": { "type": ["string", "null"] },
+        "gameSessionId": { "type": ["string", "null"] },
+        "senderInstanceId": { "type": "string", "minLength": 1 },
+        "sequenceNumber": { "type": "integer", "minimum": 0 },
+        "worldRevision": { "type": "integer", "minimum": 0 },
+        "sentAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": ["string", "null"], "format": "date-time" },
+        "idempotencyKey": { "type": ["string", "null"] },
+        "payload": { "type": "object" }
+      }
+    },
+    "runtimeHello": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "messageType": { "const": "runtime.hello" },
+            "worldRevision": { "const": 0 },
+            "payload": {
+              "type": "object",
+              "required": ["supportedProtocolVersions", "runtimeVersion", "features"],
+              "properties": {
+                "supportedProtocolVersions": {
+                  "type": "array",
+                  "contains": { "const": "0.1" }
+                },
+                "runtimeVersion": { "type": "string", "minLength": 1 },
+                "sessionToken": { "type": ["string", "null"] },
+                "features": {
+                  "type": "object",
+                  "additionalProperties": { "type": "boolean" }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "modWelcome": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["saveId", "gameSessionId"],
+          "properties": {
+            "messageType": { "const": "mod.welcome" },
+            "saveId": { "type": "string", "minLength": 1 },
+            "gameSessionId": { "type": "string", "minLength": 1 },
+            "payload": {
+              "type": "object",
+              "required": ["selectedProtocolVersion", "modVersion", "gameVersion", "smapiVersion", "skills"],
+              "properties": {
+                "selectedProtocolVersion": { "const": "0.1" },
+                "modVersion": { "type": "string", "minLength": 1 },
+                "gameVersion": { "type": "string", "minLength": 1 },
+                "smapiVersion": { "type": "string", "minLength": 1 },
+                "lifecycleState": { "type": "string" },
+                "skills": { "type": "array", "items": { "type": "string" } }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "worldSnapshot": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["saveId", "gameSessionId"],
+          "properties": {
+            "messageType": { "const": "world.snapshot" },
+            "saveId": { "type": "string", "minLength": 1 },
+            "gameSessionId": { "type": "string", "minLength": 1 },
+            "payload": {
+              "type": "object",
+              "required": ["capturedRevision", "companion", "world"],
+              "properties": {
+                "capturedRevision": { "type": "integer", "minimum": 0 },
+                "companion": { "type": "object" },
+                "world": { "type": "object" },
+                "farmWork": {
+                  "type": "object",
+                  "required": [
+                    "tilledUnwateredTiles",
+                    "tilledUnwateredCount",
+                    "isTruncated",
+                    "matureCropCount",
+                    "matureCrops",
+                    "matureCropsTruncated"
+                  ],
+                  "properties": {
+                    "tilledUnwateredTiles": {
+                      "type": "array",
+                      "items": { "$ref": "#/$defs/tileCoord" }
+                    },
+                    "tilledUnwateredCount": { "type": "integer", "minimum": 0 },
+                    "isTruncated": { "type": "boolean" },
+                    "matureCropCount": { "type": "integer", "minimum": 0 },
+                    "matureCrops": {
+                      "type": "array",
+                      "maxItems": 64,
+                      "items": {
+                        "type": "object",
+                        "required": ["x", "y", "cropId"],
+                        "properties": {
+                          "x": { "type": "integer" },
+                          "y": { "type": "integer" },
+                          "cropId": { "type": "string", "minLength": 1 }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "matureCropsTruncated": { "type": "boolean" }
+                  },
+                  "additionalProperties": false
+                },
+                "inventory": {
+                  "type": "object",
+                  "required": ["capacity", "freeSlots", "slots"],
+                  "properties": {
+                    "capacity": { "type": "integer", "minimum": 0 },
+                    "freeSlots": { "type": "integer", "minimum": 0 },
+                    "slots": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["index", "itemId", "name", "stack", "quality"],
+                        "properties": {
+                          "index": { "type": "integer", "minimum": 0 },
+                          "itemId": { "type": "string", "minLength": 1 },
+                          "name": { "type": "string" },
+                          "stack": { "type": "integer", "minimum": 1 },
+                          "quality": { "type": "integer", "minimum": 0 }
+                        },
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "chests": {
+                  "type": "object",
+                  "required": ["truncated", "items"],
+                  "properties": {
+                    "truncated": { "type": "boolean" },
+                    "items": {
+                      "type": "array",
+                      "maxItems": 16,
+                      "items": {
+                        "type": "object",
+                        "required": ["tile", "capacity", "freeSlots", "contents"],
+                        "properties": {
+                          "tile": { "$ref": "#/$defs/tileCoord" },
+                          "capacity": { "type": "integer", "minimum": 0 },
+                          "freeSlots": { "type": "integer", "minimum": 0 },
+                          "contents": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "required": ["slot", "itemId", "name", "stack", "quality"],
+                              "properties": {
+                                "slot": { "type": "integer", "minimum": 0 },
+                                "itemId": { "type": "string", "minLength": 1 },
+                                "name": { "type": "string" },
+                                "stack": { "type": "integer", "minimum": 1 },
+                                "quality": { "type": "integer", "minimum": 0 }
+                              },
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "planting": {
+                  "type": "object",
+                  "required": ["season", "dayOfMonth", "companionHasHoe", "seeds", "candidateTiles", "searchBounds"],
+                  "properties": {
+                    "season": { "type": "string" },
+                    "dayOfMonth": { "type": "integer", "minimum": 1 },
+                    "companionHasHoe": { "type": "boolean" },
+                    "seeds": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["itemId", "name", "stack", "canPlantCurrentSeason", "seasons"],
+                        "properties": {
+                          "itemId": { "type": "string" },
+                          "name": { "type": "string" },
+                          "stack": { "type": "integer", "minimum": 1 },
+                          "canPlantCurrentSeason": { "type": "boolean" },
+                          "seasons": { "type": "array", "items": { "type": "string" } },
+                          "growthDays": { "type": ["integer", "null"] },
+                          "regrows": { "type": ["boolean", "null"] },
+                          "isRaised": { "type": ["boolean", "null"] }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "candidateTiles": {
+                      "type": "object",
+                      "required": ["tilledEmptyCount", "tilledEmptyTiles", "tilledEmptyTruncated", "tillableCount", "tillableTiles", "tillableTruncated"],
+                      "properties": {
+                        "tilledEmptyCount": { "type": "integer", "minimum": 0 },
+                        "tilledEmptyTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
+                        "tilledEmptyTruncated": { "type": "boolean" },
+                        "tillableCount": { "type": "integer", "minimum": 0 },
+                        "tillableTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
+                        "tillableTruncated": { "type": "boolean" }
+                      },
+                      "additionalProperties": false
+                    },
+                    "searchBounds": {
+                      "type": "object",
+                      "required": ["center", "radius"],
+                      "properties": {
+                        "center": { "$ref": "#/$defs/tileCoord" },
+                        "radius": { "type": "integer", "minimum": 0 }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "machines": {
+                  "type": "object",
+                  "required": ["truncated", "items"],
+                  "properties": {
+                    "truncated": { "type": "boolean" },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["tile", "itemId", "name", "isReady", "minutesUntilReady"],
+                        "properties": {
+                          "tile": { "$ref": "#/$defs/tileCoord" },
+                          "itemId": { "type": "string" },
+                          "name": { "type": "string" },
+                          "isReady": { "type": "boolean" },
+                          "minutesUntilReady": { "type": "integer", "minimum": 0 },
+                          "outputItemId": { "type": ["string", "null"] },
+                          "outputName": { "type": ["string", "null"] },
+                          "outputStack": { "type": "integer", "minimum": 0 },
+                          "outputQuality": { "type": "integer", "minimum": 0 },
+                          "lastInputItemId": { "type": ["string", "null"] },
+                          "hasInput": { "type": "boolean" }
+                        },
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "livestock": {
+                  "type": "object",
+                  "required": ["buildingsTruncated", "animalsTruncated", "buildings", "roamingAnimals"],
+                  "properties": {
+                    "buildingsTruncated": { "type": "boolean" },
+                    "animalsTruncated": { "type": "boolean" },
+                    "buildings": { "type": "array", "items": { "type": "object" } },
+                    "roamingAnimals": { "type": "array", "items": { "$ref": "#/$defs/animalSnapshot" } }
+                  },
+                  "additionalProperties": false
+                },
+                "farming": {
+                  "type": "object",
+                  "required": ["location", "refillWaterTiles", "groundItems", "groundItemsTruncated", "fertilizedTiles", "companionTools"],
+                  "properties": {
+                    "location": { "type": "string" },
+                    "refillWaterTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
+                    "groundItems": { "type": "array", "items": { "type": "object" } },
+                    "groundItemsTruncated": { "type": "boolean" },
+                    "fertilizedTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
+                    "companionTools": { "type": "array", "items": { "type": "string" } }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "skillExecute": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["saveId", "gameSessionId", "idempotencyKey", "expiresAt"],
+          "properties": {
+            "messageType": { "const": "skill.execute" },
+            "saveId": { "type": "string", "minLength": 1 },
+            "gameSessionId": { "type": "string", "minLength": 1 },
+            "idempotencyKey": { "type": "string", "minLength": 1 },
+            "expiresAt": { "type": "string", "format": "date-time" },
+            "payload": {
+              "type": "object",
+              "required": [
+                "commandId",
+                "taskId",
+                "skillId",
+                "skillVersion",
+                "expectedWorldRevision",
+                "parameters",
+                "budgets",
+                "cancelPolicy",
+                "policyDecisionId"
+              ],
+              "properties": {
+                "commandId": { "type": "string", "minLength": 1 },
+                "taskId": { "type": "string", "minLength": 1 },
+                "skillId": { "type": "string", "minLength": 1 },
+                "skillVersion": { "type": "string", "minLength": 1 },
+                "expectedWorldRevision": { "type": "integer", "minimum": 0 },
+                "parameters": {
+                  "type": "object",
+                  "required": ["locationId"],
+                  "properties": {
+                    "locationId": { "type": "string", "minLength": 1 },
+                    "tile": {
+                      "type": "object",
+                      "required": ["x", "y"],
+                      "properties": {
+                        "x": { "type": "integer" },
+                        "y": { "type": "integer" }
+                      },
+                      "additionalProperties": false
+                    },
+                    "tiles": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "type": "object",
+                        "required": ["x", "y"],
+                        "properties": {
+                          "x": { "type": "integer" },
+                          "y": { "type": "integer" }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "chestTile": { "$ref": "#/$defs/tileCoord" },
+                    "itemIds": {
+                      "type": "array",
+                      "maxItems": 36,
+                      "items": { "type": "string", "minLength": 1 }
+                    },
+                    "seedItemId": { "type": "string", "minLength": 1 },
+                    "fertilizerItemId": { "type": "string", "minLength": 1 },
+                    "itemId": { "type": "string", "minLength": 1 },
+                    "itemCount": { "type": "integer", "minimum": 1, "maximum": 36 },
+                    "animalName": { "type": "string", "minLength": 1 },
+                    "buildingName": { "type": "string", "minLength": 1 }
+                  },
+                  "additionalProperties": false
+                },
+                "budgets": {
+                  "type": "object",
+                  "properties": {
+                    "maxGameMinutes": { "type": "integer", "minimum": 1 },
+                    "maxStamina": { "type": "number", "minimum": 0 },
+                    "maxWater": { "type": "integer", "minimum": 0 }
+                  },
+                  "additionalProperties": false
+                },
+                "cancelPolicy": { "type": "string", "enum": ["safe-point", "finish-atomic"] },
+                "policyDecisionId": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "skillCancel": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["saveId", "gameSessionId", "correlationId"],
+          "properties": {
+            "messageType": { "const": "skill.cancel" },
+            "saveId": { "type": "string", "minLength": 1 },
+            "gameSessionId": { "type": "string", "minLength": 1 },
+            "correlationId": { "type": "string", "minLength": 1 },
+            "payload": {
+              "type": "object",
+              "required": ["commandId", "reason", "requestedByPlayer", "cancelPolicy"],
+              "properties": {
+                "commandId": { "type": "string", "minLength": 1 },
+                "reason": { "type": "string", "minLength": 1 },
+                "requestedByPlayer": { "type": "boolean" },
+                "cancelPolicy": { "type": "string", "enum": ["safe-point", "finish-atomic"] }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "skillPause": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["saveId", "gameSessionId", "correlationId"],
+          "properties": {
+            "messageType": { "const": "skill.pause" },
+            "saveId": { "type": "string", "minLength": 1 },
+            "gameSessionId": { "type": "string", "minLength": 1 },
+            "correlationId": { "type": "string", "minLength": 1 },
+            "payload": {
+              "type": "object",
+              "required": ["commandId", "reason"],
+              "properties": {
+                "commandId": { "type": "string", "minLength": 1 },
+                "reason": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "skillResume": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["saveId", "gameSessionId", "correlationId"],
+          "properties": {
+            "messageType": { "const": "skill.resume" },
+            "saveId": { "type": "string", "minLength": 1 },
+            "gameSessionId": { "type": "string", "minLength": 1 },
+            "correlationId": { "type": "string", "minLength": 1 },
+            "payload": {
+              "type": "object",
+              "required": ["commandId"],
+              "properties": {
+                "commandId": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "skillResult": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["saveId", "gameSessionId", "correlationId"],
+          "properties": {
+            "messageType": { "const": "skill.result" },
+            "saveId": { "type": "string", "minLength": 1 },
+            "gameSessionId": { "type": "string", "minLength": 1 },
+            "correlationId": { "type": "string", "minLength": 1 },
+            "payload": {
+              "type": "object",
+              "required": [
+                "commandId",
+                "taskId",
+                "terminalState",
+                "completedCount",
+                "skippedCount",
+                "failedCount",
+                "finalWorldRevision",
+                "effects"
+              ],
+              "properties": {
+                "commandId": { "type": "string", "minLength": 1 },
+                "taskId": { "type": "string", "minLength": 1 },
+                "terminalState": {
+                  "type": "string",
+                  "enum": ["succeeded", "partially-succeeded", "failed", "cancelled", "rejected"]
+                },
+                "completedCount": { "type": "integer", "minimum": 0 },
+                "skippedCount": { "type": "integer", "minimum": 0 },
+                "failedCount": { "type": "integer", "minimum": 0 },
+                "finalWorldRevision": { "type": "integer", "minimum": 0 },
+                "effects": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "tile": { "$ref": "#/$defs/tileCoord" },
+                      "chestTile": { "$ref": "#/$defs/tileCoord" },
+                      "state": { "type": "string", "minLength": 1 },
+                      "reason": { "type": "string", "minLength": 1 },
+                      "cropId": { "type": "string", "minLength": 1 },
+                      "itemId": { "type": "string", "minLength": 1 },
+                      "itemName": { "type": "string" },
+                      "stack": { "type": "integer", "minimum": 0 },
+                      "quality": { "type": "integer", "minimum": 0 },
+                      "mergedStack": { "type": "integer", "minimum": 0 }
+                    }
+                  }
+                },
+                "details": {
+                  "type": ["object", "null"],
+                  "properties": {
+                    "inventoryFull": { "type": "boolean" },
+                    "chestFull": { "type": "boolean" },
+                    "outOfSeeds": { "type": "boolean" },
+                    "remainingSeedStack": { "type": "integer" },
+                    "seedItemId": { "type": "string" },
+                    "hoedTiles": { "type": "array" },
+                    "plantedTiles": { "type": "array" },
+                    "skippedTiles": { "type": "array" }
+                  },
+                  "additionalProperties": false
+                },
+                "resources": {
+                  "type": ["object", "null"],
+                  "properties": {
+                    "staminaUsed": { "type": "number", "minimum": 0 },
+                    "waterUsed": { "type": "integer", "minimum": 0 },
+                    "gameMinutesElapsed": { "type": "integer", "minimum": 0 }
+                  },
+                  "additionalProperties": false
+                },
+                "error": {
+                  "type": ["object", "null"],
+                  "required": ["code", "message"],
+                  "properties": {
+                    "code": { "type": "string", "minLength": 1 },
+                    "message": { "type": "string", "minLength": 1 },
+                    "details": { "type": ["string", "null"] },
+                    "retryable": { "type": "boolean" }
+                  },
+                  "additionalProperties": false
+                },
+                "retryRecommended": { "type": "boolean" },
+                "playerActionRequired": { "type": "boolean" }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "autonomyControl": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "properties": {
+          "messageType": { "const": "autonomy.control" },
+          "payload": { "type": "object", "required": ["requestId", "saveId", "action"],
+            "properties": { "requestId": { "type": "string", "minLength": 1 }, "saveId": { "type": "string", "minLength": 1 },
+              "action": { "enum": ["set_mode", "pause", "resume", "cancel", "set_preferences"] },
+              "parameters": { "type": "object" } }, "additionalProperties": false }
+        } }
+      ], "unevaluatedProperties": false
+    },
+    "autonomyState": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "properties": {
+          "messageType": { "const": "autonomy.state" },
+          "payload": { "type": "object", "required": ["requestId", "saveId", "mode", "paused", "preferences", "preferencesRevision", "decisionEpoch", "gameDate", "dailySpend", "status"],
+            "properties": { "requestId": { "type": "string" }, "saveId": { "type": "string" }, "mode": { "enum": ["command", "free"] },
+              "paused": { "type": "boolean" }, "preferences": { "type": "object" }, "preferencesRevision": { "type": "integer", "minimum": 0 },
+              "decisionEpoch": { "type": "integer", "minimum": 0 }, "gameDate": { "type": ["string", "null"] }, "dailySpend": { "type": "integer", "minimum": 0 },
+              "status": { "enum": ["confirmed", "rejected"] }, "reason": { "type": ["string", "null"] } }, "additionalProperties": false }
+        } }
+      ], "unevaluatedProperties": false
+    },
+    "protocolError": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "messageType": { "const": "protocol.error" },
+            "payload": {
+              "type": "object",
+              "required": ["code", "message"],
+              "properties": {
+                "code": { "type": "string", "minLength": 1 },
+                "message": { "type": "string", "minLength": 1 },
+                "details": { "type": ["string", "null"] }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

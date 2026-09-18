@@ -1,0 +1,35 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.execute",
+  "messageId": "msg-execute-water-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 3,
+  "worldRevision": 12,
+  "sentAt": "2026-08-24T00:00:05Z",
+  "expiresAt": "2026-08-24T00:00:35Z",
+  "idempotencyKey": "save-hash-example:task-water-001:attempt-001",
+  "payload": {
+    "commandId": "command-water-001",
+    "taskId": "task-water-001",
+    "skillId": "water-zone",
+    "skillVersion": "0.1",
+    "expectedWorldRevision": 12,
+    "parameters": {
+      "locationId": "Farm",
+      "tiles": [
+        { "x": 64, "y": 15 },
+        { "x": 64, "y": 16 },
+        { "x": 65, "y": 15 }
+      ]
+    },
+    "budgets": {
+      "maxGameMinutes": 30,
+      "maxStamina": 50.0,
+      "maxWater": 20
+    },
+    "cancelPolicy": "safe-point",
+    "policyDecisionId": "policy-decision-water-001"
+  }
+}

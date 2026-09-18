@@ -1,0 +1,31 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.execute",
+  "messageId": "msg-execute-organize-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 6,
+  "worldRevision": 17,
+  "sentAt": "2026-08-24T00:02:00Z",
+  "expiresAt": "2026-08-24T00:02:30Z",
+  "idempotencyKey": "save-hash-example:task-organize-001:attempt-001",
+  "payload": {
+    "commandId": "command-organize-001",
+    "taskId": "task-organize-001",
+    "skillId": "organize-chest",
+    "skillVersion": "0.1",
+    "expectedWorldRevision": 17,
+    "parameters": {
+      "locationId": "Farm",
+      "chestTile": { "x": 70, "y": 12 }
+    },
+    "budgets": {
+      "maxGameMinutes": 60,
+      "maxStamina": 50.0,
+      "maxWater": 20
+    },
+    "cancelPolicy": "safe-point",
+    "policyDecisionId": "policy-decision-organize-001"
+  }
+}

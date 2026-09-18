@@ -1,0 +1,108 @@
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# .NET / C#
+.vs/
+bin/
+obj/
+TestResults/
+*.user
+*.suo
+*.nupkg
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Runtime state and test artifacts
+.kimi-code/
+runtime-data/
+logs/
+artifacts/
+.local/
+.test-runs/
+test-runs/
+diagnostics/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Local Stardew Valley / SMAPI installations and saves
+local-game/
+local-mods/
+local-saves/
+test-saves/
+golden-saves/private/
+
+# Local machine baseline
+.env.local
+
+# Models, audio, and caches
+models/
+audio-cache/
+model-cache/
+*.wav
+*.mp3
+
+# Machine-specific provider selection and installation receipts
+/config/chat-backend.json
+/config/installed-candidate.json
+
+# Test spillover and local session exports
+MagicMock/
+/steps_cecil.txt
+/steps_summary.txt
+
+# Private development notes and acceptance workflows
+/docs/[0-9]*
+/docs/HANDOFF.md
+/三天自由模式试用.md
+/安装三天候选并启动伙伴.cmd
+/检查三天候选（不安装）.cmd
+/更新伙伴修复包.cmd
+/src/StardewAI.Companion.TestDriver/
+/config/test-runner*.json
+/tests/test_save_isolation.py
+/tests/test_harness_behavioral.py
+/runtime/tests/test_acceptance_helpers.py
+/runtime/tests/test_milking_overall_gate.py
+/runtime/tests/test_kimi_profile_tools.py
+
+# Publish only supported development and user-facing tools
+/tools/*
+!/tools/bootstrap-dotnet.ps1
+!/tools/build-mod.ps1
+!/tools/candidate-package.ps1
+!/tools/check_release_boundaries.py
+!/tools/detect-game.ps1
+!/tools/export-chat-wire-test.py
+!/tools/preflight.ps1
+!/tools/register-mcp.ps1
+!/tools/setup-companion.ps1
+!/tools/start-companion.ps1
+!/tools/test.ps1
+!/tools/view-usage.py

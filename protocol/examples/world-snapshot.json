@@ -1,0 +1,70 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "world.snapshot",
+  "messageId": "msg-snapshot-002",
+  "correlationId": "msg-runtime-hello-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "mod-instance-001",
+  "sequenceNumber": 1,
+  "worldRevision": 18,
+  "sentAt": "2026-08-24T00:02:35Z",
+  "payload": {
+    "capturedRevision": 18,
+    "companion": {
+      "locationId": "Farm",
+      "tileX": 64,
+      "tileY": 15,
+      "facingDirection": 2,
+      "stamina": 270.0,
+      "maxStamina": 270,
+      "waterCanLevel": 40,
+      "maxWaterCanLevel": 40,
+      "hasWateringCan": true,
+      "activity": "idle"
+    },
+    "world": {
+      "currentLocation": "Farm",
+      "timeOfDay": 610,
+      "season": "spring",
+      "dayOfMonth": 1,
+      "isRaining": false
+    },
+    "farmWork": {
+      "tilledUnwateredTiles": [
+        { "x": 64, "y": 15 },
+        { "x": 64, "y": 16 }
+      ],
+      "tilledUnwateredCount": 2,
+      "isTruncated": false,
+      "matureCropCount": 2,
+      "matureCrops": [
+        { "x": 65, "y": 15, "cropId": "(O)24" },
+        { "x": 66, "y": 15, "cropId": "(O)188" }
+      ],
+      "matureCropsTruncated": false
+    },
+    "inventory": {
+      "capacity": 12,
+      "freeSlots": 10,
+      "slots": [
+        { "index": 0, "itemId": "(O)24", "name": "Parsnip", "stack": 3, "quality": 0 },
+        { "index": 1, "itemId": "(O)188", "name": "Green Bean", "stack": 2, "quality": 1 }
+      ]
+    },
+    "chests": {
+      "truncated": false,
+      "items": [
+        {
+          "tile": { "x": 70, "y": 12 },
+          "capacity": 36,
+          "freeSlots": 34,
+          "contents": [
+            { "slot": 0, "itemId": "(O)24", "name": "Parsnip", "stack": 5, "quality": 0 },
+            { "slot": 1, "itemId": "(O)192", "name": "Cauliflower", "stack": 1, "quality": 2 }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.execute",
+  "messageId": "msg-execute-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 2,
+  "worldRevision": 12,
+  "sentAt": "2026-08-24T00:00:02Z",
+  "expiresAt": "2026-08-24T00:00:12Z",
+  "idempotencyKey": "save-hash-example:task-001:attempt-001",
+  "payload": {
+    "commandId": "command-001",
+    "taskId": "task-001",
+    "skillId": "wait-at-location",
+    "skillVersion": "0.1",
+    "expectedWorldRevision": 12,
+    "parameters": {
+      "locationId": "Farm",
+      "tile": { "x": 64, "y": 15 }
+    },
+    "budgets": {
+      "maxGameMinutes": 10
+    },
+    "cancelPolicy": "safe-point",
+    "policyDecisionId": "policy-001"
+  }
+}

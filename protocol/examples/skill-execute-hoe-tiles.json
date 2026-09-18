@@ -1,0 +1,34 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.execute",
+  "messageId": "msg-execute-hoe-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 5,
+  "worldRevision": 18,
+  "sentAt": "2026-08-24T00:02:40Z",
+  "expiresAt": "2026-08-24T00:03:10Z",
+  "idempotencyKey": "save-hash-example:task-hoe-001:attempt-001",
+  "payload": {
+    "commandId": "command-hoe-001",
+    "taskId": "task-hoe-001",
+    "skillId": "hoe-tiles",
+    "skillVersion": "0.1",
+    "expectedWorldRevision": 18,
+    "parameters": {
+      "locationId": "Farm",
+      "tiles": [
+        { "x": 64, "y": 15 },
+        { "x": 65, "y": 15 }
+      ]
+    },
+    "budgets": {
+      "maxGameMinutes": 60,
+      "maxStamina": 50.0,
+      "maxWater": 20
+    },
+    "cancelPolicy": "safe-point",
+    "policyDecisionId": "policy-decision-hoe-001"
+  }
+}

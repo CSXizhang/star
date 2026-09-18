@@ -1,0 +1,35 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.execute",
+  "messageId": "msg-execute-plant-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 6,
+  "worldRevision": 19,
+  "sentAt": "2026-08-24T00:03:40Z",
+  "expiresAt": "2026-08-24T00:04:10Z",
+  "idempotencyKey": "save-hash-example:task-plant-001:attempt-001",
+  "payload": {
+    "commandId": "command-plant-001",
+    "taskId": "task-plant-001",
+    "skillId": "plant-seeds",
+    "skillVersion": "0.1",
+    "expectedWorldRevision": 19,
+    "parameters": {
+      "locationId": "Farm",
+      "tiles": [
+        { "x": 64, "y": 15 },
+        { "x": 65, "y": 15 }
+      ],
+      "seedItemId": "(O)472"
+    },
+    "budgets": {
+      "maxGameMinutes": 60,
+      "maxStamina": 50.0,
+      "maxWater": 20
+    },
+    "cancelPolicy": "safe-point",
+    "policyDecisionId": "policy-decision-plant-001"
+  }
+}

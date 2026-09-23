@@ -141,7 +141,14 @@ def classify_step_outcome(result: Any) -> tuple[str, str | None]:
     """Map a real operation result to the unified outcome enum."""
     if not isinstance(result, dict) or not result:
         return "unknown", "INVALID_TOOL_RESULT"
-    reason = str(result.get("reasonCode") or result.get("error") or result.get("message") or "") or None
+    reason_raw = result.get("reasonCode")
+    if not reason_raw:
+        err = result.get("error")
+        if isinstance(err, dict):
+            reason_raw = err.get("code") or err.get("message")
+        else:
+            reason_raw = err or result.get("message")
+    reason = str(reason_raw) if reason_raw else None
     terminal = str(result.get("terminalState") or "").lower()
     status = str(result.get("status") or "").lower()
     outcome = result.get("outcome")

@@ -9,6 +9,11 @@ from stardew_ai_runtime.chat_bridge import ChatBridge
 def test_invalid_failed_and_rejected_never_success(raw):
     assert classify_step_outcome(raw)[0] != "completed"
 
+def test_error_dict_reason_uses_code_not_stringified_dict():
+    outcome, reason = classify_step_outcome({"status":"executed","terminalState":"rejected","error":{"code":"no-produce","message":"Precondition not satisfied: no-produce.","details":None,"retryable":False}})
+    assert outcome == "partial"
+    assert reason == "no-produce"
+
 @pytest.mark.parametrize("message",["unsupported parameter tiles","World snapshot does not include farming","no watering can","native path blocked"])
 def test_business_exception_has_terminal_no_retry(tmp_path,message):
     store=WorkStore(tmp_path/"work.json")

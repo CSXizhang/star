@@ -11,7 +11,8 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// Native MilkPail/Shears create and insert their own produce, but Farmer's boolean
 /// insertion entry rejects detached farmers before touching their inventory.
 /// Permit only the exact companion during equipped tool harvest or pickup of
-/// the exact collectible egg still present in its current animal house.
+/// the exact collectible egg / spawned ground item still present in its current
+/// location.
 /// No player swapping, identity changes, item creation or inventory replacement.
 /// </summary>
 internal sealed class NativeAnimalHarvestInventoryScope : IDisposable
@@ -26,6 +27,8 @@ internal sealed class NativeAnimalHarvestInventoryScope : IDisposable
     [ThreadStatic] private static GameLocation? _debrisLocation;
     [ThreadStatic] private static Debris? _debris;
     [ThreadStatic] private static Chunk? _chunk;
+    [ThreadStatic] private static GameLocation? _spawnLocation;
+    [ThreadStatic] private static StardewValley.Object? _spawned;
     private bool _disposed;
 
     public NativeAnimalHarvestInventoryScope(Farmer receiver, Tool tool)
@@ -49,6 +52,19 @@ internal sealed class NativeAnimalHarvestInventoryScope : IDisposable
         _house = house;
         _tile = tile;
         _egg = egg;
+    }
+
+    public NativeAnimalHarvestInventoryScope(Farmer receiver, GameLocation location, Vector2 tile, StardewValley.Object spawned)
+    {
+        if (_receiver is not null || ReferenceEquals(receiver, Game1.player)
+            || !ReferenceEquals(receiver.currentLocation, location)
+            || !spawned.CanBeGrabbed || !ReferenceEquals(location.getObjectAtTile((int)tile.X, (int)tile.Y), spawned))
+            throw new InvalidOperationException("Invalid or nested companion ground item inventory context.");
+        EnsurePatched();
+        _receiver = receiver;
+        _spawnLocation = location;
+        _tile = tile;
+        _spawned = spawned;
     }
 
     public NativeAnimalHarvestInventoryScope(Farmer receiver, GameLocation location, Debris debris, Chunk chunk)
@@ -97,7 +113,10 @@ internal sealed class NativeAnimalHarvestInventoryScope : IDisposable
                     && ReferenceEquals(_house.getObjectAtTile((int)_tile.X, (int)_tile.Y), _egg))
                 || (_debrisLocation is not null && _debris is not null && _chunk is not null
                     && ReferenceEquals(farmer.currentLocation, _debrisLocation)
-                    && _debrisLocation.debris.Contains(_debris) && _debris.Chunks.Contains(_chunk))));
+                    && _debrisLocation.debris.Contains(_debris) && _debris.Chunks.Contains(_chunk))
+                || (_spawnLocation is not null && _spawned is not null && _spawned.CanBeGrabbed
+                    && ReferenceEquals(farmer.currentLocation, _spawnLocation)
+                    && ReferenceEquals(_spawnLocation.getObjectAtTile((int)_tile.X, (int)_tile.Y), _spawned))));
 
     // Replace precisely the one ownership gate. The entire native insertion body,
     // capacity rules, returned bool and all animal state changes remain native.
@@ -124,6 +143,8 @@ internal sealed class NativeAnimalHarvestInventoryScope : IDisposable
         _debrisLocation = null;
         _debris = null;
         _chunk = null;
+        _spawnLocation = null;
+        _spawned = null;
         _disposed = true;
     }
 }

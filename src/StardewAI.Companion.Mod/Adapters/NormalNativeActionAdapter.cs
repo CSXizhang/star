@@ -495,9 +495,30 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                     return NativeActionStepResult.Failed("Companion is not inside the egg's animal house.");
                 if (!actor.GameFarmer.couldInventoryAcceptThisItem(spawned))
                     return NativeActionStepResult.Precondition("Companion inventory cannot accept the ground item.", "inventory-full");
-                using (groundEgg ? new NativeAnimalHarvestInventoryScope(actor.GameFarmer, (AnimalHouse)loc,
-                           new Vector2(target.Tile.X, target.Tile.Y), spawned) : null)
+                // The native grab path inserts through addItemToInventoryBool, whose
+                // ownership gate rejects detached farmers; scope the exact item so the
+                // pickup lands in the companion backpack, exactly like the egg path.
+                using (groundEgg
+                           ? new NativeAnimalHarvestInventoryScope(actor.GameFarmer, (AnimalHouse)loc,
+                               new Vector2(target.Tile.X, target.Tile.Y), spawned)
+                           : new NativeAnimalHarvestInventoryScope(actor.GameFarmer, loc,
+                               new Vector2(target.Tile.X, target.Tile.Y), spawned))
                     loc.checkAction(tileLoc, Game1.viewport, actor.GameFarmer);
+                // The native grab path also plays the hold-item-up animation on `who`
+                // (animateOnce, unchecked by IsLocalPlayer). Unlike the local player
+                // the companion's sprite has no native timer draining it, so the
+                // single-animation pause would stick and silently no-op later native
+                // calls such as FarmAnimal.pet. Clear it explicitly.
+                try
+                {
+                    if (actor.GameFarmer.FarmerSprite is not null)
+                        actor.GameFarmer.FarmerSprite.PauseForSingleAnimation = false;
+                    actor.GameFarmer.completelyStopAnimatingOrDoingAction();
+                }
+                catch (Exception ex)
+                {
+                    _monitor.Log($"Ground pickup animation cleanup failed: {ex.Message}", LogLevel.Warn);
+                }
                 int gained = MeasureGainedStack(inventoryBefore, SnapshotInventoryTotals(actor.GameFarmer), spawnedId);
                 bool gone = loc.getObjectAtTile(target.Tile.X, target.Tile.Y) is null;
                 if (!gone || gained != stack)

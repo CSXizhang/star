@@ -637,6 +637,16 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                 $"Animal '{target.TargetId}' was not found on '{request.LocationId}' near {target.Tile}.",
                 "animal-not-found");
 
+        if (actor.GameFarmer is null)
+            return NativeActionStepResult.Failed("Companion actor has no GameFarmer instance.");
+
+        // Tile distance is meaningless across maps: petting requires being on the
+        // animal's actual map, never through a wall from another location.
+        if (!ReferenceEquals(actor.GameFarmer.currentLocation, animal.currentLocation))
+            return NativeActionStepResult.Precondition(
+                $"Companion is not on the same map as animal '{animal.Name}' ({animal.currentLocation?.NameOrUniqueName ?? "unknown"}).",
+                "wrong-map");
+
         if (Distance(actor.Tile, new TileCoordinate((int)animal.Tile.X, (int)animal.Tile.Y)) > 2)
             return NativeActionStepResult.Precondition(
                 $"Animal '{animal.Name}' moved to {animal.Tile}; the companion is not close enough.",
@@ -644,9 +654,6 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
 
         if (animal.wasPet?.Value == true)
             return NativeActionStepResult.Precondition($"Animal '{animal.Name}' was already petted today.", "already-petted");
-
-        if (actor.GameFarmer is null)
-            return NativeActionStepResult.Failed("Companion actor has no GameFarmer instance.");
 
         return InvokeIsolated(actor, "pet-animal", () =>
         {
@@ -731,8 +738,17 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                 if (occupied)
                     continue;
 
-                if (actor.GetItemCount(HayItemId) <= 0 && !WithdrawHayFromSilo(house, actor))
-                    break;
+                if (actor.GetItemCount(HayItemId) <= 0)
+                {
+                    var withdraw = WithdrawHayFromSilo(house, actor);
+                    if (withdraw == HayWithdrawStatus.InventoryFull)
+                        return NativeActionStepResult.Precondition(
+                            $"Companion inventory is full and cannot hold silo hay for '{indoorsName}'.",
+                            "inventory-full",
+                            playerActionRequired: true);
+                    if (withdraw == HayWithdrawStatus.NoHay)
+                        break;
+                }
 
                 if (PlaceHayOnTrough(house, actor, tile))
                     filled++;
@@ -847,13 +863,17 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
         return total;
     }
 
+    /// <summary>Why a silo hay withdrawal ended: success, genuine empty silos, or no bag space.</summary>
+    private enum HayWithdrawStatus { Success, NoHay, InventoryFull }
+
     /// <summary>
     /// Withdraws one real hay object from a silo through the game's own native
     /// <c>GetHayFromAnySilo</c> (it decrements the silo before returning the item) and puts
     /// it in the companion's inventory. If the companion cannot hold it, the hay is put
-    /// back into a silo so the world total is never silently drained.
+    /// back into a silo so the world total is never silently drained, and the caller can
+    /// tell a full bag apart from genuinely empty silos.
     /// </summary>
-    private bool WithdrawHayFromSilo(AnimalHouse house, IFarmerActor actor)
+    private HayWithdrawStatus WithdrawHayFromSilo(AnimalHouse house, IFarmerActor actor)
     {
         try
         {
@@ -863,19 +883,19 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
 
             var hay = GameLocation.GetHayFromAnySilo(root);
             if (hay is null)
-                return false;
+                return HayWithdrawStatus.NoHay;
 
             if (actor.TryAddItemToInventory(hay))
-                return true;
+                return HayWithdrawStatus.Success;
 
             try { GameLocation.StoreHayInAnySilo(1, root); }
             catch (Exception ex) { _monitor.Log($"Could not return unheld hay to a silo: {ex.Message}", LogLevel.Warn); }
-            return false;
+            return HayWithdrawStatus.InventoryFull;
         }
         catch (Exception ex)
         {
             _monitor.Log($"Native silo hay withdrawal failed: {ex.Message}", LogLevel.Warn);
-            return false;
+            return HayWithdrawStatus.NoHay;
         }
     }
 
@@ -1097,6 +1117,21 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
 
             if (actor.GameFarmer is null)
                 return NativeActionStepResult.Failed("Companion actor has no GameFarmer instance.");
+
+            // Mirror the native MilkPail/Shears.beginUsing capacity gate: the game refuses
+            // to start the harvest when the farmer cannot accept the produce, so report an
+            // actionable inventory-full instead of running DoFunction into a silent no-op.
+            bool canAccept;
+            try { canAccept = actor.GameFarmer.couldInventoryAcceptThisItem($"(O){produce}", 1, 0); }
+            catch (Exception ex)
+            {
+                return NativeActionStepResult.Failed($"couldInventoryAcceptThisItem threw: {ex.Message}");
+            }
+            if (!canAccept)
+                return NativeActionStepResult.Precondition(
+                    $"Companion inventory cannot accept produce '{produce}' from '{animal.Name}'.",
+                    "inventory-full",
+                    playerActionRequired: true);
 
             return InvokeIsolated(actor, "collect-animal-produce", () =>
             {

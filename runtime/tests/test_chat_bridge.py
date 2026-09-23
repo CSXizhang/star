@@ -8,14 +8,25 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+import logging
 
 import pytest
 
 from stardew_ai_runtime.chat_bridge import (
     ActiveChatTask,
+    CHAT_BRIDGE_LOG_BACKUP_COUNT,
+    CHAT_BRIDGE_LOG_ENCODING,
+    CHAT_BRIDGE_LOG_FILENAME,
+    CHAT_BRIDGE_LOG_MAX_BYTES,
     ChatBridge,
+    configure_chat_bridge_file_logging,
+    get_chat_bridge_fallback_log_dir,
+    get_chat_bridge_log_path,
     get_command_usage_delta,
     get_max_gen_idx,
+    main,
+    remove_chat_bridge_file_logging,
+    resolve_chat_bridge_run_dir,
 )
 from stardew_ai_runtime.protocol import (
     ChatCancelPayload,
@@ -137,6 +148,13 @@ def test_format_agent_prompt() -> None:
     assert "收割所有成熟作物" in prompt
     assert "stardew-companion" in prompt
     assert "MCP" in prompt
+    assert "始终用中文回复玩家" in prompt
+
+
+def test_format_chain_prompt_contains_chinese_reply_instruction() -> None:
+    bridge = ChatBridge()
+    prompt = bridge._format_chain_prompt("继续播种")
+    assert "始终用中文回复玩家" in prompt
 
 
 def test_execute_agy_turn_success_parsing() -> None:
@@ -755,6 +773,7 @@ def test_autonomy_chat_channel_lifecycle_replays_initial_snapshot_and_enable(tmp
             assert submit.await_args.args[0].__class__.__name__ == "FakeSocket"
             assert "75" in submit.await_args.args[2]
             assert "作物入箱" in submit.await_args.args[2]
+            assert "始终用中文回复玩家" in submit.await_args.args[2]
             await bridge._send_reply(
                 submit.await_args.args[0],
                 Envelope.create_chat_reply(bridge.instance_id, "autonomy-reply", "completed", "已完成", save_id="save-1"),
@@ -1348,4 +1367,125 @@ def test_plan_worker_dispatch_uses_stable_command_id_and_counts_only_completed(
     assert failing[0].reason_code == "TRANSPORT_RETRY_PENDING"
     assert worker2.attempted_steps == 1
     assert worker2.completed_steps == 0
+
+
+def test_chat_bridge_file_logging_created_and_written(tmp_path: Path) -> None:
+    """Verifies that RotatingFileHandler creates logs/chat-bridge.log and records formatted UTF-8 entries."""
+    remove_chat_bridge_file_logging()
+    try:
+        handler, log_path = configure_chat_bridge_file_logging(tmp_path)
+        assert log_path == tmp_path / "logs" / "chat-bridge.log"
+        assert log_path.is_file()
+
+        test_logger = logging.getLogger("stardew_ai_runtime.test_logger")
+        test_logger.info("测试星露谷后台日志落盘：中文消息")
+        handler.flush()
+
+        content = log_path.read_text(encoding="utf-8")
+        assert "[INFO]" in content
+        assert "[stardew_ai_runtime.test_logger]" in content
+        assert "测试星露谷后台日志落盘：中文消息" in content
+    finally:
+        remove_chat_bridge_file_logging()
+
+
+def test_chat_bridge_file_logging_rotation_policy(tmp_path: Path) -> None:
+    """Verifies that RotatingFileHandler configures 5MB x 3 backups, UTF-8 encoding, and rolls over."""
+    remove_chat_bridge_file_logging()
+    try:
+        handler, log_path = configure_chat_bridge_file_logging(tmp_path)
+        assert handler.maxBytes == 5 * 1024 * 1024
+        assert handler.backupCount == 3
+        assert handler.encoding.lower() == "utf-8"
+
+        # Reduce maxBytes threshold to trigger an actual rollover in test
+        handler.maxBytes = 200
+        test_logger = logging.getLogger("stardew_ai_runtime.rotation_test")
+        for i in range(20):
+            test_logger.info("Line %02d: %s", i, "X" * 40)
+        handler.flush()
+
+        backup_file = log_path.with_name("chat-bridge.log.1")
+        assert backup_file.is_file()
+    finally:
+        remove_chat_bridge_file_logging()
+
+
+def test_chat_bridge_file_logging_fallback_when_run_dir_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that missing run-dir falls back to user directory without crashing."""
+    remove_chat_bridge_file_logging()
+    fallback_dir = tmp_path / "user_home" / ".gemini" / "antigravity-cli" / "logs"
+    monkeypatch.setenv("STARDEW_FALLBACK_LOG_DIR", str(fallback_dir))
+    monkeypatch.delenv("STARDEW_RUN_DIR", raising=False)
+    monkeypatch.setattr(
+        "stardew_ai_runtime.chat_bridge.resolve_chat_bridge_run_dir",
+        lambda r=None: None,
+    )
+
+    try:
+        handler, log_path = configure_chat_bridge_file_logging(None)
+        assert log_path == fallback_dir / "chat-bridge.log"
+        assert log_path.is_file()
+
+        test_logger = logging.getLogger("stardew_ai_runtime.fallback_test")
+        test_logger.warning("回退路径正常写入")
+        handler.flush()
+
+        content = log_path.read_text(encoding="utf-8")
+        assert "回退路径正常写入" in content
+    finally:
+        remove_chat_bridge_file_logging()
+
+
+def test_chat_bridge_main_prints_log_path_and_writes_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that main() prints the log file path and configures file logging."""
+    remove_chat_bridge_file_logging()
+
+    async def mock_run(self, stop_event: Any = None) -> None:
+        return None
+
+    monkeypatch.setattr(ChatBridge, "run", mock_run)
+
+    try:
+        main(["--run-dir", str(tmp_path)])
+        captured = capsys.readouterr().out
+        assert "日志文件:" in captured
+        expected_log = str(tmp_path / "logs" / "chat-bridge.log")
+        assert expected_log in captured or "chat-bridge.log" in captured
+
+        log_file = tmp_path / "logs" / "chat-bridge.log"
+        assert log_file.is_file()
+        content = log_file.read_text(encoding="utf-8")
+        assert "ChatBridge 文件日志已启动" in content
+    finally:
+        remove_chat_bridge_file_logging()
+
+
+def test_chat_bridge_uncaught_exception_flushed_to_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that unhandled exceptions causing service exit are flushed to chat-bridge.log."""
+    remove_chat_bridge_file_logging()
+
+    async def mock_crashing_run(self, stop_event: Any = None) -> None:
+        raise RuntimeError("Fatal unhandled bridge crash")
+
+    monkeypatch.setattr(ChatBridge, "run", mock_crashing_run)
+
+    try:
+        with pytest.raises(RuntimeError, match="Fatal unhandled bridge crash"):
+            main(["--run-dir", str(tmp_path)])
+
+        log_file = tmp_path / "logs" / "chat-bridge.log"
+        assert log_file.is_file()
+        content = log_file.read_text(encoding="utf-8")
+        assert "后台服务发生未捕获异常退出" in content
+        assert "Fatal unhandled bridge crash" in content
+        assert "Traceback" in content
+    finally:
+        remove_chat_bridge_file_logging()
 

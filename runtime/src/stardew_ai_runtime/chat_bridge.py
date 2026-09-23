@@ -25,6 +25,7 @@ import contextlib
 import datetime
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sqlite3
@@ -45,7 +46,11 @@ from stardew_ai_runtime.plan_executor import PlanExecutor, StepExecution
 from stardew_ai_runtime.protocol import (
     Envelope,
 )
-from stardew_ai_runtime.scheduler import DiscoveryError, resolve_discovery
+from stardew_ai_runtime.scheduler import (
+    DiscoveryError,
+    get_candidate_discovery_paths,
+    resolve_discovery,
+)
 from stardew_ai_runtime.websocket_client import (
     ConnectionClosed,
     WebSocketClient,
@@ -54,6 +59,144 @@ from stardew_ai_runtime.websocket_client import (
 from stardew_ai_runtime.work_state import WorkStore
 
 logger = logging.getLogger("stardew_ai_runtime.chat_bridge")
+
+CHAT_BRIDGE_LOG_FILENAME = "chat-bridge.log"
+CHAT_BRIDGE_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+CHAT_BRIDGE_LOG_BACKUP_COUNT = 3
+CHAT_BRIDGE_LOG_ENCODING = "utf-8"
+CHAT_BRIDGE_LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+CHAT_BRIDGE_LOG_DATEFMT = "%H:%M:%S"
+
+
+def resolve_chat_bridge_run_dir(run_dir: str | Path | None = None) -> Path | None:
+    """Resolves the active run directory, consulting explicit path, environment, and auto-discovery."""
+    if run_dir:
+        return Path(run_dir).resolve()
+    env_dir = os.getenv("STARDEW_RUN_DIR")
+    if env_dir and env_dir.strip():
+        return Path(env_dir.strip()).resolve()
+    try:
+        candidate_meta = project_root() / "config" / "installed-candidate.json"
+        if candidate_meta.is_file():
+            meta = json.loads(candidate_meta.read_text(encoding="utf-8"))
+            mod_dir = meta.get("modDirectory")
+            if mod_dir and Path(mod_dir).is_dir():
+                return Path(mod_dir).resolve()
+    except Exception:
+        pass
+    try:
+        for cand in get_candidate_discovery_paths(None):
+            if cand.is_file():
+                parent = cand.parent
+                mod_dir = parent.parent if parent.name.lower() == "data" else parent
+                return mod_dir.resolve()
+            parent = cand.parent
+            cand_mod = parent.parent if parent.name.lower() == "data" else parent
+            if cand_mod.is_dir():
+                return cand_mod.resolve()
+    except Exception:
+        pass
+    return None
+
+
+def get_chat_bridge_fallback_log_dir() -> Path:
+    """Returns the fallback directory for logs when run-dir cannot be resolved."""
+    env_override = os.getenv("STARDEW_FALLBACK_LOG_DIR")
+    if env_override and env_override.strip():
+        return Path(env_override.strip())
+    return Path.home() / ".gemini" / "antigravity-cli" / "logs"
+
+
+def get_chat_bridge_log_path(run_dir: str | Path | None = None) -> Path:
+    """Determines the destination path for chat-bridge.log."""
+    resolved = resolve_chat_bridge_run_dir(run_dir)
+    if resolved is not None:
+        return resolved / "logs" / CHAT_BRIDGE_LOG_FILENAME
+    return get_chat_bridge_fallback_log_dir() / CHAT_BRIDGE_LOG_FILENAME
+
+
+def has_chat_bridge_file_logging() -> bool:
+    """Checks whether a ChatBridge RotatingFileHandler is currently attached to the root logger."""
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers:
+        if getattr(h, "_is_chat_bridge_handler", False):
+            return True
+    return False
+
+
+def configure_chat_bridge_file_logging(
+    run_dir: str | Path | None = None,
+) -> tuple[RotatingFileHandler, Path]:
+    """Attaches a 5MB x 3 UTF-8 RotatingFileHandler to the root logger."""
+    log_path = get_chat_bridge_log_path(run_dir)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as ex:
+        fallback_path = get_chat_bridge_fallback_log_dir() / CHAT_BRIDGE_LOG_FILENAME
+        try:
+            fallback_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path = fallback_path
+        except Exception:
+            logger.warning("Failed to create log directories (%s); falling back to current working directory", ex)
+            log_path = Path.cwd() / "logs" / CHAT_BRIDGE_LOG_FILENAME
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers:
+        if getattr(h, "_is_chat_bridge_handler", False) and isinstance(h, RotatingFileHandler):
+            try:
+                if Path(h.baseFilename).resolve() == log_path.resolve():
+                    return h, log_path
+            except Exception:
+                pass
+
+    handler = RotatingFileHandler(
+        str(log_path),
+        maxBytes=CHAT_BRIDGE_LOG_MAX_BYTES,
+        backupCount=CHAT_BRIDGE_LOG_BACKUP_COUNT,
+        encoding=CHAT_BRIDGE_LOG_ENCODING,
+    )
+    handler.setLevel(logging.INFO)
+    handler._is_chat_bridge_handler = True  # type: ignore[attr-defined]
+    formatter = logging.Formatter(
+        CHAT_BRIDGE_LOG_FORMAT,
+        datefmt=CHAT_BRIDGE_LOG_DATEFMT,
+    )
+    handler.setFormatter(formatter)
+    root_logger.addHandler(handler)
+    if root_logger.level > logging.INFO or root_logger.level == logging.NOTSET:
+        root_logger.setLevel(logging.INFO)
+    return handler, log_path
+
+
+def switch_chat_bridge_file_logging(
+    new_run_dir: str | Path | None,
+) -> tuple[RotatingFileHandler, Path]:
+    """Switches the active chat_bridge file handler to a newly discovered run directory."""
+    log_path = get_chat_bridge_log_path(new_run_dir)
+    root_logger = logging.getLogger()
+    for h in list(root_logger.handlers):
+        if getattr(h, "_is_chat_bridge_handler", False) and isinstance(h, RotatingFileHandler):
+            try:
+                if Path(h.baseFilename).resolve() == log_path.resolve():
+                    return h, log_path
+                h.close()
+                root_logger.removeHandler(h)
+            except Exception:
+                pass
+    return configure_chat_bridge_file_logging(new_run_dir)
+
+
+def remove_chat_bridge_file_logging() -> None:
+    """Closes and removes all chat_bridge file handlers from the root logger."""
+    root_logger = logging.getLogger()
+    for h in list(root_logger.handlers):
+        if getattr(h, "_is_chat_bridge_handler", False):
+            try:
+                h.close()
+            except Exception:
+                pass
+            root_logger.removeHandler(h)
 
 
 def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
@@ -501,6 +644,7 @@ class PlanWorker:
         self.supplied_save_id: str | None = None
         self.last_result: StepExecution | None = None
         self.progress_callback = None
+        self.terminal_callback: Any | None = None
         self.completed_steps = 0
         self.attempted_steps = 0
         self.pending_reasons: list[str] = []
@@ -615,13 +759,24 @@ class PlanWorker:
                 feedback["stepsCompleted"] = sum(step.status == "completed" for step in completed_task.steps) if completed_task else 0
                 self.store.finish_job(save_id, feedback, task_id=execution.task_id)
                 self.pending_reasons.append("SHORT_JOB_TERMINAL")
+                if self.terminal_callback:
+                    try:
+                        res = self.terminal_callback(save_id, execution, "SHORT_JOB_TERMINAL")
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        logger.warning("Plan worker terminal callback failed", exc_info=True)
                 break
             if execution.needs_model:
-                # A deviation (partial/unknown) or a refused dispatch needs one
-                # decision; do not spin on it and do not re-dispatch blindly.
-                self.pending_reasons.append(
-                    execution.reason_code or execution.outcome or "STEP_DEVIATION"
-                )
+                reason = execution.reason_code or execution.outcome or "STEP_DEVIATION"
+                self.pending_reasons.append(reason)
+                if self.terminal_callback:
+                    try:
+                        res = self.terminal_callback(save_id, execution, reason)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        logger.warning("Plan worker terminal callback failed", exc_info=True)
                 break
         if executions:
             # Re-check on the next tick: a completed step may unlock the next one.
@@ -675,6 +830,16 @@ class ActiveChatTask:
     abort_reason: str | None = None
     start_time: float = field(default_factory=time.monotonic)
     recorded: bool = False
+
+
+@dataclass
+class CommandChain:
+    instruction: str
+    save_id: str
+    started_at: float
+    chain_count: int = 0
+    generation: int = 0
+    ws: WebSocketClient | None = None
 
 
 class ChatBridge:
@@ -762,11 +927,16 @@ class ChatBridge:
         self._autonomy_last_snapshot_at: dict[str, float] = {}
         self._autonomy_pending_snapshot: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
         self._autonomy_debounce_tasks: dict[str, asyncio.Task] = {}
+        self._autonomy_pending_task_fingerprints: dict[str, tuple[str, str]] = {}
         self._bind_autonomy_store()
         # Durable per-save goals/tasks/todos; bound once a run dir is known
         # (explicit --run-dir or discovered from the running Mod).
         self._work_store: WorkStore | None = None
         self._plan_worker: PlanWorker | None = None
+        self._command_chains: dict[str, CommandChain] = {}
+        self._chain_requests: set[str] = set()
+        self._chain_generation = 0
+        self._chain_tasks: set[asyncio.Task] = set()
         # Serializes native command-socket ownership between the provider turn and
         # the internal plan worker (the Mod transport accepts one command client).
         self._execution_lock = asyncio.Lock()
@@ -858,6 +1028,7 @@ class ChatBridge:
         if self._plan_worker is not None:
             self._plan_worker.store = store
             self._plan_worker.snapshot_provider = self._plan_snapshot_state
+            self._plan_worker.terminal_callback = self._on_job_terminal
             return
         client = self._internal_plan_client_override
         if client is None:
@@ -865,6 +1036,7 @@ class ChatBridge:
         self._plan_worker = PlanWorker(store, client)
         self._plan_worker.progress_callback = self._publish_job_progress
         self._plan_worker.snapshot_provider = self._plan_snapshot_state
+        self._plan_worker.terminal_callback = self._on_job_terminal
 
     def _plan_snapshot_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """(latest world.snapshot payload, native game date) for wait evaluation."""
@@ -1107,6 +1279,12 @@ class ChatBridge:
                     self.run_dir = Path(mod_dir)
                     self._bind_autonomy_store()
                     self._bind_work_store()
+                    if has_chat_bridge_file_logging():
+                        try:
+                            _, new_log = switch_chat_bridge_file_logging(self.run_dir)
+                            logger.info("已将日志文件切换至运行目录: %s", new_log)
+                        except Exception as ex:
+                            logger.debug("Failed to switch log path to %s: %s", self.run_dir, ex)
 
                 # Guard against save switch while task was running
                 if self._active_task and self._active_task.save_id != save_id:
@@ -1253,6 +1431,7 @@ class ChatBridge:
                     tracked_tasks.add(task)
         finally:
             self.abort_active_task("Chat channel stopped")
+            self._break_command_chain()
             for debounce in list(self._autonomy_debounce_tasks.values()):
                 debounce.cancel()
             self._autonomy_debounce_tasks.clear()
@@ -1285,7 +1464,13 @@ class ChatBridge:
                 self._autonomy_debounce_tasks[save_id] = asyncio.create_task(flush())
             return
         state = self._autonomy.state(save_id)
-        if not state.enabled or state.paused or self._active_task is not None or self._busy_lock.locked():
+        if (
+            not state.enabled
+            or state.paused
+            or self._active_task is not None
+            or self._busy_lock.locked()
+            or self._autonomy.is_cooling_down(save_id)
+        ):
             return
         snapshot = envelope.payload or {}
         if self._work_store is not None:
@@ -1321,6 +1506,7 @@ class ChatBridge:
             "原生事实优先，知识不足才 query_wiki；无合适工作就说明待命，不为待命查 wiki。"
             "长期目标或待办用remember_intent，它们不是执行授权；本次用submit_plan选择一个语义短作业，允许内部导航和同一业务范围的多步操作。完成后信任工具精简终态，不重复查询。下一业务由下一次模型决策选择，不预排存箱或出售。"
             f"已保存目标：{state.goal or '由当前状态决定'}。"
+            "始终用中文回复玩家。"
         )
         # Unique per-request identity: a worldRevision may repeat (revision reset /
         # same-revision decisions) and must never collide across epochs.
@@ -1335,6 +1521,8 @@ class ChatBridge:
         if store is None:
             return
         try:
+            if action in {"pause", "cancel", "set_mode"}:
+                self._break_command_chain(save_id)
             if action == "pause":
                 store.set_paused(save_id, True)
             elif action == "resume":
@@ -1698,6 +1886,8 @@ class ChatBridge:
         # save or a repeated day must not churn the provider session.
         if settlement and settlement.get("settled"):
             self._rotate_provider_session(save_id, reason="game-day-advanced")
+        if self._autonomy is not None and save_id:
+            self._autonomy.reset_breaker(save_id)
 
     async def _publish_job_progress(self, execution: StepExecution) -> None:
         binding = getattr(self, "_job_reply_binding", None)
@@ -1742,6 +1932,14 @@ class ChatBridge:
             "preferencesRevision": state.preferences_revision,
             "decisionEpoch": state.decision_epoch,
             "gameDate": state.game_date, "dailySpend": state.daily_spend,
+            "failureCount": state.failure_count,
+            "failure_count": state.failure_count,
+            "breakerTripped": state.breaker_tripped,
+            "breaker_tripped": state.breaker_tripped,
+            "breakerCooldownUntil": state.breaker_cooldown_until,
+            "breaker_cooldown_until": state.breaker_cooldown_until,
+            "breakerReason": state.breaker_reason,
+            "breaker_reason": state.breaker_reason,
         }
         # F8 visibility: the last plan action and why the worker is waiting.
         worker = self._plan_worker
@@ -1751,6 +1949,8 @@ class ChatBridge:
             payload["planWaitReason"] = (
                 worker.pending_reasons[-1] if worker.pending_reasons else None
             )
+        if self._autonomy is not None and self._autonomy.is_cooling_down(save_id):
+            payload["planWaitReason"] = "自动模式已熔断冷却"
         overview = self._latest_work_overview(save_id)
         if overview is not None:
             payload["lastSettledDay"] = overview.get("lastSettledDay")
@@ -1774,14 +1974,16 @@ class ChatBridge:
         params = envelope.payload.get("parameters") or {}
         try:
             if save_id and action in {"pause", "cancel", "set_mode"}:
+                self._break_command_chain(save_id)
                 await self._interrupt_short_job(save_id)
             state = self._autonomy.control(save_id, action, **params)
             if self._work_store is not None:
                 self._apply_work_control(save_id, action, params)
             if action in {"pause", "cancel", "set_mode"} and self._active_task is not None:
-                if self._active_task.request_id.startswith("autonomy-"):
-                    self._autonomy_generation += 1
-                    self.abort_active_task(f"autonomy control: {action}")
+                if self._active_task.request_id.startswith("autonomy-") or self._active_task.request_id.startswith("chain-"):
+                    if self._active_task.request_id.startswith("autonomy-"):
+                        self._autonomy_generation += 1
+                    self.abort_active_task(f"control: {action}")
                     self._active_task = None
             status, reason = "confirmed", None
         except (TypeError, ValueError) as ex:
@@ -1812,10 +2014,13 @@ class ChatBridge:
         save_id: str | None,
     ) -> None:
         """Handles immediate cancellation: kills active agy subprocess, records command, and notifies game."""
+        self._break_command_chain(save_id)
         await self._interrupt_short_job(save_id)
+        self._autonomy_pending_task_fingerprints.clear()
         task = self._active_task
         if self._autonomy is not None and save_id:
             self._autonomy.set_enabled(save_id, False)
+            self._autonomy.reset_breaker(save_id)
         if task is not None:
             active_req = task.request_id
             active_save = task.save_id or save_id or ""
@@ -1910,11 +2115,11 @@ class ChatBridge:
         if self._autonomy is not None and save_id:
             self._autonomy.record_event(save_id, f"chat-submit:{request_id}", "chat.submit")
 
-        # A player request always wins over a pending autonomous request.
-        # Invalidate the old generation before entering the busy guard so its
-        # finally callback cannot schedule another autonomous turn.
-        self._preempt_autonomy_for_player(request_id)
-        if request_id not in self._autonomy_requests:
+        is_player = self._is_player_request(request_id)
+        if is_player:
+            self._preempt_autonomy_for_player(request_id)
+            if self._autonomy is not None and save_id:
+                self._autonomy.reset_breaker(save_id)
             if self._work_store is not None and save_id:
                 try:
                     if self._work_store.state(save_id).paused:
@@ -1930,6 +2135,8 @@ class ChatBridge:
                     self._autonomy.set_enabled(save_id, True)
                 async with self._busy_lock:
                     pass
+            if save_id:
+                self._register_command_chain(save_id, text, ws)
 
         # 1. Concurrency deduplication guard
         if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
@@ -1952,7 +2159,14 @@ class ChatBridge:
                 save_id, self.get_conversation_id(save_id)
             )
             previous_cid = existing_cid
-            prompt = self._format_agent_prompt(text, save_id)
+            if request_id in self._chain_requests:
+                chain = self._command_chains.get(save_id or "")
+                instruction = chain.instruction if chain else text
+                prompt = self._format_chain_prompt(instruction, save_id)
+                task_prompt = f"[续链#{chain.chain_count if chain else 1}] {instruction}"
+            else:
+                prompt = self._format_agent_prompt(text, save_id)
+                task_prompt = text
             is_kimi = self.backend_name == "kimi"
             # The agy SQLite bill is agy-only; Kimi usage comes from the provider
             # wire file. Capture the byte offset now so this turn's records are
@@ -1965,7 +2179,7 @@ class ChatBridge:
             active_task = ActiveChatTask(
                 request_id=request_id,
                 save_id=save_id or "",
-                prompt=text,
+                prompt=task_prompt,
                 start_max_idx=start_max_idx,
                 start_max_step_idx=start_max_step_idx,
                 wire_start_offset=wire_start_offset,
@@ -2041,7 +2255,7 @@ class ChatBridge:
                 if cid and existing_cid and cid != existing_cid:
                     start_max_idx = -1
                 if new_session_established and cid:
-                    logger.info("New Kimi session established [%s]; game agent profile bound.", cid)
+                    logger.info("New %s session established [%s]; game agent profile bound.", self.provider, cid)
                 err = result.get("error")
                 duration = result.get("duration", 0.0)
 
@@ -2144,7 +2358,7 @@ class ChatBridge:
                     request_id=request_id,
                     save_id=save_id,
                     conversation_id=cid,
-                    prompt=text,
+                    prompt=active_task.prompt,
                     status=status,
                     start_idx=start_max_idx,
                     end_idx=end_max_idx,
@@ -2159,14 +2373,18 @@ class ChatBridge:
                 if plan_line:
                     reply_text = (reply_text + "\n" + plan_line) if reply_text else plan_line
                 reply_status = status
+                job_selected = False
                 if status == "completed" and self._work_store and save_id:
                     selected = self._work_store.state(save_id).decision
                     if selected.get("selected") and not selected.get("finished"):
                         reply_status = "selected"
+                        job_selected = True
                         self._job_reply_binding = (request_id, save_id, selected.get("taskId"), ws)
                         reply_text = "已选择短作业，等待原生执行。\n" + (reply_text or "")
                     else:
                         reply_status = "decision-completed"
+                if not job_selected or status != "completed":
+                    self._break_command_chain(save_id)
                 final_reply = Envelope.create_chat_reply(
                     sender_instance_id=self.instance_id,
                     request_id=request_id,
@@ -2190,7 +2408,49 @@ class ChatBridge:
                     self._autonomy.record_event(save_id, f"chat-terminal:{request_id}:{status}", f"chat.{status}")
                     autonomy_fingerprint = self._autonomy_requests.pop(request_id, None)
                     if autonomy_fingerprint:
-                        self._autonomy.record_action_result(save_id, autonomy_fingerprint, status == "completed")
+                        if status != "completed":
+                            self._autonomy.record_action_result(
+                                save_id, autonomy_fingerprint, False, reason=err or f"turn_{status}"
+                            )
+                        elif self._work_store is not None:
+                            job_state = self._work_store.state(save_id)
+                            decision = job_state.decision if job_state else {}
+                            if not decision.get("selected"):
+                                self._autonomy.record_action_result(
+                                    save_id, autonomy_fingerprint, True, reason="standby"
+                                )
+                            else:
+                                task_id = decision.get("taskId")
+                                task = next((t for t in job_state.tasks if t.id == task_id), None) if task_id else None
+                                last_job = job_state.last_job or {}
+                                terminal_status = None
+                                fail_reason = None
+                                if task and task.status in {"partial", "rejected", "failed", "unknown", "cancelled", "completed"}:
+                                    terminal_status = task.status
+                                    if task.status != "completed":
+                                        fail_reason = getattr(task, "error", None) or task.status
+                                elif last_job:
+                                    lj_status = str(last_job.get("status") or last_job.get("outcome") or "").lower()
+                                    if lj_status:
+                                        terminal_status = lj_status
+                                        if lj_status != "completed":
+                                            fail_reason = last_job.get("reasonCode") or last_job.get("message") or last_job.get("error") or lj_status
+
+                                if terminal_status in {"partial", "rejected", "failed", "unknown", "cancelled"}:
+                                    self._autonomy.record_action_result(
+                                        save_id, autonomy_fingerprint, False, reason=fail_reason or terminal_status
+                                    )
+                                elif terminal_status == "completed":
+                                    self._autonomy.record_action_result(
+                                        save_id, autonomy_fingerprint, True
+                                    )
+                                else:
+                                    if task_id:
+                                        self._autonomy_pending_task_fingerprints[task_id] = (save_id, autonomy_fingerprint)
+                        else:
+                            self._autonomy.record_action_result(
+                                save_id, autonomy_fingerprint, status == "completed"
+                            )
                     self._autonomy.record_usage(
                         save_id,
                         self._current_game_day_key or "unknown",
@@ -2221,6 +2481,7 @@ class ChatBridge:
 
             except asyncio.CancelledError:
                 logger.info("handle_chat_submit [%s] cancelled.", request_id)
+                self._break_command_chain(save_id)
                 if not getattr(active_task, "recorded", False):
                     duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
                     cid = self.get_conversation_id(save_id)
@@ -2228,7 +2489,7 @@ class ChatBridge:
                         request_id=request_id,
                         save_id=save_id,
                         conversation_id=cid,
-                        prompt=text,
+                        prompt=active_task.prompt,
                         status="interrupted",
                         start_idx=start_max_idx,
                         end_idx=-1,
@@ -2240,6 +2501,7 @@ class ChatBridge:
                     active_task.recorded = True
             except Exception as ex:
                 logger.error("Error in handle_chat_submit [%s]: %s", request_id, ex, exc_info=True)
+                self._break_command_chain(save_id)
                 err_reply = Envelope.create_chat_reply(
                     sender_instance_id=self.instance_id,
                     request_id=request_id,
@@ -2268,8 +2530,180 @@ class ChatBridge:
             "下一业务须下一次模型决策。job-selected仅表示已选择，未执行成功；"
             "下一次输入lastResult是实际终态，信任它，不重复核查。\n"
             "自主执行，不要向玩家询问坐标或请求额外确认。不要读写代码文件或执行终端命令。\n"
-            "任务完成后，向玩家简短汇报完成情况与剩余工作。\n\n"
+            "任务完成后，向玩家简短汇报完成情况与剩余工作。\n"
+            "始终用中文回复玩家。\n\n"
             f"玩家指令：{user_text}"
+        )
+
+    def _is_player_request(self, request_id: str) -> bool:
+        if request_id in self._autonomy_requests:
+            return False
+        if request_id in self._chain_requests:
+            return False
+        if request_id.startswith("autonomy-") or request_id.startswith("chain-"):
+            return False
+        return True
+
+    def _register_command_chain(self, save_id: str, text: str, ws: WebSocketClient | None) -> None:
+        self._chain_generation += 1
+        self._command_chains[save_id] = CommandChain(
+            instruction=text,
+            save_id=save_id,
+            started_at=time.monotonic(),
+            chain_count=0,
+            generation=self._chain_generation,
+            ws=ws,
+        )
+
+    def _break_command_chain(self, save_id: str | None = None) -> None:
+        self._chain_generation += 1
+        if save_id:
+            self._command_chains.pop(save_id, None)
+        else:
+            self._command_chains.clear()
+        for task in list(self._chain_tasks):
+            if not task.done():
+                task.cancel()
+        self._chain_tasks.clear()
+
+    def _get_command_chain_max(self) -> int:
+        try:
+            return int(os.getenv("STARDEW_COMMAND_CHAIN_MAX", "8"))
+        except ValueError:
+            return 8
+
+    async def _on_job_terminal(
+        self, save_id: str, execution: StepExecution, reason: str
+    ) -> None:
+        if not save_id:
+            return
+        pending_af = self._autonomy_pending_task_fingerprints.pop(execution.task_id, None)
+        if pending_af and self._autonomy is not None:
+            af_save_id, af_fingerprint = pending_af
+            job_success = (execution.task_status == "completed" and execution.outcome == "completed")
+            job_fail_reason = execution.reason_code or execution.message or execution.outcome or reason
+            self._autonomy.record_action_result(
+                af_save_id, af_fingerprint, job_success, reason=None if job_success else job_fail_reason
+            )
+        chain = self._command_chains.get(save_id)
+        if chain is None:
+            return
+        if self._work_store and self._work_store.state(save_id).paused:
+            self._break_command_chain(save_id)
+            return
+        self._schedule_command_chain(save_id)
+
+    def _schedule_command_chain(self, save_id: str) -> asyncio.Task | None:
+        chain = self._command_chains.get(save_id)
+        if chain is None:
+            return None
+        if self._work_store and self._work_store.state(save_id).paused:
+            self._break_command_chain(save_id)
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(
+            self._run_command_chain_continuation(save_id, chain.generation)
+        )
+        self._chain_tasks.add(task)
+        task.add_done_callback(self._chain_tasks.discard)
+        return task
+
+    async def _run_command_chain_continuation(
+        self, save_id: str, generation: int
+    ) -> None:
+        while (
+            self._busy_lock.locked()
+            or self._active_task is not None
+            or (self._plan_worker and self._plan_worker._provider_active)
+        ):
+            await asyncio.sleep(0.05)
+            chain = self._command_chains.get(save_id)
+            if chain is None or chain.generation != generation:
+                return
+            if self._work_store and self._work_store.state(save_id).paused:
+                self._break_command_chain(save_id)
+                return
+
+        chain = self._command_chains.get(save_id)
+        if chain is None or chain.generation != generation:
+            return
+        if self._work_store and self._work_store.state(save_id).paused:
+            self._break_command_chain(save_id)
+            return
+
+        max_chains = self._get_command_chain_max()
+        if chain.chain_count >= max_chains:
+            self._break_command_chain(save_id)
+            msg = f"指令续链已达到上限（{max_chains}次），已停止继续。若任务未全部完成，请再次输入指令。"
+            reply = Envelope.create_chat_reply(
+                sender_instance_id=self.instance_id,
+                request_id=f"chain-limit-{uuid.uuid4().hex[:8]}",
+                status="completed",
+                reply_text=msg,
+                save_id=save_id,
+            )
+            await self._send_reply(chain.ws, reply)
+            return
+
+        chain.chain_count += 1
+        req_id = f"chain-{uuid.uuid4().hex}"
+        self._chain_requests.add(req_id)
+        try:
+            await self.handle_chat_submit(
+                chain.ws, req_id, chain.instruction, save_id
+            )
+        finally:
+            self._chain_requests.discard(req_id)
+
+    async def wait_for_chains(self, timeout: float = 5.0) -> None:
+        if not self._chain_tasks:
+            return
+        await asyncio.wait_for(
+            asyncio.gather(*list(self._chain_tasks), return_exceptions=True),
+            timeout=timeout,
+        )
+
+    def _format_chain_prompt(
+        self, instruction: str, save_id: str | None = None
+    ) -> str:
+        snapshot: dict[str, Any] = {}
+        if self._latest_snapshot_payload is not None:
+            snapshot = {
+                "payload": self._latest_snapshot_payload,
+                "worldRevision": self._latest_snapshot_revision,
+            }
+        work = self._work_context(save_id) if save_id else None
+        compact = build_decision_context(
+            snapshot, work=work, origin="chat-continuation"
+        )
+        last_result = None
+        if self._work_store and save_id:
+            last_result = self._work_store.state(save_id).last_job
+        if not last_result and work and work.get("lastJob"):
+            last_result = work.get("lastJob")
+        if last_result:
+            compact["lastResult"] = last_result
+        context = render_decision_context(compact)
+        last_result_str = (
+            json.dumps(last_result, ensure_ascii=False) if last_result else "none"
+        )
+        return (
+            "你是星露谷伙伴智能体，请直接通过已接入的 stardew-companion MCP 工具操作游戏，完成玩家的指令。\n"
+            "每次请求都会附带以下紧凑实时上下文（字段缺失为 unknown）；工具结果是执行后的最新事实，"
+            "不要为了确认再重复查询。\n"
+            f"实时上下文：{context}\n"
+            f"这是对玩家指令『{instruction}』的继续。若指令意图已全部完成，直接向玩家总结收尾（本轮不要 submit_plan）；若还有下一业务，用 submit_plan 选择下一个短作业。\n"
+            "用submit_plan选择本次唯一语义短作业；内部导航和同一业务的多步操作由运行时执行。"
+            "remember_intent记录目标与待办，它们不是执行授权。不要预排第二种业务；"
+            "下一业务须下一次模型决策。job-selected仅表示已选择，未执行成功；"
+            "下一次输入lastResult是实际终态，信任它，不重复核查。\n"
+            "自主执行，不要向玩家询问坐标或请求额外确认。不要读写代码文件或执行终端命令。\n"
+            "始终用中文回复玩家。\n\n"
+            f"原指令：{instruction}\n"
+            f"上一步作业结果（lastResult）：{last_result_str}"
         )
 
     def _execute_turn(
@@ -2660,19 +3094,49 @@ def main(argv: list[str] | None = None) -> None:
         kimi_cmd=args.kimi_cmd,
     )
 
+    _, log_file_path = configure_chat_bridge_file_logging(bridge.run_dir)
+    logger.info("ChatBridge 文件日志已启动: %s", log_file_path)
+
     print("================================================================")
     print(">>> 星露谷伙伴后台对话服务 (Stardew Chat Bridge) 已就绪 <<<")
-    print(f"运行目录: {args.run_dir or '自动发现 (优先使用设置向导已配置的正常游戏Mod路径)'}")
+    print(f"运行目录: {bridge.run_dir or args.run_dir or '自动发现 (优先使用设置向导已配置的正常游戏Mod路径)'}")
+    print(f"日志文件: {log_file_path}")
     print(f"实际后端: {bridge.provider} | 模型标识: {bridge.model}")
     if bridge.provider == "agy":
         print(f"agy 思考强度: {args.effort}")
     print("在游戏中按 F8 开启伙伴窗口，输入中文指令即可直接交互！")
     print("================================================================")
 
+    def _flush_handlers() -> None:
+        for handler in logging.getLogger().handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+
+    prev_excepthook = sys.excepthook
+
+    def _unhandled_exception_hook(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            prev_excepthook(exc_type, exc_value, exc_traceback)
+            return
+        logger.critical("未捕获异常导致服务退出", exc_info=(exc_type, exc_value, exc_traceback))
+        _flush_handlers()
+        prev_excepthook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = _unhandled_exception_hook
+
     try:
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
         print("\n服务已由用户退出。")
+    except Exception as ex:
+        logger.critical("后台服务发生未捕获异常退出: %s", ex, exc_info=True)
+        _flush_handlers()
+        raise
+    finally:
+        _flush_handlers()
+        sys.excepthook = prev_excepthook
 
 
 if __name__ == "__main__":

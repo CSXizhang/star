@@ -10,10 +10,28 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+DEFAULT_BREAKER_THRESHOLD = 3
+DEFAULT_BREAKER_COOLDOWN_SECONDS = 300.0
+
+
+def get_breaker_threshold() -> int:
+    try:
+        return max(1, int(os.getenv("STARDEW_AUTONOMY_BREAKER_THRESHOLD", str(DEFAULT_BREAKER_THRESHOLD))))
+    except (TypeError, ValueError):
+        return DEFAULT_BREAKER_THRESHOLD
+
+
+def get_breaker_cooldown_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("STARDEW_AUTONOMY_BREAKER_COOLDOWN_SECONDS", str(DEFAULT_BREAKER_COOLDOWN_SECONDS))))
+    except (TypeError, ValueError):
+        return DEFAULT_BREAKER_COOLDOWN_SECONDS
 
 
 @dataclass
@@ -39,6 +57,9 @@ class SaveAutonomyState:
     last_action_fingerprint: str | None = None
     failure_count: int = 0
     last_attempt_revision: int = -1
+    breaker_tripped: bool = False
+    breaker_cooldown_until: float | None = None
+    breaker_reason: str | None = None
 
     def __post_init__(self) -> None:
         # ``enabled`` was the pre-free-mode public field.  Read old files as
@@ -72,6 +93,10 @@ class AutonomyController:
                         "gameDate": "game_date", "dailySpend": "daily_spend",
                         "spendReservations": "spend_reservations",
                         "settledSpendCommands": "settled_spend_commands",
+                        "failureCount": "failure_count",
+                        "breakerTripped": "breaker_tripped",
+                        "breakerCooldownUntil": "breaker_cooldown_until",
+                        "breakerReason": "breaker_reason",
                     }.items():
                         if wire in value and field_name not in value:
                             value[field_name] = value[wire]
@@ -135,6 +160,10 @@ class AutonomyController:
                 "dailySpend": item.pop("daily_spend"),
                 "spendReservations": item.pop("spend_reservations"),
                 "settledSpendCommands": item.pop("settled_spend_commands"),
+                "failureCount": item.get("failure_count", 0),
+                "breakerTripped": item.pop("breaker_tripped"),
+                "breakerCooldownUntil": item.pop("breaker_cooldown_until"),
+                "breakerReason": item.pop("breaker_reason"),
             })
             values[key] = item
         temp.write_text(
@@ -176,9 +205,12 @@ class AutonomyController:
             if value and state.mode != "free":
                 state.last_action_fingerprint = None
                 state.last_decision_fingerprint = None
-                state.failure_count = 0
                 state.decision_epoch += 1
                 state.paused = False
+            state.failure_count = 0
+            state.breaker_tripped = False
+            state.breaker_cooldown_until = None
+            state.breaker_reason = None
             state.mode = mode
             state.enabled = value
             if not value:
@@ -186,7 +218,13 @@ class AutonomyController:
         return self._mutate(save_id, mutate)
 
     def set_paused(self, save_id: str, paused: bool) -> SaveAutonomyState:
-        return self._mutate(save_id, lambda state: setattr(state, "paused", bool(paused)))
+        def mutate(state: SaveAutonomyState) -> None:
+            state.paused = bool(paused)
+            state.failure_count = 0
+            state.breaker_tripped = False
+            state.breaker_cooldown_until = None
+            state.breaker_reason = None
+        return self._mutate(save_id, mutate)
 
     def control(self, save_id: str, action: str, **params: Any) -> SaveAutonomyState:
         if action == "set_mode":
@@ -229,6 +267,10 @@ class AutonomyController:
                 state.preferences_revision += 1
                 state.decision_epoch += 1
                 state.last_decision_fingerprint = None
+                state.failure_count = 0
+                state.breaker_tripped = False
+                state.breaker_cooldown_until = None
+                state.breaker_reason = None
         return self._mutate(save_id, mutate)
 
     def on_day_started(self, save_id: str, day: int, *, game_date: str | None = None) -> SaveAutonomyState:
@@ -240,6 +282,10 @@ class AutonomyController:
             state.daily_spend = 0
             state.decision_epoch += 1
             state.last_decision_fingerprint = None
+            state.failure_count = 0
+            state.breaker_tripped = False
+            state.breaker_cooldown_until = None
+            state.breaker_reason = None
         return self._mutate(save_id, mutate)
 
     def request_job_decision(self, save_id: str) -> None:
@@ -248,10 +294,25 @@ class AutonomyController:
             state.last_decision_fingerprint = None
         self._mutate(save_id, mutate)
 
-    def next_candidate(self, save_id: str, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    def is_cooling_down(self, save_id: str, now: float | None = None) -> bool:
+        state = self.state(save_id)
+        if not state.breaker_tripped or state.breaker_cooldown_until is None:
+            return False
+        current = now if now is not None else time.time()
+        return current < state.breaker_cooldown_until
+
+    def reset_breaker(self, save_id: str) -> SaveAutonomyState:
+        def mutate(state: SaveAutonomyState) -> None:
+            state.failure_count = 0
+            state.breaker_tripped = False
+            state.breaker_cooldown_until = None
+            state.breaker_reason = None
+        return self._mutate(save_id, mutate)
+
+    def next_candidate(self, save_id: str, snapshot: dict[str, Any], *, now: float | None = None) -> dict[str, Any] | None:
         """Return one explainable task from fresh native data, or None when idle."""
         state = self.state(save_id)
-        if not state.enabled or state.paused:
+        if not state.enabled or state.paused or self.is_cooling_down(save_id, now=now):
             return None
         world = snapshot.get("world") if isinstance(snapshot.get("world"), dict) else {}
         day = world.get("dayOfMonth")
@@ -260,6 +321,8 @@ class AutonomyController:
         if day_key and state.game_date != day_key:
             self.on_day_started(save_id, int(day), game_date=day_key)
             state = self.state(save_id)
+            if self.is_cooling_down(save_id, now=now):
+                return None
         farm = snapshot.get("farmWork") if isinstance(snapshot.get("farmWork"), dict) else {}
         if farm.get("matureCropCount", 0) > 0:
             return {"kind": "harvest", "reason": "成熟作物待收", "max_tiles": 16}
@@ -318,11 +381,34 @@ class AutonomyController:
         self._mutate(save_id, mutate)
         return accepted
 
-    def record_action_result(self, save_id: str, fingerprint: str, success: bool) -> SaveAutonomyState:
+    def record_action_result(
+        self,
+        save_id: str,
+        fingerprint: str | None = None,
+        success: bool = True,
+        *,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> SaveAutonomyState:
+        threshold = get_breaker_threshold()
+        cooldown = get_breaker_cooldown_seconds()
+        current_time = now if now is not None else time.time()
+
         def mutate(state: SaveAutonomyState) -> None:
-            if state.last_action_fingerprint != fingerprint:
+            if fingerprint is not None and state.last_action_fingerprint != fingerprint:
                 return
-            state.failure_count = 0 if success else state.failure_count + 1
+            if success:
+                state.failure_count = 0
+                state.breaker_tripped = False
+                state.breaker_cooldown_until = None
+                state.breaker_reason = None
+            else:
+                state.failure_count += 1
+                state.breaker_reason = reason or state.breaker_reason or "action_failed"
+                if state.failure_count >= threshold:
+                    state.breaker_tripped = True
+                    state.breaker_cooldown_until = current_time + max(0.0, cooldown)
+
         return self._mutate(save_id, mutate)
 
     def record_completion(self, save_id: str, action: str) -> SaveAutonomyState:

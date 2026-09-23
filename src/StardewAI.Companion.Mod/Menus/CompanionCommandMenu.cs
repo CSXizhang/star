@@ -54,6 +54,26 @@ public sealed class CompanionCommandMenu : IClickableMenu
     public static string ModeButtonText => ModeChangePending ? "等待模式确认" : AutonomyMode == "free" ? "退出自由模式" : "开启自由模式";
     public static string AutonomyMode { get; set; } = "command";
     public static bool AutonomyPaused { get; set; }
+    public const string PausedText = "已暂停";
+    public static bool IsPausedBadgeVisible => AutonomyPaused;
+    public static string? PausedBadgeText => AutonomyPaused ? PausedText : null;
+
+    public static Rectangle GetPausedBadgeRect(int xPositionOnScreen, int yPositionOnScreen, int width) =>
+        new(xPositionOnScreen + width - 232, yPositionOnScreen + 50, 84, 28);
+
+    public static int GetStatusMaxTextWidth(int width, bool isPaused) => isPaused ? width - 264 : width - 178;
+
+    public static Color GetStatusColor(bool isProcessing, string? currentStatusText, bool isPaused)
+    {
+        if (isPaused)
+            return Color.DarkGoldenrod;
+        if (isProcessing)
+            return Color.DarkOrange;
+        if (currentStatusText == "失败")
+            return Color.Red;
+        return Color.DarkGreen;
+    }
+
     public static int DailySpendLimit { get; set; }
     public static string BoxPreference { get; set; } = "none";
     public static IReadOnlyList<string> AvailableChestOptions { get; set; } = new[] { "none" };
@@ -300,6 +320,12 @@ public sealed class CompanionCommandMenu : IClickableMenu
             return;
         }
 
+        if (AutonomyPaused && GetPausedBadgeRect(xPositionOnScreen, yPositionOnScreen, width).Contains(x, y))
+        {
+            _onResume?.Invoke();
+            return;
+        }
+
         if (_sendButtonRect.Contains(x, y))
         {
             Submit();
@@ -411,9 +437,15 @@ public sealed class CompanionCommandMenu : IClickableMenu
         b.DrawString(Game1.smallFont, "X", new Vector2(_closeButtonRect.X + 8, _closeButtonRect.Y + 2), Color.Red);
 
         // 4. Fixed status + two-line progress header.
-        Color statusColor = IsProcessing ? Color.DarkOrange : (CurrentStatusText == "失败" ? Color.Red : Color.DarkGreen);
+        Color statusColor = GetStatusColor(IsProcessing, CurrentStatusText, AutonomyPaused);
         string statusPrefix = IsProcessing ? "● [处理中] " : "● [状态] ";
-        b.DrawString(Game1.smallFont, ClipToWidth(statusPrefix + CurrentStatusText, width - 178), new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 54), statusColor);
+        int maxStatusWidth = GetStatusMaxTextWidth(width, AutonomyPaused);
+        b.DrawString(Game1.smallFont, ClipToWidth(statusPrefix + CurrentStatusText, maxStatusWidth), new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 54), statusColor);
+        if (AutonomyPaused)
+        {
+            Rectangle pausedRect = GetPausedBadgeRect(xPositionOnScreen, yPositionOnScreen, width);
+            DrawButton(b, pausedRect, PausedText, Color.DarkGoldenrod, pausedRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
+        }
         DrawButton(b, _detailButtonRect, ShowTechnicalDetail ? "隐藏详情" : "显示详情", Color.SteelBlue, _detailButtonRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
 
         string actionLine = !string.IsNullOrEmpty(CurrentActionText)
@@ -447,7 +479,11 @@ public sealed class CompanionCommandMenu : IClickableMenu
         }
 
         if (!string.IsNullOrEmpty(LastTokenInfo))
-            b.DrawString(Game1.smallFont, ClipToWidth(LastTokenInfo, width - 320), new Vector2(xPositionOnScreen + 300, yPositionOnScreen + 54), Color.Teal);
+        {
+            int maxTokenWidth = AutonomyPaused ? width - 240 - 300 : width - 320;
+            if (maxTokenWidth > 20)
+                b.DrawString(Game1.smallFont, ClipToWidth(LastTokenInfo, maxTokenWidth), new Vector2(xPositionOnScreen + 300, yPositionOnScreen + 54), Color.Teal);
+        }
 
         // 5. Divider line
         b.Draw(Game1.fadeToBlackRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 156, width - 48, 2), Color.Gray * 0.5f);

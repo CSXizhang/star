@@ -820,6 +820,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void RequestPauseMenuAction()
     {
+        CompanionCommandMenu.AutonomyPaused = true;
         _ = SendAutonomyControl("pause", new JsonObject());
         if (RequestPause(out string msg))
         {
@@ -831,6 +832,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void RequestResumeMenuAction()
     {
+        CompanionCommandMenu.AutonomyPaused = false;
         _ = SendAutonomyControl("resume", new JsonObject());
         if (RequestResume(out string msg))
         {

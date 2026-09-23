@@ -14,6 +14,9 @@ if (Test-Path -LiteralPath $metadata) {
     Assert-FormalCandidateTarget $installed.gameDirectory $installed.modDirectory
     if ($candidate.version -ne $installed.version -or
         (Get-CandidateHash (Join-Path $installed.modDirectory 'StardewAI.Companion.Mod.dll')) -ne $candidate.modSha256) {
+        if ($candidate.manifestType -eq 'local-dev' -or $candidate.version -eq 'local-dev') {
+            throw 'Installed Mod and local-dev runtime differ. Run tools/build-mod.ps1 and tools/setup-companion.ps1.'
+        }
         throw 'Installed Mod and candidate runtime differ. Close the game and use the candidate installer.'
     }
     if ($ForwardArgs | Where-Object { $_ -match '^--run-dir(=|$)' }) {

@@ -1,4 +1,4 @@
-﻿# Register the Stardew AI Companion MCP server into various agent CLIs, or print
+# Register the Stardew AI Companion MCP server into various agent CLIs, or print
 # ready-to-paste configs. The MCP server connects to a RUNNING game session via
 # its transport-discovery.json, so the game must be started first (normal play).
 #
@@ -47,7 +47,7 @@ if (-not $discoveryFound) {
 }
 
 $serverName = "stardew-companion"
-$uvArgs = @("run", "--project", (Join-Path $repoRoot "runtime"), "python", "-m", "stardew_ai_runtime.mcp_server", "--run-dir", $runDirAbs)
+$uvArgs = @("run", "--project", (Join-Path $repoRoot "runtime"), "python", "-m", "stardew_ai_runtime.mcp_server", "--run-dir", $runDirAbs, "--surface", "light")
 
 function Format-CliArg([string]$arg) {
     if ($arg -match '[\s"''`$]') {

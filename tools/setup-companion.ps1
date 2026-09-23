@@ -179,6 +179,75 @@ function Install-ModFiles([string]$sourceDir, [string]$destinationDir, [bool]$is
         $configDirectory = Join-Path $repoRoot 'config'
         [void][IO.Directory]::CreateDirectory($configDirectory)
         [IO.File]::WriteAllText((Join-Path $configDirectory 'installed-candidate.json'), ($installed | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+    } else {
+        # 自建绑定路径：安装自编译产物后计算 SHA256，生成 local-dev 清单并写入 config/installed-candidate.json。
+        # 仅当目标是检测到的真实游戏 Mod 目录时才写仓库级绑定；显式 -TargetModDir 的自定义/测试安装不触碰绑定。
+        $normDestForBinding = [IO.Path]::GetFullPath($destinationDir).TrimEnd('\')
+        $writeBinding = $false
+        if ($detectedGame) {
+            $normExpectedForBinding = [IO.Path]::GetFullPath((Join-Path $detectedGame 'Mods\StardewAI.Companion.Mod')).TrimEnd('\')
+            $writeBinding = ($normDestForBinding -eq $normExpectedForBinding)
+        }
+        if (-not $writeBinding) {
+            Write-Host "目标不是检测到的游戏 Mod 目录，跳过本地绑定写入（config/installed-candidate.json 保持不变）"
+        } else {
+        $installedDll = Join-Path $destinationDir "StardewAI.Companion.Mod.dll"
+        $modSha256 = Get-Sha256 $installedDll
+        $localDevDir = Join-Path $repoRoot "artifacts\releases\local-dev"
+        [void][IO.Directory]::CreateDirectory($localDevDir)
+        $localDevManifest = Join-Path $localDevDir "manifest.json"
+
+        $filesList = @()
+        foreach ($fn in $prodFiles) {
+            $distFilePath = "artifacts/dist/StardewAI.Companion.Mod/$fn"
+            $fullDistFilePath = Join-Path $repoRoot ("artifacts\dist\StardewAI.Companion.Mod\" + $fn)
+            if (Test-Path -LiteralPath $fullDistFilePath) {
+                $filesList += [ordered]@{
+                    path = $distFilePath
+                    sha256 = Get-Sha256 $fullDistFilePath
+                }
+            }
+        }
+
+        $manifestData = [ordered]@{
+            version = "local-dev"
+            manifestType = "local-dev"
+            acceptancePassed = $true
+            acceptanceScope = "local-dev source build; developer verified"
+            modSource = "artifacts/dist/StardewAI.Companion.Mod"
+            modSha256 = $modSha256
+            backend = "preserve-existing"
+            files = $filesList
+        }
+        $manifestJson = $manifestData | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($localDevManifest, $manifestJson, (New-Object Text.UTF8Encoding($false)))
+
+        $effectiveGame = $detectedGame
+        if ($destinationDir -match '[\\/]Mods[\\/][^\\/]+$') {
+            $inferredGame = Split-Path (Split-Path $destinationDir -Parent) -Parent
+            if ($detectedGame) {
+                $normDest = [IO.Path]::GetFullPath($destinationDir).TrimEnd('\')
+                $normDetectedExpected = [IO.Path]::GetFullPath((Join-Path $detectedGame 'Mods\StardewAI.Companion.Mod')).TrimEnd('\')
+                if ($normDest -ne $normDetectedExpected) {
+                    $effectiveGame = $inferredGame
+                }
+            } else {
+                $effectiveGame = $inferredGame
+            }
+        }
+
+        $installed = [ordered]@{
+            version = "local-dev"
+            manifestType = "local-dev"
+            backupDirectory = $null
+            manifest = [IO.Path]::GetFullPath($localDevManifest)
+            gameDirectory = $effectiveGame
+            modDirectory = [IO.Path]::GetFullPath($destinationDir)
+        }
+        $configDirectory = Join-Path $repoRoot 'config'
+        [void][IO.Directory]::CreateDirectory($configDirectory)
+        [IO.File]::WriteAllText((Join-Path $configDirectory 'installed-candidate.json'), ($installed | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+        }
     }
 
     return [PSCustomObject]@{

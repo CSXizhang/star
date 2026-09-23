@@ -6,7 +6,7 @@
 
 先按[首页](../README.md)编译和安装 Mod，通过 SMAPI 启动游戏并进入存档。Mod 会在自己的 `data` 目录下生成 `transport-discovery.json`，供 Runtime 发现本地连接。
 
-当前动作执行还依赖配套包清单与 DLL 校验。干净克隆尚不能完成完整安装；缺少清单时返回 `COMPATIBILITY_UNKNOWN`，版本不一致时返回 `MOD_RUNTIME_MISMATCH`。接入成功不代表已满足动作执行条件。
+当前动作执行依赖 Mod DLL 与本地配对清单一致：干净克隆可从源码编译后运行 `tools/setup-companion.ps1` 生成 `local-dev` 绑定完成安装；缺少清单时返回 `COMPATIBILITY_UNKNOWN`，DLL 与清单不一致时返回 `MOD_RUNTIME_MISMATCH`（重新运行设置向导同步）。
 
 ## 注册 MCP
 

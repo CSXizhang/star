@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Debug'
@@ -34,3 +34,16 @@ if (-not $env:STARDEW_GAME_PATH) {
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
+
+# 同步纯净构建产物至分发源目录 artifacts/dist/StardewAI.Companion.Mod
+$binDir = Join-Path $repoRoot "artifacts\bin\StardewAI.Companion.Mod\$Configuration\net6.0"
+$distDir = Join-Path $repoRoot "artifacts\dist\StardewAI.Companion.Mod"
+[void][System.IO.Directory]::CreateDirectory($distDir)
+$prodFiles = @('manifest.json', 'StardewAI.Companion.Mod.dll', 'StardewAI.Companion.Mod.pdb', 'StardewAI.Companion.Mod.deps.json')
+foreach ($file in $prodFiles) {
+    $src = Join-Path $binDir $file
+    if (Test-Path -LiteralPath $src) {
+        Copy-Item -LiteralPath $src -Destination (Join-Path $distDir $file) -Force
+    }
+}
+Write-Host "Mod 构建完成并同步至分发目录: $distDir"

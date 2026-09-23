@@ -58,6 +58,8 @@ def test_context_matches_real_captured_snapshot_schema() -> None:
     assert context["time"] == 610
     assert context["location"]["name"] == "Farm"
     assert context["location"]["tileX"] == 61
+    assert "playerLocation" in context
+    assert context["playerLocation"] == "Farm"
     assert context["stamina"] == {"current": 210.5, "max": 270}
     # Funds come from the companion wallet in the real payload.
     assert context["funds"] == 1250
@@ -132,9 +134,33 @@ def test_no_snapshot_reports_unavailable_without_guessing() -> None:
     context = build_decision_context(None)
     assert context["provenance"] == UNKNOWN
     assert context["date"] == UNKNOWN
+    assert context["location"] == UNKNOWN
+    assert "playerLocation" in context
+    assert context["playerLocation"] == UNKNOWN
     assert context["funds"] == UNKNOWN
     assert context["inventory"]["items"] == []
     assert context["currentTask"]["nextStep"] is None
+
+
+def test_location_name_comes_from_companion_not_player() -> None:
+    snapshot = {
+        "payload": {
+            "world": {
+                "currentLocation": "FarmHouse",
+            },
+            "companion": {
+                "locationId": "Farm",
+                "tileX": 61,
+                "tileY": 17,
+            },
+        }
+    }
+    context = build_decision_context(snapshot)
+    assert context["location"]["name"] == "Farm"
+    assert context["location"]["tileX"] == 61
+    assert context["location"]["tileY"] == 17
+    assert "playerLocation" in context
+    assert context["playerLocation"] == "FarmHouse"
 
 
 def test_context_rebuild_is_bounded_not_append_only() -> None:

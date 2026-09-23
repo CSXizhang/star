@@ -86,6 +86,7 @@ def build_decision_context(
             "weather": UNKNOWN,
             "time": UNKNOWN,
             "location": UNKNOWN,
+            "playerLocation": UNKNOWN,
             "stamina": UNKNOWN,
             "funds": UNKNOWN,
             "inventory": {"items": [], "freeSlots": UNKNOWN, "tools": []},
@@ -130,9 +131,9 @@ def build_decision_context(
     if stamina != UNKNOWN:
         stamina_block = {"current": stamina, "max": _value(companion, "maxStamina")}
 
-    location = _value(world, "currentLocation")
+    location = _value(companion, "locationId")
     if location == UNKNOWN:
-        location = _value(companion, "locationId")
+        location = _value(world, "currentLocation")
     location_block: Any = location
     tile_x = companion.get("tileX")
     tile_y = companion.get("tileY")
@@ -142,6 +143,7 @@ def build_decision_context(
             "tileX": tile_x if tile_x is not None else UNKNOWN,
             "tileY": tile_y if tile_y is not None else UNKNOWN,
         }
+    player_location = _value(world, "currentLocation")
 
     # Funds: the companion wallet published in the native snapshot. The older
     # shop-section reading is only a fallback for pre-upgrade payloads.
@@ -237,6 +239,7 @@ def build_decision_context(
         "weather": weather,
         "time": _value(world, "timeOfDay"),
         "location": location_block,
+        "playerLocation": player_location,
         "stamina": stamina_block,
         "funds": funds,
         "inventory": inventory_block,

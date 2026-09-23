@@ -299,4 +299,185 @@ public class NavigationStateMachineTests
         Assert.NotNull(machine.FinalResult);
         Assert.Equal("DESTINATION_UNREACHABLE", machine.FinalResult.ErrorCode);
     }
+
+    [Fact]
+    public void DestinationWarpTriggerTile_SnapsToAdjacentPassableAndSetsTargetAdjusted()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm", PixelPosition = new(60 * 64, 15 * 64) };
+        var observer = new SimulatedWorldObserver();
+        var navigator = new SameMapNavigator(observer);
+        var graph = new WorldMapGraph();
+        var machine = new NavigationStateMachine(actor, observer, navigator, graph);
+
+        var requested = new TileCoordinate(64, 15);
+        observer.SetWarpOrDoor(requested, true);
+
+        var req = new NavigationRequest(
+            CommandId: "cmd-warp-snap-1",
+            TaskId: "task-warp-snap-1",
+            LocationId: "Farm",
+            TargetTile: requested,
+            MaxGameMinutes: 120
+        );
+
+        Assert.True(machine.Start(req, out _));
+
+        for (int i = 0; i < 200 && machine.CurrentState != ExecutionState.Succeeded && machine.CurrentState != ExecutionState.Failed; i++)
+        {
+            machine.Update(null, i + 1);
+        }
+
+        Assert.Equal(ExecutionState.Succeeded, machine.CurrentState);
+        Assert.NotNull(machine.FinalResult);
+        Assert.True(machine.FinalResult.TargetAdjusted);
+        Assert.Equal(requested, machine.FinalResult.RequestedTile);
+        Assert.NotEqual(requested, machine.FinalResult.FinalTile);
+        Assert.True(machine.FinalResult.FinalTile.IsAdjacentTo(requested));
+        Assert.Equal("Farm", machine.FinalResult.FinalLocation);
+    }
+
+    [Fact]
+    public void DestinationWarpTriggerTile_GraphEdgeSourceTile_SnapsToAdjacentPassable()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm", PixelPosition = new(60 * 64, 15 * 64) };
+        var observer = new SimulatedWorldObserver();
+        var navigator = new SameMapNavigator(observer);
+        var graph = new WorldMapGraph();
+
+        var doorTile = new TileCoordinate(64, 15);
+        graph.AddEdge(new MapEdge("Farm", "FarmHouse", doorTile, new TileCoordinate(10, 20), MapEdgeKind.Door));
+
+        var machine = new NavigationStateMachine(actor, observer, navigator, graph);
+
+        var req = new NavigationRequest(
+            CommandId: "cmd-warp-snap-2",
+            TaskId: "task-warp-snap-2",
+            LocationId: "Farm",
+            TargetTile: doorTile,
+            MaxGameMinutes: 120
+        );
+
+        Assert.True(machine.Start(req, out _));
+
+        for (int i = 0; i < 200 && machine.CurrentState != ExecutionState.Succeeded && machine.CurrentState != ExecutionState.Failed; i++)
+        {
+            machine.Update(null, i + 1);
+        }
+
+        Assert.Equal(ExecutionState.Succeeded, machine.CurrentState);
+        Assert.NotNull(machine.FinalResult);
+        Assert.True(machine.FinalResult.TargetAdjusted);
+        Assert.Equal(doorTile, machine.FinalResult.RequestedTile);
+        Assert.NotEqual(doorTile, machine.FinalResult.FinalTile);
+        Assert.True(machine.FinalResult.FinalTile.IsAdjacentTo(doorTile));
+    }
+
+    [Fact]
+    public void DestinationNormalPassable_DoesNotSetTargetAdjusted_SettlesAndSucceeds()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm", PixelPosition = new(10 * 64, 10 * 64) };
+        var observer = new SimulatedWorldObserver();
+        var navigator = new SameMapNavigator(observer);
+        var graph = new WorldMapGraph();
+        var machine = new NavigationStateMachine(actor, observer, navigator, graph);
+
+        var target = new TileCoordinate(10, 11);
+        var req = new NavigationRequest(
+            CommandId: "cmd-normal-1",
+            TaskId: "task-normal-1",
+            LocationId: "Farm",
+            TargetTile: target,
+            MaxGameMinutes: 120
+        );
+
+        Assert.True(machine.Start(req, out _));
+
+        for (int i = 0; i < 50 && machine.CurrentState != ExecutionState.Succeeded && machine.CurrentState != ExecutionState.Failed; i++)
+        {
+            machine.Update(null, i + 1);
+        }
+
+        Assert.Equal(ExecutionState.Succeeded, machine.CurrentState);
+        Assert.NotNull(machine.FinalResult);
+        Assert.False(machine.FinalResult.TargetAdjusted);
+        Assert.Equal(target, machine.FinalResult.FinalTile);
+        Assert.Equal(target, machine.FinalResult.RequestedTile);
+    }
+
+    [Fact]
+    public void ArrivalVerification_WhenCompanionWarpsAwayDuringWindow_FailsWithArrivalUnstable()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm", PixelPosition = new(10 * 64, 10 * 64) };
+        var observer = new SimulatedWorldObserver();
+        var navigator = new SameMapNavigator(observer);
+        var graph = new WorldMapGraph();
+        var machine = new NavigationStateMachine(actor, observer, navigator, graph);
+
+        var target = new TileCoordinate(10, 11);
+        var req = new NavigationRequest(
+            CommandId: "cmd-warp-fail-1",
+            TaskId: "task-warp-fail-1",
+            LocationId: "Farm",
+            TargetTile: target,
+            MaxGameMinutes: 120
+        );
+
+        Assert.True(machine.Start(req, out _));
+
+        int tick = 1;
+        while (machine.CurrentState != ExecutionState.Verifying && tick < 50)
+        {
+            machine.Update(null, tick++);
+        }
+
+        Assert.Equal(ExecutionState.Verifying, machine.CurrentState);
+
+        actor.SetLocation("FarmHouse", new TileCoordinate(10, 20));
+
+        machine.Update(null, tick++);
+
+        Assert.Equal(ExecutionState.Failed, machine.CurrentState);
+        Assert.NotNull(machine.FinalResult);
+        Assert.Equal("ARRIVAL_UNSTABLE", machine.FinalResult.ErrorCode);
+        Assert.Equal("FarmHouse", machine.FinalResult.FinalLocation);
+        Assert.Contains("ARRIVAL_UNSTABLE: warped to 'FarmHouse'", machine.FinalResult.ErrorMessage);
+    }
+
+    [Fact]
+    public void ArrivalVerification_WhenCompanionDriftsTileDuringWindow_FailsWithArrivalUnstable()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm", PixelPosition = new(10 * 64, 10 * 64) };
+        var observer = new SimulatedWorldObserver();
+        var navigator = new SameMapNavigator(observer);
+        var graph = new WorldMapGraph();
+        var machine = new NavigationStateMachine(actor, observer, navigator, graph);
+
+        var target = new TileCoordinate(10, 11);
+        var req = new NavigationRequest(
+            CommandId: "cmd-drift-fail-1",
+            TaskId: "task-drift-fail-1",
+            LocationId: "Farm",
+            TargetTile: target,
+            MaxGameMinutes: 120
+        );
+
+        Assert.True(machine.Start(req, out _));
+
+        int tick = 1;
+        while (machine.CurrentState != ExecutionState.Verifying && tick < 50)
+        {
+            machine.Update(null, tick++);
+        }
+
+        Assert.Equal(ExecutionState.Verifying, machine.CurrentState);
+
+        actor.PixelPosition = new Microsoft.Xna.Framework.Vector2(20 * 64, 20 * 64);
+
+        machine.Update(null, tick++);
+
+        Assert.Equal(ExecutionState.Failed, machine.CurrentState);
+        Assert.NotNull(machine.FinalResult);
+        Assert.Equal("ARRIVAL_UNSTABLE", machine.FinalResult.ErrorCode);
+        Assert.Contains("ARRIVAL_UNSTABLE: drifted to", machine.FinalResult.ErrorMessage);
+    }
 }

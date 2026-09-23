@@ -268,7 +268,8 @@ public sealed class SameMapNavigator
         string locationName,
         TileCoordinate startTile,
         TileCoordinate centerTile,
-        int maxRadius = 3)
+        int maxRadius = 3,
+        Func<TileCoordinate, bool>? isTileExcluded = null)
     {
         var candidates = new List<(TileCoordinate Tile, float Distance)>();
 
@@ -283,6 +284,8 @@ public sealed class SameMapNavigator
                 var tile = new TileCoordinate(centerTile.X + dx, centerTile.Y + dy);
                 if (tile.X >= 0 && tile.Y >= 0 && IsTileNavigable(locationName, tile, null))
                 {
+                    if (isTileExcluded != null && isTileExcluded(tile))
+                        continue;
                     candidates.Add((tile, dist));
                 }
             }

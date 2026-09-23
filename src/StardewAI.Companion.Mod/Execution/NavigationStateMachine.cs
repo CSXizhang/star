@@ -20,6 +20,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerLeg = 3;
     private const long MaxMonotonicTicks = 7200;
+    private const int VerificationSettleTicks = 3;
 
     private readonly IFarmerActor _actor;
     private readonly IWorldObserver _observer;
@@ -46,6 +47,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
     private int _startClock;
     private bool _targetAdjusted;
     private TileCoordinate? _effectiveTargetTile;
+    private int _verifyingTicks;
 
     private volatile bool _cancelRequested;
     private volatile string? _cancelReason;
@@ -110,6 +112,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             _pauseRequested = false;
             _targetAdjusted = false;
             _effectiveTargetTile = null;
+            _verifyingTicks = 0;
             FinalResult = null;
 
             _actor.SetActiveTask(request.TaskId);
@@ -309,11 +312,13 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             _targetAdjusted = false;
             _effectiveTargetTile = requestedTile;
 
-            // 1. If requested tile is passable, try direct path
-            if (_observer.IsTilePassable(_actor.LocationName, requestedTile))
+            bool isTriggerTile = IsWarpOrDoorTriggerTile(_actor.LocationName, requestedTile);
+
+            if (!isTriggerTile && _observer.IsTilePassable(_actor.LocationName, requestedTile))
             {
                 if (_actor.Tile == requestedTile)
                 {
+                    _verifyingTicks = 0;
                     CurrentState = ExecutionState.Verifying;
                     return;
                 }
@@ -327,40 +332,69 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
                 }
             }
 
-            // 2. If requested tile is impassable or direct path failed, fallback to adjacent/nearest reachable tile
             if (pathResult == null || !pathResult.Success || pathResult.Steps.Count == 0)
             {
-                // Check if actor is already at a passable tile adjacent to requested tile
-                if (_actor.Tile.IsAdjacentTo(requestedTile) && _observer.IsTilePassable(_actor.LocationName, _actor.Tile))
+                if (_actor.Tile.IsAdjacentTo(requestedTile) &&
+                    _observer.IsTilePassable(_actor.LocationName, _actor.Tile) &&
+                    !IsWarpOrDoorTriggerTile(_actor.LocationName, _actor.Tile))
                 {
                     _effectiveTargetTile = _actor.Tile;
                     _targetAdjusted = true;
-                    Log($"Actor already at adjacent passable tile {_actor.Tile} for impassable destination {requestedTile} (targetAdjusted=true).");
+                    Log($"Actor already at adjacent passable tile {_actor.Tile} for destination {requestedTile} (targetAdjusted=true).");
+                    _verifyingTicks = 0;
                     CurrentState = ExecutionState.Verifying;
                     return;
                 }
 
-                // Search for nearest reachable standing tile within small radius (1..3)
-                var fallback = _navigator.FindNearestPassableReachableTile(
-                    _actor.LocationName,
-                    _actor.Tile,
-                    requestedTile,
-                    maxRadius: 3);
-
-                if (fallback.HasValue)
+                if (isTriggerTile)
                 {
-                    targetTile = fallback.Value.Tile;
-                    pathResult = fallback.Value.Path;
-                    _effectiveTargetTile = targetTile;
-                    _targetAdjusted = true;
-                    Log($"Destination tile {requestedTile} is impassable or unreachable on '{_actor.LocationName}'. Adjusted target to nearest reachable tile {targetTile} (targetAdjusted=true, steps={pathResult.Steps.Count}).");
+                    var adjacentCandidates = requestedTile.CardinalNeighbors()
+                        .Where(n => n.X >= 0 && n.Y >= 0 &&
+                                    _observer.IsTilePassable(_actor.LocationName, n) &&
+                                    !IsWarpOrDoorTriggerTile(_actor.LocationName, n) &&
+                                    !_observer.IsPlayerOnTile(_actor.LocationName, n))
+                        .OrderBy(n => Math.Abs(n.X - _actor.Tile.X) + Math.Abs(n.Y - _actor.Tile.Y))
+                        .ToList();
+
+                    foreach (var candidate in adjacentCandidates)
+                    {
+                        var path = _navigator.FindPath(_actor.LocationName, _actor.Tile, candidate);
+                        if (path.Success && path.Steps.Count > 0)
+                        {
+                            targetTile = candidate;
+                            pathResult = path;
+                            _effectiveTargetTile = targetTile;
+                            _targetAdjusted = true;
+                            Log($"Destination tile {requestedTile} is a warp/door trigger tile on '{_actor.LocationName}'. Snapped to adjacent non-trigger tile {targetTile} (targetAdjusted=true, steps={pathResult.Steps.Count}).");
+                            break;
+                        }
+                    }
+                }
+
+                if (pathResult == null || !pathResult.Success || pathResult.Steps.Count == 0)
+                {
+                    var fallback = _navigator.FindNearestPassableReachableTile(
+                        _actor.LocationName,
+                        _actor.Tile,
+                        requestedTile,
+                        maxRadius: 3,
+                        isTileExcluded: t => IsWarpOrDoorTriggerTile(_actor.LocationName, t));
+
+                    if (fallback.HasValue)
+                    {
+                        targetTile = fallback.Value.Tile;
+                        pathResult = fallback.Value.Path;
+                        _effectiveTargetTile = targetTile;
+                        _targetAdjusted = true;
+                        Log($"Adjusted target to nearest reachable non-trigger tile {targetTile} for destination {requestedTile} on '{_actor.LocationName}' (targetAdjusted=true, steps={pathResult.Steps.Count}).");
+                    }
                 }
             }
 
             if (pathResult == null || !pathResult.Success || pathResult.Steps.Count == 0)
             {
                 FinishExecution(ExecutionState.Failed,
-                    $"No passable path found to destination tile {requestedTile} (or nearby reachable tiles) on map '{_actor.LocationName}'.",
+                    $"No passable path found to destination tile {requestedTile} (or nearby reachable non-trigger tiles) on map '{_actor.LocationName}'.",
                     "DESTINATION_UNREACHABLE");
                 return;
             }
@@ -462,6 +496,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             bool isFinalLeg = _currentLegIndex >= _locationRoute.Count - 1;
             if (isFinalLeg)
             {
+                _verifyingTicks = 0;
                 CurrentState = ExecutionState.Verifying;
                 return;
             }
@@ -607,26 +642,64 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         var expectedTile = _effectiveTargetTile ?? reqTile;
 
         bool locMatches = string.Equals(_actor.LocationName, reqLoc, StringComparison.OrdinalIgnoreCase);
-        bool tileMatches = _actor.Tile == expectedTile ||
-                           _actor.Tile == reqTile ||
-                           _actor.Tile.IsAdjacentTo(reqTile) ||
-                           (_targetAdjusted && _actor.Tile.IsAdjacentTo(expectedTile));
-
-        if (locMatches && tileMatches)
+        if (!locMatches)
         {
-            // Record final leg if not already recorded
-            if (_hopRecords.Count == 0 || _hopRecords[^1].Location != reqLoc)
-            {
-                _hopRecords.Add(new NavigationHopRecord(reqLoc, _currentPath.Count, null));
-            }
-            FinishExecution(ExecutionState.Succeeded, null, null);
+            FinishExecution(ExecutionState.Failed,
+                $"ARRIVAL_UNSTABLE: warped to '{_actor.LocationName}' at {_actor.Tile} (expected '{reqLoc}' at {expectedTile}).",
+                "ARRIVAL_UNSTABLE");
+            return;
+        }
+
+        bool tileMatches;
+        if (_targetAdjusted)
+        {
+            tileMatches = (_actor.Tile == expectedTile || _actor.Tile.IsAdjacentTo(expectedTile)) &&
+                          !IsWarpOrDoorTriggerTile(_actor.LocationName, _actor.Tile);
         }
         else
         {
-            FinishExecution(ExecutionState.Failed,
-                $"Verification failed: Companion at '{_actor.LocationName}' {_actor.Tile}, expected '{reqLoc}' {expectedTile} (requested: {reqTile}).",
-                "LOCATION_MISMATCH");
+            tileMatches = (_actor.Tile == expectedTile || _actor.Tile == reqTile || _actor.Tile.IsAdjacentTo(reqTile)) &&
+                          !IsWarpOrDoorTriggerTile(_actor.LocationName, _actor.Tile);
         }
+
+        if (!tileMatches)
+        {
+            FinishExecution(ExecutionState.Failed,
+                $"ARRIVAL_UNSTABLE: drifted to {_actor.Tile} on '{_actor.LocationName}' (expected {expectedTile}).",
+                "ARRIVAL_UNSTABLE");
+            return;
+        }
+
+        _verifyingTicks++;
+        if (_verifyingTicks < VerificationSettleTicks)
+        {
+            return;
+        }
+
+        if (_hopRecords.Count == 0 || _hopRecords[^1].Location != reqLoc)
+        {
+            _hopRecords.Add(new NavigationHopRecord(reqLoc, _currentPath.Count, null));
+        }
+        FinishExecution(ExecutionState.Succeeded, null, null);
+    }
+
+    private bool IsWarpOrDoorTriggerTile(string locationName, TileCoordinate tile)
+    {
+        if (_observer.IsWarpOrDoorTile(locationName, tile))
+        {
+            return true;
+        }
+
+        var edges = _mapGraph.GetOutgoingEdges(locationName);
+        foreach (var edge in edges)
+        {
+            if (edge.SourceTile == tile && !string.Equals(edge.TargetLocation, locationName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private bool CheckPauseOrCancel()

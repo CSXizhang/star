@@ -101,6 +101,27 @@ public class SameMapNavigatorTests
     }
 
     [Fact]
+    public void FindNearestPassableReachableTile_ExcludesSpecifiedTiles()
+    {
+        var observer = new SimulatedWorldObserver { CurrentLocationName = "Farm" };
+        var navigator = new SameMapNavigator(observer);
+
+        // Center at (43, 57) is impassable
+        observer.SetPassable(new TileCoordinate(43, 57), false);
+
+        var start = new TileCoordinate(43, 60);
+        var result = navigator.FindNearestPassableReachableTile(
+            "Farm",
+            start,
+            new TileCoordinate(43, 57),
+            maxRadius: 3,
+            isTileExcluded: t => t == new TileCoordinate(43, 58));
+
+        Assert.True(result.HasValue);
+        Assert.NotEqual(new TileCoordinate(43, 58), result.Value.Tile);
+    }
+
+    [Fact]
     public void FindNearestPassableReachableTile_ReturnsNullWhenAllCandidatesBlocked()
     {
         var observer = new SimulatedWorldObserver { CurrentLocationName = "Farm" };

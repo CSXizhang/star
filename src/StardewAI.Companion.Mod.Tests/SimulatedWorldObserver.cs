@@ -20,7 +20,15 @@ public sealed class SimulatedWorldObserver : IWorldObserver
     public bool IsMainThread { get; set; } = true;
     public bool PlayerOnSameMap { get; set; } = true;
 
+    private readonly HashSet<TileCoordinate> _warpOrDoorTiles = new();
+
     public void SetPassable(TileCoordinate tile, bool passable) => _passability[tile] = passable;
+
+    public void SetWarpOrDoor(TileCoordinate tile, bool isWarpOrDoor)
+    {
+        if (isWarpOrDoor) _warpOrDoorTiles.Add(tile);
+        else _warpOrDoorTiles.Remove(tile);
+    }
 
     public void SetDirt(TileCoordinate tile, TileDirtState state)
     {
@@ -35,6 +43,13 @@ public sealed class SimulatedWorldObserver : IWorldObserver
         if (!string.Equals(CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
             return false;
         return _passability.TryGetValue(tile, out bool passable) ? passable : true;
+    }
+
+    public bool IsWarpOrDoorTile(string locationName, TileCoordinate tile)
+    {
+        if (!string.Equals(CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+            return false;
+        return _warpOrDoorTiles.Contains(tile);
     }
 
     public TileDirtState GetDirtState(string locationName, TileCoordinate tile)
@@ -339,6 +354,22 @@ public sealed class SimulatedWorldObserver : IWorldObserver
         if (!string.Equals(CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
             return Array.Empty<GroundItemScanInfo>();
         return _groundItems
+            .Where(i => Math.Abs(i.Tile.X - center.X) <= radius && Math.Abs(i.Tile.Y - center.Y) <= radius)
+            .Take(maxItems)
+            .ToList();
+    }
+
+    public List<ChoppableTreeScanInfo> ChoppableTrees { get; } = new();
+
+    public IReadOnlyList<ChoppableTreeScanInfo> ScanChoppableTrees(
+        string locationName,
+        TileCoordinate center,
+        int radius,
+        int maxItems = 64)
+    {
+        if (!string.Equals(CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+            return Array.Empty<ChoppableTreeScanInfo>();
+        return ChoppableTrees
             .Where(i => Math.Abs(i.Tile.X - center.X) <= radius && Math.Abs(i.Tile.Y - center.Y) <= radius)
             .Take(maxItems)
             .ToList();

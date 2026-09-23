@@ -306,6 +306,15 @@ public sealed record GroundItemSnapshot(
     [property: JsonPropertyName("isTwig")] bool IsTwig = false
 );
 
+public sealed record ChoppableTreeSnapshot(
+    [property: JsonPropertyName("tile")] TileCoord Tile,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("growthStage")] int GrowthStage,
+    [property: JsonPropertyName("tapped")] bool Tapped,
+    [property: JsonPropertyName("width")] int Width = 1,
+    [property: JsonPropertyName("height")] int Height = 1
+);
+
 public sealed record FarmingSnapshot(
     [property: JsonPropertyName("location")] string Location,
     [property: JsonPropertyName("refillWaterTiles")] List<TileCoord> RefillWaterTiles,
@@ -314,7 +323,9 @@ public sealed record FarmingSnapshot(
     [property: JsonPropertyName("fertilizedTiles")] List<TileCoord> FertilizedTiles,
     // Tools the companion really carries (from its own inventory). Observation only:
     // the Mod never grants tools, and the model needs to know what it can act with.
-    [property: JsonPropertyName("companionTools")] List<string> CompanionTools
+    [property: JsonPropertyName("companionTools")] List<string> CompanionTools,
+    [property: JsonPropertyName("choppableTrees")] List<ChoppableTreeSnapshot>? ChoppableTrees = null,
+    [property: JsonPropertyName("choppableTreesTruncated")] bool ChoppableTreesTruncated = false
 );
 
 

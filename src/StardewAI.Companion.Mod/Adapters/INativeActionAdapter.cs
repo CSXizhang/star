@@ -10,6 +10,13 @@ public sealed class NativeActionStepResult
 {
     public bool Success { get; }
     public bool PreconditionFailed { get; }
+
+    /// <summary>
+    /// True when the action is legitimately unfinished and needs more tick windows
+    /// (e.g. chop-tree waiting out the native fall animation). The state machine
+    /// stays on the same target without recording an effect.
+    /// </summary>
+    public bool InProgress { get; }
     public string? ErrorMessage { get; }
 
     /// <summary>
@@ -40,7 +47,8 @@ public sealed class NativeActionStepResult
         int waterGained,
         string? itemId,
         int itemCount,
-        bool playerActionRequired)
+        bool playerActionRequired,
+        bool inProgress = false)
     {
         Success = success;
         PreconditionFailed = preconditionFailed;
@@ -53,6 +61,7 @@ public sealed class NativeActionStepResult
         ItemId = itemId;
         ItemCount = itemCount;
         PlayerActionRequired = playerActionRequired;
+        InProgress = inProgress;
     }
 
     public static NativeActionStepResult Succeeded(
@@ -73,6 +82,9 @@ public sealed class NativeActionStepResult
 
     public static NativeActionStepResult Failed(string reason, bool playerActionRequired = false) =>
         new(false, false, reason, null, "failed", 0f, 0, 0, null, 0, playerActionRequired);
+
+    public static NativeActionStepResult Continue(string state) =>
+        new(false, false, null, null, state, 0f, 0, 0, null, 0, false, inProgress: true);
 }
 
 /// <summary>

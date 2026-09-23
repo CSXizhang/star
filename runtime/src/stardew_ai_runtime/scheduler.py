@@ -2492,6 +2492,9 @@ class CompanionScheduler:
             "groundItems": farming.get("groundItems", []),
             "groundItemsTruncated": bool(farming.get("groundItemsTruncated", False)),
             "fertilizedTiles": farming.get("fertilizedTiles", []),
+            # Choppable wild trees / giant stumps / hollow logs near the companion.
+            "choppableTrees": farming.get("choppableTrees", []),
+            "choppableTreesTruncated": bool(farming.get("choppableTreesTruncated", False)),
             # Tools the companion really carries (native inventory). Empty means the
             # player has not provided that tool yet; nothing is granted by the Mod.
             "companionTools": [
@@ -2576,6 +2579,34 @@ class CompanionScheduler:
         else:
             client = await self.ensure_connected()
             await self._refresh_snapshot(client)
+            # An already-full can is a satisfied goal, not work: answer NO_WORK
+            # without dispatching, instead of pathing to refill tiles just to be
+            # told already-full (or worse, unreachable) per target.
+            snap = self._latest_snapshot_data or {}
+            payload = snap.get("payload", {}) if isinstance(snap, dict) else {}
+            companion = payload.get("companion") if isinstance(payload, dict) else None
+            if isinstance(companion, dict):
+                level = companion.get("waterCanLevel")
+                max_level = companion.get("maxWaterCanLevel")
+                if (
+                    isinstance(level, int)
+                    and isinstance(max_level, int)
+                    and max_level > 0
+                    and level >= max_level
+                ):
+                    return {
+                        **build_unified_outcome(
+                            outcome="completed",
+                            goal_satisfied=True,
+                            effects=[],
+                            remaining={"refillTiles": 0},
+                            reason_code="NO_WORK",
+                            snapshot_revision=self.latest_world_revision,
+                        ),
+                        "status": "no-work",
+                        "message": "Watering can is already full; no refill needed.",
+                        "terminalState": "none",
+                    }
             validated = self._snapshot_farming_refill_tiles(max_tiles)
 
         parameters = {"locationId": location_id, "tiles": validated}
@@ -2653,6 +2684,30 @@ class CompanionScheduler:
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "pickup-items",
+            parameters,
+            tiles=validated,
+            timeout_seconds=timeout_seconds,
+            task_id=task_id,
+            command_id=command_id,
+        )
+
+    async def chop_tree(
+        self,
+        tiles: list[dict[str, Any]],
+        location_id: str = "Farm",
+        timeout_seconds: float = 30.0,
+        task_id: str | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Chops explicitly selected wild trees, giant stumps or hollow logs.
+
+        Fruit trees are protected (``protected-tree``); tiles without a choppable
+        target return ``no-tree`` and a missing Axe returns ``missing-tool:Axe``.
+        """
+        validated = validate_action_tiles(tiles, max_tiles=64)
+        parameters = {"locationId": location_id, "tiles": validated}
+        return await self._execute_native_action(
+            "chop-tree",
             parameters,
             tiles=validated,
             timeout_seconds=timeout_seconds,

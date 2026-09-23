@@ -561,7 +561,8 @@ def test_mcp_server_tool_registration(mock_scheduler):
         assert "collect_animal_produce" in tool_names
         assert "feed_animals" in tool_names
         assert "toggle_animal_door" in tool_names
-        assert len(tools) == 50
+        assert "chop_tree" in tool_names
+        assert len(tools) == 51
         assert "autonomy_status" in tool_names
         assert "set_autonomy" in tool_names
         assert "query_wiki" in tool_names

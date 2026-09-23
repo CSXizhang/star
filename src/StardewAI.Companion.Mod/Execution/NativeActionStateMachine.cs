@@ -10,8 +10,8 @@ namespace StardewAI.Companion.Mod.Execution;
 
 /// <summary>
 /// Tick-driven lifecycle shared by the explicit native agricultural/husbandry
-/// skills (refill-watering-can, apply-fertilizer, clear-debris, pickup-items,
-/// insert-machine, collect-machine, pet-animal, feed-animals,
+/// skills (refill-watering-can, apply-fertilizer, clear-debris, chop-tree,
+/// pickup-items, insert-machine, collect-machine, pet-animal, feed-animals,
 /// toggle-animal-door, collect-animal-produce).
 ///
 /// It reuses the standard execution guarantees every other skill has: single-task
@@ -450,6 +450,23 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             _skipped.Add(new NativeActionEffect(targetLabel, "skipped", result.SkipReason, result.ItemId, 0, _currentTarget.Tile));
             _playerActionRequired |= result.PlayerActionRequired;
             EmitProgress("waiting", result.SkipReason);
+        }
+        else if (result.InProgress)
+        {
+            // Multi-tick actions (e.g. chop-tree waiting out the native fall
+            // animation) stay on the same target: no effect is recorded yet and
+            // the target index does not advance.
+            EmitProgress("acting", result.State);
+            if (_actor.IsExhausted)
+            {
+                _currentTargetIndex++;
+                FinishExecution(_completed.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed,
+                    "Companion stamina exhausted.", "STAMINA_EXHAUSTED");
+                return;
+            }
+            if (CheckPauseOrCancel()) return;
+            CurrentState = ExecutionState.Preparing;
+            return;
         }
         else
         {

@@ -241,6 +241,7 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
     ),
     "clear_debris": ("clear_debris", frozenset({"tiles", "location_id"})),
     "pickup_items": ("pickup_items", frozenset({"tiles", "location_id"})),
+    "chop_tree": ("chop_tree", frozenset({"tiles", "location_id"})),
     "insert_machine": ("insert_machine", frozenset({"tile", "item_id", "item_count", "location_id"})),
     "collect_machine": ("collect_machine", frozenset({"tiles", "location_id"})),
     "pet_animal": ("pet_animal", frozenset({"animal_name", "tile", "location_id"})),
@@ -327,6 +328,7 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
         "clear_debris",
         "pickup_items",
     ),
+    "forestry": ("chop_tree",),
     "machines": ("observe_machines", "insert_machine", "collect_machine"),
     "livestock": (
         "observe_livestock",
@@ -680,7 +682,14 @@ def create_mcp_server(
         sid = await current_save_id()
         if save_id is not None and save_id != sid:
             raise ToolError("save_id must match the currently connected save")
-        return {"saveId": sid, **autonomy_for_run().state(sid).__dict__}
+        state_dict = dict(autonomy_for_run().state(sid).__dict__)
+        state_dict.update({
+            "failureCount": state_dict.get("failure_count", 0),
+            "breakerTripped": state_dict.get("breaker_tripped", False),
+            "breakerCooldownUntil": state_dict.get("breaker_cooldown_until"),
+            "breakerReason": state_dict.get("breaker_reason"),
+        })
+        return {"saveId": sid, **state_dict}
 
     @mcp.tool()
     async def set_autonomy(
@@ -698,7 +707,14 @@ def create_mcp_server(
             autonomy = autonomy_for_run()
             autonomy.set_preferences(sid, goal=goal, budget_limit=budget_limit, box_preference=box_preference)
             state = autonomy.set_enabled(sid, enabled)
-            return {"saveId": sid, **state.__dict__}
+            state_dict = dict(state.__dict__)
+            state_dict.update({
+                "failureCount": state_dict.get("failure_count", 0),
+                "breakerTripped": state_dict.get("breaker_tripped", False),
+                "breakerCooldownUntil": state_dict.get("breaker_cooldown_until"),
+                "breakerReason": state_dict.get("breaker_reason"),
+            })
+            return {"saveId": sid, **state_dict}
         except ValueError as ex:
             raise ToolError(str(ex)) from None
 
@@ -2347,10 +2363,11 @@ def create_mcp_server(
 
     @mcp.tool()
     async def observe_farming_helpers(location_id: str = "Farm") -> dict[str, Any]:
-        """Observe the farming-help group only: native refill-water tiles, ground items, fertilized tiles.
+        """Observe the farming-help group only: native refill-water tiles, ground items, fertilized tiles, choppable trees.
 
         This is the on-demand group surface: it never dumps the backpack or chests.
-        Use it to choose explicit tiles for refill_watering_can / clear_debris / pickup_items.
+        Use it to choose explicit tiles for refill_watering_can / clear_debris /
+        pickup_items / chop_tree.
         """
         try:
             return await sched.query_farming_helpers(location_id=location_id)
@@ -2479,6 +2496,22 @@ def create_mcp_server(
             raise ToolError(str(ex)) from None
         except Exception as ex:
             raise ToolError(f"Pickup items failed: {ex}") from None
+
+    @mcp.tool()
+    async def chop_tree(tiles: list[dict[str, Any]], location_id: str = "Farm") -> dict[str, Any]:
+        """Chop explicitly selected wild trees, giant stumps or hollow logs with the companion's own Axe.
+
+        Every swing is a real native Axe.DoFunction (companion stamina, native damage
+        and drops). Fruit trees are protected (protected-tree); a tile without a
+        choppable target returns no-tree; a missing Axe returns missing-tool:Axe.
+        """
+        try:
+            res = await sched.chop_tree(tiles=tiles, location_id=location_id)
+            return _native_action_response("chop-tree", res)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+        except Exception as ex:
+            raise ToolError(f"Chop tree failed: {ex}") from None
 
     @mcp.tool()
     async def insert_machine(

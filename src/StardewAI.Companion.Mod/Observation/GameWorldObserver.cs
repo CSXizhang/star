@@ -68,6 +68,130 @@ public sealed class GameWorldObserver : IWorldObserver
         return loc.isTilePassable(tileLoc, Game1.viewport);
     }
 
+    public bool IsWarpOrDoorTile(string locationName, TileCoordinate tile)
+    {
+        var loc = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+        if (loc is null)
+            return false;
+
+        var pt = new Point(tile.X, tile.Y);
+
+        if (loc.warps != null)
+        {
+            foreach (var w in loc.warps)
+            {
+                if (w != null && w.X == tile.X && w.Y == tile.Y)
+                {
+                    try
+                    {
+                        if (w.npcOnly.Value) continue;
+                    }
+                    catch { }
+                    return true;
+                }
+            }
+        }
+
+        if (loc.doors != null)
+        {
+            try
+            {
+                if (loc.doors.ContainsKey(pt))
+                    return true;
+            }
+            catch { }
+            try
+            {
+                if (loc.getWarpFromDoor(pt, null) != null)
+                    return true;
+            }
+            catch { }
+        }
+
+        if (loc.buildings != null)
+        {
+            foreach (var b in loc.buildings)
+            {
+                if (b == null) continue;
+                try
+                {
+                    if (b.daysOfConstructionLeft.Value > 0) continue;
+                }
+                catch { }
+
+                Point doorPt;
+                try
+                {
+                    doorPt = b.getPointForHumanDoor();
+                }
+                catch
+                {
+                    doorPt = new Point(
+                        (b.tileX?.Value ?? 0) + (b.humanDoor?.X ?? 0),
+                        (b.tileY?.Value ?? 0) + (b.humanDoor?.Y ?? 0)
+                    );
+                }
+
+                if (doorPt == pt)
+                    return true;
+            }
+        }
+
+        string[] layers = { "Back", "Buildings" };
+        foreach (var layer in layers)
+        {
+            try
+            {
+                string? touchAction = loc.doesTileHaveProperty(tile.X, tile.Y, "TouchAction", layer);
+                if (!string.IsNullOrWhiteSpace(touchAction))
+                {
+                    var actionName = touchAction.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
+                    if (actionName.Equals("Warp", StringComparison.OrdinalIgnoreCase) ||
+                        actionName.Equals("LockedDoorWarp", StringComparison.OrdinalIgnoreCase) ||
+                        actionName.Equals("Door", StringComparison.OrdinalIgnoreCase) ||
+                        actionName.Equals("MagicWarp", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        foreach (var layer in layers)
+        {
+            try
+            {
+                string? action = loc.doesTileHaveProperty(tile.X, tile.Y, "Action", layer);
+                if (!string.IsNullOrWhiteSpace(action))
+                {
+                    var actionName = action.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
+                    if (actionName.Equals("Warp", StringComparison.OrdinalIgnoreCase) ||
+                        actionName.Equals("LockedDoorWarp", StringComparison.OrdinalIgnoreCase) ||
+                        actionName.Equals("Door", StringComparison.OrdinalIgnoreCase) ||
+                        actionName.Equals("EnterSewer", StringComparison.OrdinalIgnoreCase) ||
+                        actionName.Equals("WarpGreenhouse", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        try
+        {
+            var rect = new Rectangle(tile.X * 64, tile.Y * 64, 64, 64);
+            if (loc.isCollidingWithWarpOrDoor(rect, null) != null)
+            {
+                return true;
+            }
+        }
+        catch { }
+
+        return false;
+    }
+
     public TileDirtState GetDirtState(string locationName, TileCoordinate tile)
     {
         var loc = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
@@ -1721,6 +1845,91 @@ public sealed class GameWorldObserver : IWorldObserver
         catch (Exception ex)
         {
             _monitor.Log($"Error scanning ground items at '{locationName}': {ex.Message}", LogLevel.Warn);
+        }
+
+        return items.OrderBy(i => Math.Abs(i.Tile.X - center.X) + Math.Abs(i.Tile.Y - center.Y))
+            .ThenBy(i => i.Tile.Y).ThenBy(i => i.Tile.X).Take(maxItems).ToList();
+    }
+
+    public IReadOnlyList<ChoppableTreeScanInfo> ScanChoppableTrees(
+        string locationName,
+        TileCoordinate center,
+        int radius,
+        int maxItems = 64)
+    {
+        var loc = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+        if (loc is null)
+            return Array.Empty<ChoppableTreeScanInfo>();
+
+        radius = Math.Clamp(radius, 0, 64);
+        var items = new List<ChoppableTreeScanInfo>();
+
+        bool InRange(int x, int y) =>
+            Math.Abs(x - center.X) <= radius && Math.Abs(y - center.Y) <= radius;
+
+        try
+        {
+            foreach (var pair in loc.terrainFeatures.Pairs)
+            {
+                // Wild trees only: fruit trees are long-term player investments and
+                // are never offered as chopping targets.
+                if (pair.Value is not StardewValley.TerrainFeatures.Tree tree)
+                    continue;
+                int x = (int)pair.Key.X;
+                int y = (int)pair.Key.Y;
+                if (!InRange(x, y))
+                    continue;
+
+                int stage;
+                try { stage = tree.growthStage?.Value ?? -1; } catch { stage = -1; }
+                bool tapped;
+                try { tapped = tree.tapped?.Value == true; } catch { tapped = false; }
+                bool stump;
+                try { stump = tree.stump?.Value == true; } catch { stump = false; }
+
+                items.Add(new ChoppableTreeScanInfo(
+                    Tile: new TileCoordinate(x, y),
+                    Kind: stump ? "stump" : "tree",
+                    GrowthStage: stage,
+                    Tapped: tapped));
+            }
+
+            foreach (var clump in loc.resourceClumps)
+            {
+                if (clump is null)
+                    continue;
+                // Giant stump (600) and hollow log (602) are the choppable clumps;
+                // boulders and meteorites are pickaxe targets, never listed here.
+                int sheetIndex;
+                try { sheetIndex = clump.parentSheetIndex?.Value ?? -1; } catch { continue; }
+                if (sheetIndex != 600 && sheetIndex != 602)
+                    continue;
+
+                int cx, cy, cw, ch;
+                try
+                {
+                    var tile = clump.Tile;
+                    cx = (int)tile.X;
+                    cy = (int)tile.Y;
+                    cw = clump.width?.Value ?? 1;
+                    ch = clump.height?.Value ?? 1;
+                }
+                catch { continue; }
+                if (!InRange(cx, cy))
+                    continue;
+
+                items.Add(new ChoppableTreeScanInfo(
+                    Tile: new TileCoordinate(cx, cy),
+                    Kind: sheetIndex == 600 ? "stump" : "log",
+                    GrowthStage: -1,
+                    Tapped: false,
+                    Width: cw,
+                    Height: ch));
+            }
+        }
+        catch (Exception ex)
+        {
+            _monitor.Log($"Error scanning choppable trees at '{locationName}': {ex.Message}", LogLevel.Warn);
         }
 
         return items.OrderBy(i => Math.Abs(i.Tile.X - center.X) + Math.Abs(i.Tile.Y - center.Y))

@@ -122,6 +122,7 @@ def test_native_action_parameter_contract() -> None:
         "apply-fertilizer",
         "clear-debris",
         "pickup-items",
+        "chop-tree",
         "insert-machine",
         "collect-machine",
         "pet-animal",
@@ -220,6 +221,33 @@ def test_scheduler_insert_machine_validates_count_and_item() -> None:
     asyncio.run(run())
 
 
+def test_scheduler_chop_tree_dispatches_allowlisted_command() -> None:
+    async def run():
+        client = _client()
+        scheduler = CompanionScheduler(client=client)
+        res = await scheduler.chop_tree(tiles=[{"x": 60, "y": 12}], location_id="Farm")
+        assert res["terminalState"] == "succeeded"
+        client.execute_native_action.assert_awaited_once()
+        kwargs = client.execute_native_action.await_args.kwargs
+        assert kwargs["skill_id"] == "chop-tree"
+        assert kwargs["parameters"] == {"locationId": "Farm", "tiles": [{"x": 60, "y": 12}]}
+
+    import asyncio
+
+    asyncio.run(run())
+
+
+def test_scheduler_chop_tree_rejects_empty_tiles() -> None:
+    import asyncio
+
+    async def run():
+        scheduler = CompanionScheduler(client=_client())
+        with pytest.raises(PolicyViolationError):
+            await scheduler.chop_tree(tiles=[])
+
+    asyncio.run(run())
+
+
 def test_scheduler_refill_uses_snapshot_refill_tiles() -> None:
     import asyncio
 
@@ -287,6 +315,11 @@ def test_scheduler_query_farming_projects_companion_tools_and_obstacles() -> Non
                     ],
                     "groundItemsTruncated": False,
                     "fertilizedTiles": [],
+                    "choppableTrees": [
+                        {"tile": {"x": 58, "y": 12}, "kind": "tree", "growthStage": 5, "tapped": False, "width": 1, "height": 1},
+                        {"tile": {"x": 59, "y": 12}, "kind": "stump", "growthStage": 0, "tapped": False, "width": 2, "height": 2},
+                    ],
+                    "choppableTreesTruncated": False,
                     "companionTools": ["Axe", "Hoe", "MilkPail", "Pickaxe", "Shears", "WateringCan"],
                 }
             }
@@ -296,6 +329,8 @@ def test_scheduler_query_farming_projects_companion_tools_and_obstacles() -> Non
         assert farming["companionTools"] == ["Axe", "Hoe", "MilkPail", "Pickaxe", "Shears", "WateringCan"]
         kinds = {item["kind"]: item["clearTool"] for item in farming["groundItems"]}
         assert kinds == {"stone": "pickaxe", "twig": "axe"}
+        assert [t["kind"] for t in farming["choppableTrees"]] == ["tree", "stump"]
+        assert farming["choppableTreesTruncated"] is False
 
     asyncio.run(run())
 
@@ -432,6 +467,7 @@ def test_plan_operation_allowlist_covers_native_actions_only() -> None:
         "apply_fertilizer",
         "clear_debris",
         "pickup_items",
+        "chop_tree",
         "insert_machine",
         "collect_machine",
         "pet_animal",
@@ -471,6 +507,9 @@ def test_discover_capabilities_exposes_memory_write_schema(tmp_path: Path) -> No
         _, livestock = await server.call_tool("discover_capabilities", {"group": "livestock"})
         names = {entry["name"] for entry in livestock["groups"]["livestock"]}
         assert {"observe_livestock", "pet_animal", "collect_animal_produce", "feed_animals", "toggle_animal_door"} <= names
+
+        _, forestry = await server.call_tool("discover_capabilities", {"group": "forestry"})
+        assert [entry["name"] for entry in forestry["groups"]["forestry"]] == ["chop_tree"]
 
     asyncio.run(run())
 

@@ -18,7 +18,8 @@ public enum NativeActionKind
     PetAnimal,
     FeedAnimals,
     ToggleAnimalDoor,
-    CollectAnimalProduce
+    CollectAnimalProduce,
+    ChopTree
 }
 
 /// <summary>

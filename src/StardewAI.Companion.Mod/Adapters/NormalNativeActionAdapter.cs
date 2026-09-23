@@ -62,6 +62,7 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                 NativeActionKind.FeedAnimals => FeedAnimals(actor, request, target),
                 NativeActionKind.ToggleAnimalDoor => ToggleAnimalDoor(actor, request, target),
                 NativeActionKind.CollectAnimalProduce => CollectAnimalProduce(actor, request, target),
+                NativeActionKind.ChopTree => ChopTree(actor, request, target),
                 _ => NativeActionStepResult.Precondition($"unsupported native action '{request.Kind}'", "unsupported")
             };
         }
@@ -306,6 +307,126 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                 staminaCost: Math.Max(0f, staminaBefore - actor.Stamina),
                 itemId: obj.QualifiedItemId ?? obj.ItemId,
                 itemCount: 1);
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Forestry: wild trees / giant stumps / hollow logs (explicit tiles only)
+    // ------------------------------------------------------------------
+    private NativeActionStepResult ChopTree(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
+    {
+        var loc = ResolveLocation(request.LocationId);
+        if (loc is null)
+            return NativeActionStepResult.Failed($"Game location '{request.LocationId}' not found.");
+
+        if (!actor.Tile.IsAdjacentTo(target.Tile) && actor.Tile != target.Tile)
+            return NativeActionStepResult.Precondition($"Actor at {actor.Tile} is not adjacent to target tile {target.Tile}.", "not-adjacent");
+
+        var v = new Vector2(target.Tile.X, target.Tile.Y);
+
+        // Fruit trees are long-term player investments and are never chopped.
+        if (loc.terrainFeatures.TryGetValue(v, out var tf) && tf is FruitTree)
+            return NativeActionStepResult.Precondition(
+                $"Tile {target.Tile} holds a fruit tree; fruit trees are never chopped by this action.",
+                "protected-tree");
+
+        Tree? tree = tf as Tree;
+        ResourceClump? clump = null;
+        if (tree is null)
+        {
+            try
+            {
+                foreach (var candidate in loc.resourceClumps)
+                {
+                    if (candidate is null)
+                        continue;
+                    // Giant stump (600) and hollow log (602) are the choppable clumps;
+                    // boulders and meteorites belong to the pickaxe, never this action.
+                    int sheetIndex = candidate.parentSheetIndex?.Value ?? -1;
+                    if (sheetIndex != 600 && sheetIndex != 602)
+                        continue;
+                    var ct = candidate.Tile;
+                    int cw = candidate.width?.Value ?? 1;
+                    int ch = candidate.height?.Value ?? 1;
+                    if (target.Tile.X >= (int)ct.X && target.Tile.X < (int)ct.X + cw
+                        && target.Tile.Y >= (int)ct.Y && target.Tile.Y < (int)ct.Y + ch)
+                    {
+                        clump = candidate;
+                        break;
+                    }
+                }
+            }
+            catch { clump = null; }
+        }
+
+        if (tree is null && clump is null)
+            return NativeActionStepResult.Precondition(
+                $"Tile {target.Tile} has no choppable tree, stump or log.", "no-tree");
+
+        var axe = actor.FindTool<Axe>();
+        if (axe is null)
+            return NativeActionStepResult.Precondition(
+                "Companion does not possess the native Axe needed to chop wood.",
+                "missing-tool:Axe",
+                playerActionRequired: true);
+
+        if (actor.GameFarmer is null)
+            return NativeActionStepResult.Failed("Companion actor has no GameFarmer instance.");
+
+        return InvokeIsolated(actor, "chop-tree", () =>
+        {
+            float staminaBefore = actor.Stamina;
+            int pixelX = target.Tile.X * 64 + 32;
+            int pixelY = target.Tile.Y * 64 + 32;
+
+            // A grown target needs several genuine swings, exactly like the player
+            // standing still and swinging until the trunk falls. Every swing is a
+            // real Axe.DoFunction (companion stamina, native damage and drops).
+            // Chopping is multi-tick: once the trunk starts falling the native
+            // animation owns the object (stump=true, health=5, falling=true) and
+            // the stump only becomes removable after `falling` flips back on a
+            // later game tick, so this batch then stops and asks the state machine
+            // for another tick window instead of burning stamina on a falling tree.
+            bool dealtDamage = false;
+            for (int swing = 0; swing < 8; swing++)
+            {
+                if (tree is not null)
+                {
+                    if (!loc.terrainFeatures.TryGetValue(v, out var current) || !ReferenceEquals(current, tree))
+                        return NativeActionStepResult.Succeeded(
+                            "tree-felled",
+                            staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
+
+                    bool falling;
+                    try { falling = tree.falling?.Value == true; } catch { falling = false; }
+                    if (falling)
+                        return NativeActionStepResult.Continue("tree-falling");
+                }
+                else
+                {
+                    if (!loc.resourceClumps.Contains(clump!))
+                        return NativeActionStepResult.Succeeded(
+                            "clump-cleared",
+                            staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
+                }
+
+                if (actor.IsExhausted)
+                    return NativeActionStepResult.Failed(
+                        $"Companion stamina exhausted after {swing} swing(s); the target at {target.Tile} still stands.");
+
+                float healthBefore = tree is not null ? tree.health?.Value ?? 0f : clump!.health?.Value ?? 0f;
+                axe.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
+                float healthAfter = tree is not null ? tree.health?.Value ?? 0f : clump!.health?.Value ?? 0f;
+                if (healthAfter < healthBefore)
+                    dealtDamage = true;
+                else if (!dealtDamage)
+                    return NativeActionStepResult.Failed(
+                        $"Native Axe.DoFunction dealt no damage to the target at {target.Tile} " +
+                        $"(health {healthBefore} -> {healthAfter}); a stronger axe may be required.");
+            }
+
+            // The batch ended with the target still standing: more tick windows needed.
+            return NativeActionStepResult.Continue("chopping");
         });
     }
 

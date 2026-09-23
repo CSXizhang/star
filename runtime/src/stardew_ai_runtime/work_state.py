@@ -50,6 +50,7 @@ ALLOWED_OPERATIONS = frozenset(
         "apply_fertilizer",
         "clear_debris",
         "pickup_items",
+        "chop_tree",
         "insert_machine",
         "collect_machine",
         "pet_animal",

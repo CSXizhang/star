@@ -19,6 +19,9 @@ public sealed class TestNativeActionAdapter : INativeActionAdapter
     public string FailureMessage { get; set; } = "native failure";
     public bool SimulatePlayerActionRequired { get; set; }
 
+    /// <summary>Return Continue() for the first N calls, simulating a multi-tick action.</summary>
+    public int ContinueCallsBeforeSuccess { get; set; }
+
     public NativeActionStepResult Execute(
         IFarmerActor actor,
         NativeActionRequest request,
@@ -26,6 +29,12 @@ public sealed class TestNativeActionAdapter : INativeActionAdapter
     {
         CallCount++;
         Calls.Add((request.Kind, target));
+
+        if (ContinueCallsBeforeSuccess > 0)
+        {
+            ContinueCallsBeforeSuccess--;
+            return NativeActionStepResult.Continue("chopping");
+        }
 
         if (SimulatePrecondition)
         {

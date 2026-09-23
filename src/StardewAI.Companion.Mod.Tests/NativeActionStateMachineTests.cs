@@ -71,6 +71,7 @@ public class NativeActionStateMachineTests
     [InlineData(NativeActionKind.RefillWateringCan)]
     [InlineData(NativeActionKind.ApplyFertilizer)]
     [InlineData(NativeActionKind.ClearDebris)]
+    [InlineData(NativeActionKind.ChopTree)]
     public void EmptyCanRefill_ReachesAdapterWithoutStartingWaterPourAnimation(NativeActionKind kind)
     {
         var (machine, actor, _, adapter) = CreateHarness();
@@ -147,6 +148,24 @@ public class NativeActionStateMachineTests
         Assert.Single(result.Failed);
         Assert.Equal("Weed at (10,12) was not removed by the native tool action.", result.ErrorMessage);
         Assert.Equal("failed", result.ToTransportPayload().TerminalState);
+    }
+
+    [Fact]
+    public void MultiTickAction_StaysOnSameTargetUntilTerminal()
+    {
+        var (machine, _, _, adapter) = CreateHarness();
+        adapter.ContinueCallsBeforeSuccess = 2;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(200);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Succeeded, result.FinalState);
+        Assert.Single(result.Effects);
+        Assert.Empty(result.Skipped);
+        Assert.Empty(result.Failed);
+        Assert.Equal(3, adapter.CallCount);
+        Assert.All(adapter.Calls, c => Assert.Equal(NativeActionKind.ChopTree, c.Kind));
     }
 
     [Fact]

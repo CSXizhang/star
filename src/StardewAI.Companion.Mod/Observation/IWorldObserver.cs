@@ -45,6 +45,11 @@ public interface IWorldObserver
     bool IsTilePassable(string locationName, TileCoordinate tile);
 
     /// <summary>
+    /// Checks whether a tile on the given location is a door, warp, or transition trigger tile.
+    /// </summary>
+    bool IsWarpOrDoorTile(string locationName, TileCoordinate tile);
+
+    /// <summary>
     /// Reads soil / hoe-dirt state at the specified tile.
     /// </summary>
     TileDirtState GetDirtState(string locationName, TileCoordinate tile);
@@ -165,6 +170,16 @@ public interface IWorldObserver
     /// so the model can choose explicit tiles instead of guessing.
     /// </summary>
     IReadOnlyList<GroundItemScanInfo> ScanGroundItems(
+        string locationName,
+        TileCoordinate center,
+        int radius,
+        int maxItems = 64);
+
+    /// <summary>
+    /// Scans choppable native targets (wild trees, giant stumps, hollow logs) within
+    /// radius so the model can choose explicit tiles. Fruit trees are never listed.
+    /// </summary>
+    IReadOnlyList<ChoppableTreeScanInfo> ScanChoppableTrees(
         string locationName,
         TileCoordinate center,
         int radius,

@@ -23,6 +23,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
     private const int MaxReportedAnimals = 60;
     private const int MaxReportedRefillTiles = 16;
     private const int MaxReportedGroundItems = 48;
+    private const int MaxReportedChoppableTrees = 24;
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -634,6 +635,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 "feed-animals" => NativeActionKind.FeedAnimals,
                 "toggle-animal-door" => NativeActionKind.ToggleAnimalDoor,
                 "collect-animal-produce" => NativeActionKind.CollectAnimalProduce,
+                "chop-tree" => NativeActionKind.ChopTree,
                 _ => null
             };
 
@@ -706,7 +708,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     or NativeActionKind.ApplyFertilizer or NativeActionKind.ClearDebris
                     or NativeActionKind.PickupItems or NativeActionKind.CollectMachine
                     or NativeActionKind.PetAnimal or NativeActionKind.CollectAnimalProduce
-                    or NativeActionKind.ToggleAnimalDoor;
+                    or NativeActionKind.ToggleAnimalDoor or NativeActionKind.ChopTree;
 
                 if (needsTiles && (payload.Parameters.Tiles is null || payload.Parameters.Tiles.Count == 0))
                 {
@@ -1603,13 +1605,28 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 try { companionTools = _actor.GetToolNames().OrderBy(n => n).ToList(); }
                 catch { companionTools = new List<string>(); }
 
+                var choppable = _observer.ScanChoppableTrees(locationName, _actor.Tile, 16, MaxReportedChoppableTrees + 1);
+                bool choppableTruncated = choppable.Count > MaxReportedChoppableTrees;
+                var reportedChoppable = (choppableTruncated ? choppable.Take(MaxReportedChoppableTrees) : choppable)
+                    .Select(t => new ChoppableTreeSnapshot(
+                        Tile: new TileCoord(t.Tile.X, t.Tile.Y),
+                        Kind: t.Kind,
+                        GrowthStage: t.GrowthStage,
+                        Tapped: t.Tapped,
+                        Width: t.Width,
+                        Height: t.Height
+                    ))
+                    .ToList();
+
                 farming = new FarmingSnapshot(
                     Location: locationName,
                     RefillWaterTiles: reportingRefill,
                     GroundItems: reportedGround,
                     GroundItemsTruncated: groundTruncated,
                     FertilizedTiles: fertilized,
-                    CompanionTools: companionTools
+                    CompanionTools: companionTools,
+                    ChoppableTrees: reportedChoppable,
+                    ChoppableTreesTruncated: choppableTruncated
                 );
             }
             catch
@@ -1680,6 +1697,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
         NativeActionKind.FeedAnimals => "feeding",
         NativeActionKind.ToggleAnimalDoor => "toggling-door",
         NativeActionKind.CollectAnimalProduce => "collecting-produce",
+        NativeActionKind.ChopTree => "chopping",
         _ => "working"
     };
 

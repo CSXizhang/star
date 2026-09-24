@@ -4,7 +4,7 @@
 
 在游戏里按 `F8`，告诉它要做什么，例如“把没浇水的地浇完”或“从箱子里拿种子种下去”。模型负责理解指令、安排任务，SMAPI Mod 负责寻路和执行游戏动作；也可以通过 MCP 客户端直接调用这些能力。
 
-项目仍在开发中。基础种植流程有实机运行记录，但自由模式、聊天界面和长时间运行还在修整，暂不作为稳定版发布。
+项目仍在开发中。种植流程、组合日常作业、跨天日结与连续三天自由模式均有实机验收记录；聊天界面细节与更长时间的稳定性仍在修整，暂不作为稳定版发布。
 
 ## 目前能做什么
 
@@ -62,18 +62,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/build-mod.ps1 -Con
 
 已有 .NET SDK 时可以跳过 `bootstrap-dotnet.ps1`。编译依赖本机游戏程序集，仓库不附带游戏文件、存档或已编译的 Mod。
 
-### 2. 安装 Mod
+### 2. 安装 Mod 并完成绑定
 
-关闭游戏后，在游戏的 `Mods` 目录下新建 `StardewAI.Companion.Mod` 文件夹，将编译产物放进去：
+推荐直接使用设置向导，一次完成安装与配对绑定：
 
-```text
-artifacts/bin/StardewAI.Companion.Mod/Release/net6.0/StardewAI.Companion.Mod.dll
-src/StardewAI.Companion.Mod/manifest.json
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/setup-companion.ps1 -AutoInstall
 ```
 
-建议先用备份存档体验。
+`tools/build-mod.ps1` 编译后已把产物同步到 `artifacts/dist/StardewAI.Companion.Mod`；向导完成安装并生成本地 `local-dev` 配对清单（`artifacts/releases/local-dev/manifest.json`），运行时的 DLL 校验即可通过。也可以双击 `设置星露谷伙伴.bat` 使用图形向导。之后若重新编译了 Mod，重跑一次设置向导即可同步绑定。
 
-也可以改用设置向导完成安装与绑定：`tools/build-mod.ps1` 编译后会自动把产物同步到 `artifacts/dist/StardewAI.Companion.Mod`，再运行 `tools/setup-companion.ps1 -AutoInstall` 即完成安装，并自动生成本地 `local-dev` 配对清单（`artifacts/releases/local-dev/manifest.json`），运行时的 DLL 校验即可通过。之后若重新编译了 Mod，重跑一次设置向导即可同步绑定。
+**注意：只手动复制 DLL 而不运行向导，动作执行会被 `COMPATIBILITY_UNKNOWN` 拦截**——运行时要求 Mod 目录与配对清单一致。坚持手动安装时，关闭游戏后在游戏 `Mods` 目录下新建 `StardewAI.Companion.Mod` 文件夹，放入编译产物（`StardewAI.Companion.Mod.dll` 及同目录附属文件、`src/StardewAI.Companion.Mod/manifest.json`），然后仍需运行一次设置向导生成配对清单。
+
+建议先用备份存档体验。
 
 ### 3. 连接模型与游戏
 
@@ -90,7 +91,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -
 uv run --project runtime python -m stardew_ai_runtime.chat_bridge --run-dir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" --backend kimi
 ```
 
-保持服务窗口开启，在游戏内按 `F8` 输入指令。其他 MCP 客户端和聊天后端的配置见 [MCP 接入指南](docs/mcp.md)。本机模型选择、账号配置和安装记录不纳入版本管理。
+保持服务窗口开启，在游戏内按 `F8` 输入指令（也可以双击 `启动伙伴服务.bat` 启动服务、`查看使用记录.bat` 查看本地用量记录）。其他 MCP 客户端和聊天后端的配置见 [MCP 接入指南](docs/mcp.md)。本机模型选择、账号配置和安装记录不纳入版本管理。当前不提供预编译发布包，请按上文从源码构建。
 
 ## 开发与检查
 
@@ -100,7 +101,7 @@ uv run --project runtime pytest runtime/tests tests
 uv run --project runtime python tools/check_release_boundaries.py
 ```
 
-当前测试和代码规范检查仍有未通过项，主要涉及短任务规则、实例兼容校验和代码格式。贡献代码前请运行相关检查；游戏动作还需要实机验证。具体说明见[贡献指南](CONTRIBUTING.md)。
+测试与代码规范基线已全绿；依赖游戏实例或 Windows PowerShell 的用例在无对应环境时按条件跳过。贡献代码前请运行相关检查；游戏动作还需要实机验证。具体说明见[贡献指南](CONTRIBUTING.md)。
 
 | 目录 | 内容 |
 | --- | --- |

@@ -25,7 +25,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/build-mod.ps1 -Con
 
 C# 测试需要本机游戏程序集和 .NET SDK。可以使用 `dotnet test` 分别运行 `src` 下的测试项目，并通过 `StardewGamePath` 构建参数指定游戏目录。
 
-当前测试集还有已知失败，包括短任务规则与旧用例不一致、实例兼容校验所需环境不完整，以及代码规范问题。请说明改动前后的相关测试结果，不要用跳过检查代替修复。
+测试与代码规范基线已全绿（lint + pytest）；依赖游戏实例或 Windows PowerShell 的用例在无对应环境时按条件跳过。请说明改动前后的相关测试结果，不要用新增跳过来掩盖回归。
 
 离线测试不应调用付费模型服务。涉及游戏动作的验证请使用备份存档，记录实际消耗与结果，不要仅凭模型回复判断成功。
 

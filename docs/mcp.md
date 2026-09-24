@@ -18,13 +18,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -
 
 `-Agent` 支持 `kimi`、`agy`、`claude`、`codex`、`dsh` 和 `all`。省略 `-Install` 时输出配置供你检查；不同客户端的注册方式和可用程度可能不同。
 
-手动配置支持 stdio 的 MCP 客户端时，使用仓库虚拟环境中的 Python，参数为：
+手动配置支持 stdio 的 MCP 客户端时，可以直接使用 `uv run --project <仓库根目录>/runtime python`（与 `register-mcp.ps1 -Install` 生成的配置一致），参数为：
 
 ```text
 -m stardew_ai_runtime.mcp_server --run-dir <Mod 安装目录>
 ```
 
-Python 可执行文件通常位于 `runtime/.venv/Scripts/python.exe`。请使用绝对路径，工作目录设为仓库根目录。
+也可以使用仓库虚拟环境中的 Python（通常位于 `runtime/.venv/Scripts/python.exe`），效果相同。请使用绝对路径，工作目录设为仓库根目录。
 
 ## 游戏内聊天
 
@@ -34,7 +34,7 @@ Python 可执行文件通常位于 `runtime/.venv/Scripts/python.exe`。请使�
 uv run --project runtime python -m stardew_ai_runtime.chat_bridge --run-dir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" --backend kimi
 ```
 
-保持服务运行，在游戏中按 `F8` 打开对话。自由模式、界面缩放和异常恢复仍在开发中。
+保持服务运行，在游戏中按 `F8` 打开对话。自由模式已通过实机验收（含连续三天实跑）；界面缩放和异常恢复仍在开发中。
 
 ## 常见问题
 

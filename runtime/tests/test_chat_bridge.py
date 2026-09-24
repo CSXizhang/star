@@ -4,29 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
-import logging
 
 import pytest
 
 from stardew_ai_runtime.chat_bridge import (
     ActiveChatTask,
-    CHAT_BRIDGE_LOG_BACKUP_COUNT,
-    CHAT_BRIDGE_LOG_ENCODING,
-    CHAT_BRIDGE_LOG_FILENAME,
-    CHAT_BRIDGE_LOG_MAX_BYTES,
     ChatBridge,
     configure_chat_bridge_file_logging,
-    get_chat_bridge_fallback_log_dir,
-    get_chat_bridge_log_path,
     get_command_usage_delta,
     get_max_gen_idx,
     main,
     remove_chat_bridge_file_logging,
-    resolve_chat_bridge_run_dir,
 )
 from stardew_ai_runtime.protocol import (
     ChatCancelPayload,

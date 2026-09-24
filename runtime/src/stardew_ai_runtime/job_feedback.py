@@ -1,6 +1,7 @@
 """Bounded facts from real results; never materializes invented state."""
-from typing import Any
 import json
+from typing import Any
+
 
 def compact_job_feedback(result: Any, *, operation: str = "", status: str | None = None) -> dict[str, Any]:
     raw = result if isinstance(result, dict) else {}

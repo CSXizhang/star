@@ -1,14 +1,15 @@
 import asyncio
-import os
 import json
+import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from stardew_ai_runtime.chat_bridge import ChatBridge, ActiveChatTask
-from stardew_ai_runtime.work_state import WorkStore, WorkStateError
+
+from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
 from stardew_ai_runtime.decision_context import build_decision_context
 from stardew_ai_runtime.mcp_server import create_mcp_server
-from mcp.server.fastmcp.exceptions import ToolError
+from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 
 def test_player_chat_submit_unpauses_work_state(tmp_path, monkeypatch):
@@ -188,7 +189,7 @@ def test_dispatch_plan_operation_strips_unknown_params(tmp_path):
         }],
     )
     # Claim it
-    claim = store.claim_next_step("Save1", "worker1")
+    store.claim_next_step("Save1", "worker1")
     command_id = "plan:Save1:t1:s1:attempt-1"
     store.assign_command_id("Save1", "t1", "s1", command_id)
 

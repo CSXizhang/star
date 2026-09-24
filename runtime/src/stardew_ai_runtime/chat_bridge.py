@@ -18,14 +18,12 @@ Architecture:
 
 from __future__ import annotations
 
-from stardew_ai_runtime.job_feedback import compact_job_feedback
 import argparse
 import asyncio
 import contextlib
 import datetime
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import re
 import sqlite3
@@ -34,6 +32,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +40,7 @@ from stardew_ai_runtime.agent_backends import AgyBackend, KimiBackend
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
 from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
+from stardew_ai_runtime.job_feedback import compact_job_feedback
 from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
 from stardew_ai_runtime.plan_executor import PlanExecutor, StepExecution
 from stardew_ai_runtime.protocol import (

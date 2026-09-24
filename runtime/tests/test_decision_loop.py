@@ -1,10 +1,11 @@
 import asyncio
 import json
-from pathlib import Path
+
 import pytest
-from stardew_ai_runtime.work_state import WorkStore, WorkStateError
+
 from stardew_ai_runtime.chat_bridge import PlanWorker
 from stardew_ai_runtime.job_feedback import compact_job_feedback
+from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 
 def tasks(op="water_auto", steps=None):
@@ -61,8 +62,10 @@ def test_direct_and_plan_share_decision_budget(tmp_path):
     store=WorkStore(tmp_path/"work.json")
     store.begin_decision("save","one")
     store.select_direct_job("save","one","water_auto")
-    with pytest.raises(WorkStateError): store.select_direct_job("save","one","ship_items")
-    with pytest.raises(WorkStateError): store.submit_plan("save",goal_text="again",tasks=tasks(),decision_token="one")
+    with pytest.raises(WorkStateError):
+        store.select_direct_job("save","one","ship_items")
+    with pytest.raises(WorkStateError):
+        store.submit_plan("save",goal_text="again",tasks=tasks(),decision_token="one")
 
 
 def test_feedback_is_compact_and_does_not_invent_state():
@@ -81,8 +84,9 @@ def test_cross_day_does_not_resume_old_job(tmp_path):
 
 
 def test_mcp_direct_and_capability_cannot_bypass_job_selection(tmp_path, monkeypatch):
-    from stardew_ai_runtime.mcp_server import create_mcp_server
     from mcp.server.fastmcp.exceptions import ToolError
+
+    from stardew_ai_runtime.mcp_server import create_mcp_server
     class Scheduler:
         run_dir=tmp_path
         async def get_status(self): return {"saveId":"save"}
@@ -129,6 +133,7 @@ def test_interrupt_at_step_boundary_does_not_advance(tmp_path):
 
 def test_native_cancel_bypasses_work_queue(tmp_path):
     from types import SimpleNamespace
+
     from stardew_ai_runtime.chat_bridge import InternalMcpPlanClient
     async def exercise():
         client=InternalMcpPlanClient(tmp_path)
@@ -147,9 +152,11 @@ def test_native_cancel_bypasses_work_queue(tmp_path):
 def test_fake_provider_two_decisions_receive_real_worker_feedback(tmp_path, monkeypatch):
     """No provider process: production grant -> registered MCP -> worker -> prompt."""
     import os
-    from stardew_ai_runtime.chat_bridge import ChatBridge, ActiveChatTask
-    from stardew_ai_runtime.mcp_server import create_mcp_server
+
     from mcp.server.fastmcp.exceptions import ToolError
+
+    from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
+    from stardew_ai_runtime.mcp_server import create_mcp_server
     bridge=ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
     store=bridge._work_store
     class Scheduler:
@@ -157,10 +164,13 @@ def test_fake_provider_two_decisions_receive_real_worker_feedback(tmp_path, monk
         async def get_status(self): return {"saveId":"save"}
     server=create_mcp_server(scheduler=Scheduler(),run_dir=tmp_path,surface="full")
     registered={t.name:t.fn for t in server._tool_manager.list_tools()}
-    prompts=[]; tokens=[]; dispatches=[]
+    prompts=[]
+    tokens=[]
+    dispatches=[]
     class FakeProvider:
         def run(self, task, cid, prompt):
-            prompts.append(prompt); tokens.append(os.environ["STARDEW_DECISION_TOKEN"])
+            prompts.append(prompt)
+            tokens.append(os.environ["STARDEW_DECISION_TOKEN"])
             steps=[{"operation":"navigate_to","params":{"tile":{"x":i,"y":1}}} for i in range(3)]
             steps += [{"operation":"water_auto","params":{"max_tiles":3}}]
             asyncio.run(registered["submit_plan"](tasks=tasks(steps=steps),goal_text="care"))
@@ -192,7 +202,7 @@ def test_fake_provider_two_decisions_receive_real_worker_feedback(tmp_path, monk
 
 
 def test_same_active_chat_request_is_transport_replay(tmp_path, monkeypatch):
-    from stardew_ai_runtime.chat_bridge import ChatBridge, ActiveChatTask
+    from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
     bridge=ChatBridge(run_dir=tmp_path,enable_plan_worker=False)
     bridge._active_task=ActiveChatTask(request_id="same",save_id="save")
     def forbidden(*args): raise AssertionError("replay must not invoke provider")

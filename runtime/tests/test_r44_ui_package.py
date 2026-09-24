@@ -1,6 +1,8 @@
 import hashlib
 import json
+
 import pytest
+
 from stardew_ai_runtime import compatibility as compat
 
 

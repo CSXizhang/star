@@ -8,15 +8,14 @@ enforcing single-task execution, input validation, and loopback security.
 
 from __future__ import annotations
 
-import time
-import functools
-from stardew_ai_runtime.job_feedback import compact_job_feedback
 import argparse
 import asyncio
+import functools
 import inspect
 import logging
 import os
 import sys
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path

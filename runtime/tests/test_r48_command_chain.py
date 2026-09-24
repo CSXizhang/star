@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock
+
 import pytest
 
 from stardew_ai_runtime.chat_bridge import ChatBridge, CommandChain

@@ -1,9 +1,12 @@
 import asyncio
 from unittest.mock import AsyncMock
+
 import pytest
-from stardew_ai_runtime.plan_executor import classify_step_outcome, PlanExecutor, StepExecution
-from stardew_ai_runtime.work_state import WorkStore
+
 from stardew_ai_runtime.chat_bridge import ChatBridge
+from stardew_ai_runtime.plan_executor import PlanExecutor, StepExecution, classify_step_outcome
+from stardew_ai_runtime.work_state import WorkStore
+
 
 @pytest.mark.parametrize("raw",[None,"success",[],{}, {"status":"executed","terminalState":"failed","effects":[],"error":"blocked path"}, {"outcome":"rejected","reasonCode":"MCP_TOOL_ERROR"}, {"isError":True,"status":"completed"}, {"status":"executed","terminalState":"unknown"}])
 def test_invalid_failed_and_rejected_never_success(raw):
@@ -20,7 +23,9 @@ def test_business_exception_has_terminal_no_retry(tmp_path,message):
     store.begin_decision("s","d")
     store.submit_plan("s",goal_text="g",decision_token="d",tasks=[{"title":"t","steps":[{"operation":"water_auto"}]}])
     calls=[]
-    async def dispatch(*args): calls.append(args);raise RuntimeError(message)
+    async def dispatch(*args):
+        calls.append(args)
+        raise RuntimeError(message)
     e=PlanExecutor(store,dispatch=dispatch)
     result=asyncio.run(e.run_once("s","w"))
     assert result.outcome=="partial" and result.message==message
@@ -41,17 +46,23 @@ def test_worker_reply_retains_request_and_real_failure(tmp_path):
 
 
 def test_compatibility_rejects_old_dll_without_writing(tmp_path, monkeypatch):
-    import hashlib,json
+    import hashlib
+    import json
+
     import stardew_ai_runtime.compatibility as compat
     monkeypatch.setattr(compat,"__file__",str(tmp_path/"runtime/src/stardew_ai_runtime/compatibility.py"))
     manifest=tmp_path/"artifacts/releases/repair-r43/manifest.json"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(json.dumps({"modSha256":hashlib.sha256(b"new").hexdigest().upper()}))
-    mod=tmp_path/"normal-Mod";mod.mkdir();dll=mod/"StardewAI.Companion.Mod.dll";dll.write_bytes(b"old")
+    mod=tmp_path/"normal-Mod"
+    mod.mkdir()
+    dll=mod/"StardewAI.Companion.Mod.dll"
+    dll.write_bytes(b"old")
     with pytest.raises(compat.CompatibilityError,match="MOD_RUNTIME_MISMATCH"):
         compat.assert_native_compatible(mod)
     assert dll.read_bytes()==b"old"
-    dll.write_bytes(b"new");compat.assert_native_compatible(mod)
+    dll.write_bytes(b"new")
+    compat.assert_native_compatible(mod)
 
 
 def test_model_reply_is_selected_then_worker_reports_failure(tmp_path, monkeypatch):
@@ -76,6 +87,7 @@ def test_missing_compatibility_proof_is_unknown(tmp_path, monkeypatch):
     with pytest.raises(compat.CompatibilityError,match="COMPATIBILITY_UNKNOWN"):
         compat.assert_native_compatible(tmp_path)
     manifest=tmp_path/"artifacts/releases/repair-r43/manifest.json"
-    manifest.parent.mkdir(parents=True);manifest.write_text('{"modSha256":"expected"}')
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"modSha256":"expected"}')
     with pytest.raises(compat.CompatibilityError,match="COMPATIBILITY_UNKNOWN"):
         compat.assert_native_compatible(tmp_path)

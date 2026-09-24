@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+
 import pytest
 
 spec = importlib.util.spec_from_file_location("candidate_usage", Path(__file__).resolve().parents[2] / "tools/view-usage.py")

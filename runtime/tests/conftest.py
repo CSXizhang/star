@@ -1,7 +1,9 @@
 """Offline unit suite must never invoke an installed model provider."""
 import os
 import subprocess
+
 import pytest
+
 
 @pytest.fixture(autouse=True)
 def forbid_real_provider_processes(monkeypatch):

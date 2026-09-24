@@ -2046,114 +2046,24 @@ def create_mcp_server(
         Stock, limited stock status, dynamic unit price, and budget/funds limits are evaluated.
         Accepts items list where each item has itemId and count (1..36 items).
         budget_limit specifies the maximum currency authorized for this purchase call.
+        In free mode the daily purchase budget is enforced at execution time in
+        the scheduler (reserve -> settle), so it holds on every dispatch path.
         Returns terminalState, completedCount, totalCost, remainingBudget, purchasedItems,
         skippedItems, skipReason, availableMoneyAfter, rollbackPerformed, fresh, details, error,
         and effects (if detail=True).
         """
         pre_rev_getter = getattr(sched, "latest_world_revision", 0)
         pre_rev = pre_rev_getter() if callable(pre_rev_getter) else int(pre_rev_getter)
-        sid = await current_save_id()
-        autonomy = autonomy_for_run()
-        auto_state = autonomy.state(sid)
-        is_free = auto_state.mode == "free"
-        effective_budget = budget_limit
         command_id = command_id or f"purchase-{uuid.uuid4().hex[:16]}"
-        quoted_cost: int | None = None
         try:
-            if is_free:
-                if command_id in auto_state.settled_spend_commands:
-                    return {"status": "replayed", "terminalState": "succeeded", "commandId": command_id,
-                            "totalCost": 0, "message": "该购买 commandId 已结算，未重复购买。"}
-                # Before accepting a different purchase, reconcile every older
-                # reservation. An unverified spend blocks further shopping.
-                for pending_id in list(auto_state.spend_reservations):
-                    if pending_id == command_id:
-                        continue
-                    recovered = await sched.reconcile_command(pending_id)
-                    if recovered is None:
-                        return {
-                            "status": "rejected",
-                            "terminalState": "unknown",
-                            "commandId": command_id,
-                            "error": "AUTONOMY_PENDING_RECONCILIATION",
-                            "message": "存在未核对的购买命令，核对完成前不会继续购物。",
-                        }
-                    recovered_details = recovered.get("details") if isinstance(recovered, dict) else None
-                    recovered_details = recovered_details if isinstance(recovered_details, dict) else {}
-                    recovered_terminal = recovered.get("terminalState") if isinstance(recovered, dict) else None
-                    recovered_cost = recovered_details.get("totalCost")
-                    settleable = recovered_terminal in {"succeeded", "failed", "cancelled"} and isinstance(recovered_cost, int) and recovered_cost >= 0
-                    autonomy.settle_spend(pending_id, recovered_cost if settleable else None, unknown=not settleable)
-                    if not settleable:
-                        return {
-                            "status": "rejected", "terminalState": "unknown", "commandId": command_id,
-                            "error": "AUTONOMY_PENDING_RECONCILIATION",
-                            "message": "存在结果未知的购买命令，核对完成前不会继续购物。",
-                        }
-                auto_state = autonomy.state(sid)
-                active = getattr(sched, "active_task", None)
-                active_matches = bool(active and getattr(active, "requested_command_id", None) == command_id)
-                if command_id in auto_state.spend_reservations and not active_matches:
-                    # A reconnect/retry must first recover the original command;
-                    # never blind-dispatch a second purchase for the same ID.
-                    recovered = await sched.reconcile_command(command_id)
-                    if recovered is None:
-                        return {
-                            "status": "executing",
-                            "terminalState": "running",
-                            "inProgress": True,
-                            "commandId": command_id,
-                            "message": "原购买命令仍待核对，已保留预算；核对完成前不会重新购物。",
-                        }
-                    recovered_details = recovered.get("details") if isinstance(recovered, dict) else None
-                    recovered_details = recovered_details if isinstance(recovered_details, dict) else {}
-                    recovered_terminal = recovered.get("terminalState") if isinstance(recovered, dict) else None
-                    recovered_cost = recovered_details.get("totalCost")
-                    settleable = recovered_terminal in {"succeeded", "failed", "cancelled"} and isinstance(recovered_cost, int) and recovered_cost >= 0
-                    autonomy.settle_spend(sid, command_id, recovered_cost if settleable else None, unknown=not settleable)
-                    if not settleable:
-                        return {
-                            "status": "executing", "terminalState": "unknown", "inProgress": True,
-                            "commandId": command_id, "details": recovered_details,
-                            "message": "原购买命令结果仍未知，已保留预算。",
-                        }
-                    return {
-                        "status": "executed", "terminalState": recovered_terminal,
-                        "commandId": command_id, "taskId": recovered.get("taskId"),
-                        "totalCost": recovered_cost, "details": recovered_details,
-                        "error": recovered.get("error"),
-                    }
-                remaining = max(0, (auto_state.budget_limit or 0) - auto_state.daily_spend - sum(auto_state.spend_reservations.values()))
-                effective_budget = min(budget_limit, remaining)
-                if effective_budget <= 0:
-                    return {"status": "rejected", "terminalState": "none", "error": "AUTONOMY_BUDGET_EXHAUSTED", "message": "自由模式每日购买预算不足。"}
-                # Quote from the native shop snapshot. Never infer a price.
-                shop = await sched.query_shop(shop_id=shop_id, detail=True)
-                native_items = {str(item.get("itemId")): item for item in (shop.get("items") or []) if isinstance(item, dict)}
-                quote = 0
-                for requested in items:
-                    native = native_items.get(str(requested.get("itemId")))
-                    price = native.get("price") if native else None
-                    count = requested.get("count")
-                    if not isinstance(price, int) or price < 0 or not isinstance(count, int):
-                        raise ToolError("无法取得原生报价，已阻止自由模式购买。")
-                    quote += price * count
-                quoted_cost = quote
-                # Pass the already-reduced call allowance; reserve_spend applies
-                # the shared daily remaining formula again under its lock.
-                try:
-                    autonomy.reserve_spend(sid, command_id, quoted_cost, limit=effective_budget)
-                except ValueError:
-                    return {
-                        "status": "rejected",
-                        "terminalState": "none",
-                        "commandId": command_id,
-                        "error": "AUTONOMY_BUDGET_EXHAUSTED",
-                        "message": "自由模式每日购买预算不足。",
-                    }
+            # The free-mode daily-budget discipline (reserve, reconcile, settle,
+            # AUTONOMY_BUDGET_EXHAUSTED) lives in the scheduler's
+            # execute_purchase_items — the single execution layer every real
+            # purchase path funnels through — so the limit is a program
+            # guarantee instead of a model-facing hint.
             res = await sched.execute_purchase_items(
                 items=items,
-                budget_limit=effective_budget,
+                budget_limit=budget_limit,
                 shop_id=shop_id,
                 command_id=command_id,
             )
@@ -2171,22 +2081,23 @@ def create_mcp_server(
                     "details": res.get("details"),
                 }
 
+            if res.get("status") in {"rejected", "replayed"}:
+                return {
+                    "status": res.get("status"),
+                    "commandId": res.get("commandId", command_id),
+                    "terminalState": res.get("terminalState"),
+                    "totalCost": res.get("totalCost", 0),
+                    "error": res.get("error"),
+                    "message": res.get("message"),
+                    "details": res.get("details"),
+                }
+
             fresh_snap, fresh = await _safe_wait_for_fresh_snapshot(sched, pre_rev, timeout=1.0)
 
             details = res.get("details") or {}
             purchased_items = details.get("purchasedItems", [])
             skipped_items = details.get("skippedItems", [])
             total_cost = details.get("totalCost")
-            if is_free:
-                terminal = res.get("terminalState")
-                terminal_states = {"succeeded", "failed", "cancelled"}
-                settleable = terminal in terminal_states and isinstance(total_cost, int) and total_cost >= 0
-                autonomy.settle_spend(
-                    sid,
-                    command_id,
-                    total_cost if settleable else None,
-                    unknown=not settleable,
-                )
             remaining_budget = details.get("remainingBudget", 0)
             available_money_after = details.get("availableMoneyAfter")
             skip_reason = details.get("skipReason")

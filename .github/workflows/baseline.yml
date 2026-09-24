@@ -25,3 +25,8 @@ jobs:
         run: uv run --project runtime pytest
       - name: Check production boundary
         run: uv run --project runtime python tools/check_release_boundaries.py
+      - name: C# checks (not executed in CI)
+        run: |
+          echo "CI 环境没有 Stardew Valley 游戏程序集 (STARDEW_GAME_PATH 未设置, 也不会上传游戏程序集),"
+          echo "因此 C# 构建与 C# 测试 (Mod.Tests / Transport.Tests) 未执行。"
+          echo "此步骤仅明确记录跳过原因, 不属于已通过检查; 本地具备游戏安装时请运行 tools/test.ps1 (可用 -RequireCSharpTests 把缺失视为失败)。"

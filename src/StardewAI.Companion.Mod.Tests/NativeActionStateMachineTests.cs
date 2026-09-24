@@ -520,4 +520,107 @@ public class NativeActionStateMachineTests
         else
             Assert.Null(resolved);
     }
+
+    // ------------------------------------------------------------------
+    // Multi-round stamina accounting (P2): the reported staminaUsed must
+    // equal the actor's real total consumption across ALL rounds of a
+    // multi-tick action — Continue rounds, failed rounds and waits for
+    // the native fall animation included, with nothing double counted.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void MultiTickContinue_RoundsReportCumulativeActualStaminaUsage()
+    {
+        var (machine, actor, _, adapter) = CreateHarness();
+        adapter.StaminaCostPerAction = 2f;
+        adapter.ContinueCallsBeforeSuccess = 1;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(200);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Succeeded, result.FinalState);
+        Assert.Single(result.Effects);
+        // Round 1 swung and continued (-2), round 2 swung and succeeded (-2):
+        // the report must cover the real 4 points, not just the success round.
+        Assert.Equal(4f, result.StaminaUsed);
+        Assert.Equal(266f, actor.Stamina);
+        Assert.Equal(270f - actor.Stamina, result.StaminaUsed);
+    }
+
+    [Fact]
+    public void MultiTickWaitingRounds_WithoutSwings_DoNotInflateStaminaReport()
+    {
+        var (machine, actor, _, adapter) = CreateHarness();
+        adapter.StaminaCostPerAction = 2f;
+        adapter.ContinueCallsBeforeSuccess = 2;
+        // The native fall animation owns the target: these rounds swing nothing.
+        adapter.ContinueConsumesStamina = false;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(300);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Succeeded, result.FinalState);
+        Assert.Equal(2f, result.StaminaUsed);
+        Assert.Equal(268f, actor.Stamina);
+        Assert.Equal(270f - actor.Stamina, result.StaminaUsed);
+    }
+
+    [Fact]
+    public void MultiTickExhaustedAfterConsumedRounds_StillReportsConsumedStamina()
+    {
+        var (machine, actor, _, adapter) = CreateHarness(initialStamina: 2f);
+        adapter.StaminaCostPerAction = 2f;
+        adapter.ContinueCallsBeforeSuccess = 5; // the tree never gets felled
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(200);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Failed, result.FinalState);
+        Assert.Equal("STAMINA_EXHAUSTED", result.ErrorCode);
+        Assert.Equal(0f, actor.Stamina);
+        // The swing that drained the stamina bar really happened: report it.
+        Assert.Equal(2f, result.StaminaUsed);
+    }
+
+    [Fact]
+    public void FailedRoundAfterConsumption_StillReportsConsumedStamina()
+    {
+        var (machine, actor, _, adapter) = CreateHarness();
+        adapter.StaminaCostPerAction = 2f;
+        adapter.ContinueCallsBeforeSuccess = 1;
+        adapter.SimulateFailure = true;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(300);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Failed, result.FinalState);
+        Assert.Single(result.Failed);
+        // 2 points spent in the continue round plus 2 in the failed round.
+        Assert.Equal(4f, result.StaminaUsed);
+        Assert.Equal(266f, actor.Stamina);
+        Assert.Equal(270f - actor.Stamina, result.StaminaUsed);
+    }
+
+    [Fact]
+    public void CancelledMidMultiTick_StillReportsConsumedStamina()
+    {
+        var (machine, actor, _, adapter) = CreateHarness();
+        adapter.StaminaCostPerAction = 2f;
+        adapter.ContinueCallsBeforeSuccess = 5;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(15); // first continue round fully processed
+        Assert.Equal(1, adapter.CallCount);
+        machine.RequestCancel("Player cancellation request");
+        machine.StepTicks(20);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Cancelled, result.FinalState);
+        Assert.Equal(268f, actor.Stamina);
+        Assert.Equal(2f, result.StaminaUsed);
+    }
 }

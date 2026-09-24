@@ -14,7 +14,8 @@ public sealed class NativeActionStepResult
     /// <summary>
     /// True when the action is legitimately unfinished and needs more tick windows
     /// (e.g. chop-tree waiting out the native fall animation). The state machine
-    /// stays on the same target without recording an effect.
+    /// stays on the same target; the round's real resource deltas (e.g. stamina
+    /// spent on swings that happened before the wait) are still accumulated.
     /// </summary>
     public bool InProgress { get; }
     public string? ErrorMessage { get; }
@@ -29,7 +30,14 @@ public sealed class NativeActionStepResult
     /// <summary>Effect state recorded on success, e.g. "refilled", "fertilized".</summary>
     public string State { get; }
 
+    /// <summary>
+    /// Real stamina delta observed during this round. Success, failure and
+    /// in-progress rounds may all spend stamina; the state machine sums every
+    /// round's value so the final report equals the actor's actual consumption.
+    /// </summary>
     public float StaminaCost { get; }
+
+    /// <summary>Real water delta observed during this round; accumulated like <see cref="StaminaCost"/>.</summary>
     public int WaterUsed { get; }
     public int WaterGained { get; }
     public string? ItemId { get; }
@@ -80,11 +88,18 @@ public sealed class NativeActionStepResult
         bool playerActionRequired = false) =>
         new(false, true, reason, skipReason ?? reason, "skipped", 0f, 0, 0, null, 0, playerActionRequired);
 
-    public static NativeActionStepResult Failed(string reason, bool playerActionRequired = false) =>
-        new(false, false, reason, null, "failed", 0f, 0, 0, null, 0, playerActionRequired);
+    public static NativeActionStepResult Failed(
+        string reason,
+        bool playerActionRequired = false,
+        float staminaCost = 0f,
+        int waterUsed = 0) =>
+        new(false, false, reason, null, "failed", staminaCost, waterUsed, 0, null, 0, playerActionRequired);
 
-    public static NativeActionStepResult Continue(string state) =>
-        new(false, false, null, null, state, 0f, 0, 0, null, 0, false, inProgress: true);
+    public static NativeActionStepResult Continue(
+        string state,
+        float staminaCost = 0f,
+        int waterUsed = 0) =>
+        new(false, false, null, null, state, staminaCost, waterUsed, 0, null, 0, false, inProgress: true);
 }
 
 /// <summary>

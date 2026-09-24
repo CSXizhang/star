@@ -455,7 +455,12 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         {
             // Multi-tick actions (e.g. chop-tree waiting out the native fall
             // animation) stay on the same target: no effect is recorded yet and
-            // the target index does not advance.
+            // the target index does not advance. The round itself really ran,
+            // though — record its actual resource deltas so stamina/water spent
+            // in earlier rounds is never lost. Wait-only rounds report a zero
+            // delta, so nothing is ever double counted or inflated.
+            _staminaUsed += result.StaminaCost;
+            _waterUsed += result.WaterUsed;
             EmitProgress("acting", result.State);
             if (_actor.IsExhausted)
             {
@@ -471,6 +476,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         else
         {
             _failed.Add(new NativeActionEffect(targetLabel, "failed", result.ErrorMessage, result.ItemId, 0, _currentTarget.Tile));
+            // A failed round may already have consumed real resources (e.g. the
+            // swings before a chop gave up): report those deltas instead of
+            // dropping them.
+            _staminaUsed += result.StaminaCost;
+            _waterUsed += result.WaterUsed;
             _playerActionRequired |= result.PlayerActionRequired;
             EmitProgress("failed", result.ErrorMessage);
         }

@@ -400,7 +400,11 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                     bool falling;
                     try { falling = tree.falling?.Value == true; } catch { falling = false; }
                     if (falling)
-                        return NativeActionStepResult.Continue("tree-falling");
+                        // No swing happens while the native fall animation owns the
+                        // tree, so this round's delta is 0 — never inflated.
+                        return NativeActionStepResult.Continue(
+                            "tree-falling",
+                            staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
                 }
                 else
                 {
@@ -412,7 +416,8 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
 
                 if (actor.IsExhausted)
                     return NativeActionStepResult.Failed(
-                        $"Companion stamina exhausted after {swing} swing(s); the target at {target.Tile} still stands.");
+                        $"Companion stamina exhausted after {swing} swing(s); the target at {target.Tile} still stands.",
+                        staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
 
                 float healthBefore = tree is not null ? tree.health?.Value ?? 0f : clump!.health?.Value ?? 0f;
                 axe.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
@@ -422,11 +427,14 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                 else if (!dealtDamage)
                     return NativeActionStepResult.Failed(
                         $"Native Axe.DoFunction dealt no damage to the target at {target.Tile} " +
-                        $"(health {healthBefore} -> {healthAfter}); a stronger axe may be required.");
+                        $"(health {healthBefore} -> {healthAfter}); a stronger axe may be required.",
+                        staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
             }
 
             // The batch ended with the target still standing: more tick windows needed.
-            return NativeActionStepResult.Continue("chopping");
+            return NativeActionStepResult.Continue(
+                "chopping",
+                staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
         });
     }
 

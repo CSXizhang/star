@@ -22,6 +22,13 @@ public sealed class TestNativeActionAdapter : INativeActionAdapter
     /// <summary>Return Continue() for the first N calls, simulating a multi-tick action.</summary>
     public int ContinueCallsBeforeSuccess { get; set; }
 
+    /// <summary>
+    /// When true (default), each Continue round really swings and deducts stamina,
+    /// like a genuine chop batch that did not finish. When false, Continue rounds
+    /// only wait (e.g. for the native tree-fall animation) and consume nothing.
+    /// </summary>
+    public bool ContinueConsumesStamina { get; set; } = true;
+
     public NativeActionStepResult Execute(
         IFarmerActor actor,
         NativeActionRequest request,
@@ -30,10 +37,17 @@ public sealed class TestNativeActionAdapter : INativeActionAdapter
         CallCount++;
         Calls.Add((request.Kind, target));
 
+        // Mirror the real adapter: every round physically deducts stamina first
+        // and then reports the measured delta for that round, so a multi-round
+        // action's true total cost is observable on the actor and comparable
+        // with what the state machine aggregates.
         if (ContinueCallsBeforeSuccess > 0)
         {
             ContinueCallsBeforeSuccess--;
-            return NativeActionStepResult.Continue("chopping");
+            float staminaBefore = actor.Stamina;
+            if (ContinueConsumesStamina && actor.Stamina > 0f)
+                actor.Stamina = Math.Max(0f, actor.Stamina - StaminaCostPerAction);
+            return NativeActionStepResult.Continue("chopping", staminaCost: staminaBefore - actor.Stamina);
         }
 
         if (SimulatePrecondition)
@@ -46,15 +60,22 @@ public sealed class TestNativeActionAdapter : INativeActionAdapter
 
         if (SimulateFailure)
         {
-            return NativeActionStepResult.Failed(FailureMessage, playerActionRequired: SimulatePlayerActionRequired);
+            float staminaBeforeFailure = actor.Stamina;
+            if (actor.Stamina > 0f)
+                actor.Stamina = Math.Max(0f, actor.Stamina - StaminaCostPerAction);
+            return NativeActionStepResult.Failed(
+                FailureMessage,
+                playerActionRequired: SimulatePlayerActionRequired,
+                staminaCost: staminaBeforeFailure - actor.Stamina);
         }
 
+        float staminaBeforeSuccess = actor.Stamina;
         if (actor.Stamina > 0f)
             actor.Stamina = Math.Max(0f, actor.Stamina - StaminaCostPerAction);
 
         return NativeActionStepResult.Succeeded(
             request.Kind.ToString().ToLowerInvariant(),
-            staminaCost: StaminaCostPerAction,
+            staminaCost: staminaBeforeSuccess - actor.Stamina,
             itemId: request.ItemId,
             itemCount: target.TargetId is null ? 1 : 0);
     }

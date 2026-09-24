@@ -1,10 +1,13 @@
 """Offline unit suite must never invoke an installed model provider."""
+import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+import stardew_ai_runtime.compatibility as compat_module
 from stardew_ai_runtime.compatibility import CompatibilityError, assert_native_compatible
 from stardew_ai_runtime.scheduler import DiscoveryError, resolve_discovery
 
@@ -41,3 +44,43 @@ def bound_native_game() -> Path:
     except CompatibilityError as ex:
         pytest.skip(str(ex))
     return run_dir
+
+
+@pytest.fixture
+def native_compatible_run_dir(tmp_path: Path, monkeypatch) -> Path:
+    """Synthetic run_dir that passes the real compatibility gate without a game.
+
+    Builds the minimal local-dev pairing under tmp_path — a mod dir whose DLL
+    sha256 matches a local-dev manifest — and points the gate's repo-root anchor
+    (compatibility.__file__) at the same tmp tree. This is the exact recipe of
+    test_compatibility_local_dev.py: assert_native_compatible itself runs
+    unmocked against synthetic pairing materials; only the anchor that locates
+    the repo's own artifacts/ and config/ is redirected. Core-logic unit tests
+    wired to fake clients should use this instead of bound_native_game so they
+    stop skipping wherever no game instance is bound.
+    """
+    repo_root = tmp_path / "repo"
+    mod_dir = repo_root / "Mods" / "StardewAI.Companion.Mod"
+    mod_dir.mkdir(parents=True)
+    dll = mod_dir / "StardewAI.Companion.Mod.dll"
+    dll.write_bytes(b"synthetic-local-dev-dll")
+    manifest = repo_root / "artifacts" / "releases" / "local-dev" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": "local-dev",
+                "manifestType": "local-dev",
+                "modSha256": hashlib.sha256(dll.read_bytes()).hexdigest().upper(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        compat_module,
+        "__file__",
+        str(repo_root / "runtime" / "src" / "stardew_ai_runtime" / "compatibility.py"),
+    )
+    assert_native_compatible(mod_dir)
+    return mod_dir

@@ -288,7 +288,7 @@ def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path) ->
     assert state.spend_reservations == {"cmd-pending": 40}
 
 
-def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp_path: Path, bound_native_game) -> None:
+def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp_path: Path, native_compatible_run_dir) -> None:
     client = MagicMock()
     client.is_connected = True
     client.save_id = "save-a"
@@ -299,7 +299,7 @@ def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp
         TimeoutError(),
         SimpleNamespace(payload={"terminalState": "succeeded", "details": {"totalCost": 0}}),
     ])
-    scheduler = CompanionScheduler(client=client, run_dir=bound_native_game)
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
 
     async def run() -> None:
         first = await scheduler.execute_purchase_items(

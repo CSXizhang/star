@@ -20,6 +20,41 @@ WINDOWS_POWERSHELL_ONLY = pytest.mark.skipif(
 )
 
 
+def _run_powershell(
+    cmd: list[str],
+    *,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+) -> subprocess.CompletedProcess[str]:
+    """Run one of the repo's PowerShell tools with pipes decoded to match the
+    encoding that script actually emits.
+
+    Bare ``text=True`` decodes with the locale preferred encoding (cp1252 on
+    this host), which crashes on the tools' real output bytes. Verified by
+    capturing raw bytes from each script:
+    - setup-companion.ps1 pins ``[Console]::OutputEncoding`` to BOM-less UTF-8,
+      and its DryRun progress output is UTF-8 Chinese (e.g. bytes E6 98 9F for
+      星) -> strict UTF-8 here.
+    - register-mcp.ps1 pins ASCII (its comment says double-click callers decode
+      with the legacy code page) and its captured output is pure ASCII, which
+      strict UTF-8 (a superset) matches exactly.
+    - start-companion.ps1 pins no encoding, so PowerShell falls back to the
+      console code page (locale-dependent). Its output is ASCII-only on every
+      code path these tests assert on, so ``errors="replace"`` only guards
+      against locale-localized error banners (e.g. a non-English ``throw``
+      rendering) that no assertion depends on.
+    """
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding=encoding,
+        errors=errors,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+
+
 def test_double_click_entry_files_exist() -> None:
     cmd_file = REPO_ROOT / "设置星露谷伙伴.cmd"
     bat_file = REPO_ROOT / "设置星露谷伙伴.bat"
@@ -45,7 +80,7 @@ def test_setup_companion_check_only() -> None:
         str(REPO_ROOT / "tools" / "setup-companion.ps1"),
         "-CheckOnly",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    res = _run_powershell(cmd)
     assert res.returncode == 0, f"CheckOnly failed: {res.stderr}\n{res.stdout}"
 
     # Parse JSON output
@@ -68,7 +103,7 @@ def test_setup_companion_dry_run() -> None:
         str(REPO_ROOT / "tools" / "setup-companion.ps1"),
         "-DryRun",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    res = _run_powershell(cmd)
     assert res.returncode == 0, f"DryRun failed: {res.stderr}\n{res.stdout}"
 
 
@@ -94,7 +129,7 @@ def test_setup_companion_isolated_install(tmp_path: Path) -> None:
         "-Agent",
         "none",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    res = _run_powershell(cmd)
     assert res.returncode == 0, f"AutoInstall failed: {res.stderr}\n{res.stdout}"
 
     # Verify 4 production files were copied
@@ -111,7 +146,7 @@ def test_setup_companion_isolated_install(tmp_path: Path) -> None:
     assert custom_data.read_text(encoding="utf-8") == '{"keep": true}'
 
     # Re-run for idempotency test
-    res2 = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    res2 = _run_powershell(cmd)
     assert res2.returncode == 0
     assert custom_data.read_text(encoding="utf-8") == '{"keep": true}'
 
@@ -130,7 +165,7 @@ def test_register_mcp_spaces_handling() -> None:
         "-Agent",
         "all",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    res = _run_powershell(cmd)
     assert res.returncode == 0, f"register-mcp failed: {res.stderr}\n{res.stdout}"
     assert "stardew-companion" in res.stdout
     assert "mcpServers" in res.stdout
@@ -186,7 +221,7 @@ def _run_local_dev_onboarding_case(tmp_path: Path, installed_cfg: Path) -> None:
         "-Agent",
         "none",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    res = _run_powershell(cmd)
     assert res.returncode == 0, f"AutoInstall failed: {res.stderr}\n{res.stdout}"
 
     installed_cfg = REPO_ROOT / "config" / "installed-candidate.json"
@@ -219,7 +254,7 @@ def _run_local_dev_onboarding_case(tmp_path: Path, installed_cfg: Path) -> None:
         str(REPO_ROOT / "tools" / "start-companion.ps1"),
         "-CheckOnly",
     ]
-    start_res = subprocess.run(start_cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    start_res = _run_powershell(start_cmd, errors="replace")
     assert start_res.returncode == 0, f"start-companion -CheckOnly failed: {start_res.stderr}\n{start_res.stdout}"
     assert "Candidate local-dev" in start_res.stdout
 
@@ -232,7 +267,7 @@ def _run_local_dev_onboarding_case(tmp_path: Path, installed_cfg: Path) -> None:
     assert "tools/build-mod.ps1 与 tools/setup-companion.ps1" in err
 
     # 4. DLL modified -> start-companion.ps1 also catches difference and suggests rebuild + setup
-    start_tampered = subprocess.run(start_cmd, capture_output=True, text=True, cwd=str(REPO_ROOT), check=False)
+    start_tampered = _run_powershell(start_cmd, errors="replace")
     assert start_tampered.returncode != 0
     assert "Installed Mod and local-dev runtime differ" in start_tampered.stderr or "Installed Mod and local-dev runtime differ" in start_tampered.stdout
     assert "setup-companion.ps1" in (start_tampered.stderr + start_tampered.stdout)

@@ -40,6 +40,13 @@ public interface IWorldObserver
     bool IsMainThread { get; }
 
     /// <summary>
+    /// Checks whether a named location is loaded and can host companion work. The
+    /// companion works on its own logical map, which may differ from the player's
+    /// active map (<see cref="CurrentLocationName"/>).
+    /// </summary>
+    bool LocationExists(string locationName);
+
+    /// <summary>
     /// Evaluates if a given tile is passable without collision.
     /// </summary>
     bool IsTilePassable(string locationName, TileCoordinate tile);

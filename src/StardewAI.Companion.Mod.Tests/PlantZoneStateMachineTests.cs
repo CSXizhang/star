@@ -252,4 +252,36 @@ public class PlantZoneStateMachineTests
         Assert.NotNull(result);
         Assert.Equal(ExecutionState.Cancelled, result.FinalState);
     }
+
+    [Theory]
+    [InlineData("Farm", "FarmHouse", true)]
+    [InlineData("FarmHouse", "Farm", false)]
+    public void LocationValidationUsesCompanionNotPlayer(string companionLocation, string playerLocation, bool expectedAccepted)
+    {
+        // After an overnight pass-out the player wakes in the FarmHouse while the
+        // companion is still on the Farm; zone validation must follow the companion.
+        var (machine, actor, observer, _) = CreateHarness();
+        actor.UpdatePose(companionLocation, new TileCoordinate(10, 10), FacingDirection.Down);
+        observer.CurrentLocationName = playerLocation;
+
+        var request = new PlantZoneRequest(
+            CommandId: "cmd-loc",
+            TaskId: "task-loc",
+            LocationId: "Farm",
+            SeedItemId: "472",
+            TargetTiles: new[] { new TileCoordinate(10, 12) }
+        );
+
+        Assert.Equal(expectedAccepted, machine.Start(request, out var early));
+        if (expectedAccepted)
+        {
+            Assert.Null(early);
+        }
+        else
+        {
+            Assert.NotNull(early);
+            Assert.Equal(ExecutionState.Rejected, early!.FinalState);
+            Assert.Equal("LOCATION_MISMATCH", early.ErrorCode);
+        }
+    }
 }

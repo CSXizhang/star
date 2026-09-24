@@ -107,8 +107,11 @@ public class NormalWateringCanAdapterTests
     }
 
     [Fact]
-    public void MapMismatch_FailsImmediately()
+    public void UnknownMap_FailsImmediately()
     {
+        // The player's active map no longer gates watering; only an unloadable
+        // target map fails. The companion may water the Farm while the player
+        // is elsewhere (e.g. FarmHouse the morning after a pass-out).
         var observer = new SimulatedWorldObserver { CurrentLocationName = "Town" };
         var monitor = new TestMonitor();
         var adapter = new NormalWateringCanAdapter(observer, monitor);
@@ -117,9 +120,9 @@ public class NormalWateringCanAdapterTests
         var targetTile = new TileCoordinate(64, 16);
         actor.UpdatePose("Farm", new TileCoordinate(64, 15), FacingDirection.Down);
 
-        var result = adapter.WaterTile(actor, "Farm", targetTile);
+        var result = adapter.WaterTile(actor, "Nowhere", targetTile);
 
         Assert.False(result.Success);
-        Assert.Contains("does not match active map", result.ErrorMessage);
+        Assert.Contains("not loaded or does not exist", result.ErrorMessage);
     }
 }

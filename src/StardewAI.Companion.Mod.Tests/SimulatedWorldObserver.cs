@@ -20,6 +20,12 @@ public sealed class SimulatedWorldObserver : IWorldObserver
     public bool IsMainThread { get; set; } = true;
     public bool PlayerOnSameMap { get; set; } = true;
 
+    /// <summary>Locations the simulation treats as loaded; defaults to the Farm.</summary>
+    public HashSet<string> KnownLocations { get; } = new(StringComparer.OrdinalIgnoreCase) { "Farm" };
+
+    public bool LocationExists(string locationName) =>
+        !string.IsNullOrWhiteSpace(locationName) && KnownLocations.Contains(locationName);
+
     private readonly HashSet<TileCoordinate> _warpOrDoorTiles = new();
 
     public void SetPassable(TileCoordinate tile, bool passable) => _passability[tile] = passable;

@@ -47,11 +47,12 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
             return WaterTileResult.Failed("Watering can operation rejected: must execute on the game main thread.");
         }
 
-        // 2. Current map invariant
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        // 2. Target map must be loaded. The companion works on its own logical map,
+        // which may differ from the player's active map (e.g. the morning after a
+        // pass-out the player wakes in the FarmHouse while the companion is on the Farm).
+        if (!_observer.LocationExists(locationName))
         {
-            return WaterTileResult.Failed(
-                $"Watering target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+            return WaterTileResult.Failed($"Watering target map '{locationName}' is not loaded or does not exist.");
         }
 
         // 3. Precheck empty can (CRITICAL: prevent invoking game empty-can path which touches Game1.player)
@@ -93,7 +94,7 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         try
         {
             // 8. Execute tool action through actual WateringCan lifecycle
-            var location = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+            var location = Game1.getLocationFromName(locationName);
             if (location is null)
             {
                 return WaterTileResult.Failed($"Game location '{locationName}' not found.");

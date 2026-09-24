@@ -172,4 +172,37 @@ public sealed class ShippingStateMachineTests
         Assert.NotNull(payload);
         Assert.Equal("cancelled", payload.TerminalState);
     }
+
+    [Theory]
+    [InlineData("Farm", "FarmHouse", true)]
+    [InlineData("FarmHouse", "Farm", false)]
+    public void LocationValidationUsesCompanionNotPlayer(string companionLocation, string playerLocation, bool expectedAccepted)
+    {
+        // After an overnight pass-out the player wakes in the FarmHouse while the
+        // companion is still on the Farm; zone validation must follow the companion.
+        var (machine, actor, observer, _) = CreateTestContext(new TileCoordinate(71, 15));
+        actor.TryAddItemToInventory(new InventoryItem("(O)24", "Parsnip", stack: 4));
+        actor.UpdatePose(companionLocation, new TileCoordinate(71, 15), FacingDirection.Down);
+        observer.CurrentLocationName = playerLocation;
+
+        var request = new ShippingRequest(
+            CommandId: "cmd-loc",
+            TaskId: "task-loc",
+            LocationId: "Farm",
+            Items: new[] { new ShippingItemRequest("(O)24", 2) }
+        );
+
+        Assert.Equal(expectedAccepted, machine.Start(request, out var early));
+        if (expectedAccepted)
+        {
+            Assert.Null(early);
+            machine.RequestCancel("test cleanup");
+        }
+        else
+        {
+            Assert.NotNull(early);
+            Assert.Equal(ExecutionState.Rejected, early!.FinalState);
+            Assert.Equal("LOCATION_MISMATCH", early.ErrorCode);
+        }
+    }
 }

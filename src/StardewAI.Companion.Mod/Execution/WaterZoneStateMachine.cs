@@ -138,13 +138,14 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (_observer.CurrentLocationName is not null &&
-                !string.Equals(_observer.CurrentLocationName, request.LocationId, StringComparison.OrdinalIgnoreCase))
+            // The observer's current map belongs to the player. Zone work runs on the
+            // companion, which may have navigated into a different location.
+            if (!string.Equals(_actor.LocationName, request.LocationId, StringComparison.OrdinalIgnoreCase))
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    $"Location mismatch: Companion is on map '{_observer.CurrentLocationName}', but request specifies '{request.LocationId}'.",
+                    $"Location mismatch: Companion is on map '{_actor.LocationName}', but request specifies '{request.LocationId}'.",
                     "LOCATION_MISMATCH");
                 return false;
             }

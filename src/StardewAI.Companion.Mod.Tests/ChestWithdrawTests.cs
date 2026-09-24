@@ -181,4 +181,23 @@ public sealed class ChestWithdrawTests
         Assert.Equal("Carrot Seeds", item.Name);
         Assert.Equal("(O)CarrotSeeds", item.ItemId);
     }
+
+    [Fact]
+    public void LocationValidationUsesCompanionNotPlayer()
+    {
+        // The player stands on the Farm while the companion is elsewhere. A guard
+        // keyed on the player's map would accept; the companion-keyed guard rejects.
+        var (machine, actor, observer, _) = CreateTestContext(new TileCoordinate(10, 10), new TileCoordinate(11, 10));
+        actor.TryAddItemToInventory(new InventoryItem("(O)184", "Milk", 1));
+        actor.UpdatePose("FarmHouse", new TileCoordinate(10, 10), FacingDirection.Down);
+        observer.CurrentLocationName = "Farm";
+
+        var request = new ChestActionRequest("cmd-loc", "task-loc", ChestActionKind.Deposit,
+            "Farm", new TileCoordinate(11, 10), ItemIds: new[] { "(O)184" });
+
+        Assert.False(machine.Start(request, out var early));
+        Assert.NotNull(early);
+        Assert.Equal(ExecutionState.Rejected, early!.FinalState);
+        Assert.Equal("LOCATION_MISMATCH", early.ErrorCode);
+    }
 }

@@ -30,6 +30,9 @@ public sealed class GameWorldObserver : IWorldObserver
 
     public bool IsMainThread => Environment.CurrentManagedThreadId == _mainThreadId;
 
+    public bool LocationExists(string locationName) =>
+        !string.IsNullOrWhiteSpace(locationName) && Game1.getLocationFromName(locationName) is not null;
+
     public GameWorldObserver(IMonitor monitor)
     {
         _monitor = monitor ?? throw new ArgumentNullException(nameof(monitor));

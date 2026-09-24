@@ -223,4 +223,36 @@ public class HoeZoneStateMachineTests
         Assert.Equal(ExecutionState.Succeeded, machine.FinalResult.FinalState);
         Assert.True(observer.GetDirtState("Farm", t1).IsTilled);
     }
+
+    [Theory]
+    [InlineData("Farm", "FarmHouse", true)]
+    [InlineData("FarmHouse", "Farm", false)]
+    public void LocationValidationUsesCompanionNotPlayer(string companionLocation, string playerLocation, bool expectedAccepted)
+    {
+        // After an overnight pass-out the player wakes in the FarmHouse while the
+        // companion is still on the Farm; zone validation must follow the companion.
+        var (machine, actor, observer, _) = CreateHarness();
+        actor.UpdatePose(companionLocation, new TileCoordinate(10, 10), FacingDirection.Down);
+        observer.CurrentLocationName = playerLocation;
+
+        var request = new HoeZoneRequest(
+            CommandId: "cmd-loc",
+            TaskId: "task-loc",
+            LocationId: "Farm",
+            TargetTiles: new[] { new TileCoordinate(10, 12) },
+            MaxStamina: 50f
+        );
+
+        Assert.Equal(expectedAccepted, machine.Start(request, out var early));
+        if (expectedAccepted)
+        {
+            Assert.Null(early);
+        }
+        else
+        {
+            Assert.NotNull(early);
+            Assert.Equal(ExecutionState.Rejected, early!.FinalState);
+            Assert.Equal("LOCATION_MISMATCH", early.ErrorCode);
+        }
+    }
 }

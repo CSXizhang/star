@@ -170,10 +170,10 @@ def test_create_execute_native_action_envelope_shape() -> None:
     assert env.payload["budgets"]["maxGameMinutes"] == 60
 
 
-def test_scheduler_apply_fertilizer_dispatches_allowlisted_command() -> None:
+def test_scheduler_apply_fertilizer_dispatches_allowlisted_command(bound_native_game) -> None:
     async def run():
         client = _client()
-        scheduler = CompanionScheduler(client=client)
+        scheduler = CompanionScheduler(client=client, run_dir=bound_native_game)
         res = await scheduler.apply_fertilizer(
             tiles=[{"x": 64, "y": 14}],
             fertilizer_item_id="(O)368",
@@ -221,10 +221,10 @@ def test_scheduler_insert_machine_validates_count_and_item() -> None:
     asyncio.run(run())
 
 
-def test_scheduler_chop_tree_dispatches_allowlisted_command() -> None:
+def test_scheduler_chop_tree_dispatches_allowlisted_command(bound_native_game) -> None:
     async def run():
         client = _client()
-        scheduler = CompanionScheduler(client=client)
+        scheduler = CompanionScheduler(client=client, run_dir=bound_native_game)
         res = await scheduler.chop_tree(tiles=[{"x": 60, "y": 12}], location_id="Farm")
         assert res["terminalState"] == "succeeded"
         client.execute_native_action.assert_awaited_once()
@@ -248,13 +248,13 @@ def test_scheduler_chop_tree_rejects_empty_tiles() -> None:
     asyncio.run(run())
 
 
-def test_scheduler_refill_uses_snapshot_refill_tiles() -> None:
+def test_scheduler_refill_uses_snapshot_refill_tiles(bound_native_game) -> None:
     import asyncio
 
     async def run():
         snapshot = _snapshot_env({"farming": {"location": "Farm", "refillWaterTiles": [{"x": 66, "y": 15}]}})
         client = _client(snapshot)
-        scheduler = CompanionScheduler(client=client)
+        scheduler = CompanionScheduler(client=client, run_dir=bound_native_game)
         await scheduler.refill_watering_can(location_id="Farm")
         kwargs = client.execute_native_action.await_args.kwargs
         assert kwargs["skill_id"] == "refill-watering-can"
@@ -536,7 +536,7 @@ def test_trigger_validation_names_allowed_kinds(tmp_path: Path) -> None:
     assert todo["todo"]["trigger"]["type"] == "inventory"
 
 
-def test_refill_public_tool_forwards_optional_explicit_native_tile(tmp_path: Path) -> None:
+def test_refill_public_tool_forwards_optional_explicit_native_tile(tmp_path: Path, provider_decision_context) -> None:
     import asyncio
     async def run():
         scheduler = MagicMock()

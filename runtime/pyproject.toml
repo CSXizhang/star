@@ -28,7 +28,7 @@ packages = ["src/stardew_ai_runtime"]
 [tool.pytest.ini_options]
 addopts = "-q"
 pythonpath = ["src"]
-testpaths = ["runtime/tests"]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

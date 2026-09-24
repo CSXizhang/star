@@ -280,10 +280,10 @@ def test_scheduler_get_status(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_single_active_task_policy(mock_transport_client):
+def test_scheduler_single_active_task_policy(mock_transport_client, bound_native_game):
     """Enforces that concurrent task execution is rejected."""
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         wait_event = asyncio.Event()
 
@@ -339,9 +339,9 @@ def test_scheduler_single_active_task_policy(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_idempotency_key_generation(mock_transport_client):
+def test_scheduler_idempotency_key_generation(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         result_env = Envelope.from_mapping({
             "protocolVersion": "0.1",
@@ -394,9 +394,9 @@ def test_scheduler_control_actions_when_idle_raises(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_pause_resume_cancel_lifecycle(mock_transport_client):
+def test_scheduler_pause_resume_cancel_lifecycle(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         wait_event = asyncio.Event()
 
@@ -564,7 +564,7 @@ def test_scheduler_water_auto_no_work(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_water_auto_with_work_within_budget(mock_transport_client):
+def test_scheduler_water_auto_with_work_within_budget(mock_transport_client, bound_native_game):
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
             "tilledUnwateredTiles": [
@@ -576,7 +576,7 @@ def test_scheduler_water_auto_with_work_within_budget(mock_transport_client):
             "isTruncated": False,
             "matureCropCount": 1,
         }
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         result_env = Envelope.from_mapping({
             "protocolVersion": "0.1",
@@ -613,7 +613,7 @@ def test_scheduler_water_auto_with_work_within_budget(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_water_auto_compact_snapshot_targets_crops_only(mock_transport_client):
+def test_scheduler_water_auto_compact_snapshot_targets_crops_only(mock_transport_client, bound_native_game):
     async def run():
         # The compact query used by water_auto must retain native crop-only
         # candidates; the empty tilled tile is an intentional negative target.
@@ -626,7 +626,7 @@ def test_scheduler_water_auto_compact_snapshot_targets_crops_only(mock_transport
             "isTruncated": False,
             "matureCropCount": 0,
         }
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-crop-only")
         mock_transport_client.wait_for_result = AsyncMock(return_value=Envelope.from_mapping({
             "protocolVersion": "0.1",
@@ -659,7 +659,7 @@ def test_scheduler_water_auto_compact_snapshot_targets_crops_only(mock_transport
     asyncio.run(run())
 
 
-def test_scheduler_water_auto_with_truncation(mock_transport_client):
+def test_scheduler_water_auto_with_truncation(mock_transport_client, bound_native_game):
     async def run():
         # 10 unwatered tiles, max_tiles=4
         tiles = [{"x": 60 + i, "y": 10} for i in range(10)]
@@ -669,7 +669,7 @@ def test_scheduler_water_auto_with_truncation(mock_transport_client):
             "isTruncated": False,
             "matureCropCount": 0,
         }
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         result_env = Envelope.from_mapping({
             "protocolVersion": "0.1",
@@ -706,7 +706,7 @@ def test_scheduler_water_auto_with_truncation(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_water_auto_concurrent_rejection(mock_transport_client):
+def test_scheduler_water_auto_concurrent_rejection(mock_transport_client, bound_native_game):
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
             "tilledUnwateredTiles": [{"x": 64, "y": 15}],
@@ -714,7 +714,7 @@ def test_scheduler_water_auto_concurrent_rejection(mock_transport_client):
             "isTruncated": False,
             "matureCropCount": 0,
         }
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         wait_event = asyncio.Event()
 
@@ -835,7 +835,7 @@ def test_scheduler_harvest_auto_no_work(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_harvest_auto_executed(mock_transport_client):
+def test_scheduler_harvest_auto_executed(mock_transport_client, bound_native_game):
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
             "tilledUnwateredTiles": [],
@@ -849,7 +849,7 @@ def test_scheduler_harvest_auto_executed(mock_transport_client):
             ],
             "matureCropsTruncated": True,
         }
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         result_env = _make_skill_result_envelope(
             command_id="cmd-harvest-1",
@@ -900,14 +900,14 @@ def test_scheduler_harvest_auto_executed(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_harvest_auto_task_id_prefix(mock_transport_client):
+def test_scheduler_harvest_auto_task_id_prefix(mock_transport_client, bound_native_game):
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
             "matureCropCount": 1,
             "matureCrops": [{"x": 64, "y": 15, "cropId": "(O)24"}],
             "matureCropsTruncated": False,
         }
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         async def capture_execute(**kwargs):
             return "cmd-harvest-2"
@@ -960,9 +960,9 @@ def test_scheduler_deposit_to_chest_invalid_item_ids(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_deposit_to_chest_executed(mock_transport_client):
+def test_scheduler_deposit_to_chest_executed(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         result_env = _make_skill_result_envelope(
             command_id="cmd-deposit-1",
@@ -1014,9 +1014,9 @@ def test_scheduler_deposit_to_chest_executed(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_organize_chest_executed(mock_transport_client):
+def test_scheduler_organize_chest_executed(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         result_env = _make_skill_result_envelope(
             command_id="cmd-organize-1",
@@ -1073,10 +1073,10 @@ def test_scheduler_organize_chest_invalid_coords(mock_transport_client, bad_coor
     asyncio.run(run())
 
 
-def test_scheduler_chest_skills_concurrent_rejection(mock_transport_client):
+def test_scheduler_chest_skills_concurrent_rejection(mock_transport_client, bound_native_game):
     """Deposit/organize are rejected while another task is active."""
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         wait_event = asyncio.Event()
 
@@ -1621,9 +1621,9 @@ def test_scheduler_query_planting_options_explicit_unknown(mock_transport_client
     asyncio.run(run())
 
 
-def test_scheduler_execute_hoe_tiles(mock_transport_client):
+def test_scheduler_execute_hoe_tiles(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         mock_transport_client.execute_hoe_tiles = AsyncMock(return_value="cmd-hoe-test-01")
         mock_transport_client.wait_for_result = AsyncMock(
             return_value=Envelope(
@@ -1666,9 +1666,9 @@ def test_scheduler_execute_hoe_tiles(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_execute_plant_seeds(mock_transport_client):
+def test_scheduler_execute_plant_seeds(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         mock_transport_client.execute_plant_seeds = AsyncMock(return_value="cmd-plant-test-01")
         mock_transport_client.wait_for_result = AsyncMock(
             return_value=Envelope(
@@ -1875,9 +1875,9 @@ def test_scheduler_validate_ship_items():
     ]
 
 
-def test_scheduler_execute_ship_items(mock_transport_client):
+def test_scheduler_execute_ship_items(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         mock_transport_client.execute_ship_items = AsyncMock(return_value="cmd-ship-test-01")
         mock_transport_client.wait_for_result = AsyncMock(
             return_value=Envelope(
@@ -1939,9 +1939,9 @@ def test_scheduler_execute_ship_items(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_execute_navigate_to(mock_transport_client):
+def test_scheduler_execute_navigate_to(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         mock_transport_client.execute_navigate_to = AsyncMock(return_value="cmd-nav-test-01")
         mock_transport_client.wait_for_result = AsyncMock(
             return_value=Envelope(
@@ -2041,9 +2041,9 @@ def test_scheduler_validate_purchase_items():
     ]
 
 
-def test_scheduler_execute_purchase_items(mock_transport_client):
+def test_scheduler_execute_purchase_items(mock_transport_client, bound_native_game):
     async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         mock_transport_client.execute_purchase_items = AsyncMock(
             return_value="cmd-purchase-test-01"
         )
@@ -2115,7 +2115,7 @@ def test_scheduler_execute_purchase_items(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_task_timeout_returns_executing_and_retains_active_task(mock_transport_client):
+def test_scheduler_task_timeout_returns_executing_and_retains_active_task(mock_transport_client, bound_native_game):
     """Timeout does not mean task failure. Status is executing, active task is retained, blind re-dispatch blocked."""
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
@@ -2127,7 +2127,7 @@ def test_scheduler_task_timeout_returns_executing_and_retains_active_task(mock_t
         mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-water-slow-1")
         mock_transport_client.wait_for_result = AsyncMock(side_effect=TimeoutError("Timed out"))
 
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         res = await scheduler.water_auto(max_tiles=10, timeout_seconds=1.0)
         assert res["status"] == "executing"
@@ -2174,7 +2174,7 @@ def test_scheduler_task_timeout_returns_executing_and_retains_active_task(mock_t
     asyncio.run(run())
 
 
-def test_scheduler_get_status_settles_completed_task(mock_transport_client):
+def test_scheduler_get_status_settles_completed_task(mock_transport_client, bound_native_game):
     """get_status detects background task completion via cached result."""
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
@@ -2185,7 +2185,7 @@ def test_scheduler_get_status_settles_completed_task(mock_transport_client):
         mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-water-bg-1")
         mock_transport_client.wait_for_result = AsyncMock(side_effect=TimeoutError("Timed out"))
 
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         res = await scheduler.water_auto(max_tiles=10)
         assert res["status"] == "executing"
         assert scheduler.has_active_task is True
@@ -2215,7 +2215,7 @@ def test_scheduler_get_status_settles_completed_task(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_pause_and_cancel_immediate_on_running_task(mock_transport_client):
+def test_scheduler_pause_and_cancel_immediate_on_running_task(mock_transport_client, bound_native_game):
     """Running task after timeout can be paused and cancelled immediately."""
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
@@ -2228,7 +2228,7 @@ def test_scheduler_pause_and_cancel_immediate_on_running_task(mock_transport_cli
         mock_transport_client.pause_skill = AsyncMock()
         mock_transport_client.cancel_skill = AsyncMock()
 
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
         await scheduler.water_auto(max_tiles=10)
 
         assert scheduler.has_active_task is True
@@ -2437,7 +2437,7 @@ def test_scheduler_plant_crop_workflow_blocked_no_seeds(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_navigate_to_dynamic_shop_and_unsupported_landmark(mock_transport_client):
+def test_scheduler_navigate_to_dynamic_shop_and_unsupported_landmark(mock_transport_client, bound_native_game):
     """navigate_to resolves dynamic shop interactionTile from snapshot, and rejects unsupported landmarks."""
     async def run():
         mock_transport_client.latest_snapshot.payload["shop"] = {
@@ -2464,7 +2464,7 @@ def test_scheduler_navigate_to_dynamic_shop_and_unsupported_landmark(mock_transp
                 },
             )
         )
-        scheduler = CompanionScheduler(client=mock_transport_client)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=bound_native_game)
 
         # 1. Omitting tile resolves dynamic shop interactionTile
         res = await scheduler.execute_navigate_to(location_id="SeedShop")

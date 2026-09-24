@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The onboarding wizard, registration and start scripts are Windows PowerShell
+# only; their end-to-end tests run only where PowerShell actually exists.
+WINDOWS_POWERSHELL_ONLY = pytest.mark.skipif(
+    sys.platform != "win32" or shutil.which("powershell.exe") is None,
+    reason="onboarding wizard scripts require Windows PowerShell",
+)
 
 
 def test_double_click_entry_files_exist() -> None:
@@ -23,6 +34,7 @@ def test_double_click_entry_files_exist() -> None:
     assert "-STA" in content_cmd
 
 
+@WINDOWS_POWERSHELL_ONLY
 def test_setup_companion_check_only() -> None:
     cmd = [
         "powershell.exe",
@@ -45,6 +57,7 @@ def test_setup_companion_check_only() -> None:
         assert "TargetModDir" in data["ModStatus"]
 
 
+@WINDOWS_POWERSHELL_ONLY
 def test_setup_companion_dry_run() -> None:
     cmd = [
         "powershell.exe",
@@ -59,6 +72,7 @@ def test_setup_companion_dry_run() -> None:
     assert res.returncode == 0, f"DryRun failed: {res.stderr}\n{res.stdout}"
 
 
+@WINDOWS_POWERSHELL_ONLY
 def test_setup_companion_isolated_install(tmp_path: Path) -> None:
     # Test installing into a path with spaces and Chinese characters
     iso_mod_dir = tmp_path / "测试 安装 目录 with spaces" / "Mods" / "StardewAI.Companion.Mod"
@@ -102,6 +116,7 @@ def test_setup_companion_isolated_install(tmp_path: Path) -> None:
     assert custom_data.read_text(encoding="utf-8") == '{"keep": true}'
 
 
+@WINDOWS_POWERSHELL_ONLY
 def test_register_mcp_spaces_handling() -> None:
     cmd = [
         "powershell.exe",
@@ -121,6 +136,7 @@ def test_register_mcp_spaces_handling() -> None:
     assert "mcpServers" in res.stdout
 
 
+@WINDOWS_POWERSHELL_ONLY
 def test_setup_companion_local_dev_manifest_and_compatibility(tmp_path: Path) -> None:
     # The wizard writes repo-level binding state; snapshot and restore it so the
     # production binding survives the test regardless of outcome.

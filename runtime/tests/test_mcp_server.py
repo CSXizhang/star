@@ -727,7 +727,7 @@ def test_mcp_server_call_query_farm_work(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_water_zone(mock_scheduler):
+def test_mcp_server_call_water_zone(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         # Default concise call
@@ -751,7 +751,7 @@ def test_mcp_server_call_water_zone(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_water_auto(mock_scheduler):
+def test_mcp_server_call_water_auto(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         # Default concise call
@@ -811,7 +811,7 @@ def test_mcp_server_call_query_chests(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_harvest_auto(mock_scheduler):
+def test_mcp_server_call_harvest_auto(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool("harvest_auto", {"max_tiles": 10})
@@ -830,7 +830,7 @@ def test_mcp_server_call_harvest_auto(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_harvest_auto_default(mock_scheduler):
+def test_mcp_server_call_harvest_auto_default(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool("harvest_auto", {})
@@ -841,7 +841,7 @@ def test_mcp_server_call_harvest_auto_default(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_deposit_to_chest(mock_scheduler):
+def test_mcp_server_call_deposit_to_chest(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -867,7 +867,7 @@ def test_mcp_server_call_deposit_to_chest(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler):
+def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -882,7 +882,7 @@ def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_withdraw_from_chest(mock_scheduler):
+def test_mcp_server_call_withdraw_from_chest(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -918,7 +918,7 @@ def test_mcp_server_call_withdraw_from_chest(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_organize_chest(mock_scheduler):
+def test_mcp_server_call_organize_chest(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -974,7 +974,7 @@ def test_mcp_server_call_query_shop(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_hoe_tiles(mock_scheduler):
+def test_mcp_server_call_hoe_tiles(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -997,7 +997,7 @@ def test_mcp_server_call_hoe_tiles(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_plant_seeds(mock_scheduler):
+def test_mcp_server_call_plant_seeds(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -1022,7 +1022,7 @@ def test_mcp_server_call_plant_seeds(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_ship_items(mock_scheduler):
+def test_mcp_server_call_ship_items(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -1052,7 +1052,7 @@ def test_mcp_server_call_ship_items(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_purchase_items(mock_scheduler):
+def test_mcp_server_call_purchase_items(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -1084,7 +1084,7 @@ def test_mcp_server_call_purchase_items(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_navigate_to(mock_scheduler):
+def test_mcp_server_call_navigate_to(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -1132,7 +1132,7 @@ def test_mcp_server_call_navigate_to(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_controls(mock_scheduler):
+def test_mcp_server_call_controls(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
 
@@ -1181,7 +1181,7 @@ def test_mcp_controls_disable_autonomy_before_no_active_task(tmp_path: Path, moc
     asyncio.run(run())
 
 
-def test_mcp_server_error_handling(mock_scheduler):
+def test_mcp_server_error_handling(mock_scheduler, provider_decision_context):
     async def run():
         from stardew_ai_runtime.scheduler import PolicyViolationError
         mock_scheduler.execute_water_zone.side_effect = PolicyViolationError(
@@ -1199,7 +1199,7 @@ def test_mcp_server_error_handling(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_new_tools_error_mapping(mock_scheduler):
+def test_mcp_server_new_tools_error_mapping(mock_scheduler, provider_decision_context):
     async def run():
         from stardew_ai_runtime.scheduler import PolicyViolationError, SchedulerError
 
@@ -1282,7 +1282,7 @@ def test_mcp_server_new_tools_error_mapping(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_state_closing_loop_fresh_and_details():
+def test_mcp_server_state_closing_loop_fresh_and_details(provider_decision_context):
     """Verifies that post-action state closure accurately consumes fresh snapshots
 
     and preserves crucial decision details like inventoryFull and chestFull.
@@ -1458,7 +1458,7 @@ def test_mcp_server_state_closing_loop_fresh_and_details():
     asyncio.run(run())
 
 
-def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path):
+def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path, provider_decision_context):
     """End-to-end integration test spawning MCP server process via stdio client against mock server.
 
     NOTE: This integration test runs against MockModTransportServer on loopback
@@ -1542,7 +1542,7 @@ def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path):
     asyncio.run(run())
 
 
-def test_mcp_server_call_plant_crop_workflow(mock_scheduler):
+def test_mcp_server_call_plant_crop_workflow(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -1580,7 +1580,7 @@ def test_mcp_server_call_plant_crop_workflow(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_navigate_to_with_landmark(mock_scheduler):
+def test_mcp_server_call_navigate_to_with_landmark(mock_scheduler, provider_decision_context):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         content, data = await server.call_tool(
@@ -1685,7 +1685,7 @@ def test_mcp_server_call_query_shop_filter(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_navigate_to_xy_and_executing_status(mock_scheduler):
+def test_mcp_server_navigate_to_xy_and_executing_status(mock_scheduler, provider_decision_context):
     async def run():
         mock_scheduler.execute_navigate_to = AsyncMock(return_value={
             "status": "executing",
@@ -1715,7 +1715,7 @@ def test_mcp_server_navigate_to_xy_and_executing_status(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_water_auto_blocked_targets_actionable_summary(mock_scheduler):
+def test_mcp_server_water_auto_blocked_targets_actionable_summary(mock_scheduler, provider_decision_context):
     async def run():
         mock_scheduler.water_auto = AsyncMock(return_value={
             "status": "executed",
@@ -1750,7 +1750,7 @@ def test_mcp_server_water_auto_blocked_targets_actionable_summary(mock_scheduler
     asyncio.run(run())
 
 
-def test_mcp_server_executing_status_propagation(mock_scheduler):
+def test_mcp_server_executing_status_propagation(mock_scheduler, provider_decision_context):
     async def run():
         exec_payload = {
             "status": "executing",
@@ -1784,7 +1784,7 @@ def test_mcp_server_executing_status_propagation(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_work_plan_runs_step_and_goes_idle(mock_scheduler, tmp_path):
+def test_mcp_work_plan_runs_step_and_goes_idle(mock_scheduler, tmp_path, provider_decision_context):
     """Harness worker claims a ready step, executes the real scheduler op, and commits."""
     mock_scheduler.run_dir = None
 
@@ -1881,7 +1881,7 @@ def test_mcp_todo_due_selection_uses_latest_snapshot(mock_scheduler, tmp_path):
     asyncio.run(run())
 
 
-def test_progressive_disclosure_default_list_is_small_and_callable(mock_scheduler, tmp_path):
+def test_progressive_disclosure_default_list_is_small_and_callable(mock_scheduler, tmp_path, provider_decision_context):
     """Light surface lists common actions + write entries; base schemas stay callable.
 
     The generic default is the full legacy list (no existing tool disappears on
@@ -1970,7 +1970,7 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
     asyncio.run(run())
 
 
-def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_scheduler, tmp_path):
+def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_scheduler, tmp_path, provider_decision_context):
     """submit_plan revises a plan; remember_intent records agent goals/todos only."""
     mock_scheduler.run_dir = None
 
@@ -2035,7 +2035,7 @@ def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_schedul
     asyncio.run(run())
 
 
-def test_harvest_and_store_uses_authorized_chest_only(mock_scheduler, tmp_path):
+def test_harvest_and_store_uses_authorized_chest_only(mock_scheduler, tmp_path, provider_decision_context):
     mock_scheduler.run_dir = None
 
     async def run():
@@ -2055,7 +2055,7 @@ def test_harvest_and_store_uses_authorized_chest_only(mock_scheduler, tmp_path):
     asyncio.run(run())
 
 
-def test_internal_dispatch_plan_operation_forwards_stable_command_id(mock_scheduler, tmp_path):
+def test_internal_dispatch_plan_operation_forwards_stable_command_id(mock_scheduler, tmp_path, provider_decision_context):
     """The worker dispatch must reach the real method with the persisted id.
 
     ``call_capability`` is the model-facing schema and has no ``command_id``; using

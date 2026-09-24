@@ -147,7 +147,7 @@ def test_purchase_accounting_covers_cumulative_replay_and_unknown_result(tmp_pat
     assert ctl.state("save-a").spend_reservations["b"] == 4
 
 
-def test_free_purchase_entry_uses_native_quote_min_budget_and_command_replay(tmp_path: Path) -> None:
+def test_free_purchase_entry_uses_native_quote_min_budget_and_command_replay(tmp_path: Path, provider_decision_context) -> None:
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -182,7 +182,7 @@ def test_free_purchase_entry_uses_native_quote_min_budget_and_command_replay(tmp
     assert AutonomyController(tmp_path / "data" / "autonomy-state.json").state("save-a").daily_spend == 4
 
 
-def test_free_purchase_daily_limit_reservations_are_not_double_counted(tmp_path: Path) -> None:
+def test_free_purchase_daily_limit_reservations_are_not_double_counted(tmp_path: Path, provider_decision_context) -> None:
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -220,7 +220,7 @@ def test_free_purchase_daily_limit_reservations_are_not_double_counted(tmp_path:
     assert scheduler.execute_purchase_items.await_count == 2
 
 
-def test_free_purchase_unknown_terminal_keeps_reservation(tmp_path: Path) -> None:
+def test_free_purchase_unknown_terminal_keeps_reservation(tmp_path: Path, provider_decision_context) -> None:
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -245,7 +245,7 @@ def test_free_purchase_unknown_terminal_keeps_reservation(tmp_path: Path) -> Non
     assert state.spend_reservations == {"cmd-unknown": 10}
 
 
-def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path) -> None:
+def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path, provider_decision_context) -> None:
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -276,7 +276,7 @@ def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path) ->
     scheduler.execute_purchase_items.assert_not_awaited()
 
 
-def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp_path: Path) -> None:
+def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp_path: Path, bound_native_game) -> None:
     client = MagicMock()
     client.is_connected = True
     client.save_id = "save-a"
@@ -287,7 +287,7 @@ def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp
         TimeoutError(),
         SimpleNamespace(payload={"terminalState": "succeeded", "details": {"totalCost": 0}}),
     ])
-    scheduler = CompanionScheduler(client=client, run_dir=tmp_path)
+    scheduler = CompanionScheduler(client=client, run_dir=bound_native_game)
 
     async def run() -> None:
         first = await scheduler.execute_purchase_items(

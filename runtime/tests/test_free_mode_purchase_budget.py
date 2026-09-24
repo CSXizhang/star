@@ -16,10 +16,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from stardew_ai_runtime.autonomy import AutonomyController
+from stardew_ai_runtime.compatibility import CompatibilityError
 from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.protocol import Envelope
-from stardew_ai_runtime.scheduler import CompanionScheduler
+from stardew_ai_runtime.scheduler import (
+    CompanionScheduler,
+    PolicyViolationError,
+    SchedulerError,
+)
 from stardew_ai_runtime.work_state import WorkStore
 
 SAVE = "save-a"
@@ -294,32 +301,39 @@ def test_unknown_result_keeps_reservation_and_settles_once_on_reconcile(
 def test_terminal_results_settle_confirmed_cost_and_failure_refunds(
     native_compatible_run_dir,
 ) -> None:
-    """Success, failure and partial fill all settle by the confirmed real cost;
-    a failed purchase releases its reservation without charging."""
+    """Success, failure and a REAL partially-succeeded terminal all settle by
+    the confirmed real cost; failure/partial release the rest of the
+    reservation instead of blocking every later purchase."""
     _free_mode(native_compatible_run_dir, budget=100)
     client = _make_client([
-        SimpleNamespace(payload=_purchase_result("x", "succeeded", 40)),
-        SimpleNamespace(payload=_purchase_result("x", "failed", 0)),
-        SimpleNamespace(payload=_purchase_result("x", "succeeded", 10)),
+        SimpleNamespace(payload=_purchase_result("c1", "succeeded", 40)),
+        SimpleNamespace(payload=_purchase_result("c2", "failed", 0)),
+        SimpleNamespace(payload=_purchase_result("c3", "partially-succeeded", 10)),
     ])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
-    server = create_mcp_server(scheduler=scheduler, full=True)
-    store = _work_store(native_compatible_run_dir)
 
-    ok = asyncio.run(_run_purchase_plan(server, store, [{"itemId": MID, "count": 1}], 40, "decision-1"))
-    failed = asyncio.run(_run_purchase_plan(server, store, [{"itemId": MID, "count": 1}], 40, "decision-2"))
-    partial = asyncio.run(_run_purchase_plan(server, store, [{"itemId": CHEAP, "count": 2}], 20, "decision-3"))
+    async def run() -> None:
+        ok = await scheduler.execute_purchase_items(
+            items=[{"itemId": MID, "count": 1}], budget_limit=40, command_id="cmd-ok",
+        )
+        assert ok["terminalState"] == "succeeded"
+        failed = await scheduler.execute_purchase_items(
+            items=[{"itemId": MID, "count": 1}], budget_limit=40, command_id="cmd-failed",
+        )
+        assert failed["terminalState"] == "failed"
+        # Quote 20, native partially-succeeded: only the confirmed 10 is spent
+        # and the remaining reservation is released.
+        partial = await scheduler.execute_purchase_items(
+            items=[{"itemId": CHEAP, "count": 2}], budget_limit=20, command_id="cmd-partial",
+        )
+        assert partial["terminalState"] == "partially-succeeded"
+        assert client.execute_purchase_items.await_count == 3
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 50  # 40 + 0 (failure) + 10 (confirmed partial)
+        assert state.spend_reservations == {}
+        assert sorted(state.settled_spend_commands) == ["cmd-failed", "cmd-ok", "cmd-partial"]
 
-    assert ok["outcome"] == "completed"
-    assert failed["outcome"] == "partial"  # native terminal failed -> step deviation, cost refunded
-    assert partial["outcome"] == "completed"
-    assert client.execute_purchase_items.await_count == 3
-    state = _autonomy(native_compatible_run_dir).state(SAVE)
-    assert state.daily_spend == 50  # 40 + 0 (failure) + 10 (partial fill)
-    assert state.spend_reservations == {}
-    assert sorted(state.settled_spend_commands) == sorted(
-        [ok["commandId"], failed["commandId"], partial["commandId"]]
-    )
+    asyncio.run(run())
 
 
 def test_new_day_resets_budget_and_carries_unsettled_reservation(
@@ -413,3 +427,288 @@ def test_free_mode_without_configured_budget_rejects_purchases(native_compatible
 
     client.execute_purchase_items.assert_not_called()
     assert execution["reasonCode"] == "AUTONOMY_BUDGET_EXHAUSTED"
+
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: terminalState="partially-succeeded" is a real native purchase
+# terminal (PurchaseStateMachine: PartiallySucceeded => partially-succeeded,
+# always carrying a confirmed non-negative totalCost) but the ledger only
+# accepted succeeded/failed/cancelled, so partial spends never settled and
+# every later purchase stayed blocked on AUTONOMY_PENDING_RECONCILIATION.
+# ---------------------------------------------------------------------------
+
+
+def test_partially_succeeded_settles_confirmed_cost_and_unblocks_next_purchase(
+    native_compatible_run_dir,
+) -> None:
+    _free_mode(native_compatible_run_dir, budget=100)
+    client = _make_client([
+        SimpleNamespace(payload=_purchase_result("c1", "partially-succeeded", 10)),
+        SimpleNamespace(payload=_purchase_result("c2", "succeeded", 40)),
+    ])
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+
+    async def run() -> None:
+        # Quote 20; the native side partially filled the order for 10.
+        first = await scheduler.execute_purchase_items(
+            items=[{"itemId": CHEAP, "count": 2}], budget_limit=20, command_id="cmd-p1",
+        )
+        assert first["terminalState"] == "partially-succeeded"
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 10  # confirmed cost only
+        assert state.spend_reservations == {}  # the rest of the reservation is released
+
+        second = await scheduler.execute_purchase_items(
+            items=[{"itemId": MID, "count": 1}], budget_limit=40, command_id="cmd-p2",
+        )
+        assert second["terminalState"] == "succeeded"
+        assert client.execute_purchase_items.await_count == 2
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 50
+
+    asyncio.run(run())
+
+
+def test_repeated_reconcile_of_same_partial_terminal_settles_once(
+    native_compatible_run_dir,
+) -> None:
+    _free_mode(native_compatible_run_dir, budget=100)
+    client = _make_client([TimeoutError()])
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+
+    async def run() -> None:
+        first = await scheduler.execute_purchase_items(
+            items=[{"itemId": CHEAP, "count": 2}], budget_limit=20,
+            command_id="cmd-r1", timeout_seconds=0.01,
+        )
+        assert first["terminalState"] == "running"
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.spend_reservations == {"cmd-r1": 20}
+        client.cache_result("cmd-r1", _purchase_result("cmd-r1", "partially-succeeded", 10))
+
+        payload = await scheduler.reconcile_command("cmd-r1")
+        assert payload["terminalState"] == "partially-succeeded"
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 10
+        assert state.spend_reservations == {}
+
+        # Reconciling the same cached terminal again must not double-charge.
+        payload = await scheduler.reconcile_command("cmd-r1")
+        assert payload["terminalState"] == "partially-succeeded"
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 10
+        assert state.settled_spend_commands == ["cmd-r1"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "terminal,total_cost,quote,daily_expect,reserved_expect",
+    [
+        ("succeeded", 40, 40, 40, 0),
+        ("partially-succeeded", 10, 20, 10, 0),
+        ("failed", 0, 40, 0, 0),
+        ("cancelled", 0, 40, 0, 0),
+        ("rejected", 0, 40, 0, 0),
+        # Closed terminals without a confirmed cost never settle by guesswork.
+        ("succeeded", None, 40, 0, 40),
+        # Unfinished terminals always keep the reservation for a later reconcile.
+        ("running", None, 40, 0, 40),
+        ("unknown", None, 40, 0, 40),
+    ],
+    ids=[
+        "succeeded",
+        "partially-succeeded",
+        "failed",
+        "cancelled",
+        "rejected",
+        "succeeded-without-cost",
+        "running",
+        "unknown",
+    ],
+)
+def test_terminal_boundary_settles_confirmed_cost_or_keeps_reservation(
+    native_compatible_run_dir,
+    terminal: str,
+    total_cost: int | None,
+    quote: int,
+    daily_expect: int,
+    reserved_expect: int,
+) -> None:
+    """Native purchase terminals: closed ones settle the confirmed totalCost;
+    running/unknown (or any result without a confirmed cost) keep the
+    reservation — money may still move, so it must stay blocked."""
+    _free_mode(native_compatible_run_dir, budget=100)
+    result = _purchase_result("c1", terminal, total_cost if total_cost is not None else 0)
+    if total_cost is None:
+        result["details"].pop("totalCost")
+    client = _make_client([SimpleNamespace(payload=result)])
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+
+    async def run() -> None:
+        res = await scheduler.execute_purchase_items(
+            items=[{"itemId": CHEAP, "count": quote // 10}],
+            budget_limit=quote,
+            command_id="cmd-b1",
+        )
+        assert res["terminalState"] == terminal
+
+    asyncio.run(run())
+    state = _autonomy(native_compatible_run_dir).state(SAVE)
+    assert state.daily_spend == daily_expect
+    assert sum(state.spend_reservations.values()) == reserved_expect
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: pre-dispatch failures (compatibility gate, single-active-task
+# rejection) happened AFTER the budget reservation, leaking a reservation for
+# a command that was never sent — permanently blocking free-mode purchases.
+# ---------------------------------------------------------------------------
+
+
+def test_compatibility_rejection_leaves_no_reservation_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command rejected by the compatibility gate was never dispatched: no
+    native call, no budget reservation. Once the gate passes, the same
+    purchase proceeds — a leaked reservation would have exhausted budget 40."""
+    run_dir = tmp_path / "mods" / "StardewAI.Companion.Mod"
+    run_dir.mkdir(parents=True)
+    _free_mode(run_dir, budget=40)
+    client = _make_client([SimpleNamespace(payload=_purchase_result("c1", "succeeded", 40))])
+    scheduler = CompanionScheduler(client=client, run_dir=run_dir)
+
+    async def attempt() -> dict:
+        return await scheduler.execute_purchase_items(
+            items=[{"itemId": MID, "count": 1}], budget_limit=40,
+            command_id="cmd-c", timeout_seconds=0.01,
+        )
+
+    with pytest.raises(CompatibilityError):
+        asyncio.run(attempt())
+    client.execute_purchase_items.assert_not_called()
+    state = _autonomy(run_dir).state(SAVE)
+    assert state.daily_spend == 0
+    assert state.spend_reservations == {}
+
+    monkeypatch.setattr(
+        "stardew_ai_runtime.compatibility.assert_native_compatible", lambda _run_dir: None
+    )
+    res = asyncio.run(attempt())
+    assert res["terminalState"] == "succeeded"
+    state = _autonomy(run_dir).state(SAVE)
+    assert state.daily_spend == 40
+    assert state.spend_reservations == {}
+
+
+def test_concurrent_task_rejection_leaves_no_purchase_reservation(
+    native_compatible_run_dir,
+) -> None:
+    """A purchase rejected by the single-active-task rule was never sent: it
+    must not leave a reservation; after the other task finishes the same
+    purchase succeeds."""
+    _free_mode(native_compatible_run_dir, budget=100)
+    gate: dict[str, asyncio.Event] = {}
+
+    async def wait_side_effect(command_id: str, timeout: float = 10.0):
+        if command_id == "cmd-water":
+            await gate["event"].wait()
+            return SimpleNamespace(payload={
+                "commandId": "cmd-water", "terminalState": "succeeded",
+                "completedCount": 1, "skippedCount": 0, "failedCount": 0,
+                "effects": [], "details": {},
+            })
+        if command_id == "cmd-buy":
+            return SimpleNamespace(payload=_purchase_result("cmd-buy", "succeeded", 40))
+        raise AssertionError(f"unexpected wait_for_result({command_id})")
+
+    client = MagicMock()
+    client.is_connected = True
+    client.save_id = SAVE
+    client.game_session_id = "session-a"
+    client.world_revision = 5
+    client.latest_snapshot = _snapshot_env(_payload())
+    client.wait_for_snapshot = AsyncMock(return_value=client.latest_snapshot)
+    client.get_cached_result = MagicMock(return_value=None)
+    client.execute_water_zone = AsyncMock(return_value="cmd-water")
+    client.execute_purchase_items = AsyncMock(return_value="cmd-buy")
+    client.wait_for_result = AsyncMock(side_effect=wait_side_effect)
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+
+    async def run() -> None:
+        gate["event"] = asyncio.Event()
+        water = asyncio.create_task(
+            scheduler.execute_water_zone(center_x=64, center_y=15, radius=0)
+        )
+        for _ in range(200):
+            if scheduler.has_active_task:
+                break
+            await asyncio.sleep(0.001)
+        assert scheduler.has_active_task
+
+        with pytest.raises(PolicyViolationError, match="another task"):
+            await scheduler.execute_purchase_items(
+                items=[{"itemId": MID, "count": 1}], budget_limit=40, command_id="cmd-buy",
+            )
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.spend_reservations == {}
+        assert state.daily_spend == 0
+        client.execute_purchase_items.assert_not_called()
+
+        gate["event"].set()
+        water_result = await water
+        assert water_result["terminalState"] == "succeeded"
+
+        bought = await scheduler.execute_purchase_items(
+            items=[{"itemId": MID, "count": 1}], budget_limit=40, command_id="cmd-buy",
+        )
+        assert bought["terminalState"] == "succeeded"
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 40
+        assert state.spend_reservations == {}
+
+    asyncio.run(run())
+
+
+def test_dispatch_send_result_loss_keeps_reservation_until_reconciled(
+    native_compatible_run_dir,
+) -> None:
+    """Once the native dispatch was sent, a lost result must KEEP the
+    reservation (the money may have moved) and reconcile settles exactly once
+    without a second dispatch."""
+    _free_mode(native_compatible_run_dir, budget=100)
+
+    async def wait_side_effect(command_id: str, timeout: float = 10.0):
+        if command_id == "cmd-p":
+            raise ConnectionError("result lost after send")
+        raise AssertionError(f"unexpected wait_for_result({command_id})")
+
+    client = _make_client([])
+    client.wait_for_result = AsyncMock(side_effect=wait_side_effect)
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+
+    async def run() -> None:
+        with pytest.raises(SchedulerError, match="Task execution error"):
+            await scheduler.execute_purchase_items(
+                items=[{"itemId": MID, "count": 1}], budget_limit=40,
+                command_id="cmd-p", timeout_seconds=0.01,
+            )
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 0
+        assert state.spend_reservations == {"cmd-p": 40}  # send-unconfirmed: keep
+        assert client.execute_purchase_items.await_count == 1
+
+        client.cache_result("cmd-p", _purchase_result("cmd-p", "succeeded", 40))
+        recovered = await scheduler.execute_purchase_items(
+            items=[{"itemId": MID, "count": 1}], budget_limit=40,
+            command_id="cmd-p", timeout_seconds=0.01,
+        )
+        assert recovered["status"] == "executed"
+        assert recovered["totalCost"] == 40
+        assert client.execute_purchase_items.await_count == 1  # no re-dispatch
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 40
+        assert state.spend_reservations == {}
+
+    asyncio.run(run())

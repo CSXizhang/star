@@ -752,6 +752,7 @@ class _FreePurchaseGuard:
     save_id: str | None
     command_id: str | None
     effective_budget: int
+    quote: int = 0
     early_response: dict[str, Any] | None = None
 
 
@@ -816,13 +817,42 @@ class CompanionScheduler:
     def _autonomy_store(self) -> AutonomyController:
         return AutonomyController(Path(self.run_dir or ".") / "data" / "autonomy-state.json")
 
+    @staticmethod
+    def _confirmed_purchase_cost(payload: Any) -> int | None:
+        """Confirmed spend of a closed native purchase result, else None.
+
+        The Mod attaches a non-negative int ``totalCost`` to every terminal
+        purchase result (PurchaseStateMachine BuildResult): succeeded and
+        partially-succeeded spent it, failed was rolled back (0), cancelled
+        and rejected never deducted (0). Those terminals close the money
+        question and settle by the confirmed cost — never by guesswork.
+        running/unknown/none, or any terminal without a confirmed cost, keep
+        the reservation for a later reconcile: the money may still move.
+        """
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("terminalState") not in {
+            "succeeded",
+            "partially-succeeded",
+            "failed",
+            "cancelled",
+            "canceled",
+            "rejected",
+        }:
+            return None
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        total_cost = details.get("totalCost")
+        if isinstance(total_cost, bool) or not isinstance(total_cost, int) or total_cost < 0:
+            return None
+        return total_cost
+
     def _settle_free_mode_purchase(self, save_id: str, command_id: str, payload: Any) -> None:
         """Charge (or release) a reserved purchase exactly once from a confirmed result.
 
-        Only terminal native results settle: success/failure/cancel with a
-        confirmed non-negative ``totalCost`` charge the real cost (a failure
-        therefore refunds its reservation); anything else keeps the reservation
-        for a later reconcile. Settling is idempotent per command id.
+        A closed terminal with a confirmed cost settles it (a failure or
+        rejection therefore refunds its reservation); anything unfinished keeps
+        the reservation for a later reconcile. Settling is idempotent per
+        command id.
         """
         if not isinstance(payload, dict):
             return
@@ -831,19 +861,12 @@ class CompanionScheduler:
             state = autonomy.state(save_id)
             if command_id not in state.spend_reservations:
                 return
-            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-            total_cost = details.get("totalCost")
-            terminal = payload.get("terminalState")
-            settleable = (
-                terminal in {"succeeded", "failed", "cancelled"}
-                and isinstance(total_cost, int)
-                and total_cost >= 0
-            )
+            confirmed = self._confirmed_purchase_cost(payload)
             autonomy.settle_spend(
                 save_id,
                 command_id,
-                total_cost if settleable else None,
-                unknown=not settleable,
+                confirmed if confirmed is not None else None,
+                unknown=confirmed is None,
             )
         except Exception:
             logger.debug("Free-mode purchase settle failed for %s", command_id, exc_info=True)
@@ -1295,6 +1318,7 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         requested_command_id: str | None = None,
+        pre_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Generic single-active-task execution core shared by all skills.
 
@@ -1307,6 +1331,11 @@ class CompanionScheduler:
         `dispatch` is invoked as
         `dispatch(client, task_id=..., idempotency_key=..., expires_seconds=...)`
         and must send the skill.execute envelope, returning its command id.
+
+        ``pre_dispatch`` runs after the compatibility and single-active-task
+        checks, immediately before ``dispatch`` — the reliable not-sent-yet
+        boundary. Use it for bookkeeping (e.g. the free-mode budget
+        reservation) that must not survive a command that ends up never sent.
         """
         from stardew_ai_runtime.compatibility import assert_native_compatible
         assert_native_compatible(self.run_dir)
@@ -1358,6 +1387,10 @@ class CompanionScheduler:
 
         try:
             if not is_same_task:
+                if pre_dispatch is not None:
+                    # The not-sent-yet boundary: any failure here means the
+                    # native command was never dispatched.
+                    pre_dispatch()
                 cmd_id = await dispatch(
                     client,
                     task_id=self._active_task.task_id,
@@ -2218,10 +2251,12 @@ class CompanionScheduler:
 
         Every real purchase path (plan worker, model surface, direct scheduler
         call) funnels through ``execute_purchase_items``, so the daily limit is
-        a program guarantee here instead of a prompt hint. Free mode reserves
-        the native shop quote before dispatch (idempotent per ``command_id``),
-        clamps the forwarded call allowance to the daily remaining budget, and
-        refuses new spend while an older reservation is still unverified.
+        a program guarantee here instead of a prompt hint. Free mode clamps
+        the forwarded call allowance to the daily remaining budget, quotes the
+        native shop snapshot, and refuses new spend while an older reservation
+        is still unverified. The reservation itself is created at the dispatch
+        boundary (``execute_skill``'s ``pre_dispatch`` hook), so a command that
+        fails the compatibility/concurrency pre-checks never occupies budget.
         Command mode passes through untouched with the caller's budget_limit.
         """
         client = await self.ensure_connected()
@@ -2233,7 +2268,7 @@ class CompanionScheduler:
         if not command_id:
             command_id = f"purchase-{uuid.uuid4().hex[:16]}"
         if command_id in auto_state.settled_spend_commands:
-            return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, {
+            return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, early_response={
                 "status": "replayed", "terminalState": "succeeded", "commandId": command_id,
                 "totalCost": 0, "message": "该购买 commandId 已结算，未重复购买。",
             })
@@ -2243,21 +2278,8 @@ class CompanionScheduler:
             if pending_id == command_id:
                 continue
             recovered = await self.reconcile_command(pending_id)
-            recovered_payload = recovered if isinstance(recovered, dict) else {}
-            recovered_terminal = recovered_payload.get("terminalState")
-            recovered_details = (
-                recovered_payload.get("details")
-                if isinstance(recovered_payload.get("details"), dict)
-                else {}
-            )
-            recovered_cost = recovered_details.get("totalCost")
-            settleable = (
-                recovered_terminal in {"succeeded", "failed", "cancelled"}
-                and isinstance(recovered_cost, int)
-                and recovered_cost >= 0
-            )
-            if not settleable:
-                return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, {
+            if self._confirmed_purchase_cost(recovered) is None:
+                return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, early_response={
                     "status": "rejected", "terminalState": "unknown", "commandId": command_id,
                     "error": {
                         "code": "AUTONOMY_PENDING_RECONCILIATION",
@@ -2272,27 +2294,21 @@ class CompanionScheduler:
             # A retry must first recover the original command; never blind-
             # dispatch a second purchase for the same id.
             recovered = await self.reconcile_command(command_id)
+            recovered_cost = self._confirmed_purchase_cost(recovered)
+            if recovered_cost is None:
+                return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, early_response={
+                    "status": "executing", "terminalState": "running", "inProgress": True,
+                    "commandId": command_id,
+                    "message": "原购买命令仍待核对，已保留预算；核对完成前不会重新购物。",
+                })
             recovered_payload = recovered if isinstance(recovered, dict) else {}
-            recovered_terminal = recovered_payload.get("terminalState")
             recovered_details = (
                 recovered_payload.get("details")
                 if isinstance(recovered_payload.get("details"), dict)
                 else {}
             )
-            recovered_cost = recovered_details.get("totalCost")
-            settleable = (
-                recovered_terminal in {"succeeded", "failed", "cancelled"}
-                and isinstance(recovered_cost, int)
-                and recovered_cost >= 0
-            )
-            if not settleable:
-                return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, {
-                    "status": "executing", "terminalState": "running", "inProgress": True,
-                    "commandId": command_id,
-                    "message": "原购买命令仍待核对，已保留预算；核对完成前不会重新购物。",
-                })
-            return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, {
-                "status": "executed", "terminalState": recovered_terminal,
+            return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, early_response={
+                "status": "executed", "terminalState": recovered_payload.get("terminalState"),
                 "commandId": command_id, "taskId": recovered_payload.get("taskId"),
                 "totalCost": recovered_cost, "details": recovered_details,
                 "error": recovered_payload.get("error"),
@@ -2305,7 +2321,7 @@ class CompanionScheduler:
         )
         effective_budget = min(budget_limit, remaining)
         if effective_budget <= 0:
-            return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, {
+            return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, early_response={
                 "status": "rejected", "terminalState": "rejected", "commandId": command_id,
                 "error": {
                     "code": "AUTONOMY_BUDGET_EXHAUSTED",
@@ -2327,19 +2343,18 @@ class CompanionScheduler:
             if not isinstance(price, int) or price < 0 or not isinstance(count, int):
                 raise SchedulerError("无法取得原生报价，已阻止自由模式购买。")
             quote += price * count
-        # reserve_spend applies the shared daily remaining formula again under
-        # its lock; a quote above the clamped allowance rejects the purchase.
-        try:
-            autonomy.reserve_spend(save_id, command_id, quote, limit=effective_budget)
-        except ValueError:
-            return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, {
+        # The quote must fit the clamped allowance. The reservation itself is
+        # created later, at the dispatch boundary inside execute_skill, so a
+        # command that never gets sent cannot leak budget.
+        if quote > effective_budget:
+            return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, early_response={
                 "status": "rejected", "terminalState": "rejected", "commandId": command_id,
                 "error": {
                     "code": "AUTONOMY_BUDGET_EXHAUSTED",
                     "message": "自由模式每日购买预算不足。",
                 },
             })
-        return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget)
+        return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, quote=quote)
 
     async def execute_purchase_items(
         self,
@@ -2388,6 +2403,21 @@ class CompanionScheduler:
         if guard.command_id:
             command_id = guard.command_id
 
+        def _reserve_free_mode_spend() -> None:
+            # Runs at execute_skill's not-sent-yet boundary: after the
+            # compatibility and single-active-task checks, immediately before
+            # the native dispatch. A command rejected by those checks — or a
+            # dispatch that never returns — therefore leaves no reservation
+            # behind, while a sent command keeps it until its result is
+            # confirmed. reserve_spend re-checks the daily remaining formula
+            # under its own lock, so a cross-process race still cannot
+            # overdraw (it surfaces as SchedulerError without a leak).
+            if guard.autonomy is None or not guard.save_id or not command_id:
+                return
+            guard.autonomy.reserve_spend(
+                guard.save_id, command_id, guard.quote, limit=effective_budget
+            )
+
         async def dispatch(
             client: TransportClient,
             *,
@@ -2417,6 +2447,7 @@ class CompanionScheduler:
             timeout_seconds=timeout_seconds,
             task_id=task_id,
             requested_command_id=command_id,
+            pre_dispatch=_reserve_free_mode_spend,
         )
         if guard.autonomy is not None and guard.save_id and command_id:
             self._settle_free_mode_purchase(guard.save_id, command_id, result)

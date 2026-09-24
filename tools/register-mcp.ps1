@@ -1,4 +1,4 @@
-# Register the Stardew AI Companion MCP server into various agent CLIs, or print
+﻿# Register the Stardew AI Companion MCP server into various agent CLIs, or print
 # ready-to-paste configs. The MCP server connects to a RUNNING game session via
 # its transport-discovery.json, so the game must be started first (normal play).
 #

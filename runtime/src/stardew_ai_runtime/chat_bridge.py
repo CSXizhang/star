@@ -840,6 +840,9 @@ class CommandChain:
     chain_count: int = 0
     generation: int = 0
     ws: WebSocketClient | None = None
+    # Task whose terminal may advance this chain; set when the owning turn
+    # selects a job, consumed on the matching terminal.
+    waiting_task_id: str | None = None
 
 
 class ChatBridge:
@@ -2380,6 +2383,9 @@ class ChatBridge:
                         reply_status = "selected"
                         job_selected = True
                         self._job_reply_binding = (request_id, save_id, selected.get("taskId"), ws)
+                        chain = self._command_chains.get(save_id)
+                        if chain is not None:
+                            chain.waiting_task_id = selected.get("taskId")
                         reply_text = "已选择短作业，等待原生执行。\n" + (reply_text or "")
                     else:
                         reply_status = "decision-completed"
@@ -2606,6 +2612,14 @@ class ChatBridge:
         if self._work_store and self._work_store.state(save_id).paused:
             self._break_command_chain(save_id)
             return
+        # Only the terminal of the task the chain is actually waiting on may
+        # advance it. A late terminal from a revoked previous job settles to
+        # history above but must not fire a chain turn for the player's new
+        # instruction; consuming the binding below also makes a duplicated
+        # terminal advance nothing.
+        if chain.waiting_task_id is None or chain.waiting_task_id != execution.task_id:
+            return
+        chain.waiting_task_id = None
         self._schedule_command_chain(save_id)
 
     def _schedule_command_chain(self, save_id: str) -> asyncio.Task | None:

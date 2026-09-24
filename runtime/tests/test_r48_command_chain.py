@@ -289,7 +289,7 @@ def test_autonomy_does_not_trigger_command_chain(tmp_path: Path, monkeypatch: py
                 nonlocal turn_count
                 turn_count += 1
                 token = os.environ.get("STARDEW_DECISION_TOKEN")
-                goal = bridge._work_store.add_goal("Save1", "自主工作", source="system")
+                goal = bridge._work_store.add_goal("Save1", "自主工作", source="agent")
                 bridge._work_store.submit_plan(
                     "Save1",
                     goal_id=goal.id,
@@ -311,9 +311,24 @@ def test_autonomy_does_not_trigger_command_chain(tmp_path: Path, monkeypatch: py
         await bridge.handle_chat_submit(mock_ws, auto_req, "自主规划工作", "Save1")
         assert "Save1" not in bridge._command_chains
 
+        # The autonomy decision actually selected its short job (the old
+        # "system" goal source raised WorkStateError and the whole backend run
+        # was swallowed, so nothing below was ever exercised).
+        decision = bridge._work_store.state("Save1").decision
+        assert decision.get("selected") is True
+        assert decision.get("taskId") == "t_auto"
+
         await bridge._plan_worker.evaluate()
         await bridge.wait_for_chains()
 
+        # Native dispatch actually ran and the job actually reached a terminal
+        # state, recorded as this decision's last_job.
+        assert client.dispatched == ["water_auto"]
+        last_job = bridge._work_store.state("Save1").last_job
+        assert last_job.get("status") == "completed"
+        assert last_job.get("decisionId") == decision.get("token")
+
+        # An autonomy request never starts a player-instruction command chain.
         assert turn_count == 1
         assert "Save1" not in bridge._command_chains
 

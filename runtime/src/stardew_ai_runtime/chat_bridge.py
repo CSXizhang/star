@@ -2429,7 +2429,14 @@ class ChatBridge:
                                     terminal_status = task.status
                                     if task.status != "completed":
                                         fail_reason = getattr(task, "error", None) or task.status
-                                elif last_job:
+                                elif (
+                                    last_job
+                                    and last_job.get("decisionId") == decision.get("token")
+                                    and (not last_job.get("taskId") or last_job.get("taskId") == task_id)
+                                ):
+                                    # Only a last_job written for THIS decision may settle it;
+                                    # an older decision's feedback defers to the pending
+                                    # fingerprint below (_on_job_terminal settles it exactly once).
                                     lj_status = str(last_job.get("status") or last_job.get("outcome") or "").lower()
                                     if lj_status:
                                         terminal_status = lj_status
@@ -2561,7 +2568,15 @@ class ChatBridge:
             self._command_chains.pop(save_id, None)
         else:
             self._command_chains.clear()
+        # Never cancel the caller itself: a chain-continuation task breaks its
+        # own chain at end of turn and must still deliver the final reply.
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
         for task in list(self._chain_tasks):
+            if task is current:
+                continue
             if not task.done():
                 task.cancel()
         self._chain_tasks.clear()

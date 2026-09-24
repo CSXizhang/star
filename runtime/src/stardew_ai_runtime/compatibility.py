@@ -55,7 +55,7 @@ def assert_native_compatible(run_dir):
                 "COMPATIBILITY_UNKNOWN：已绑定实例找不到生产DLL，未执行动作；请核对Mod目录并重新运行 tools/build-mod.ps1 与 tools/setup-companion.ps1。"
             )
         raise CompatibilityError(
-            "COMPATIBILITY_UNKNOWN：已绑定实例找不到生产DLL，未执行动作；请核对Mod目录并使用更新伙伴修复包.cmd。"
+            "COMPATIBILITY_UNKNOWN：已绑定实例找不到生产DLL，未执行动作；请核对Mod目录，并使用随修复包提供的更新脚本或重新运行 tools/setup-companion.ps1。"
         )
 
     actual = hashlib.sha256(dll.read_bytes()).hexdigest().upper()
@@ -66,5 +66,5 @@ def assert_native_compatible(run_dir):
                 f"MOD_RUNTIME_MISMATCH：当前Mod {actual[:12]} 与配套运行时不匹配（需要 {expected[:12]}）。请退出游戏和伙伴服务，运行 tools/build-mod.ps1 与 tools/setup-companion.ps1 重新安装。未执行游戏动作。"
             )
         raise CompatibilityError(
-            f"MOD_RUNTIME_MISMATCH：当前Mod {actual[:12]} 与配套运行时不匹配（需要 {expected[:12]}）。请退出游戏和伙伴服务，双击 更新伙伴修复包.cmd；保留现有agy/其他后端配置。未执行游戏动作。"
+            f"MOD_RUNTIME_MISMATCH：当前Mod {actual[:12]} 与配套运行时不匹配（需要 {expected[:12]}）。请退出游戏和伙伴服务，使用随修复包提供的更新脚本或重新运行 tools/setup-companion.ps1 安装配对版本；保留现有agy/其他后端配置。未执行游戏动作。"
         )

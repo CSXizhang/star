@@ -51,7 +51,6 @@ function Find-StardewDirectory {
     }
     # 默认兜底检测
     $fallbacks = @(
-        "E:\Game\steam\steamapps\common\Stardew Valley",
         "C:\Program Files (x86)\Steam\steamapps\common\Stardew Valley",
         "C:\Program Files\Steam\steamapps\common\Stardew Valley",
         "D:\SteamLibrary\steamapps\common\Stardew Valley"

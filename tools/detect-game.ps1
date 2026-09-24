@@ -4,16 +4,13 @@ param()
 
 $candidates = [System.Collections.Generic.List[string]]::new()
 
-# 1. Known user paths / common Steam libraries
+# 1. Common Steam library locations
 $commonPaths = @(
-    "E:\Game\steam\steamapps\common\Stardew Valley",
     "C:\Program Files (x86)\Steam\steamapps\common\Stardew Valley",
     "C:\Program Files\Steam\steamapps\common\Stardew Valley",
     "D:\SteamLibrary\steamapps\common\Stardew Valley",
     "E:\SteamLibrary\steamapps\common\Stardew Valley",
-    "F:\SteamLibrary\steamapps\common\Stardew Valley",
-    "D:\Game\steam\steamapps\common\Stardew Valley",
-    "D:\Games\Steam\steamapps\common\Stardew Valley"
+    "F:\SteamLibrary\steamapps\common\Stardew Valley"
 )
 foreach ($p in $commonPaths) {
     if (Test-Path -LiteralPath $p) {

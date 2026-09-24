@@ -99,7 +99,7 @@ def test_local_dev_dll_missing_raises_compatibility_unknown(tmp_path, monkeypatc
     assert "tools/build-mod.ps1 与 tools/setup-companion.ps1" in err
 
 
-def test_official_package_mismatch_retains_update_cmd_guidance(tmp_path, monkeypatch):
+def test_official_package_mismatch_retains_update_guidance(tmp_path, monkeypatch):
     monkeypatch.setattr(compat, "__file__", str(tmp_path / "runtime/src/stardew_ai_runtime/compatibility.py"))
     mod = tmp_path / "mod"
     mod.mkdir()
@@ -124,7 +124,7 @@ def test_official_package_mismatch_retains_update_cmd_guidance(tmp_path, monkeyp
         compat.assert_native_compatible(mod)
     err = str(exc_info.value)
     assert "MOD_RUNTIME_MISMATCH" in err
-    assert "更新伙伴修复包.cmd" in err
+    assert "tools/setup-companion.ps1" in err
 
 
 def test_local_dev_fallback_without_installed_candidate(tmp_path, monkeypatch):

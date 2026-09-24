@@ -421,6 +421,14 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         {
             _actionEffectExecuted = true;
             _lastStepResult = _adapter.Execute(_actor, _currentRequest!, _currentTarget);
+            // Settle this round's real resource deltas immediately. Cancel,
+            // monotonic timeout or the game-clock budget can terminate the
+            // machine while this result is still pending in Acting (before it
+            // ever reaches Verifying), and every terminal path must report
+            // exactly what the round consumed. Settled here once, Verifying
+            // never adds it again.
+            _staminaUsed += _lastStepResult.StaminaCost;
+            _waterUsed += _lastStepResult.WaterUsed;
         }
 
         if (_actionTicks >= ActionDurationTicks)
@@ -440,9 +448,9 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         }
         else if (result.Success)
         {
+            // Resource deltas were already settled when the adapter returned
+            // (see HandleActing); this stage only records the per-target effect.
             _completed.Add(new NativeActionEffect(targetLabel, result.State, null, result.ItemId, result.ItemCount, _currentTarget.Tile));
-            _staminaUsed += result.StaminaCost;
-            _waterUsed += result.WaterUsed;
             EmitProgress("verifying", result.State);
         }
         else if (result.PreconditionFailed)
@@ -455,12 +463,9 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         {
             // Multi-tick actions (e.g. chop-tree waiting out the native fall
             // animation) stay on the same target: no effect is recorded yet and
-            // the target index does not advance. The round itself really ran,
-            // though — record its actual resource deltas so stamina/water spent
-            // in earlier rounds is never lost. Wait-only rounds report a zero
-            // delta, so nothing is ever double counted or inflated.
-            _staminaUsed += result.StaminaCost;
-            _waterUsed += result.WaterUsed;
+            // the target index does not advance. This round's resource deltas
+            // were already settled when the adapter returned (see HandleActing),
+            // including the zero delta of a wait-only round.
             EmitProgress("acting", result.State);
             if (_actor.IsExhausted)
             {
@@ -476,11 +481,9 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         else
         {
             _failed.Add(new NativeActionEffect(targetLabel, "failed", result.ErrorMessage, result.ItemId, 0, _currentTarget.Tile));
-            // A failed round may already have consumed real resources (e.g. the
-            // swings before a chop gave up): report those deltas instead of
-            // dropping them.
-            _staminaUsed += result.StaminaCost;
-            _waterUsed += result.WaterUsed;
+            // Resource deltas were already settled when the adapter returned
+            // (see HandleActing), so the failure is recorded without dropping
+            // or repeating the round's real consumption.
             _playerActionRequired |= result.PlayerActionRequired;
             EmitProgress("failed", result.ErrorMessage);
         }

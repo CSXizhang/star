@@ -623,4 +623,77 @@ public class NativeActionStateMachineTests
         Assert.Equal(268f, actor.Stamina);
         Assert.Equal(2f, result.StaminaUsed);
     }
+
+    // ------------------------------------------------------------------
+    // Pending-result window (P2): the adapter deducts real stamina in the
+    // Acting phase, but cancel / monotonic timeout / game-clock budget can
+    // terminate the machine BEFORE the result ever reaches Verifying. Every
+    // terminal path must still report exactly what the pending round consumed.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void CancelledBeforeVerifying_StillReportsConsumedStamina()
+    {
+        var (machine, actor, _, adapter) = CreateHarness();
+        adapter.StaminaCostPerAction = 2f;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(6); // Acting tick 4: adapter executed and deducted stamina, result pending
+        Assert.Equal(1, adapter.CallCount);
+        Assert.True(machine.IsExecuting);
+
+        machine.RequestCancel("Player cancellation request");
+        machine.Update(null, 7); // cancel lands before the pending result reaches Verifying
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Cancelled, result.FinalState);
+        Assert.Equal("CANCELLED", result.ErrorCode);
+        Assert.Equal(268f, actor.Stamina);
+        Assert.Equal(2f, result.StaminaUsed); // the real deduction is reported, not 0
+    }
+
+    [Fact]
+    public void MonotonicTimeoutWithPendingResult_StillReportsConsumedStamina()
+    {
+        var (machine, actor, _, adapter) = CreateHarness();
+        adapter.StaminaCostPerAction = 2f;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(6); // result produced and pending in Acting
+        Assert.Equal(1, adapter.CallCount);
+
+        var maxTicksField = typeof(NativeActionStateMachine).GetField(
+            "MaxMonotonicTicks", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+        long maxTicks = (long)maxTicksField.GetValue(null)!;
+        var elapsedField = typeof(NativeActionStateMachine).GetField(
+            "_elapsedTicks", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        elapsedField.SetValue(machine, maxTicks);
+        machine.Update(null, 7); // timeout fires while the result is still pending
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Failed, result.FinalState);
+        Assert.Equal("TIMEOUT", result.ErrorCode);
+        Assert.Equal(268f, actor.Stamina);
+        Assert.Equal(2f, result.StaminaUsed);
+    }
+
+    [Fact]
+    public void BudgetExceededWithPendingResult_StillReportsConsumedStamina()
+    {
+        var (machine, actor, observer, adapter) = CreateHarness();
+        adapter.StaminaCostPerAction = 2f;
+
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        machine.StepTicks(6); // result produced and pending in Acting
+        Assert.Equal(1, adapter.CallCount);
+
+        observer.TimeOfDay = 900; // 300 game minutes elapsed, way over the 60-minute budget
+        machine.Update(null, 7);  // budget fires while the result is still pending
+
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.Failed, result.FinalState);
+        Assert.Equal("BUDGET_EXCEEDED", result.ErrorCode);
+        Assert.Equal(268f, actor.Stamina);
+        Assert.Equal(2f, result.StaminaUsed);
+    }
 }

@@ -536,15 +536,32 @@ def test_trigger_validation_names_allowed_kinds(tmp_path: Path) -> None:
     assert todo["todo"]["trigger"]["type"] == "inventory"
 
 
-def test_refill_public_tool_forwards_optional_explicit_native_tile(tmp_path: Path, provider_decision_context) -> None:
+def test_refill_public_tool_forwards_optional_explicit_native_tile(tmp_path: Path) -> None:
+    """The refill tool selects one short job on the model surface; the harness
+    dispatch forwards the explicit native tile parameters."""
     import asyncio
+    import os
+    from unittest.mock import AsyncMock, patch
+
     async def run():
         scheduler = MagicMock()
+        scheduler.run_dir = str(tmp_path)
+        scheduler.get_status = AsyncMock(return_value={"saveId": "mock-save-123"})
         scheduler.refill_watering_can = AsyncMock(return_value={"status": "executed", "terminalState": "rejected", "completedCount": 0,
             "skippedCount": 1, "effects": [{"state": "skipped", "reason": "not-refillable"}]})
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        store.begin_decision("mock-save-123", "decision-rf")
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="light")
         tiles = [{"x": 64, "y": 19}]
-        _, result = await server.call_tool("refill_watering_can", {"tiles": tiles, "location_id": "Farm"})
-        scheduler.refill_watering_can.assert_awaited_once_with(location_id="Farm", max_tiles=4, tiles=tiles)
-        assert result["outcome"] == "rejected" and result["reasonCode"] == "not-refillable"
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-rf"}):
+            _, result = await server.call_tool(
+                "refill_watering_can", {"tiles": tiles, "location_id": "Farm"}
+            )
+        assert result["status"] == "job-selected"
+        assert result["effectStatus"] == "not_executed_yet"
+        scheduler.refill_watering_can.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "refill_watering_can"
+        assert step.params == {"location_id": "Farm", "max_tiles": 4, "tiles": tiles}
+
     asyncio.run(run())

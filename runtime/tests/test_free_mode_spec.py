@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +13,7 @@ from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
 from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.protocol import Envelope
 from stardew_ai_runtime.scheduler import CompanionScheduler, requested_task_id
+from stardew_ai_runtime.work_state import WorkStore
 
 
 def _snapshot(day: int = 1, *, mature: int = 0) -> dict:
@@ -147,11 +149,12 @@ def test_purchase_accounting_covers_cumulative_replay_and_unknown_result(tmp_pat
     assert ctl.state("save-a").spend_reservations["b"] == 4
 
 
-def test_free_purchase_entry_uses_native_quote_min_budget_and_command_replay(tmp_path: Path, provider_decision_context) -> None:
+def test_free_purchase_entry_selects_short_job_and_preserves_command_id(tmp_path: Path) -> None:
+    """The model surface only selects the purchase job; quoting/replay accounting
+    runs in the harness execution path, not at selection time."""
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
-    scheduler.get_status = AsyncMock(return_value={"saveId": "save-a"})
     scheduler.get_status = AsyncMock(return_value={"saveId": "save-a"})
     scheduler.wait_for_fresh_snapshot = AsyncMock(return_value=(None, False))
     scheduler.query_shop = AsyncMock(return_value={"items": [{"itemId": "seed", "price": 2}]})
@@ -162,27 +165,34 @@ def test_free_purchase_entry_uses_native_quote_min_budget_and_command_replay(tmp
     ctl = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     ctl.set_mode("save-a", "free")
     ctl.set_preferences("save-a", budget_limit=6)
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("save-a", "decision-fp")
 
     async def run() -> None:
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, full=True)
-        _, result = await server.call_tool("purchase_items", {
-            "items": [{"itemId": "seed", "count": 2}], "budget_limit": 99, "command_id": "cmd-1"
-        })
-        assert result["totalCost"] == 4
-        scheduler.execute_purchase_items.assert_awaited_once_with(
-            items=[{"itemId": "seed", "count": 2}], budget_limit=6, shop_id="SeedShop", command_id="cmd-1"
-        )
-        _, replay = await server.call_tool("purchase_items", {
-            "items": [{"itemId": "seed", "count": 2}], "budget_limit": 99, "command_id": "cmd-1"
-        })
-        assert replay["status"] == "replayed"
-        assert scheduler.execute_purchase_items.await_count == 1
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-fp"}):
+            _, result = await server.call_tool("purchase_items", {
+                "items": [{"itemId": "seed", "count": 2}], "budget_limit": 99, "command_id": "cmd-1"
+            })
+        assert result["status"] == "job-selected"
+        assert result["effectStatus"] == "not_executed_yet"
+        scheduler.execute_purchase_items.assert_not_awaited()
+        scheduler.query_shop.assert_not_awaited()
+        step = store.state("save-a").tasks[0].steps[0]
+        assert step.operation == "purchase_items"
+        assert step.params == {"items": [{"itemId": "seed", "count": 2}], "budget_limit": 99,
+                               "shop_id": "SeedShop", "detail": False, "command_id": "cmd-1"}
 
     asyncio.run(run())
-    assert AutonomyController(tmp_path / "data" / "autonomy-state.json").state("save-a").daily_spend == 4
+    # Selection does not clamp the budget or settle any spend.
+    state = AutonomyController(tmp_path / "data" / "autonomy-state.json").state("save-a")
+    assert state.daily_spend == 0
+    assert state.spend_reservations == {}
 
 
-def test_free_purchase_daily_limit_reservations_are_not_double_counted(tmp_path: Path, provider_decision_context) -> None:
+def test_free_purchase_selection_does_not_consume_budget(tmp_path: Path) -> None:
+    """Repeated purchase selections are never rejected by the daily budget: budget
+    enforcement lives in the harness/prompt layer, not the selection guard."""
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -196,31 +206,28 @@ def test_free_purchase_daily_limit_reservations_are_not_double_counted(tmp_path:
     ctl = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     ctl.set_mode("save-a", "free")
     ctl.set_preferences("save-a", budget_limit=100)
+    store = WorkStore(tmp_path / "data" / "work-state.json")
     server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, full=True)
 
     async def run() -> None:
-        for command_id in ("cmd-a", "cmd-b"):
-            _, result = await server.call_tool("purchase_items", {
-                "items": [{"itemId": "seed", "count": 1}],
-                "budget_limit": 40,
-                "command_id": command_id,
-            })
-            assert result["totalCost"] == 40
-        _, rejected = await server.call_tool("purchase_items", {
-            "items": [{"itemId": "seed", "count": 1}],
-            "budget_limit": 40,
-            "command_id": "cmd-c",
-        })
-        assert rejected["status"] == "rejected"
-        assert rejected["error"] == "AUTONOMY_BUDGET_EXHAUSTED"
+        for command_id in ("cmd-a", "cmd-b", "cmd-c"):
+            store.begin_decision("save-a", "decision-fp")
+            with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-fp"}):
+                _, result = await server.call_tool("purchase_items", {
+                    "items": [{"itemId": "seed", "count": 1}],
+                    "budget_limit": 40,
+                    "command_id": command_id,
+                })
+            assert result["status"] == "job-selected"
+        scheduler.execute_purchase_items.assert_not_awaited()
 
     asyncio.run(run())
     state = AutonomyController(tmp_path / "data" / "autonomy-state.json").state("save-a")
-    assert state.daily_spend == 80
-    assert scheduler.execute_purchase_items.await_count == 2
+    assert state.daily_spend == 0
+    assert state.spend_reservations == {}
 
 
-def test_free_purchase_unknown_terminal_keeps_reservation(tmp_path: Path, provider_decision_context) -> None:
+def test_free_purchase_selection_keeps_reservations_untouched(tmp_path: Path) -> None:
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -231,21 +238,27 @@ def test_free_purchase_unknown_terminal_keeps_reservation(tmp_path: Path, provid
     ctl = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     ctl.set_mode("save-a", "free")
     ctl.set_preferences("save-a", budget_limit=100)
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("save-a", "decision-fp")
 
     async def run() -> None:
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, full=True)
-        _, result = await server.call_tool("purchase_items", {
-            "items": [{"itemId": "seed", "count": 1}], "budget_limit": 10, "command_id": "cmd-unknown"
-        })
-        assert result["terminalState"] == "unknown"
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-fp"}):
+            _, result = await server.call_tool("purchase_items", {
+                "items": [{"itemId": "seed", "count": 1}], "budget_limit": 10, "command_id": "cmd-unknown"
+            })
+        assert result["status"] == "job-selected"
+        scheduler.execute_purchase_items.assert_not_awaited()
 
     asyncio.run(run())
     state = AutonomyController(tmp_path / "data" / "autonomy-state.json").state("save-a")
     assert state.daily_spend == 0
-    assert state.spend_reservations == {"cmd-unknown": 10}
+    assert state.spend_reservations == {}
 
 
-def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path, provider_decision_context) -> None:
+def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path) -> None:
+    """Selection never reconciles or dispatches: a pending reservation survives
+    the model call untouched for the harness worker to recover."""
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -257,23 +270,22 @@ def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path, pr
     ctl.set_mode("save-a", "free")
     ctl.set_preferences("save-a", budget_limit=100)
     ctl.reserve_spend("save-a", "cmd-pending", 40)
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("save-a", "decision-fp")
 
     async def run() -> None:
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, full=True)
-        _, result = await server.call_tool("purchase_items", {
-            "items": [{"itemId": "seed", "count": 1}], "budget_limit": 40, "command_id": "cmd-pending"
-        })
-        assert result["status"] == "executing"
-        assert result["terminalState"] == "running"
-        _, blocked = await server.call_tool("purchase_items", {
-            "items": [{"itemId": "seed", "count": 1}], "budget_limit": 40, "command_id": "cmd-next"
-        })
-        assert blocked["status"] == "rejected"
-        assert blocked["error"] == "AUTONOMY_PENDING_RECONCILIATION"
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-fp"}):
+            _, result = await server.call_tool("purchase_items", {
+                "items": [{"itemId": "seed", "count": 1}], "budget_limit": 40, "command_id": "cmd-pending"
+            })
+        assert result["status"] == "job-selected"
+        scheduler.reconcile_command.assert_not_awaited()
+        scheduler.execute_purchase_items.assert_not_awaited()
 
     asyncio.run(run())
-    assert scheduler.reconcile_command.await_count == 2
-    scheduler.execute_purchase_items.assert_not_awaited()
+    state = AutonomyController(tmp_path / "data" / "autonomy-state.json").state("save-a")
+    assert state.spend_reservations == {"cmd-pending": 40}
 
 
 def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp_path: Path, bound_native_game) -> None:

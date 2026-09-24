@@ -27,20 +27,30 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.scheduler import NoActiveTaskError
+from stardew_ai_runtime.work_state import WorkStore
 
 # Import MockModTransportServer from test_transport_live
 sys.path.insert(0, str(Path(__file__).parent))
 from test_transport_live import MockModTransportServer  # noqa: E402
+
+
+def _grant_decision(tmp_path: Path, scheduler, token: str = "decision-1") -> WorkStore:
+    """Begin a fresh provider decision so guarded native tools may select one short job."""
+    scheduler.run_dir = str(tmp_path)
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("mock-save-123", token)
+    return store
 
 
 @pytest.fixture(autouse=True)
@@ -727,48 +737,46 @@ def test_mcp_server_call_query_farm_work(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_water_zone(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_water_zone(mock_scheduler, tmp_path):
+    """Guarded native tools only select one short job per provider decision."""
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        # Default concise call
-        content, data = await server.call_tool(
-            "water_zone", {"center_x": 64, "center_y": 15, "radius": 0}
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 1
-        assert "effects" not in data
-        mock_scheduler.execute_water_zone.assert_awaited_once_with(
-            center_x=64, center_y=15, radius=0
-        )
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "water_zone", {"center_x": 64, "center_y": 15, "radius": 0}
+            )
+        assert data["status"] == "job-selected"
+        assert data["effectStatus"] == "not_executed_yet"
+        assert data["nextBusiness"] == "new_model_decision_required"
+        mock_scheduler.execute_water_zone.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "water_zone"
+        assert step.params == {"center_x": 64, "center_y": 15, "radius": 0,
+                               "include_empty_tiles": False, "detail": False}
 
-        # Detailed call
-        _, data_det = await server.call_tool(
-            "water_zone", {"center_x": 64, "center_y": 15, "radius": 0, "detail": True}
-        )
-        assert len(data_det["effects"]) == 1
+        # A second job in the same decision is rejected.
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            with pytest.raises(ToolError, match="当前决策周期已选择过任务"):
+                await server.call_tool(
+                    "water_zone", {"center_x": 64, "center_y": 15, "radius": 0}
+                )
+        mock_scheduler.execute_water_zone.assert_not_awaited()
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_water_auto(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_water_auto(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        # Default concise call
-        content, data = await server.call_tool("water_auto", {"max_tiles": 15})
-        assert len(content) == 1
-        assert data["status"] == "executed"
-        assert data["targetCount"] == 2
-        assert data["fresh"] is False
-        assert data["remainingUnwateredCount"] is None  # Snapshot not refreshed in mock, un-faked
-        assert "targetTiles" not in data
-        assert "effects" not in data
-        mock_scheduler.water_auto.assert_awaited_once_with(max_tiles=15)
-
-        # Detailed call
-        _, data_det = await server.call_tool("water_auto", {"max_tiles": 15, "detail": True})
-        assert len(data_det["targetTiles"]) == 2
-        assert len(data_det["effects"]) == 1
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool("water_auto", {"max_tiles": 15})
+        assert data["status"] == "job-selected"
+        mock_scheduler.water_auto.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "water_auto"
+        assert step.params == {"max_tiles": 15, "include_empty_tiles": False, "detail": False}
 
     asyncio.run(run())
 
@@ -811,131 +819,105 @@ def test_mcp_server_call_query_chests(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_harvest_auto(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_harvest_auto(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool("harvest_auto", {"max_tiles": 10})
-        assert len(content) == 1
-        assert data["status"] == "executed"
-        assert data["targetCount"] == 2
-        assert data["fresh"] is False
-        assert data["remainingMatureCount"] is None  # Snapshot not received, unfaked
-        assert "targetTiles" not in data
-        mock_scheduler.harvest_auto.assert_awaited_once_with(max_tiles=10)
-
-        # Detailed call
-        _, data_det = await server.call_tool("harvest_auto", {"max_tiles": 10, "detail": True})
-        assert len(data_det["targetTiles"]) == 2
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool("harvest_auto", {"max_tiles": 10})
+        assert data["status"] == "job-selected"
+        mock_scheduler.harvest_auto.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "harvest_auto"
+        assert step.params == {"max_tiles": 10, "detail": False}
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_harvest_auto_default(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_harvest_auto_default(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool("harvest_auto", {})
-        assert len(content) == 1
-        assert data["status"] == "executed"
-        mock_scheduler.harvest_auto.assert_awaited_once_with(max_tiles=16)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool("harvest_auto", {})
+        assert data["status"] == "job-selected"
+        mock_scheduler.harvest_auto.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "harvest_auto"
+        assert step.params == {"max_tiles": 16, "detail": False}
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_deposit_to_chest(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_deposit_to_chest(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "deposit_to_chest",
-            {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"]},
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 2
-        assert data["chest"]["tile"] == {"x": 70, "y": 12}
-        assert "effects" not in data
-        mock_scheduler.deposit_to_chest.assert_awaited_once_with(
-            chest_x=70, chest_y=12, item_ids=["(O)24"]
-        )
-
-        # Detailed call
-        _, data_det = await server.call_tool(
-            "deposit_to_chest",
-            {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "detail": True},
-        )
-        assert len(data_det["effects"]) == 1
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "deposit_to_chest",
+                {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"]},
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.deposit_to_chest.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "deposit_to_chest"
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "detail": False}
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "deposit_to_chest", {"chest_x": 70, "chest_y": 12}
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        mock_scheduler.deposit_to_chest.assert_awaited_once_with(
-            chest_x=70, chest_y=12, item_ids=None
-        )
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "deposit_to_chest", {"chest_x": 70, "chest_y": 12}
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.deposit_to_chest.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "deposit_to_chest"
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": None, "detail": False}
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_withdraw_from_chest(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_withdraw_from_chest(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "withdraw_from_chest",
-            {"chest_x": 70, "chest_y": 12, "item_id": "(O)CarrotSeeds", "count": 3},
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 1
-        assert data["chest"]["tile"] == {"x": 70, "y": 12}
-        assert "effects" not in data
-        mock_scheduler.withdraw_from_chest.assert_awaited_once_with(
-            chest_x=70,
-            chest_y=12,
-            items=None,
-            item_id="(O)CarrotSeeds",
-            count=3,
-            location_id="Farm",
-        )
-
-        # Detailed call
-        _, data_det = await server.call_tool(
-            "withdraw_from_chest",
-            {
-                "chest_x": 70,
-                "chest_y": 12,
-                "items": [{"itemId": "(O)CarrotSeeds", "count": 3}],
-                "detail": True,
-            },
-        )
-        assert len(data_det["effects"]) == 1
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "withdraw_from_chest",
+                {"chest_x": 70, "chest_y": 12, "item_id": "(O)CarrotSeeds", "count": 3},
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.withdraw_from_chest.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "withdraw_from_chest"
+        assert step.params == {
+            "chest_x": 70, "chest_y": 12, "item_id": "(O)CarrotSeeds", "count": 3,
+            "items": None, "location_id": "Farm", "detail": False,
+        }
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_organize_chest(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_organize_chest(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "organize_chest", {"chest_x": 70, "chest_y": 12}
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 1
-        assert data["chest"]["tile"] == {"x": 70, "y": 12}
-        assert "effects" not in data
-        mock_scheduler.organize_chest.assert_awaited_once_with(chest_x=70, chest_y=12)
-
-        # Detailed call
-        _, data_det = await server.call_tool(
-            "organize_chest", {"chest_x": 70, "chest_y": 12, "detail": True}
-        )
-        assert len(data_det["effects"]) == 1
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "organize_chest", {"chest_x": 70, "chest_y": 12}
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.organize_chest.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "organize_chest"
+        assert step.params == {"chest_x": 70, "chest_y": 12, "detail": False}
 
     asyncio.run(run())
 
@@ -974,185 +956,123 @@ def test_mcp_server_call_query_shop(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_hoe_tiles(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_hoe_tiles(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "hoe_tiles", {"tiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}]}
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 2
-        assert data["affectedTiles"] == [{"x": 64, "y": 14}, {"x": 65, "y": 14}]
-        assert "effects" not in data
-        mock_scheduler.execute_hoe_tiles.assert_awaited_once_with(
-            tiles=[{"x": 64, "y": 14}, {"x": 65, "y": 14}]
-        )
-
-        _, data_det = await server.call_tool(
-            "hoe_tiles", {"tiles": [{"x": 64, "y": 14}], "detail": True}
-        )
-        assert len(data_det["effects"]) == 2
-
-    asyncio.run(run())
-
-
-def test_mcp_server_call_plant_seeds(mock_scheduler, provider_decision_context):
-    async def run():
-        server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "plant_seeds",
-            {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}]},
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 1
-        assert data["plantedTiles"] == [{"x": 64, "y": 14}]
-        assert "effects" not in data
-        mock_scheduler.execute_plant_seeds.assert_awaited_once_with(
-            seed_item_id="(O)472", tiles=[{"x": 64, "y": 14}]
-        )
-
-        _, data_det = await server.call_tool(
-            "plant_seeds",
-            {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}], "detail": True},
-        )
-        assert len(data_det["effects"]) == 1
-
-    asyncio.run(run())
-
-
-def test_mcp_server_call_ship_items(mock_scheduler, provider_decision_context):
-    async def run():
-        server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "ship_items",
-            {"items": [{"itemId": "(O)24", "count": 2}]},
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 2
-        assert data["estimatedValue"] == 70
-        assert data["estimatedTotalValue"] == 70
-        assert data["shippingBinTotalCount"] == 2
-        assert data["remainingBackpackCounts"] == {"(O)24": 2}
-        assert len(data["shippedItems"]) == 1
-        assert "effects" not in data
-        mock_scheduler.execute_ship_items.assert_awaited_once_with(
-            items=[{"itemId": "(O)24", "count": 2}]
-        )
-
-        _, data_det = await server.call_tool(
-            "ship_items",
-            {"items": [{"itemId": "(O)24", "count": 2}], "detail": True},
-        )
-        assert len(data_det["effects"]) == 1
-        assert data_det["effects"][0]["state"] == "shipped"
-
-    asyncio.run(run())
-
-
-def test_mcp_server_call_purchase_items(mock_scheduler, provider_decision_context):
-    async def run():
-        server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "purchase_items",
-            {"items": [{"itemId": "(O)472", "count": 2}], "budget_limit": 100},
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["completedCount"] == 2
-        assert data["totalCost"] == 40
-        assert data["remainingBudget"] == 60
-        assert data["availableMoneyAfter"] == 460
-        assert len(data["purchasedItems"]) == 1
-        assert data["purchasedItems"][0]["itemId"] == "(O)472"
-        assert data["purchasedItems"][0]["unitPrice"] == 20
-        assert "effects" not in data
-        first_call = mock_scheduler.execute_purchase_items.await_args_list[0].kwargs
-        assert first_call["items"] == [{"itemId": "(O)472", "count": 2}]
-        assert first_call["budget_limit"] == 100 and first_call["shop_id"] == "SeedShop"
-        assert isinstance(first_call["command_id"], str) and first_call["command_id"]
-
-        _, data_det = await server.call_tool(
-            "purchase_items",
-            {"items": [{"itemId": "(O)472", "count": 2}], "budget_limit": 100, "detail": True},
-        )
-        assert len(data_det["effects"]) == 1
-        assert data_det["effects"][0]["state"] == "purchased"
-
-    asyncio.run(run())
-
-
-def test_mcp_server_call_navigate_to(mock_scheduler, provider_decision_context):
-    async def run():
-        server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "navigate_to",
-            {"location_id": "Town", "tile_x": 43, "tile_y": 58},
-        )
-        assert len(content) == 1
-        assert data["terminalState"] == "succeeded"
-        assert data["status"] == "success"
-        assert data["finalLocation"] == "Town"
-        assert data["finalTile"] == {"x": 43, "y": 58}
-        assert data["targetAdjusted"] is False
-        assert data["requestedTile"] == {"x": 43, "y": 58}
-        assert data["visitedLocations"] == ["Farm", "BusStop", "Town"]
-        assert "effects" not in data
-
-        mock_scheduler.execute_navigate_to.assert_awaited_once_with(
-            location_id="Town",
-            tile={"x": 43, "y": 58},
-        )
-
-        _, data_det = await server.call_tool(
-            "navigate_to",
-            {"location_id": "Town", "tile": {"x": 43, "y": 58}, "detail": True},
-        )
-        assert len(data_det["effects"]) == 3
-        assert "resources" in data_det
-
-        # Validation errors
-        with pytest.raises(ToolError, match="non-negative integers"):
-            await server.call_tool(
-                "navigate_to", {"location_id": "Town", "tile_x": -1, "tile_y": 5}
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "hoe_tiles", {"tiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}]}
             )
-
-        with pytest.raises(ToolError, match="non-negative integers"):
-            await server.call_tool(
-                "navigate_to", {"location_id": "Town", "tile": {"x": -1, "y": 5}}
-            )
-
-        with pytest.raises(ToolError, match="non-empty string"):
-            await server.call_tool(
-                "navigate_to", {"location_id": "", "tile_x": 10, "tile_y": 10}
-            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.execute_hoe_tiles.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "hoe_tiles"
+        assert step.params == {"tiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}], "detail": False}
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_controls(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_plant_seeds(mock_scheduler, tmp_path):
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "plant_seeds",
+                {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}]},
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.execute_plant_seeds.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "plant_seeds"
+        assert step.params == {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}], "detail": False}
+
+    asyncio.run(run())
+
+
+def test_mcp_server_call_ship_items(mock_scheduler, tmp_path):
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "ship_items",
+                {"items": [{"itemId": "(O)24", "count": 2}]},
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.execute_ship_items.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "ship_items"
+        assert step.params == {"items": [{"itemId": "(O)24", "count": 2}], "detail": False}
+
+    asyncio.run(run())
+
+
+def test_mcp_server_call_purchase_items(mock_scheduler, tmp_path):
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "purchase_items",
+                {"items": [{"itemId": "(O)472", "count": 2}], "budget_limit": 100},
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.execute_purchase_items.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "purchase_items"
+        assert step.params == {
+            "items": [{"itemId": "(O)472", "count": 2}], "budget_limit": 100,
+            "shop_id": "SeedShop", "detail": False, "command_id": None,
+        }
+
+    asyncio.run(run())
+
+
+def test_mcp_server_call_navigate_to(mock_scheduler, tmp_path):
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "navigate_to",
+                {"location_id": "Town", "tile_x": 43, "tile_y": 58},
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.execute_navigate_to.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "navigate_to"
+        assert step.params == {"location_id": "Town", "tile_x": 43, "tile_y": 58,
+                               "x": None, "y": None, "tile": None, "landmark": None,
+                               "detail": False}
+
+    asyncio.run(run())
+
+
+def test_mcp_server_call_controls(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
 
         # Pause
+        store = _grant_decision(tmp_path, mock_scheduler)
         pause_content, pause_data = await server.call_tool("pause_task", {})
         assert len(pause_content) == 1
         assert pause_data["status"] == "paused"
         mock_scheduler.pause_task.assert_awaited_once()
+        # pause revoked the decision; resume selects a job only under a fresh one.
+        assert store.state("mock-save-123").decision == {}
 
-        # Resume
-        resume_content, resume_data = await server.call_tool("resume_task", {})
-        assert len(resume_content) == 1
-        assert resume_data["status"] == "resumed"
-        mock_scheduler.resume_task.assert_awaited_once()
+        store.begin_decision("mock-save-123", "decision-1")
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, resume_data = await server.call_tool("resume_task", {})
+        assert resume_data["status"] == "job-selected"
+        mock_scheduler.resume_task.assert_not_awaited()
 
         # Cancel
-        cancel_content, cancel_data = await server.call_tool(
+        _, cancel_data = await server.call_tool(
             "cancel_task", {"reason": "MCP test"}
         )
-        assert len(cancel_content) == 1
         assert cancel_data["status"] == "cancelling"
         mock_scheduler.cancel_task.assert_awaited_once_with(reason="MCP test")
 
@@ -1181,54 +1101,18 @@ def test_mcp_controls_disable_autonomy_before_no_active_task(tmp_path: Path, moc
     asyncio.run(run())
 
 
-def test_mcp_server_error_handling(mock_scheduler, provider_decision_context):
+def test_mcp_server_error_handling(mock_scheduler, tmp_path):
     async def run():
-        from stardew_ai_runtime.scheduler import PolicyViolationError
-        mock_scheduler.execute_water_zone.side_effect = PolicyViolationError(
-            "Invalid coordinates"
-        )
-        server = create_mcp_server(scheduler=mock_scheduler)
+        from stardew_ai_runtime.scheduler import PolicyViolationError, SchedulerError
 
-        with pytest.raises(
-            ToolError, match="Water zone execution rejected: Invalid coordinates"
-        ):
+        # Guarded native tools surface guard rejections (no live decision) as ToolError.
+        server = create_mcp_server(scheduler=mock_scheduler)
+        with pytest.raises(ToolError, match="决策令牌缺失或不匹配"):
             await server.call_tool(
                 "water_zone", {"center_x": -1, "center_y": 15, "radius": 0}
             )
 
-    asyncio.run(run())
-
-
-def test_mcp_server_new_tools_error_mapping(mock_scheduler, provider_decision_context):
-    async def run():
-        from stardew_ai_runtime.scheduler import PolicyViolationError, SchedulerError
-
-        server = create_mcp_server(scheduler=mock_scheduler)
-
-        mock_scheduler.harvest_auto.side_effect = PolicyViolationError(
-            "Invalid max_tiles: 100. Value must be between 1 and 64 (inclusive)."
-        )
-        with pytest.raises(ToolError, match="Auto harvest rejected: Invalid max_tiles"):
-            await server.call_tool("harvest_auto", {"max_tiles": 100})
-
-        mock_scheduler.deposit_to_chest.side_effect = PolicyViolationError(
-            "chest_x must be an integer, got bool"
-        )
-        with pytest.raises(ToolError, match="Deposit to chest rejected: chest_x"):
-            await server.call_tool("deposit_to_chest", {"chest_x": -1, "chest_y": 12})
-
-        mock_scheduler.withdraw_from_chest.side_effect = PolicyViolationError(
-            "Either items list or item_id must be provided for withdraw_from_chest"
-        )
-        with pytest.raises(ToolError, match="Withdraw from chest rejected: Either items"):
-            await server.call_tool("withdraw_from_chest", {"chest_x": 70, "chest_y": 12})
-
-        mock_scheduler.organize_chest.side_effect = PolicyViolationError(
-            "Concurrent tasks are not permitted"
-        )
-        with pytest.raises(ToolError, match="Organize chest rejected: Concurrent tasks"):
-            await server.call_tool("organize_chest", {"chest_x": 70, "chest_y": 12})
-
+        # Read-only tools keep executing directly and map scheduler errors.
         mock_scheduler.query_inventory.side_effect = SchedulerError(
             "World snapshot does not include an 'inventory' section"
         )
@@ -1259,209 +1143,108 @@ def test_mcp_server_new_tools_error_mapping(mock_scheduler, provider_decision_co
         with pytest.raises(ToolError, match="Failed to query shop"):
             await server.call_tool("query_shop", {})
 
-        mock_scheduler.execute_hoe_tiles.side_effect = PolicyViolationError(
-            "tiles must be a non-empty list"
+        # Policy violations from the real scheduler during plan dispatch map to ToolError.
+        mock_scheduler.run_dir = None
+        internal = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="internal")
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        store.begin_decision("mock-save-123", "decision-eh")
+        store.submit_plan(
+            "mock-save-123",
+            goal_text="water",
+            decision_token="decision-eh",
+            tasks=[{
+                "id": "t1",
+                "title": "water",
+                "steps": [{"id": "s1", "operation": "water_zone",
+                           "params": {"center_x": -1, "center_y": 15, "radius": 0}}],
+            }],
         )
-        with pytest.raises(ToolError, match="Hoe tiles rejected: tiles must be a non-empty list"):
-            await server.call_tool("hoe_tiles", {"tiles": []})
+        store.claim_next_step("mock-save-123", "worker-eh")
+        command_id = "plan:mock-save-123:t1:s1:attempt-1"
+        store.assign_command_id("mock-save-123", "t1", "s1", command_id)
 
-        mock_scheduler.execute_plant_seeds.side_effect = PolicyViolationError(
-            "seed_item_id cannot be empty"
-        )
-        with pytest.raises(ToolError, match="Plant seeds rejected: seed_item_id cannot be empty"):
-            await server.call_tool(
-                "plant_seeds", {"seed_item_id": "", "tiles": [{"x": 64, "y": 15}]}
+        async def _rejecting_water_zone(**kwargs):
+            raise PolicyViolationError("Invalid coordinates")
+
+        mock_scheduler.execute_water_zone = _rejecting_water_zone
+        with pytest.raises(ToolError, match="Invalid coordinates"):
+            await internal.call_tool(
+                "dispatch_plan_operation",
+                {
+                    "operation": "water_zone",
+                    "params": {"center_x": -1, "center_y": 15, "radius": 0},
+                    "command_id": command_id,
+                },
             )
 
-        mock_scheduler.execute_ship_items.side_effect = PolicyViolationError(
-            "items must be a non-empty list of 1..36 items"
-        )
-        with pytest.raises(ToolError, match="Ship items rejected: items must be a non-empty list"):
-            await server.call_tool("ship_items", {"items": []})
-
     asyncio.run(run())
 
 
-def test_mcp_server_state_closing_loop_fresh_and_details(provider_decision_context):
-    """Verifies that post-action state closure accurately consumes fresh snapshots
-
-    and preserves crucial decision details like inventoryFull and chestFull.
-    """
+def test_mcp_server_new_tools_error_mapping(mock_scheduler, tmp_path):
+    """Two-layer validation: short-job budget rules reject at selection time;
+    execution-time parameter validation defers to plan dispatch."""
     async def run():
-        sched = MagicMock()
-        sched.latest_world_revision = 5
+        from stardew_ai_runtime.scheduler import SchedulerError
 
-        # Mock fresh snapshot arriving with revision 6
-        fresh_payload = {
-            "worldRevision": 6,
-            "payload": {
-                "farmWork": {
-                    "matureCropCount": 1,  # 1 mature crop truly remaining
-                    "tilledUnwateredCount": 0,  # 0 unwatered truly remaining
-                },
-                "inventory": {
-                    "capacity": 12,
-                    "freeSlots": 0,  # backpack full!
-                    "slots": [
-                        {"index": 0, "itemId": "(O)24", "name": "Parsnip", "stack": 1, "quality": 0}
-                    ],
-                },
-                "chests": {
-                    "items": [
-                        {
-                            "tile": {"x": 70, "y": 12},
-                            "capacity": 36,
-                            "freeSlots": 0,  # chest full!
-                            "contents": [
-                                {
-                                    "slot": 0,
-                                    "itemId": "(O)24",
-                                    "name": "Parsnip",
-                                    "stack": 999,
-                                    "quality": 0,
-                                }
-                            ],
-                        }
-                    ]
-                },
-                "planting": {
-                    "seeds": [
-                        {
-                            "itemId": "(O)472",
-                            "name": "Parsnip Seeds",
-                            "stack": 12,
-                            "canPlantCurrentSeason": True,
-                        }
-                    ],
-                    "candidateTiles": {
-                        "tilledEmptyCount": 5,
-                        "tillableCount": 15,
-                    },
-                },
-            },
-        }
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        env = {"STARDEW_DECISION_TOKEN": "decision-1"}
 
-        sched.wait_for_fresh_snapshot = AsyncMock(return_value=(fresh_payload, True))
+        # Selection-time budget violation surfaces the guard's ToolError.
+        with pytest.raises(ToolError, match="Short job exceeds 64 native targets"):
+            await server.call_tool("harvest_auto", {"max_tiles": 100})
 
-        # 1. Harvest stops early due to inventory full
-        sched.harvest_auto = AsyncMock(return_value={
-            "status": "executed",
-            "terminalState": "partially-succeeded",
-            "completedCount": 1,
-            "skippedCount": 2,
-            "failedCount": 0,
-            "targetCount": 3,
-            "details": {"inventoryFull": True},
-            "error": None,
-        })
+        # Execution-time policy violations pass selection and become a selected job.
+        for tool_name, args in [
+            ("deposit_to_chest", {"chest_x": -1, "chest_y": 12}),
+            ("withdraw_from_chest", {"chest_x": 70, "chest_y": 12}),
+            ("organize_chest", {"chest_x": 70, "chest_y": 12}),
+            ("hoe_tiles", {"tiles": []}),
+            ("plant_seeds", {"seed_item_id": "", "tiles": [{"x": 64, "y": 15}]}),
+            ("ship_items", {"items": []}),
+        ]:
+            store.begin_decision("mock-save-123", "decision-1")
+            with patch.dict(os.environ, env):
+                _, data = await server.call_tool(tool_name, args)
+            assert data["status"] == "job-selected", f"{tool_name} should be selectable"
+        mock_scheduler.deposit_to_chest.assert_not_awaited()
+        mock_scheduler.harvest_auto.assert_not_awaited()
 
-        server = create_mcp_server(scheduler=sched)
-        _, h_res = await server.call_tool("harvest_auto", {"max_tiles": 3})
-
-        assert h_res["terminalState"] == "partially-succeeded"
-        assert h_res["fresh"] is True
-        assert h_res["remainingMatureCount"] == 1  # From fresh snapshot, NOT 3-1=2!
-        assert h_res["inventory"]["freeSlots"] == 0
-        assert h_res["details"] == {"inventoryFull": True}
-
-        # 2. Deposit stops early due to chest full
-        sched.deposit_to_chest = AsyncMock(return_value={
-            "terminalState": "partially-succeeded",
-            "completedCount": 1,
-            "skippedCount": 1,
-            "failedCount": 0,
-            "details": {"chestFull": True},
-            "error": None,
-        })
-        _, d_res = await server.call_tool("deposit_to_chest", {"chest_x": 70, "chest_y": 12})
-        assert d_res["fresh"] is True
-        assert d_res["chest"]["freeSlots"] == 0
-        assert d_res["details"] == {"chestFull": True}
-
-        # 3. Water auto succeeds with 0 remaining
-        sched.water_auto = AsyncMock(return_value={
-            "status": "executed",
-            "terminalState": "succeeded",
-            "completedCount": 4,
-            "skippedCount": 0,
-            "failedCount": 0,
-            "targetCount": 4,
-            "details": None,
-            "error": None,
-        })
-        _, w_res = await server.call_tool("water_auto", {"max_tiles": 4})
-        assert w_res["fresh"] is True
-        assert w_res["remainingUnwateredCount"] == 0
-
-        # 4. Hoe tiles with fresh snapshot closure
-        sched.execute_hoe_tiles = AsyncMock(return_value={
-            "terminalState": "succeeded",
-            "completedCount": 2,
-            "skippedCount": 0,
-            "failedCount": 0,
-            "effects": [
-                {"tile": {"x": 64, "y": 14}, "state": "hoed"},
-                {"tile": {"x": 65, "y": 14}, "state": "hoed"},
-            ],
-            "details": {"hoedTiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}]},
-            "error": None,
-        })
-        _, hoe_fresh = await server.call_tool(
-            "hoe_tiles", {"tiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}]}
+        # Read-only query error mapping stays direct.
+        mock_scheduler.query_inventory.side_effect = SchedulerError(
+            "World snapshot does not include an 'inventory' section"
         )
-        assert hoe_fresh["terminalState"] == "succeeded"
-        assert hoe_fresh["fresh"] is True
-        assert hoe_fresh["candidateTiles"]["tillableCount"] == 15
-        assert hoe_fresh["candidateTiles"]["tilledEmptyCount"] == 5
-
-        # 5. Plant seeds with fresh snapshot closure
-        sched.execute_plant_seeds = AsyncMock(return_value={
-            "terminalState": "succeeded",
-            "completedCount": 1,
-            "skippedCount": 0,
-            "failedCount": 0,
-            "effects": [
-                {"tile": {"x": 64, "y": 14}, "state": "planted", "itemId": "(O)472", "stack": 12}
-            ],
-            "details": {
-                "plantedTiles": [{"x": 64, "y": 14}],
-                "remainingSeedStack": 12,
-                "seedItemId": "(O)472",
-            },
-            "error": None,
-        })
-        _, plant_fresh = await server.call_tool(
-            "plant_seeds", {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}]}
-        )
-        assert plant_fresh["terminalState"] == "succeeded"
-        assert plant_fresh["fresh"] is True
-        assert plant_fresh["remainingSeedStack"] == 12
-        assert plant_fresh["candidateTiles"]["tilledEmptyCount"] == 5
-
-        # 6. Action without fresh snapshot (fresh=False) -> unknown instead of arithmetic spoofing
-        sched.wait_for_fresh_snapshot = AsyncMock(return_value=(None, False))
-        _, plant_stale = await server.call_tool(
-            "plant_seeds", {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}]}
-        )
-        assert plant_stale["fresh"] is False
-        assert plant_stale["remainingSeedStack"] == "unknown"
-        assert plant_stale["candidateTiles"]["tilledEmptyCount"] == "unknown"
-        assert plant_stale["candidateTiles"]["fresh"] is False
-
-        _, hoe_stale = await server.call_tool(
-            "hoe_tiles", {"tiles": [{"x": 64, "y": 14}]}
-        )
-        assert hoe_stale["fresh"] is False
-        assert hoe_stale["candidateTiles"]["tillableCount"] == "unknown"
-        assert hoe_stale["candidateTiles"]["fresh"] is False
+        with pytest.raises(ToolError, match="Failed to query inventory"):
+            await server.call_tool("query_inventory", {})
 
     asyncio.run(run())
 
 
-def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path, provider_decision_context):
+def test_mcp_server_state_closing_loop_fresh_and_details(mock_scheduler, tmp_path):
+    """Post-action fresh-snapshot closure is not part of the model surface anymore:
+    native tool calls only select a short job, and the harness executes it later."""
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool("harvest_auto", {"max_tiles": 3})
+        assert data["status"] == "job-selected"
+        assert "fresh" not in data
+        assert "inventory" not in data
+        assert "details" not in data
+        mock_scheduler.harvest_auto.assert_not_awaited()
+        mock_scheduler.wait_for_fresh_snapshot.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "harvest_auto"
+        assert step.params == {"max_tiles": 3, "detail": False}
+
+    asyncio.run(run())
+
+
+def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path):
     """End-to-end integration test spawning MCP server process via stdio client against mock server.
 
-    NOTE: This integration test runs against MockModTransportServer on loopback
+    NOTE: Stdio loopback tests use MockModTransportServer on loopback
     and is strictly offline test evidence. It is NOT real game evidence.
     """
     async def run():
@@ -1480,12 +1263,18 @@ def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path, provid
             encoding="utf-8",
         )
 
+        # Pre-begin a provider decision in the subprocess run dir and export the
+        # matching token so the guarded native tool can select one short job.
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        store.begin_decision("mock-save-hash-123", "stdio-decision-1")
+
         from mcp import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
         server_params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "stardew_ai_runtime.mcp_server", "--run-dir", str(tmp_path)],
+            env={**os.environ, "STARDEW_DECISION_TOKEN": "stdio-decision-1"},
         )
 
         try:
@@ -1516,16 +1305,13 @@ def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path, provid
                     assert len(work_data["farmWork"]["tilledUnwateredTiles"]) == 2
                     assert work_data["farmWork"]["tilledUnwateredCount"] == 2
 
-                    # 4. Call water_auto
+                    # 4. Call water_auto: selects one short job, does not execute
                     auto_res = await session.call_tool("water_auto", {"max_tiles": 5})
                     assert not auto_res.isError
                     auto_data = json.loads(auto_res.content[0].text)
-                    assert auto_data["status"] == "executed"
-                    assert auto_data["terminalState"] == "succeeded"
-                    assert auto_data["completedCount"] == 2
-                    assert auto_data["targetCount"] == 2
-                    assert auto_data["fresh"] is False  # MockMod does not push fresh snapshot
-                    assert auto_data["remainingUnwateredCount"] is None  # Unfaked count
+                    assert auto_data["status"] == "job-selected"
+                    assert auto_data["effectStatus"] == "not_executed_yet"
+                    assert auto_data["nextBusiness"] == "new_model_decision_required"
 
                     # 5. Call pause_task when idle -> must return isError: True
                     pause_res = await session.call_tool("pause_task", {})
@@ -1542,57 +1328,37 @@ def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path, provid
     asyncio.run(run())
 
 
-def test_mcp_server_call_plant_crop_workflow(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_plant_crop_workflow(mock_scheduler):
+    """Composite planting workflows are rejected on the model surface: one short
+    job may contain a single business kind only."""
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "plant_crop_workflow",
-            {"crop_name_or_id": "Parsnip", "count": 3},
-        )
-        assert len(content) == 1
-        assert data["status"] == "succeeded"
-        assert data["seedsPlanted"] == 3
-        assert data["tilesHoed"] == 3
-        assert data["tilesWatered"] == 3
-        assert "effects" not in data  # detail=False strips effects
-        mock_scheduler.plant_crop_workflow.assert_awaited_once_with(
-            crop_name_or_id="Parsnip",
-            count=3,
-            target_tiles=None,
-            auto_till=True,
-            water=True,
-            withdraw_from_chest=True,
-            chest_tile=None,
-            location_id="Farm",
-        )
-
-        # Test with detail=True
-        _, data_det = await server.call_tool(
-            "plant_crop_workflow",
-            {"seed_item_id": "(O)472", "count": 2, "detail": True},
-        )
-        assert "effects" in data_det
-
-        # Test validation error
-        with pytest.raises(ToolError, match="Must provide seed_item_id or crop_name_or_id"):
-            await server.call_tool("plant_crop_workflow", {"count": 1})
+        with pytest.raises(ToolError, match="MULTIPLE_BUSINESSES"):
+            await server.call_tool(
+                "plant_crop_workflow",
+                {"crop_name_or_id": "Parsnip", "count": 3},
+            )
+        mock_scheduler.plant_crop_workflow.assert_not_called()
 
     asyncio.run(run())
 
 
-def test_mcp_server_call_navigate_to_with_landmark(mock_scheduler, provider_decision_context):
+def test_mcp_server_call_navigate_to_with_landmark(mock_scheduler, tmp_path):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
-        content, data = await server.call_tool(
-            "navigate_to",
-            {"location_id": "Farm", "landmark": "shipping_bin"},
-        )
-        assert len(content) == 1
-        mock_scheduler.execute_navigate_to.assert_awaited_with(
-            location_id="Farm",
-            tile=None,
-            landmark="shipping_bin",
-        )
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "navigate_to",
+                {"location_id": "Farm", "landmark": "shipping_bin"},
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.execute_navigate_to.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "navigate_to"
+        assert step.params == {"location_id": "Farm", "landmark": "shipping_bin",
+                               "tile_x": None, "tile_y": None, "x": None, "y": None,
+                               "tile": None, "detail": False}
 
     asyncio.run(run())
 
@@ -1685,89 +1451,52 @@ def test_mcp_server_call_query_shop_filter(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_navigate_to_xy_and_executing_status(mock_scheduler, provider_decision_context):
+def test_mcp_server_navigate_to_xy_and_executing_status(mock_scheduler, tmp_path):
+    """Executing/running propagation is a harness-side concern now: the model
+    surface only selects the navigation job."""
     async def run():
-        mock_scheduler.execute_navigate_to = AsyncMock(return_value={
-            "status": "executing",
-            "terminalState": "running",
-            "taskId": "task-nav-123",
-            "inProgress": True,
-            "message": "Navigation task is executing on companion in background.",
-            "details": {
-                "visitedLocations": ["Farm"],
-                "finalLocation": "Farm",
-                "finalTile": {"x": 61, "y": 17},
-            },
-            "error": None,
-        })
         server = create_mcp_server(scheduler=mock_scheduler)
-
-        # Call with flat x and y parameters
-        _, data = await server.call_tool("navigate_to", {"location_id": "Farm", "x": 61, "y": 17})
-        assert data["status"] == "executing"
-        assert data["terminalState"] == "running"
-        assert data["inProgress"] is True
-        assert data["taskId"] == "task-nav-123"
-        mock_scheduler.execute_navigate_to.assert_awaited_with(
-            location_id="Farm", tile={"x": 61, "y": 17}
-        )
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool(
+                "navigate_to", {"location_id": "Farm", "x": 61, "y": 17}
+            )
+        assert data["status"] == "job-selected"
+        mock_scheduler.execute_navigate_to.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "navigate_to"
+        assert step.params == {"location_id": "Farm", "x": 61, "y": 17,
+                               "tile_x": None, "tile_y": None, "tile": None,
+                               "landmark": None, "detail": False}
 
     asyncio.run(run())
 
 
-def test_mcp_server_water_auto_blocked_targets_actionable_summary(mock_scheduler, provider_decision_context):
+def test_mcp_server_water_auto_blocked_targets_actionable_summary(mock_scheduler, tmp_path):
+    """Blocked-target summaries belong to the execution result; selection records
+    the request only."""
     async def run():
-        mock_scheduler.water_auto = AsyncMock(return_value={
-            "status": "executed",
-            "taskId": "task-water-1",
-            "terminalState": "partially-succeeded",
-            "completedCount": 1,
-            "skippedCount": 0,
-            "failedCount": 1,
-            "targetCount": 2,
-            "effects": [
-                {"state": "watered", "tile": {"x": 60, "y": 21}}
-            ],
-            "details": {
-                "failedTiles": [
-                    {"tile": {"x": 61, "y": 21}, "reason": "Dynamic obstacle blocked path and maximum replans exceeded."}
-                ],
-                "skippedTiles": []
-            },
-            "error": None,
-        })
         server = create_mcp_server(scheduler=mock_scheduler)
-
-        _, data = await server.call_tool("water_auto", {"max_tiles": 25})
-        assert data["status"] == "executed"
-        assert data["wateredTiles"] == [{"x": 60, "y": 21}]
-        assert len(data["blockedTargets"]) == 1
-        assert data["blockedTargets"][0]["x"] == 61
-        assert data["blockedTargets"][0]["y"] == 21
-        assert data["blockedTargets"][0]["retryable"] is False
-        assert "Non-retryable blocked targets" in data["actionableSummary"]
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, data = await server.call_tool("water_auto", {"max_tiles": 25})
+        assert data["status"] == "job-selected"
+        assert "blockedTargets" not in data
+        assert "actionableSummary" not in data
+        mock_scheduler.water_auto.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "water_auto"
+        assert step.params == {"max_tiles": 25, "include_empty_tiles": False, "detail": False}
 
     asyncio.run(run())
 
 
-def test_mcp_server_executing_status_propagation(mock_scheduler, provider_decision_context):
+def test_mcp_server_executing_status_propagation(mock_scheduler, tmp_path):
+    """Every guarded native tool selects a job without executing; none of them
+    touches the scheduler."""
     async def run():
-        exec_payload = {
-            "status": "executing",
-            "terminalState": "running",
-            "taskId": "task-gen-999",
-            "inProgress": True,
-            "completedCount": 0,
-            "details": {"taskId": "task-gen-999"},
-        }
-        mock_scheduler.execute_water_zone = AsyncMock(return_value=exec_payload)
-        mock_scheduler.harvest_auto = AsyncMock(return_value=exec_payload)
-        mock_scheduler.deposit_to_chest = AsyncMock(return_value=exec_payload)
-        mock_scheduler.withdraw_from_chest = AsyncMock(return_value=exec_payload)
-        mock_scheduler.execute_hoe_tiles = AsyncMock(return_value=exec_payload)
-        mock_scheduler.execute_plant_seeds = AsyncMock(return_value=exec_payload)
         server = create_mcp_server(scheduler=mock_scheduler)
-
+        store = _grant_decision(tmp_path, mock_scheduler)
         for tool_name, args in [
             ("water_zone", {"center_x": 60, "center_y": 20, "radius": 1}),
             ("harvest_auto", {"max_tiles": 10}),
@@ -1776,15 +1505,23 @@ def test_mcp_server_executing_status_propagation(mock_scheduler, provider_decisi
             ("hoe_tiles", {"tiles": [{"x": 60, "y": 20}]}),
             ("plant_seeds", {"seed_item_id": "seed", "tiles": [{"x": 60, "y": 20}]}),
         ]:
-            _, data = await server.call_tool(tool_name, args)
-            assert data["status"] == "executing", f"{tool_name} should return status=executing"
-            assert data["terminalState"] == "running", f"{tool_name} should return terminalState=running"
-            assert data["inProgress"] is True
+            store.begin_decision("mock-save-123", "decision-1")
+            with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+                _, data = await server.call_tool(tool_name, args)
+            assert data["status"] == "job-selected", f"{tool_name} should only select"
+            assert data["effectStatus"] == "not_executed_yet"
+            assert data["nextBusiness"] == "new_model_decision_required"
+        mock_scheduler.execute_water_zone.assert_not_awaited()
+        mock_scheduler.harvest_auto.assert_not_awaited()
+        mock_scheduler.deposit_to_chest.assert_not_awaited()
+        mock_scheduler.withdraw_from_chest.assert_not_awaited()
+        mock_scheduler.execute_hoe_tiles.assert_not_awaited()
+        mock_scheduler.execute_plant_seeds.assert_not_awaited()
 
     asyncio.run(run())
 
 
-def test_mcp_work_plan_runs_step_and_goes_idle(mock_scheduler, tmp_path, provider_decision_context):
+def test_mcp_work_plan_runs_step_and_goes_idle(mock_scheduler, tmp_path):
     """Harness worker claims a ready step, executes the real scheduler op, and commits."""
     mock_scheduler.run_dir = None
 
@@ -1795,24 +1532,27 @@ def test_mcp_work_plan_runs_step_and_goes_idle(mock_scheduler, tmp_path, provide
         assert idle["status"] == "idle"
         assert idle["hasExecutableWork"] is False
 
-        _, goal = await server.call_tool("manage_goal", {"action": "create", "text": "照料农场"})
+        _, goal = await server.call_tool("remember_intent", {"intent": "照料农场", "kind": "goal"})
         assert goal["goal"]["source"] == "agent"
         goal_id = goal["goal"]["id"]
 
-        _, plan = await server.call_tool(
-            "manage_plan",
-            {
-                "goal_id": goal_id,
-                "tasks": [
-                    {
-                        "id": "t1",
-                        "title": "浇水",
-                        "completionCondition": "作物湿润",
-                        "steps": [{"id": "s1", "operation": "water_auto", "params": {"max_tiles": 5}}],
-                    }
-                ],
-            },
-        )
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        store.begin_decision("mock-save-123", "decision-wp")
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-wp"}):
+            _, plan = await server.call_tool(
+                "submit_plan",
+                {
+                    "goal_id": goal_id,
+                    "tasks": [
+                        {
+                            "id": "t1",
+                            "title": "浇水",
+                            "completionCondition": "作物湿润",
+                            "steps": [{"id": "s1", "operation": "water_auto", "params": {"max_tiles": 5}}],
+                        }
+                    ],
+                },
+            )
         assert plan["tasks"][0]["id"] == "t1"
 
         _, overview = await server.call_tool("work_plan_overview", {})
@@ -1881,7 +1621,7 @@ def test_mcp_todo_due_selection_uses_latest_snapshot(mock_scheduler, tmp_path):
     asyncio.run(run())
 
 
-def test_progressive_disclosure_default_list_is_small_and_callable(mock_scheduler, tmp_path, provider_decision_context):
+def test_progressive_disclosure_default_list_is_small_and_callable(mock_scheduler, tmp_path):
     """Light surface lists common actions + write entries; base schemas stay callable.
 
     The generic default is the full legacy list (no existing tool disappears on
@@ -1950,13 +1690,22 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
         assert "navigate_to" in names
         assert "get_status" in names
 
+        # call_capability runs the same guarded implementation: with a live decision
+        # it selects the navigation job instead of executing it.
         calls_before = mock_scheduler.execute_navigate_to.await_count
-        _, invoked = await light_server.call_tool(
-            "call_capability",
-            {"tool": "navigate_to", "params": {"location_id": "Farm", "x": 61, "y": 17}},
-        )
+        store = _grant_decision(tmp_path, mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            _, invoked = await light_server.call_tool(
+                "call_capability",
+                {"tool": "navigate_to", "params": {"location_id": "Farm", "x": 61, "y": 17}},
+            )
         assert invoked["tool"] == "navigate_to"
-        assert mock_scheduler.execute_navigate_to.await_count == calls_before + 1
+        assert invoked["result"]["status"] == "job-selected"
+        assert mock_scheduler.execute_navigate_to.await_count == calls_before
+        # call_capability passes params through without schema default injection.
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.operation == "navigate_to"
+        assert step.params == {"location_id": "Farm", "x": 61, "y": 17}
 
         with pytest.raises(ToolError):
             await light_server.call_tool("call_capability", {"tool": "not_a_tool", "params": {}})
@@ -1970,8 +1719,9 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
     asyncio.run(run())
 
 
-def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_scheduler, tmp_path, provider_decision_context):
-    """submit_plan revises a plan; remember_intent records agent goals/todos only."""
+def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_scheduler, tmp_path):
+    """submit_plan selects one short job per provider decision; remember_intent records
+    agent goals/todos only. Revising a plan requires a fresh decision."""
     mock_scheduler.run_dir = None
 
     async def run():
@@ -1983,36 +1733,60 @@ def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_schedul
         assert goal["kind"] == "goal"
         assert goal["goal"]["source"] == "agent"
 
-        _, plan = await server.call_tool(
-            "submit_plan",
-            {
-                "goal_id": goal["goal"]["id"],
-                "tasks": [
-                    {
-                        "id": "t1",
-                        "title": "浇水",
-                        "steps": [{"id": "s1", "operation": "water_auto", "params": {"max_tiles": 3}}],
-                    }
-                ],
-            },
-        )
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        store.begin_decision("mock-save-123", "decision-sp")
+        env = {"STARDEW_DECISION_TOKEN": "decision-sp"}
+        with patch.dict(os.environ, env):
+            _, plan = await server.call_tool(
+                "submit_plan",
+                {
+                    "goal_id": goal["goal"]["id"],
+                    "tasks": [
+                        {
+                            "id": "t1",
+                            "title": "浇水",
+                            "steps": [{"id": "s1", "operation": "water_auto", "params": {"max_tiles": 3}}],
+                        }
+                    ],
+                },
+            )
         assert plan["tasks"][0]["id"] == "t1"
 
-        # Re-submitting with replace supersedes the still-pending task.
-        _, revised = await server.call_tool(
-            "submit_plan",
-            {
-                "goal_id": goal["goal"]["id"],
-                "replace": True,
-                "tasks": [
+        # One short job per decision: revising in the same decision is rejected.
+        with patch.dict(os.environ, env):
+            with pytest.raises(ToolError, match="当前决策周期已选择过任务"):
+                await server.call_tool(
+                    "submit_plan",
                     {
-                        "id": "t2",
-                        "title": "收获",
-                        "steps": [{"id": "s2", "operation": "harvest_auto", "params": {}}],
-                    }
-                ],
-            },
-        )
+                        "goal_id": goal["goal"]["id"],
+                        "replace": True,
+                        "tasks": [
+                            {
+                                "id": "t2",
+                                "title": "收获",
+                                "steps": [{"id": "s2", "operation": "harvest_auto", "params": {}}],
+                            }
+                        ],
+                    },
+                )
+
+        # A fresh decision may revise: the still-pending task is superseded.
+        store.begin_decision("mock-save-123", "decision-sp")
+        with patch.dict(os.environ, env):
+            _, revised = await server.call_tool(
+                "submit_plan",
+                {
+                    "goal_id": goal["goal"]["id"],
+                    "replace": True,
+                    "tasks": [
+                        {
+                            "id": "t2",
+                            "title": "收获",
+                            "steps": [{"id": "s2", "operation": "harvest_auto", "params": {}}],
+                        }
+                    ],
+                },
+            )
         assert "t1" in revised["supersededTaskIds"]
 
         # A todo intent needs a valid trigger.
@@ -2035,27 +1809,22 @@ def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_schedul
     asyncio.run(run())
 
 
-def test_harvest_and_store_uses_authorized_chest_only(mock_scheduler, tmp_path, provider_decision_context):
-    mock_scheduler.run_dir = None
-
+def test_harvest_and_store_uses_authorized_chest_only(mock_scheduler):
+    """harvest_and_store stays a full-surface compatibility tool that is not
+    selectable as a short job (harvest and deposit are two business steps)."""
     async def run():
-        # harvest_and_store stays a full-surface compatibility tool (removed from light).
-        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, full=True)
-        _, data = await server.call_tool(
-            "harvest_and_store", {"chest_x": 70, "chest_y": 12, "max_tiles": 8}
-        )
-        assert data["outcome"] == "completed"
-        assert data["goalSatisfied"] is True
-        assert data["stage"] == "done"
-        mock_scheduler.harvest_auto.assert_awaited_once_with(max_tiles=8)
-        mock_scheduler.deposit_to_chest.assert_awaited_once_with(
-            chest_x=70, chest_y=12, item_ids=None
-        )
+        server = create_mcp_server(scheduler=mock_scheduler, full=True)
+        with pytest.raises(ToolError, match="SHORT_JOB_UNSUPPORTED"):
+            await server.call_tool(
+                "harvest_and_store", {"chest_x": 70, "chest_y": 12, "max_tiles": 8}
+            )
+        mock_scheduler.harvest_auto.assert_not_called()
+        mock_scheduler.deposit_to_chest.assert_not_called()
 
     asyncio.run(run())
 
 
-def test_internal_dispatch_plan_operation_forwards_stable_command_id(mock_scheduler, tmp_path, provider_decision_context):
+def test_internal_dispatch_plan_operation_forwards_stable_command_id(mock_scheduler, tmp_path):
     """The worker dispatch must reach the real method with the persisted id.
 
     ``call_capability`` is the model-facing schema and has no ``command_id``; using
@@ -2080,10 +1849,25 @@ def test_internal_dispatch_plan_operation_forwards_stable_command_id(mock_schedu
         }
 
     mock_scheduler.execute_water_zone = _execute_water_zone
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="internal")
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("mock-save-123", "decision-id")
+    store.submit_plan(
+        "mock-save-123",
+        goal_text="water",
+        decision_token="decision-id",
+        tasks=[{
+            "id": "t1",
+            "title": "water",
+            "steps": [{"id": "s1", "operation": "water_zone",
+                       "params": {"center_x": 65, "center_y": 15, "radius": 0}}],
+        }],
+    )
+    store.claim_next_step("mock-save-123", "worker1")
+    command_id = "plan:mock-save-123:t1:s1:attempt-1"
+    store.assign_command_id("mock-save-123", "t1", "s1", command_id)
 
     async def run():
-        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="internal")
-        command_id = "plan:Save1:t1:s1:attempt-1"
         _, result = await server.call_tool(
             "dispatch_plan_operation",
             {

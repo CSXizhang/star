@@ -41,17 +41,3 @@ def bound_native_game() -> Path:
     except CompatibilityError as ex:
         pytest.skip(str(ex))
     return run_dir
-
-
-@pytest.fixture
-def provider_decision_context() -> str:
-    """Skip unless invoked inside a live companion provider decision.
-
-    ChatBridge exports STARDEW_DECISION_TOKEN for exactly one model decision; the
-    guarded native tool surface requires it, so without a live decision context the
-    NEW_MODEL_DECISION_REQUIRED rejection is the correct environment signal.
-    """
-    token = os.environ.get("STARDEW_DECISION_TOKEN")
-    if not token:
-        pytest.skip("STARDEW_DECISION_TOKEN is not set; no live companion provider decision")
-    return token

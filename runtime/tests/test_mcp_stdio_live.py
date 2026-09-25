@@ -92,17 +92,20 @@ def _launch_and_list_tools(complex_dir: Path, surface: str) -> tuple[list[dict],
         assert tools_resp.get("id") == 2
         assert "result" in tools_resp
         tools = tools_resp["result"].get("tools", [])
-        return tools, tools_resp, ""
     finally:
         if proc.stdin and not proc.stdin.closed:
             proc.stdin.close()
+        # communicate() flushes stdin when the attribute is still set.  A
+        # separately closed stream raises ValueError on POSIX before pipes are
+        # drained, so detach it after sending the final request.
+        proc.stdin = None
         try:
             proc.terminate()
             _, stderr_text = proc.communicate(timeout=5)
-        except Exception:
+        except subprocess.TimeoutExpired:
             proc.kill()
             _, stderr_text = proc.communicate()
-    return [], {}, stderr_text
+    return tools, tools_resp, stderr_text
 
 
 def test_mcp_server_stdio_startup_and_tools_list(tmp_path: Path) -> None:

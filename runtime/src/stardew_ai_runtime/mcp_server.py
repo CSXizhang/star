@@ -2652,8 +2652,17 @@ def create_mcp_server(
         async def guarded(*args, **kwargs):
             sid = await current_save_id()
             store = work_for_run()
-            if name in {"pause_task", "cancel_task"}:
+            if name == "pause_task":
                 store.revoke_decision(sid)
+                return await fn(*args, **kwargs)
+            if name == "cancel_task":
+                # A new turn may ask to stop the previous native action before
+                # selecting its own short job.  Cancelling when that old action
+                # is already gone must not revoke this turn's unused token.
+                # Once this turn has selected a job, revoke it before native
+                # cancellation so a pending step cannot be dispatched later.
+                if store.state(sid).decision.get("selected"):
+                    store.revoke_decision(sid)
                 return await fn(*args, **kwargs)
             if name == "plant_crop_workflow":
                 raise ToolError("MULTIPLE_BUSINESSES: choose one short planting, watering or inventory job")

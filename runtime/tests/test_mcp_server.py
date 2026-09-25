@@ -1101,6 +1101,58 @@ def test_mcp_controls_disable_autonomy_before_no_active_task(tmp_path: Path, moc
     asyncio.run(run())
 
 
+def test_cancel_without_active_job_preserves_new_decision_token(tmp_path: Path, mock_scheduler):
+    """A new player turn may ask to stop old work before selecting its own job."""
+    async def run():
+        mock_scheduler.cancel_task.side_effect = NoActiveTaskError("idle")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler, token="new-turn")
+
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "new-turn"}):
+            with pytest.raises(ToolError, match="Cannot cancel"):
+                await server.call_tool("cancel_task", {})
+            assert store.state("mock-save-123").decision["token"] == "new-turn"
+
+            _, selected = await server.call_tool("submit_plan", {
+                "goal_text": "浇两格干土",
+                "tasks": [{
+                    "id": "new-task", "title": "浇水",
+                    "steps": [{"id": "new-step", "operation": "water_auto", "params": {"max_tiles": 2}}],
+                }],
+            })
+
+        assert selected["tasks"][0]["id"] == "new-task"
+        assert store.state("mock-save-123").decision["taskId"] == "new-task"
+        mock_scheduler.water_auto.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_cancel_selected_pending_job_revokes_dispatch_authority(tmp_path: Path, mock_scheduler):
+    """Cancelling a selected but not yet dispatched job must stop its worker claim."""
+    async def run():
+        mock_scheduler.cancel_task.side_effect = NoActiveTaskError("idle")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler, token="selected-turn")
+        store.submit_plan(
+            "mock-save-123", goal_text="旧作业", decision_token="selected-turn",
+            tasks=[{
+                "id": "selected-task", "title": "旧浇水",
+                "steps": [{"id": "s1", "operation": "water_auto", "params": {"max_tiles": 2}}],
+            }],
+        )
+        assert store.has_ready_step("mock-save-123")
+
+        with pytest.raises(ToolError, match="Cannot cancel"):
+            await server.call_tool("cancel_task", {})
+
+        assert store.state("mock-save-123").decision == {}
+        assert not store.has_ready_step("mock-save-123")
+        mock_scheduler.water_auto.assert_not_awaited()
+
+    asyncio.run(run())
+
+
 def test_mcp_server_error_handling(mock_scheduler, tmp_path):
     async def run():
         from stardew_ai_runtime.scheduler import PolicyViolationError, SchedulerError

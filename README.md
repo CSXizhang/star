@@ -88,6 +88,11 @@ Copy-Item config/chat-backend.example.json config/chat-backend.json
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -RunDir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" -Agent kimi -Install
+```
+
+首次使用时，在仓库根目录运行 `kimi` 打开交互界面，核对项目信任提示中的 MCP 启动命令和 Mod 路径，再确认信任此目录。输入 `/mcp`，确认 `stardew-companion` 已连接；注册后已打开的 Kimi 会话需重新启动。完成后再启动聊天服务：
+
+```powershell
 uv run --project runtime python -m stardew_ai_runtime.chat_bridge --run-dir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" --backend kimi
 ```
 

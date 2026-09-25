@@ -16,6 +16,8 @@
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -RunDir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" -Agent kimi -Install
 ```
 
+首次使用 Kimi 时，在仓库根目录交互运行 `kimi`，核对项目信任提示中的 MCP 启动命令和 Mod 路径后确认信任。输入 `/mcp`，确认 `stardew-companion` 已连接，再启动下文的聊天服务；已打开的 Kimi 会话需重新启动才能加载新注册的工具。
+
 `-Agent` 支持 `kimi`、`agy`、`claude`、`codex`、`dsh` 和 `all`。省略 `-Install` 时输出配置供你检查；不同客户端的注册方式和可用程度可能不同。
 
 手动配置支持 stdio 的 MCP 客户端时，可以直接使用 `uv run --project <仓库根目录>/runtime python`（与 `register-mcp.ps1 -Install` 生成的配置一致），参数为：

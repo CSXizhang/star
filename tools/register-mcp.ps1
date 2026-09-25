@@ -126,6 +126,7 @@ function Install-Kimi {
     $config = @{ mcpServers = $serverMap }
     ($config | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $mcpFile -Encoding utf8
     Write-Host ">>> 已写入 $mcpFile（重启客户端或新会话生效）"
+    Write-Host ">>> From the repo root, run interactive kimi, review and trust this folder, then use /mcp to verify $serverName before starting the chat bridge."
 }
 
 switch ($Agent) {

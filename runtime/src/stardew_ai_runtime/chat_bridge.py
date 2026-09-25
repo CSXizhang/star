@@ -42,7 +42,7 @@ from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, pro
 from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
 from stardew_ai_runtime.job_feedback import compact_job_feedback
 from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
-from stardew_ai_runtime.plan_executor import PlanExecutor, StepExecution
+from stardew_ai_runtime.plan_executor import DispatchDeferred, PlanExecutor, StepExecution
 from stardew_ai_runtime.protocol import (
     Envelope,
 )
@@ -472,9 +472,9 @@ class InternalMcpPlanClient:
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
         if self._task is None or self._task.done():
             await self.open()
-        # Native cancel must reach the existing scheduler while a long native
+        # Native controls must reach the existing scheduler while a long native
         # operation is awaiting its terminal result, not queue behind that job.
-        if name == "dispatch_plan_operation" and (arguments or {}).get("operation") in {"cancel_task", "pause_task"} and self._live_session is not None:
+        if name == "dispatch_plan_operation" and (arguments or {}).get("operation") in {"cancel_task", "pause_task", "resume_task"} and self._live_session is not None:
             result = await asyncio.wait_for(self._live_session.call_tool(name, arguments or {}), timeout=10)
             if getattr(result, "isError", False):
                 raise RuntimeError(f"Native control rejected: {_tool_result_payload(result)}")
@@ -794,15 +794,29 @@ class PlanWorker:
             task = next((t for t in state.tasks if any(s.command_id == command_id for s in t.steps)), None)
             await self.progress_callback(StepExecution(status="dispatching", task_id=task.id if task else None,
                 operation=operation, command_id=command_id, outcome="running"))
-        return await self.client.call_tool(
-            "dispatch_plan_operation",
-            {"operation": operation, "params": dict(params), "command_id": command_id},
-        )
+        save_id = self.supplied_save_id or await self._resolve_save_id()
+        state = self.store.state(save_id)
+        task = next((t for t in state.tasks if any(s.command_id == command_id for s in t.steps)), None)
+        if (state.paused or task is None or state.decision.get("taskId") != task.id
+                or state.decision.get("finished")):
+            raise DispatchDeferred("paused or decision revoked before native send")
+        try:
+            return await self.client.call_tool(
+                "dispatch_plan_operation",
+                {"operation": operation, "params": dict(params), "command_id": command_id},
+            )
+        except Exception as ex:
+            if "UNAUTHORIZED_JOB_COMMAND" in str(ex):
+                raise DispatchDeferred(str(ex)) from ex
+            raise
 
     async def _reconcile(self, command_id: str) -> Any:
         reconcile = getattr(self.client, "reconcile", None)
         if callable(reconcile):
-            return await reconcile(command_id)
+            result = await reconcile(command_id)
+            if isinstance(result, dict) and "found" in result:
+                return result.get("native") if result.get("found") else None
+            return result
         return None
 
     async def _resolve_save_id(self) -> str | None:
@@ -821,6 +835,7 @@ class ActiveChatTask:
     request_id: str
     save_id: str
     prompt: str = ""
+    command_id: str = ""
     start_max_idx: int = -1
     start_max_step_idx: int = -1
     wire_start_offset: int = 0
@@ -837,12 +852,14 @@ class CommandChain:
     instruction: str
     save_id: str
     started_at: float
+    root_request_id: str = ""
     chain_count: int = 0
     generation: int = 0
     ws: WebSocketClient | None = None
     # Task whose terminal may advance this chain; set when the owning turn
     # selects a job, consumed on the matching terminal.
     waiting_task_id: str | None = None
+    pending_continuation: bool = False
 
 
 class ChatBridge:
@@ -937,6 +954,8 @@ class ChatBridge:
         self._work_store: WorkStore | None = None
         self._plan_worker: PlanWorker | None = None
         self._command_chains: dict[str, CommandChain] = {}
+        # One unresolved native cancellation per save; cleared on confirmation.
+        self._pending_native_cancels: dict[str, tuple[str, str]] = {}
         self._chain_requests: set[str] = set()
         self._chain_generation = 0
         self._chain_tasks: set[asyncio.Task] = set()
@@ -1004,6 +1023,8 @@ class ChatBridge:
                 reply_text=f"{event.message}：{event.tool_name}",
                 save_id=save_id,
                 provider=self.backend_name,
+                command_id=(self._active_task.command_id if self._active_task and self._active_task.request_id == request_id else request_id),
+                command_complete=False,
             )
             asyncio.run_coroutine_threadsafe(self._send_reply(ws, reply), loop)
 
@@ -1244,8 +1265,8 @@ class ChatBridge:
         if request_id.startswith("autonomy-"):
             return False
         self._autonomy_generation += 1
-        self.abort_active_task("player request preempted autonomy")
-        self._active_task = None
+        # The submit path below uses handle_chat_cancel and waits for the old
+        # turn's finally block before the player's replacement is accepted.
         return True
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
@@ -1472,6 +1493,7 @@ class ChatBridge:
             or state.paused
             or self._active_task is not None
             or self._busy_lock.locked()
+            or save_id in self._command_chains
             or self._autonomy.is_cooling_down(save_id)
         ):
             return
@@ -1524,7 +1546,7 @@ class ChatBridge:
         if store is None:
             return
         try:
-            if action in {"pause", "cancel", "set_mode"}:
+            if action in {"cancel", "set_mode"}:
                 self._break_command_chain(save_id)
             if action == "pause":
                 store.set_paused(save_id, True)
@@ -1896,7 +1918,8 @@ class ChatBridge:
         binding = getattr(self, "_job_reply_binding", None)
         if not binding or binding[2] != execution.task_id:
             return
-        request_id, save_id, _, ws = binding
+        request_id, save_id, _, ws = binding[:4]
+        command_id = binding[4] if len(binding) > 4 else request_id
         phase = "job-running" if execution.status == "dispatching" else (
             "job-waiting" if execution.outcome == "waiting" else
             "job-completed" if execution.task_status == "completed" and execution.outcome == "completed" else
@@ -1905,8 +1928,13 @@ class ChatBridge:
         detail = execution.message or execution.reason_code or ""
         if execution.result and isinstance(execution.result, dict):
             detail = detail or str(execution.result.get("error") or execution.result.get("message") or "")
+        chain = self._command_chains.get(save_id)
+        command_complete = phase in {"job-completed", "job-failed"} and not (
+            chain is not None and chain.root_request_id == command_id
+        )
         await self._send_reply(ws, Envelope.create_chat_reply(self.instance_id, request_id,
-            status=phase, reply_text=f"{labels[phase]}：{execution.operation or ''} {detail[:400]}", save_id=save_id))
+            status=phase, reply_text=f"{labels[phase]}：{execution.operation or ''} {detail[:400]}", save_id=save_id,
+            command_id=command_id, command_complete=command_complete))
 
     def _plan_status_line(self) -> str | None:
         """Short F8-visible line: last plan action and the current wait reason."""
@@ -1976,19 +2004,22 @@ class ChatBridge:
         action = str(envelope.payload.get("action", ""))
         params = envelope.payload.get("parameters") or {}
         try:
-            if save_id and action in {"pause", "cancel", "set_mode"}:
-                self._break_command_chain(save_id)
-                await self._interrupt_short_job(save_id)
+            command_id = str(params.get("commandId") or "")
+            current_command = self._current_command_id(save_id)
+            if action in {"pause", "resume", "cancel"} and command_id and current_command and command_id != current_command:
+                raise ValueError("COMMAND_MISMATCH: control belongs to an older instruction")
+            native_ok = True
+            if action == "cancel":
+                native_ok = await self.handle_chat_cancel(ws, None, "F8 cancel", save_id, command_id=command_id or None)
             state = self._autonomy.control(save_id, action, **params)
             if self._work_store is not None:
                 self._apply_work_control(save_id, action, params)
-            if action in {"pause", "cancel", "set_mode"} and self._active_task is not None:
-                if self._active_task.request_id.startswith("autonomy-") or self._active_task.request_id.startswith("chain-"):
-                    if self._active_task.request_id.startswith("autonomy-"):
-                        self._autonomy_generation += 1
-                    self.abort_active_task(f"control: {action}")
-                    self._active_task = None
-            status, reason = "confirmed", None
+            if action == "resume":
+                chain = self._command_chains.get(save_id)
+                if chain is not None and chain.pending_continuation:
+                    self._schedule_command_chain(save_id)
+                self._notify_plan_worker(save_id)
+            status, reason = ("confirmed", None) if native_ok else ("rejected", "NATIVE_CANCEL_UNCONFIRMED")
         except (TypeError, ValueError) as ex:
             state, status, reason = self._autonomy.state(save_id), "rejected", str(ex)
         reply = Envelope.create_autonomy_state(
@@ -2015,10 +2046,32 @@ class ChatBridge:
         request_id: str | None,
         reason: str,
         save_id: str | None,
-    ) -> None:
+        *,
+        command_id: str | None = None,
+    ) -> bool:
         """Handles immediate cancellation: kills active agy subprocess, records command, and notifies game."""
+        current_command_id = self._current_command_id(save_id)
+        if command_id and current_command_id and command_id != current_command_id:
+            return False
+        if request_id and current_command_id and request_id not in {
+            current_command_id, self._active_task.request_id if self._active_task else "",
+        }:
+            return False
+        pending = self._pending_native_cancels.get(save_id or "")
+        native_command_id = pending[1] if pending and pending[0] == current_command_id else None
+        if native_command_id is None and save_id and self._work_store is not None:
+            state_before = self._work_store.state(save_id)
+            selected_task = next((item for item in state_before.tasks
+                                  if item.id == state_before.decision.get("taskId")), None)
+            if selected_task is not None:
+                native_command_id = next((step.command_id for step in selected_task.steps
+                                          if step.command_id and step.status == "running"), None)
         self._break_command_chain(save_id)
-        await self._interrupt_short_job(save_id)
+        native_ok = (await self._confirm_native_terminal(native_command_id)
+                     if pending and pending[0] == current_command_id
+                     else await self._interrupt_short_job(save_id))
+        if save_id and not native_ok and native_command_id:
+            self._pending_native_cancels[save_id] = (current_command_id or command_id or "", native_command_id)
         self._autonomy_pending_task_fingerprints.clear()
         task = self._active_task
         if self._autonomy is not None and save_id:
@@ -2031,6 +2084,15 @@ class ChatBridge:
             start_idx = task.start_max_idx
 
             self.abort_active_task(f"Cancel requested: {reason}")
+            old_async_task = task.async_task
+            if old_async_task is not None and old_async_task is not asyncio.current_task():
+                try:
+                    await asyncio.wait_for(asyncio.shield(old_async_task), timeout=5.0)
+                except asyncio.CancelledError:
+                    if not old_async_task.cancelled():
+                        raise
+                except TimeoutError:
+                    native_ok = False
 
             # Resolve conversation id and compute any usage produced before cancellation
             cid = self.get_conversation_id(active_save)
@@ -2072,36 +2134,97 @@ class ChatBridge:
             reply = Envelope.create_chat_reply(
                 sender_instance_id=self.instance_id,
                 request_id=request_id or active_req,
-                status="cancelled",
-                reply_text="任务已由玩家取消。",
+                status="cancelled" if native_ok else "job-waiting",
+                reply_text="任务已由玩家取消。" if native_ok else "取消已请求，原生作业终态尚未确认。",
                 save_id=active_save,
                 tokens_used=usage_delta["total_tokens"] if usage_delta else None,
                 prompt_tokens=usage_delta["input_tokens"] if usage_delta else None,
                 output_tokens=usage_delta["output_tokens"] if usage_delta else None,
                 cached_tokens=usage_delta["cache_read_tokens"] if usage_delta else None,
                 conversation_id=cid,
-                error="PLAYER_CANCELLED",
+                error="PLAYER_CANCELLED" if native_ok else "NATIVE_CANCEL_UNCONFIRMED",
                 usage_source="db_gen_metadata_delta_cancelled" if usage_delta else "cancelled",
+                command_id=current_command_id or active_req,
+                command_complete=native_ok,
             )
             await self._send_reply(ws, reply)
-            self._active_task = None
+            if (old_async_task is None or old_async_task.done()) and self._active_task is task:
+                self._active_task = None
             # The cancelled provider turn no longer owns the command socket; hand
             # it back so the worker can settle its own epoch-checked bookkeeping.
-            await self._release_execution(active_save or save_id)
+            if old_async_task is None:
+                await self._release_execution(active_save or save_id)
         else:
             logger.info("chat.cancel received but no task was actively running.")
+            binding = getattr(self, "_job_reply_binding", None)
+            binding_command = (binding[4] if len(binding) > 4 else binding[0]) if binding else None
+            if binding and binding[1] == save_id and binding_command == current_command_id:
+                await self._send_reply(ws, Envelope.create_chat_reply(
+                    self.instance_id, binding[0], "cancelled" if native_ok else "job-waiting",
+                    "任务已由玩家取消。" if native_ok else "取消已请求，原生作业终态尚未确认。",
+                    save_id=save_id, error="PLAYER_CANCELLED" if native_ok else "NATIVE_CANCEL_UNCONFIRMED",
+                    command_id=current_command_id, command_complete=native_ok,
+                ))
+        if native_ok and save_id:
+            self._pending_native_cancels.pop(save_id, None)
+        if native_ok and getattr(self, "_job_reply_binding", None) and self._job_reply_binding[1] == save_id:
+            self._job_reply_binding = None
+        return native_ok
 
-    async def _interrupt_short_job(self, save_id: str | None) -> None:
+    def _current_command_id(self, save_id: str | None) -> str | None:
+        if not save_id:
+            return None
+        chain = self._command_chains.get(save_id)
+        if chain is not None:
+            return chain.root_request_id
+        task = self._active_task
+        if task is not None and task.save_id == save_id:
+            return task.command_id or task.request_id
+        binding = getattr(self, "_job_reply_binding", None)
+        if binding and binding[1] == save_id and self._work_store is not None:
+            decision = self._work_store.state(save_id).decision
+            if decision.get("selected") and not decision.get("finished") and decision.get("taskId") == binding[2]:
+                return binding[4] if len(binding) > 4 else binding[0]
+        pending = self._pending_native_cancels.get(save_id)
+        if pending is not None:
+            return pending[0]
+        return None
+
+    async def _interrupt_short_job(self, save_id: str | None) -> bool:
         if not save_id or self._work_store is None:
-            return
-        d = self._work_store.state(save_id).decision
+            return True
+        state = self._work_store.state(save_id)
+        d = state.decision
+        selected_task = next((task for task in state.tasks if task.id == d.get("taskId")), None)
+        was_dispatched = bool(selected_task and any(
+            step.command_id and step.status == "running" for step in selected_task.steps
+        ))
+        native_command_id = next((step.command_id for step in selected_task.steps
+                                  if step.command_id and step.status == "running"), None) if selected_task else None
         self._work_store.revoke_decision(save_id)
-        if d.get("selected") and not d.get("finished") and self._plan_worker:
+        if d.get("selected") and not d.get("finished") and was_dispatched and self._plan_worker:
             try:
                 await self._plan_worker.client.call_tool("dispatch_plan_operation", {
                     "operation": "cancel_task", "params": {}, "command_id": "interrupt-" + uuid.uuid4().hex})
             except Exception:
                 logger.warning("Native cancellation not confirmed; old job authority revoked")
+                return await self._confirm_native_terminal(native_command_id)
+        return True
+
+    async def _confirm_native_terminal(self, command_id: str | None) -> bool:
+        if not command_id or self._plan_worker is None:
+            return False
+        try:
+            result = await self._plan_worker.client.reconcile(command_id)
+            if isinstance(result, dict) and "found" in result:
+                result = result.get("native") if result.get("found") else None
+            return isinstance(result, dict) and result.get("terminalState") in {
+                "succeeded", "partially-succeeded", "partial", "failed",
+                "rejected", "cancelled", "canceled",
+            }
+        except Exception:
+            logger.debug("Unable to confirm native terminal for cancelled command %s", command_id, exc_info=True)
+            return False
 
     async def handle_chat_submit(
         self,
@@ -2139,7 +2262,7 @@ class ChatBridge:
                 async with self._busy_lock:
                     pass
             if save_id:
-                self._register_command_chain(save_id, text, ws)
+                self._register_command_chain(save_id, text, ws, request_id)
 
         # 1. Concurrency deduplication guard
         if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
@@ -2151,6 +2274,8 @@ class ChatBridge:
                 reply_text="伙伴正在执行上一条任务，请稍候或点击[取消]后再试。",
                 save_id=save_id,
                 error="BUSY_CONCURRENT_COMMAND",
+                command_id=request_id,
+                command_complete=True,
             )
             await self._send_reply(ws, busy_reply)
             return
@@ -2182,6 +2307,8 @@ class ChatBridge:
             active_task = ActiveChatTask(
                 request_id=request_id,
                 save_id=save_id or "",
+                command_id=(self._command_chains[save_id].root_request_id
+                            if save_id in self._command_chains else request_id),
                 prompt=task_prompt,
                 start_max_idx=start_max_idx,
                 start_max_step_idx=start_max_step_idx,
@@ -2204,6 +2331,8 @@ class ChatBridge:
                     status="processing",
                     reply_text=rotation_note or "正在思考与执行...",
                     save_id=save_id,
+                    command_id=active_task.command_id,
+                    command_complete=False,
                 )
                 await self._send_reply(ws, prog_reply)
                 self._configure_backend_progress(ws, request_id, save_id)
@@ -2382,7 +2511,7 @@ class ChatBridge:
                     if selected.get("selected") and not selected.get("finished"):
                         reply_status = "selected"
                         job_selected = True
-                        self._job_reply_binding = (request_id, save_id, selected.get("taskId"), ws)
+                        self._job_reply_binding = (request_id, save_id, selected.get("taskId"), ws, active_task.command_id)
                         chain = self._command_chains.get(save_id)
                         if chain is not None:
                             chain.waiting_task_id = selected.get("taskId")
@@ -2408,6 +2537,8 @@ class ChatBridge:
                     error=err,
                     usage_source=usage_source,
                     provider=self.backend_name,
+                    command_id=active_task.command_id,
+                    command_complete=not job_selected,
                 )
                 await self._send_reply(ws, final_reply)
                 if self._autonomy is not None and save_id:
@@ -2522,6 +2653,8 @@ class ChatBridge:
                     reply_text=f"执行发生系统错误：{ex}",
                     save_id=save_id,
                     error=str(ex),
+                    command_id=active_task.command_id,
+                    command_complete=True,
                 )
                 await self._send_reply(ws, err_reply)
             finally:
@@ -2557,11 +2690,13 @@ class ChatBridge:
             return False
         return True
 
-    def _register_command_chain(self, save_id: str, text: str, ws: WebSocketClient | None) -> None:
+    def _register_command_chain(self, save_id: str, text: str, ws: WebSocketClient | None, request_id: str) -> None:
         self._chain_generation += 1
+        self._pending_native_cancels.pop(save_id, None)
         self._command_chains[save_id] = CommandChain(
             instruction=text,
             save_id=save_id,
+            root_request_id=request_id,
             started_at=time.monotonic(),
             chain_count=0,
             generation=self._chain_generation,
@@ -2609,9 +2744,6 @@ class ChatBridge:
         chain = self._command_chains.get(save_id)
         if chain is None:
             return
-        if self._work_store and self._work_store.state(save_id).paused:
-            self._break_command_chain(save_id)
-            return
         # Only the terminal of the task the chain is actually waiting on may
         # advance it. A late terminal from a revoked previous job settles to
         # history above but must not fire a chain turn for the player's new
@@ -2620,6 +2752,18 @@ class ChatBridge:
         if chain.waiting_task_id is None or chain.waiting_task_id != execution.task_id:
             return
         chain.waiting_task_id = None
+        if execution.reason_code == "NATIVE_TERMINAL_UNCONFIRMED":
+            self._break_command_chain(save_id)
+            await self._send_reply(chain.ws, Envelope.create_chat_reply(
+                self.instance_id, f"chain-unconfirmed-{uuid.uuid4().hex[:8]}",
+                "failed", "原生作业尚未返回最终结果；已停止续链，避免重复派发。",
+                save_id=save_id, error=execution.reason_code,
+                command_id=chain.root_request_id, command_complete=True,
+            ))
+            return
+        if self._work_store and self._work_store.state(save_id).paused:
+            chain.pending_continuation = True
+            return
         self._schedule_command_chain(save_id)
 
     def _schedule_command_chain(self, save_id: str) -> asyncio.Task | None:
@@ -2627,8 +2771,9 @@ class ChatBridge:
         if chain is None:
             return None
         if self._work_store and self._work_store.state(save_id).paused:
-            self._break_command_chain(save_id)
+            chain.pending_continuation = True
             return None
+        chain.pending_continuation = False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -2653,14 +2798,14 @@ class ChatBridge:
             if chain is None or chain.generation != generation:
                 return
             if self._work_store and self._work_store.state(save_id).paused:
-                self._break_command_chain(save_id)
+                chain.pending_continuation = True
                 return
 
         chain = self._command_chains.get(save_id)
         if chain is None or chain.generation != generation:
             return
         if self._work_store and self._work_store.state(save_id).paused:
-            self._break_command_chain(save_id)
+            chain.pending_continuation = True
             return
 
         max_chains = self._get_command_chain_max()
@@ -2673,6 +2818,8 @@ class ChatBridge:
                 status="completed",
                 reply_text=msg,
                 save_id=save_id,
+                command_id=chain.root_request_id,
+                command_complete=True,
             )
             await self._send_reply(chain.ws, reply)
             return

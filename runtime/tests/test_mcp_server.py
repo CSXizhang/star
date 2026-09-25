@@ -1060,14 +1060,13 @@ def test_mcp_server_call_controls(mock_scheduler, tmp_path):
         assert len(pause_content) == 1
         assert pause_data["status"] == "paused"
         mock_scheduler.pause_task.assert_awaited_once()
-        # pause revoked the decision; resume selects a job only under a fresh one.
-        assert store.state("mock-save-123").decision == {}
+        # Pausing a native job preserves the current model decision.
+        assert store.state("mock-save-123").decision["token"] == "decision-1"
 
-        store.begin_decision("mock-save-123", "decision-1")
         with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
             _, resume_data = await server.call_tool("resume_task", {})
-        assert resume_data["status"] == "job-selected"
-        mock_scheduler.resume_task.assert_not_awaited()
+        assert resume_data["status"] == "resumed"
+        mock_scheduler.resume_task.assert_awaited_once()
 
         # Cancel
         _, cancel_data = await server.call_tool(

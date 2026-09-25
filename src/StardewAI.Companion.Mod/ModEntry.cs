@@ -42,11 +42,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private CompanionMechanicsCoordinator? _coordinator;
     private WebSocketTransportServer? _transportServer;
     private readonly ConcurrentQueue<Action> _mainThreadActions = new();
-    private string? _pendingAutonomyRequestId;
+    private readonly ChatCommandUiState _chatUiState = new();
+    private ISkillExecutionMachine? _localPauseMachine;
+    private ISkillExecutionMachine? _deferredResumeMachine;
     private DateTime _autonomySentAt;
     private DateTime _chatActivityAt = DateTime.UtcNow;
     private string? _watchedChatRequest;
-    private readonly Dictionary<string, string> _autonomyRequestActions = new();
 
     public override void Entry(IModHelper helper)
     {
@@ -69,15 +70,15 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             OnCommandWater);
 
         helper.ConsoleCommands.Add("ai_pause",
-            "Pauses the currently executing companion watering task.\nUsage: ai_pause",
+            "Pauses the currently executing companion task.\nUsage: ai_pause",
             OnCommandPause);
 
         helper.ConsoleCommands.Add("ai_resume",
-            "Resumes a paused companion watering task.\nUsage: ai_resume",
+            "Resumes a paused companion task.\nUsage: ai_resume",
             OnCommandResume);
 
         helper.ConsoleCommands.Add("ai_cancel",
-            "Cancels the currently executing companion watering task.\nUsage: ai_cancel",
+            "Cancels the currently executing companion task.\nUsage: ai_cancel",
             OnCommandCancel);
 
         helper.ConsoleCommands.Add("ai_status",
@@ -298,15 +299,18 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
         while (_mainThreadActions.TryDequeue(out var action)) action();
-        if (_watchedChatRequest != CompanionCommandMenu.CurrentRequestId)
+        if (_watchedChatRequest != _chatUiState.CommandId)
         {
-            _watchedChatRequest = CompanionCommandMenu.CurrentRequestId;
+            _watchedChatRequest = _chatUiState.CommandId;
             _chatActivityAt = DateTime.UtcNow;
         }
-        if (_pendingAutonomyRequestId != null && DateTime.UtcNow - _autonomySentAt > TimeSpan.FromSeconds(30))
-            ShowChatChannelProblem(_pendingAutonomyRequestId, null, "模式/控制确认超时，实际结果未知；仍显示上次确认模式，请恢复连接后重试。");
-        if (CompanionCommandMenu.IsProcessing && DateTime.UtcNow - _chatActivityAt > TimeSpan.FromSeconds(120))
-            ShowChatChannelProblem(CompanionCommandMenu.CurrentRequestId, null, "120秒未收到伙伴进度，结果未确认；可检查连接后重试，或取消原任务。");
+        if (_chatUiState.PendingControlId != null && DateTime.UtcNow - _autonomySentAt > TimeSpan.FromSeconds(30))
+            ShowChatChannelProblem(_chatUiState.PendingControlId, null, "控制确认超时，服务端结果未知；可重试控制。游戏中的动作保持本地实际状态。");
+        if (_chatUiState.HasActiveCommand && DateTime.UtcNow - _chatActivityAt > TimeSpan.FromSeconds(120))
+        {
+            _chatActivityAt = DateTime.UtcNow;
+            ShowChatChannelProblem(_chatUiState.CommandId, null, "120秒未收到伙伴进度，结果未确认；请检查连接或取消原任务。");
+        }
         // 0. Defensive initialization: ensure companion is initialized as soon as the world is ready,
         // even if SaveLoaded/DayStarted fired under edge-case timing or custom loaders.
         if (_actor == null && Context.IsWorldReady && Game1.currentLocation != null)
@@ -319,8 +323,23 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
         // 2. Only advance game action if not cancelled or paused
         _coordinator?.Update(Game1.currentGameTime, e.Ticks);
+        if (_deferredResumeMachine != null && _deferredResumeMachine.IsPaused)
+        {
+            _deferredResumeMachine.Resume();
+            _deferredResumeMachine = null;
+            _localPauseMachine = null;
+            _chatUiState.NoteLocalResumed();
+            ProjectChatUiState();
+        }
+        if (_localPauseMachine != null && !_localPauseMachine.IsExecuting)
+        {
+            _localPauseMachine = null;
+            _deferredResumeMachine = null;
+            _chatUiState.NoteLocalResumed();
+            ProjectChatUiState();
+        }
 
-        if (Game1.activeClickableMenu is CompanionCommandMenu && _coordinator != null && _coordinator.GetActivityStatus() != "idle")
+        if (Game1.activeClickableMenu is CompanionCommandMenu && !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && _coordinator != null && _coordinator.GetActivityStatus() != "idle")
         {
             CompanionCommandMenu.CurrentStatusText = _coordinator.GetActivityStatus() switch
             {
@@ -329,6 +348,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 var status => status
             };
         }
+        ProjectChatUiAvailability();
+        if (Game1.activeClickableMenu is CompanionCommandMenu && !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested && _transportServer?.IsChatConnected != true)
+            CompanionCommandMenu.CurrentStatusText = "桥接未连接，输入会保留";
     }
 
     private void OnRenderedWorld(object? sender, RenderedWorldEventArgs e)
@@ -394,7 +416,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _actor = null;
             _avatar = null;
             _coordinator = null;
+            _localPauseMachine = null;
+            _deferredResumeMachine = null;
             _stateRepository = null;
+            _chatUiState.Reset();
+            ProjectChatUiState();
+            CompanionCommandMenu.DraftText = string.Empty;
             Monitor.Log("Companion actor and transport shutdown cleanly.", LogLevel.Info);
         }
         catch (Exception ex)
@@ -421,7 +448,20 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (progress is null)
             return;
 
-        string text = $"行动 {progress.Action} · 阶段 {progress.Phase}";
+        string actionName = progress.Action switch
+        {
+            "RefillWateringCan" => "加水", "ApplyFertilizer" => "施肥", "ClearDebris" => "清理杂物",
+            "PickupItems" => "拾取", "InsertMachine" => "投放机器", "CollectMachine" => "收取机器",
+            "PetAnimal" => "抚摸动物", "FeedAnimals" => "喂养动物", "ToggleAnimalDoor" => "开关畜舍门",
+            "CollectAnimalProduce" => "收取畜产品", "ChopTree" => "砍树", _ => progress.Action
+        };
+        string phaseName = progress.Phase switch
+        {
+            "Navigating" => "前往目标", "Facing" => "面向目标", "Acting" => "执行",
+            "Verifying" => "核对结果", "Paused" => "已暂停", "Cancelling" => "取消中",
+            _ => progress.Phase
+        };
+        string text = $"行动 {actionName} · 阶段 {phaseName}";
         if (progress.Total > 0)
             text += $" · 完成 {progress.Completed}/{progress.Total}";
         if (!string.IsNullOrEmpty(progress.ReasonCode))
@@ -457,6 +497,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             {
                 if (Game1.activeClickableMenu is CompanionCommandMenu)
                 {
+                    ((CompanionCommandMenu)Game1.activeClickableMenu).PreserveDraft();
                     Game1.activeClickableMenu.exitThisMenu(playSound: false);
                 }
                 return;
@@ -479,17 +520,16 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 ToggleAutonomyMode,
                 OpenAutonomySettings
             );
-            CompanionCommandMenu.CurrentStatusText = _coordinator.GetActivityStatus() switch
-            {
-                "idle" => "待命",
-                "paused" => "已暂停",
-                var status => status
-            };
+            ProjectChatUiState();
+            if (!_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && _coordinator.GetActivityStatus() != "idle")
+                CompanionCommandMenu.CurrentStatusText = _coordinator.GetActivityStatus() == "paused" ? "已暂停" : _coordinator.GetActivityStatus();
+            if (!_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested && _transportServer?.IsChatConnected != true)
+                CompanionCommandMenu.CurrentStatusText = "桥接未连接，输入会保留";
             Monitor.Log("Companion command menu opened (F8).", LogLevel.Info);
         }
     }
 
-    private void ExecuteInGameCommand(string rawInput)
+    private bool ExecuteInGameCommand(string rawInput)
     {
         Monitor.Log($"In-game command submitted: '{rawInput}'", LogLevel.Info);
 
@@ -534,147 +574,127 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     CompanionCommandMenu.CurrentStatusText = "就绪";
                     break;
             }
-            return;
+            return true;
         }
 
         // Natural language chat command dispatched to runtime agent bridge
-        DispatchNaturalLanguageChat(rawInput);
+        return DispatchNaturalLanguageChat(rawInput);
     }
 
-    private void DispatchNaturalLanguageChat(string rawInput)
+    private bool DispatchNaturalLanguageChat(string rawInput)
     {
         if (_transportServer == null)
         {
-            CompanionCommandMenu.IsProcessing = false;
             CompanionCommandMenu.CurrentStatusText = "未就绪";
             CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", "错误：传输服务尚未就绪。", Microsoft.Xna.Framework.Color.Red));
-            return;
+            return false;
         }
 
         if (!_transportServer.IsChatConnected)
         {
             TryAutoStartChatBridge();
 
-            CompanionCommandMenu.IsProcessing = false;
             CompanionCommandMenu.CurrentStatusText = "桥接未连接";
             CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", "提示：后台 AI 伙伴桥接尚未连接。已尝试启动桥接服务，或请双击根目录『启动伙伴服务.cmd』。", Microsoft.Xna.Framework.Color.DarkOrange));
             Game1.addHUDMessage(new HUDMessage("AI 伙伴桥接服务未连接，请启动服务。", HUDMessage.error_type));
-            return;
+            return false;
         }
 
         string reqId = Guid.NewGuid().ToString("N")[..8];
         string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
-        CompanionCommandMenu.BeginRequest(reqId, saveId, "正在规划");
+        if (!_chatUiState.BeginCommand(reqId, saveId)) return false;
+        ProjectChatUiState();
+        CompanionCommandMenu.CurrentActionText = null;
+        CompanionCommandMenu.CurrentToolName = null;
+        CompanionCommandMenu.PlanWaitReason = null;
+        CompanionCommandMenu.WaitingConditions = Array.Empty<string>();
+        CompanionCommandMenu.StructuredProgressText = null;
+        CompanionCommandMenu.LastTokenInfo = null;
         var payload = new ChatSubmitPayload(reqId, rawInput, "text", saveId);
 
         _ = Task.Run(async () =>
         {
-            bool ok = await _transportServer.SendChatSubmitAsync(payload).ConfigureAwait(false);
-            if (!ok)
+            bool ok;
+            try { ok = await _transportServer.SendChatSubmitAsync(payload).ConfigureAwait(false); }
+            catch (Exception ex)
             {
-                CompanionCommandMenu.IsProcessing = false;
-                CompanionCommandMenu.CurrentRequestId = null;
-                CompanionCommandMenu.CurrentStatusText = "发送失败";
-                Game1.addHUDMessage(new HUDMessage("发送指令至 AI 伙伴桥接失败。", HUDMessage.error_type));
+                Monitor.Log($"Chat submit send failed: {ex}", LogLevel.Warn);
+                ok = false;
             }
+            if (!ok) _mainThreadActions.Enqueue(() =>
+            {
+                if (!_chatUiState.FailSend(reqId)) return;
+                ProjectChatUiState();
+                CompanionCommandMenu.DraftText = rawInput;
+                CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", "发送失败，原文已保留；请恢复连接后重试。", Color.Red));
+                Game1.addHUDMessage(new HUDMessage("发送指令至 AI 伙伴桥接失败；F8 可重试。", HUDMessage.error_type));
+            });
         });
+        return true;
     }
 
     private void HandleChatReplyReceived(ChatReplyPayload reply)
     {
-        if (CompanionCommandMenu.IsCurrentReply(reply.RequestId, reply.SaveId)) _chatActivityAt = DateTime.UtcNow;
-        Monitor.Log($"Chat reply received: Status={reply.Status}, Reply='{reply.ReplyText}', Tokens={reply.TokensUsed}", LogLevel.Info);
+        string currentSave = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        if (reply.Status == "processing" && !_chatUiState.HasActiveCommand &&
+            !_chatUiState.HasPendingControl && CompanionCommandMenu.AutonomyMode == "free" &&
+            string.Equals(reply.SaveId, currentSave, StringComparison.Ordinal))
+            _chatUiState.BeginCommand(reply.CommandId ?? reply.RequestId, currentSave, "模型正在思考");
 
-        if (reply.Status == "processing" && CompanionCommandMenu.CurrentRequestId is null &&
-            CompanionCommandMenu.AutonomyMode == "free" &&
-            reply.SaveId == (Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString()))
-            CompanionCommandMenu.BeginRequest(reply.RequestId, reply.SaveId, "模型正在思考");
+        string? previousTurn = _chatUiState.TurnId;
+        if (!_chatUiState.ApplyReply(reply.RequestId, reply.CommandId, reply.SaveId, reply.Status, reply.CommandComplete))
+            return;
+        _chatActivityAt = DateTime.UtcNow;
+        ProjectChatUiState();
+        if (previousTurn != null && previousTurn != reply.RequestId)
+        {
+            CompanionCommandMenu.CurrentActionText = null;
+            CompanionCommandMenu.CurrentToolName = null;
+            CompanionCommandMenu.StructuredProgressText = null;
+        }
+        Monitor.Log($"Chat reply received: Status={reply.Status}, Command={reply.CommandId}, Turn={reply.RequestId}, Tokens={reply.TokensUsed}", LogLevel.Info);
 
         if (reply.Status.StartsWith("job-", StringComparison.OrdinalIgnoreCase))
         {
-            if (!CompanionCommandMenu.IsCurrentReply(reply.RequestId, reply.SaveId)) return;
-            bool terminal = reply.Status is "job-completed" or "job-failed";
-            CompanionCommandMenu.IsProcessing = !terminal;
-            CompanionCommandMenu.CurrentStatusText = reply.Status switch {
-                "job-completed" => "作业已完成", "job-failed" => "作业未完成",
-                "job-waiting" => "作业等待", _ => "原生执行中" };
             CompanionCommandMenu.CurrentActionText = reply.ReplyText;
-            if (terminal)
-            {
+            if (reply.Status is "job-completed" or "job-failed")
                 CompanionCommandMenu.ChatHistory.Add(new ChatMessage("执行结果", reply.ReplyText,
                     reply.Status == "job-completed" ? Color.DarkGreen : Color.Red));
-                CompanionCommandMenu.CurrentRequestId = null;
-            }
             return;
         }
         if (reply.Status is "selected" or "decision-completed")
         {
-            if (!CompanionCommandMenu.IsCurrentReply(reply.RequestId, reply.SaveId)) return;
-            bool selected = reply.Status == "selected";
-            CompanionCommandMenu.IsProcessing = selected;
-            CompanionCommandMenu.CurrentStatusText = selected ? "已选择，等待执行" : "模型回复完成";
-            CompanionCommandMenu.CurrentActionText = selected ? "短作业等待原生执行" : null;
+            CompanionCommandMenu.CurrentActionText = reply.Status == "selected" ? "短作业等待原生执行" : null;
             CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Color.DarkGreen, BuildUsageLine(reply, "本轮用量")));
-            if (!selected) CompanionCommandMenu.CurrentRequestId = null;
+            if (reply.CommandComplete == true) Game1.addHUDMessage(new HUDMessage("AI 伙伴已回复，按 F8 查看。"));
             return;
         }
-
-        if (string.Equals(reply.Status, "processing", StringComparison.OrdinalIgnoreCase))
+        if (reply.Status == "processing")
         {
-            // A late processing reply from an older request/save must never overwrite
-            // the visible progress of the request currently on screen.
-            if (!CompanionCommandMenu.IsCurrentReply(reply.RequestId, reply.SaveId))
-                return;
-
-            CompanionCommandMenu.IsProcessing = true;
-            if (!string.IsNullOrWhiteSpace(reply.ReplyText))
-                CompanionCommandMenu.CurrentActionText = reply.ReplyText;
-            if (!string.IsNullOrWhiteSpace(reply.ToolName))
-                CompanionCommandMenu.CurrentToolName = reply.ToolName;
-            if (string.IsNullOrEmpty(CompanionCommandMenu.CurrentStatusText) ||
-                CompanionCommandMenu.CurrentStatusText == "就绪")
-                CompanionCommandMenu.CurrentStatusText = "模型思考 / 观察与选择";
+            if (!string.IsNullOrWhiteSpace(reply.ReplyText)) CompanionCommandMenu.CurrentActionText = reply.ReplyText;
+            if (!string.IsNullOrWhiteSpace(reply.ToolName)) CompanionCommandMenu.CurrentToolName = reply.ToolName;
             return;
         }
 
-        if (!CompanionCommandMenu.IsCurrentReply(reply.RequestId, reply.SaveId))
-            return;
-
-        if (string.Equals(reply.Status, "completed", StringComparison.OrdinalIgnoreCase))
-        {
-            CompanionCommandMenu.IsProcessing = false;
-            CompanionCommandMenu.CurrentRequestId = null;
-            CompanionCommandMenu.CurrentStatusText = "模型回复完成";
-            CompanionCommandMenu.CurrentActionText = null;
-
-            string? tokenInfo = BuildUsageLine(reply, "本轮用量");
-            CompanionCommandMenu.LastTokenInfo = tokenInfo;
-            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Microsoft.Xna.Framework.Color.DarkGreen, tokenInfo));
-            Game1.addHUDMessage(new HUDMessage($"[AI伙伴] {reply.ReplyText}"));
-            return;
-        }
-
-        if (string.Equals(reply.Status, "cancelled", StringComparison.OrdinalIgnoreCase))
-        {
-            CompanionCommandMenu.IsProcessing = false;
-            CompanionCommandMenu.CurrentRequestId = null;
-            CompanionCommandMenu.CurrentStatusText = "已取消";
-            CompanionCommandMenu.CurrentActionText = null;
-
-            string? tokenInfo = BuildUsageLine(reply, "已中止用量");
-            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Microsoft.Xna.Framework.Color.DarkGoldenrod, tokenInfo));
-            Game1.addHUDMessage(new HUDMessage($"[AI伙伴] {reply.ReplyText}"));
-            return;
-        }
-
-        // Failed or error
-        CompanionCommandMenu.IsProcessing = false;
-        CompanionCommandMenu.CurrentRequestId = null;
-        CompanionCommandMenu.CurrentStatusText = "失败";
         CompanionCommandMenu.CurrentActionText = null;
-        string err = !string.IsNullOrEmpty(reply.Error) ? reply.Error : reply.ReplyText;
-        CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", $"任务未完成: {err}", Microsoft.Xna.Framework.Color.Red));
-        Game1.addHUDMessage(new HUDMessage($"[AI伙伴] {err}", HUDMessage.error_type));
+        string? tokenInfo = BuildUsageLine(reply, reply.Status == "cancelled" ? "已中止用量" : "本轮用量");
+        CompanionCommandMenu.LastTokenInfo = tokenInfo;
+        if (reply.Status == "cancelled")
+        {
+            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Color.DarkGoldenrod, tokenInfo));
+            Game1.addHUDMessage(new HUDMessage("AI 伙伴任务已取消，按 F8 查看。"));
+        }
+        else if (reply.Status == "completed")
+        {
+            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Color.DarkGreen, tokenInfo));
+            if (reply.CommandComplete != false) Game1.addHUDMessage(new HUDMessage("AI 伙伴已回复，按 F8 查看。"));
+        }
+        else
+        {
+            string err = !string.IsNullOrEmpty(reply.Error) ? reply.Error : reply.ReplyText;
+            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", $"任务未完成: {err}", Color.Red, tokenInfo));
+            Game1.addHUDMessage(new HUDMessage("AI 伙伴任务未完成，按 F8 查看。", HUDMessage.error_type));
+        }
     }
 
     /// <summary>
@@ -703,34 +723,58 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         return $"{prefix}: {total} tokens (输入: {input}, 缓存读: {cacheRead}, 缓存写: {cacheWrite}, 输出: {output}, 模型调用: {calls}){srcTag}";
     }
 
+    private void ProjectChatUiState()
+    {
+        CompanionCommandMenu.CurrentRequestId = _chatUiState.CommandId;
+        CompanionCommandMenu.CurrentRequestSaveId = _chatUiState.SaveId;
+        CompanionCommandMenu.IsProcessing = _chatUiState.HasActiveCommand;
+        CompanionCommandMenu.ControlPending = _chatUiState.HasPendingControl;
+        CompanionCommandMenu.PendingControlAction = _chatUiState.PendingControlAction;
+        CompanionCommandMenu.ModeChangePending = _chatUiState.PendingControlAction == "set_mode";
+        CompanionCommandMenu.AutonomyPaused = _chatUiState.IsPaused;
+        CompanionCommandMenu.CurrentStatusText = _chatUiState.StatusText;
+        ProjectChatUiAvailability();
+    }
+
+    private void ProjectChatUiAvailability()
+    {
+        CompanionCommandMenu.CanSubmitText = _chatUiState.CanSubmit;
+        CompanionCommandMenu.SubmissionBlockReason = _chatUiState.HasPendingControl
+            ? "正在等待控制确认，请稍候。"
+            : _chatUiState.IsPaused ? "伙伴已暂停，请先点击[继续]。"
+            : _chatUiState.LocalPauseRequested ? "游戏动作仍在暂停或等待安全恢复，请点击[继续]。"
+            : _chatUiState.HasActiveCommand ? "当前指令仍在执行，请稍候或点击[取消]。"
+            : null;
+    }
+
     private void ShowChatChannelProblem(string? requestId, string? saveId, string problem)
     {
         if (!string.IsNullOrEmpty(saveId) && saveId != (Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString())) return;
-        if (requestId != null && requestId != _pendingAutonomyRequestId && requestId != CompanionCommandMenu.CurrentRequestId) return;
-        if (requestId == null || requestId == _pendingAutonomyRequestId)
-        {
-            if (_pendingAutonomyRequestId != null) _autonomyRequestActions.Remove(_pendingAutonomyRequestId);
-            _pendingAutonomyRequestId = null;
-            CompanionCommandMenu.ModeChangePending = false;
-        }
-        CompanionCommandMenu.IsProcessing = false;
-        CompanionCommandMenu.CurrentStatusText = "连接/回复异常，可重试";
-        CompanionCommandMenu.CurrentActionText = problem;
-        CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", problem, Color.Red));
-        // Keep the chat request correlation: a delayed real result can still settle it.
+        bool pendingControl = requestId != null && requestId == _chatUiState.PendingControlId;
+        bool activeCommand = requestId != null && (requestId == _chatUiState.CommandId || requestId == _chatUiState.TurnId);
+        if (requestId != null && !pendingControl && !activeCommand) return;
+        bool controlProblem = pendingControl || requestId == null && _chatUiState.HasPendingControl;
+        if (controlProblem)
+            _chatUiState.FailControl(_chatUiState.PendingControlId!);
+        else _chatUiState.ShowConnectionProblem("连接/回复异常，请检查连接");
+        ProjectChatUiState();
+        string detail = controlProblem && _chatUiState.LocalPauseRequested
+            ? problem + " 游戏动作的暂停请求已发出；仍可点击[继续]请求恢复。"
+            : problem;
+        CompanionCommandMenu.CurrentActionText = detail;
+        CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", detail, Color.Red));
+        // Keep an active command correlated until a real terminal or confirmed cancel.
     }
 
     private void ToggleAutonomyMode()
     {
-        if (CompanionCommandMenu.ModeChangePending) return;
+        if (_chatUiState.HasPendingControl) return;
         string next = CompanionCommandMenu.AutonomyMode == "free" ? "command" : "free";
-        CompanionCommandMenu.CurrentStatusText = "正在连接/等待确认";
         _ = SendAutonomyControl("set_mode", new JsonObject { ["mode"] = next });
     }
 
     private void OpenAutonomySettings()
     {
-        CompanionCommandMenu.CurrentStatusText = "等待设置确认";
         _ = SendAutonomyControl("set_preferences", new JsonObject
         {
             ["budget_limit"] = CompanionCommandMenu.DailySpendLimit,
@@ -740,6 +784,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private async Task SendAutonomyControl(string action, JsonObject parameters)
     {
+        if (_chatUiState.HasPendingControl) return;
         if (_transportServer == null || !_transportServer.IsChatConnected)
         {
             ShowChatChannelProblem(null, null, "伙伴服务未连接，请启动原有伙伴服务后重试。");
@@ -747,15 +792,16 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         }
         string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
         string requestId = Guid.NewGuid().ToString("N")[..8];
-        _pendingAutonomyRequestId = requestId;
-        _autonomyRequestActions[requestId] = action;
+        if (action is "pause" or "resume" or "cancel" && _chatUiState.CommandId is string commandId)
+            parameters["commandId"] = commandId;
+        if (!_chatUiState.BeginControl(requestId, action)) return;
         _autonomySentAt = DateTime.UtcNow;
-        CompanionCommandMenu.ModeChangePending = action == "set_mode";
+        ProjectChatUiState();
         try
         {
             bool sent = await _transportServer.SendAutonomyControlAsync(
                 new AutonomyControlPayload(requestId, saveId, action, parameters)).ConfigureAwait(false);
-            if (!sent) _mainThreadActions.Enqueue(() => ShowChatChannelProblem(requestId, saveId, "控制发送失败，模式未确认；请恢复连接后重试。"));
+            if (!sent) _mainThreadActions.Enqueue(() => ShowChatChannelProblem(requestId, saveId, "控制发送失败，服务端未确认；请检查连接后重试。"));
         }
         catch (Exception ex)
         {
@@ -765,30 +811,41 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void HandleAutonomyStateReceived(AutonomyStatePayload state)
     {
-        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
-        if (!string.Equals(state.SaveId, saveId, StringComparison.Ordinal)) return;
-        if (!string.Equals(state.RequestId, _pendingAutonomyRequestId, StringComparison.Ordinal)) return;
-        string action = _autonomyRequestActions.TryGetValue(state.RequestId, out string? knownAction) ? knownAction : "unknown";
-        _autonomyRequestActions.Remove(state.RequestId);
-        Monitor.Log($"[AutonomyAck] requestId={state.RequestId} action={action} status={state.Status} mode={state.Mode} paused={state.Paused} saveId={state.SaveId}", LogLevel.Info);
-        _mainThreadActions.Enqueue(() => ApplyAutonomyStateOnMainThread(state, saveId, action));
+        _mainThreadActions.Enqueue(() =>
+        {
+            string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+            if (!string.Equals(state.SaveId, saveId, StringComparison.Ordinal)) return;
+            if (!string.Equals(state.RequestId, _chatUiState.PendingControlId, StringComparison.Ordinal)) return;
+            string action = _chatUiState.PendingControlAction ?? "unknown";
+            Monitor.Log($"[AutonomyAck] requestId={state.RequestId} action={action} status={state.Status} mode={state.Mode} paused={state.Paused} saveId={state.SaveId}", LogLevel.Info);
+            ApplyAutonomyStateOnMainThread(state, action);
+        });
     }
 
-    private void ApplyAutonomyStateOnMainThread(AutonomyStatePayload state, string saveId, string action)
+    private void ApplyAutonomyStateOnMainThread(AutonomyStatePayload state, string action)
     {
-        if (!string.Equals(state.RequestId, _pendingAutonomyRequestId, StringComparison.Ordinal)) return;
-        CompanionCommandMenu.ModeChangePending = false;
-        if (!string.Equals(state.Status, "confirmed", StringComparison.OrdinalIgnoreCase) || state.Mode is not ("free" or "command"))
+        if (!string.Equals(state.RequestId, _chatUiState.PendingControlId, StringComparison.Ordinal)) return;
+        bool confirmed = string.Equals(state.Status, "confirmed", StringComparison.OrdinalIgnoreCase) && state.Mode is "free" or "command";
+        _chatUiState.ApplyControlAck(state.RequestId, confirmed, state.Paused);
+        ProjectChatUiState();
+        if (!confirmed)
         {
-            ShowChatChannelProblem(state.RequestId, state.SaveId, "模式/控制失败：" + (state.Reason ?? "服务拒绝请求"));
-            _pendingAutonomyRequestId = null;
+            string reason = "服务未确认" + (string.IsNullOrWhiteSpace(state.Reason) ? "。" : "：" + state.Reason);
+            CompanionCommandMenu.CurrentActionText = reason + " 游戏中的动作保持本地实际状态，可重试控制。";
+            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", CompanionCommandMenu.CurrentActionText, Color.Red));
             return;
         }
-        CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", action == "set_mode"
-            ? (state.Mode == "free" ? "已确认：自由模式已开启" : "已确认：自由模式已退出")
-            : "控制已确认：" + action, Color.DarkGreen));
+        string controlResult = action switch
+        {
+            "set_mode" => state.Mode == "free" ? "已确认：自由模式已开启" : "已确认：自由模式已退出",
+            "pause" => state.Paused ? "已确认：伙伴已暂停" : "已确认：暂停请求已处理",
+            "resume" => state.Paused ? "已确认：伙伴仍处于暂停" : "已确认：伙伴已继续",
+            "cancel" => "已确认：当前指令已取消",
+            "set_preferences" => "已确认：设置已保存",
+            _ => "控制已确认"
+        };
+        CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", controlResult, Color.DarkGreen));
         CompanionCommandMenu.AutonomyMode = state.Mode;
-        CompanionCommandMenu.AutonomyPaused = state.Paused;
         if (state.Preferences != null)
         {
             if (state.Preferences.TryGetPropertyValue("dailySpendLimit", out var limit) && int.TryParse(limit?.ToString(), out int parsedLimit))
@@ -796,67 +853,68 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             if (state.Preferences.TryGetPropertyValue("boxPreference", out var box) && !string.IsNullOrWhiteSpace(box?.ToString()))
                 CompanionCommandMenu.BoxPreference = box!.ToString();
         }
-        CompanionCommandMenu.CurrentStatusText = state.Paused ? "已暂停" : (state.Mode == "free" ? "自由模式已开启" : "指令模式");
+        if (action == "set_mode") CompanionCommandMenu.CurrentStatusText = state.Paused ? "已暂停" : (state.Mode == "free" ? "自由模式已开启" : "指令模式");
+        if (action == "cancel")
+        {
+            CompanionCommandMenu.CurrentActionText = null;
+            CompanionCommandMenu.CurrentToolName = null;
+            CompanionCommandMenu.StructuredProgressText = null;
+            CompanionCommandMenu.PlanWaitReason = null;
+            CompanionCommandMenu.WaitingConditions = Array.Empty<string>();
+        }
         // F8 fixed progress lines: last plan action, wait reason and waiting conditions
         // come from the real bridge payload.
-        CompanionCommandMenu.PlanWaitReason = state.PlanWaitReason;
-        CompanionCommandMenu.WaitingConditions = state.WaitingConditions?.Select(condition => condition.DisplayText).ToArray() ?? Array.Empty<string>();
-        if (state.LastPlanAction != null)
+        if (action != "cancel")
         {
-            string? operation = state.LastPlanAction.TryGetPropertyValue("operation", out var op) ? op?.ToString() : null;
-            string? outcome = state.LastPlanAction.TryGetPropertyValue("outcome", out var oc) ? oc?.ToString() : null;
-            if (!string.IsNullOrEmpty(operation))
-                CompanionCommandMenu.CurrentActionText = $"计划动作 {operation}（{outcome ?? "unknown"}）";
+            CompanionCommandMenu.PlanWaitReason = state.PlanWaitReason;
+            CompanionCommandMenu.WaitingConditions = state.WaitingConditions?.Select(condition => condition.DisplayText).ToArray() ?? Array.Empty<string>();
+            if (state.LastPlanAction != null)
+            {
+                string? operation = state.LastPlanAction.TryGetPropertyValue("operation", out var op) ? op?.ToString() : null;
+                string? outcome = state.LastPlanAction.TryGetPropertyValue("outcome", out var oc) ? oc?.ToString() : null;
+                if (!string.IsNullOrEmpty(operation))
+                    CompanionCommandMenu.CurrentActionText = $"计划动作 {operation}（{outcome ?? "unknown"}）";
+            }
+            if (!string.IsNullOrEmpty(state.PlanWaitReason) && string.IsNullOrEmpty(CompanionCommandMenu.CurrentActionText))
+                CompanionCommandMenu.CurrentActionText = "等待：" + state.PlanWaitReason;
         }
-        if (!string.IsNullOrEmpty(state.PlanWaitReason) && string.IsNullOrEmpty(CompanionCommandMenu.CurrentActionText))
-            CompanionCommandMenu.CurrentActionText = "等待：" + state.PlanWaitReason;
         if (action == "set_mode" && state.Mode == "free" && !state.Paused && Game1.activeClickableMenu is CompanionCommandMenu)
         {
             Game1.activeClickableMenu.exitThisMenu(playSound: false);
             Game1.addHUDMessage(new HUDMessage("自由模式已开启，伙伴正在安排今天。"));
         }
-        _pendingAutonomyRequestId = null;
     }
 
     private void RequestPauseMenuAction()
     {
-        CompanionCommandMenu.AutonomyPaused = true;
-        _ = SendAutonomyControl("pause", new JsonObject());
-        if (RequestPause(out string msg))
+        if (_chatUiState.HasPendingControl) return;
+        bool local = RequestPause(out string msg);
+        if (local)
         {
-            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", msg, Microsoft.Xna.Framework.Color.DarkGoldenrod));
-            CompanionCommandMenu.CurrentStatusText = "已暂停";
-            Game1.addHUDMessage(new HUDMessage(msg));
+            _localPauseMachine = _coordinator?.ActiveMachine;
+            _deferredResumeMachine = null;
+            _chatUiState.NoteLocalPauseRequested();
         }
+        _ = SendAutonomyControl("pause", new JsonObject());
+        if (local) CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", "游戏中的动作已请求暂停；等待伙伴服务确认。", Color.DarkGoldenrod));
     }
 
     private void RequestResumeMenuAction()
     {
-        CompanionCommandMenu.AutonomyPaused = false;
+        if (_chatUiState.HasPendingControl) return;
+        bool local = RequestResume(out string msg);
         _ = SendAutonomyControl("resume", new JsonObject());
-        if (RequestResume(out string msg))
-        {
-            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", msg, Microsoft.Xna.Framework.Color.SeaGreen));
-            CompanionCommandMenu.CurrentStatusText = "已恢复";
-            Game1.addHUDMessage(new HUDMessage(msg));
-        }
+        if (local) CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", "游戏中的动作已请求继续；等待伙伴服务确认。", Color.SeaGreen));
     }
 
     private void RequestCancelMenuAction()
     {
+        if (_chatUiState.HasPendingControl) return;
+        bool local = RequestCancel("menu", out string msg);
         _ = SendAutonomyControl("cancel", new JsonObject());
-        // 1. Notify background chat bridge to cancel active agent CLI task
-        _ = _transportServer?.SendChatCancelAsync(new ChatCancelPayload(CompanionCommandMenu.CurrentRequestId, "Player clicked cancel in menu"));
-
-        // 2. Request cancel on active game skill state machine
-        bool cancelledSkill = RequestCancel("menu", out string msg);
-
-        // 3. Immediately reflect cancellation in UI regardless of whether skill was already executing
-        CompanionCommandMenu.IsProcessing = false;
-        CompanionCommandMenu.CurrentStatusText = "已取消";
-        string displayMsg = cancelledSkill ? msg : "已请求取消当前任务。";
-        CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", displayMsg, Microsoft.Xna.Framework.Color.Firebrick));
-        Game1.addHUDMessage(new HUDMessage(displayMsg));
+        CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", local
+            ? "游戏中的动作已收到取消请求；等待伙伴服务确认。"
+            : "正在请求取消当前指令；等待伙伴服务确认。", Color.Firebrick));
     }
 
     private void TryAutoStartChatBridge()
@@ -941,51 +999,67 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private bool RequestPause(out string message)
     {
-        if (!Context.IsWorldReady || _coordinator == null || !_coordinator.StateMachine.IsExecuting)
+        var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
+        if (machine == null)
         {
-            message = "No active watering task to pause.";
+            message = "No active companion task to pause.";
             return false;
         }
 
-        if (_coordinator.StateMachine.IsPaused)
+        if (machine.IsPaused)
         {
             message = "Task is already paused.";
             return false;
         }
 
-        _coordinator.StateMachine.RequestPause();
+        machine.RequestPause();
         message = "Pause requested for active task.";
         return true;
     }
 
     private bool RequestResume(out string message)
     {
-        if (!Context.IsWorldReady || _coordinator == null || !_coordinator.StateMachine.IsExecuting)
+        var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
+        if (machine == null)
         {
-            message = "No active watering task to resume.";
+            message = "No active companion task to resume.";
             return false;
         }
 
-        if (!_coordinator.StateMachine.IsPaused)
+        if (!machine.IsPaused && ReferenceEquals(machine, _localPauseMachine))
+        {
+            _deferredResumeMachine = machine;
+            message = "Resume requested; waiting for the native safe pause point.";
+            return true;
+        }
+
+        if (!machine.IsPaused)
         {
             message = "Task is not paused.";
             return false;
         }
 
-        _coordinator.StateMachine.Resume();
+        machine.Resume();
+        if (ReferenceEquals(machine, _localPauseMachine))
+        {
+            _localPauseMachine = null;
+            _deferredResumeMachine = null;
+            _chatUiState.NoteLocalResumed();
+        }
         message = "Resumed active task.";
         return true;
     }
 
     private bool RequestCancel(string source, out string message)
     {
-        if (!Context.IsWorldReady || _coordinator == null || !_coordinator.StateMachine.IsExecuting)
+        var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
+        if (machine == null)
         {
-            message = "No active watering task to cancel.";
+            message = "No active companion task to cancel.";
             return false;
         }
 
-        _coordinator.StateMachine.RequestCancel($"Cancelled via {source}.");
+        machine.RequestCancel($"Cancelled via {source}.");
         message = "Cancellation requested for active task.";
         return true;
     }

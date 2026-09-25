@@ -206,7 +206,7 @@ def test_command_chain_broken_by_pause_cancel_new_command(tmp_path: Path, monkey
 
         pause_env = Envelope.create_autonomy_control(bridge.instance_id, "p1", "Save1", "pause")
         await bridge._handle_autonomy_control(mock_ws, pause_env, "Save1")
-        assert "Save1" not in bridge._command_chains
+        assert bridge._command_chains["Save1"].root_request_id == "req-1"
 
         await bridge._plan_worker.evaluate()
         await bridge.wait_for_chains()
@@ -265,7 +265,7 @@ def test_continuation_does_not_unpause_and_paused_skips_continuation(tmp_path: P
         await bridge._on_job_terminal("Save1", StepExecution(status="executed", outcome="completed"), "SHORT_JOB_TERMINAL")
         await bridge.wait_for_chains()
 
-        assert "Save1" not in bridge._command_chains
+        assert "Save1" in bridge._command_chains
         assert bridge._work_store.state("Save1").paused is True
 
         await bridge.handle_chat_submit(mock_ws, "chain-mock-direct", "续链", "Save1")

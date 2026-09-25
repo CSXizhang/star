@@ -672,8 +672,6 @@ class WorkStore:
     @staticmethod
     def _assert_decision_valid(state: SaveWorkState, token: str | None) -> None:
         guide = "若无法继续，请直接向玩家说明当前阻塞原因，不要尝试文件系统操作排查。"
-        if state.paused:
-            raise WorkStateError(f"NEW_MODEL_DECISION_REQUIRED: 工作已暂停（F8），玩家发送新指令会自动恢复。{guide}")
         if state.decision.get("selected"):
             raise WorkStateError(f"NEW_MODEL_DECISION_REQUIRED: 当前决策周期已选择过任务（one semantic job per provider decision）。{guide}")
         d = state.decision
@@ -686,7 +684,7 @@ class WorkStore:
     def _decision_valid(state: SaveWorkState, token: str | None) -> bool:
         d = state.decision
         return bool(token and d.get("token") == token
-                    and d.get("expires", 0) > _time.time() and not state.paused and not d.get("selected"))
+                    and d.get("expires", 0) > _time.time() and not d.get("selected"))
 
     def revoke_decision(self, save_id: str) -> None:
         def mutate(state: SaveWorkState) -> None:
@@ -1139,6 +1137,7 @@ class WorkStore:
                 "attempt": step.attempts,
                 "leaseUntil": step.lease_until,
                 "releasedWait": was_waiting,
+                "waitType": step.wait.type if step.wait else None,
                 "waitReasonCode": step.wait.reason_code if step.wait else None,
                 # Persisted id from an earlier attempt; the executor reconciles it
                 # against the native result before dispatching anything new.
@@ -1162,6 +1161,26 @@ class WorkStore:
                 raise WorkStateError(f"step '{step_id}' is not running")
             step.command_id = command_id
 
+        self._mutate(save_id, mutate)
+
+    def release_unstarted_claim(
+        self, save_id: str, task_id: str, step_id: str,
+        worker_id: str, command_id: str,
+    ) -> None:
+        """Return a claimed step to pending when no native dispatch was sent."""
+        def mutate(state: SaveWorkState) -> None:
+            task = self._find_task(state, task_id)
+            step = self._find_step(task, step_id)
+            if (step.status != "running" or step.lease_owner != worker_id
+                    or step.command_id != command_id):
+                return
+            step.status = "pending"
+            step.command_id = None
+            step.lease_owner = None
+            step.lease_until = 0.0
+            step.attempts = max(0, step.attempts - 1)
+            task.status = "pending"
+            task.updated_at = _now_iso()
         self._mutate(save_id, mutate)
 
     def commit_step_result(
@@ -1644,9 +1663,7 @@ class WorkStore:
     # ----------------------------------------------------------- controls
     def set_paused(self, save_id: str, paused: bool) -> SaveWorkState:
         def mutate(state: SaveWorkState) -> None:
-            state.decision = {}
             state.paused = bool(paused)
-            state.scheduler_epoch += 1
 
         self._mutate(save_id, mutate)
         return self.state(save_id)

@@ -184,7 +184,7 @@ def test_pause_blocks_claim_and_multi_save_isolation(tmp_path: Path) -> None:
     assert store.claim_next_step("SaveA","w") is None
     assert store.claim_next_step("SaveB","w") is not None
     store.set_paused("SaveA",False)
-    assert store.claim_next_step("SaveA","w") is None
+    assert store.claim_next_step("SaveA","w") is not None
 
 
 def test_overview_exposes_next_step_and_anomalies(tmp_path: Path) -> None:

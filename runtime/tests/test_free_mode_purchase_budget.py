@@ -262,12 +262,15 @@ def test_same_command_id_retry_is_idempotent_and_settles_once(native_compatible_
 
 
 def test_unknown_result_keeps_reservation_and_settles_once_on_reconcile(
-    native_compatible_run_dir,
+    native_compatible_run_dir, monkeypatch,
 ) -> None:
     """A timed-out purchase keeps its reservation; the next purchase reconciles
     it and settles exactly once before its own dispatch."""
     _free_mode(native_compatible_run_dir, budget=100)
+    monkeypatch.setenv("STARDEW_NATIVE_RECONCILE_TIMEOUT_SECONDS", "1")
     client = _make_client([
+        TimeoutError(),
+        TimeoutError(),
         TimeoutError(),
         SimpleNamespace(payload=_purchase_result("native-2", "succeeded", 10)),
     ])
@@ -337,14 +340,17 @@ def test_terminal_results_settle_confirmed_cost_and_failure_refunds(
 
 
 def test_new_day_resets_budget_and_carries_unsettled_reservation(
-    native_compatible_run_dir,
+    native_compatible_run_dir, monkeypatch,
 ) -> None:
     """Day rollover (autonomy.on_day_started via next_candidate) zeroes the
     spend but keeps the unsettled reservation; it is settled once when the next
     purchase reconciles it, and the new day's budget is enforced on top."""
     _free_mode(native_compatible_run_dir, budget=100)
+    monkeypatch.setenv("STARDEW_NATIVE_RECONCILE_TIMEOUT_SECONDS", "1")
     client = _make_client([
         SimpleNamespace(payload=_purchase_result("native-x1", "succeeded", 40)),
+        TimeoutError(),
+        TimeoutError(),
         TimeoutError(),
         SimpleNamespace(payload=_purchase_result("native-z", "succeeded", 50)),
     ])

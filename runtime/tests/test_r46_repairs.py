@@ -37,19 +37,12 @@ def test_decision_validation_reasons_and_guidance(tmp_path):
     store = WorkStore(tmp_path / "work.json")
     guide = "若无法继续，请直接向玩家说明当前阻塞原因，不要尝试文件系统操作排查。"
 
-    # 1. Paused
+    # 1. A provider may select while paused, but native dispatch stays frozen.
     store.begin_decision("save", "tok-1")
     store.set_paused("save", True)
-    with pytest.raises(WorkStateError) as exc_paused:
-        store.select_direct_job("save", "tok-1", "water_auto")
-    assert "工作已暂停（F8）" in str(exc_paused.value)
-    assert guide in str(exc_paused.value)
-    assert str(exc_paused.value).startswith("NEW_MODEL_DECISION_REQUIRED:")
-
-    with pytest.raises(WorkStateError) as exc_paused_plan:
-        store.submit_plan("save", goal_text="g", decision_token="tok-1", tasks=[{"title": "t", "steps": [{"operation": "water_auto"}]}])
-    assert "工作已暂停（F8）" in str(exc_paused_plan.value)
-    assert guide in str(exc_paused_plan.value)
+    store.submit_plan("save", goal_text="g", decision_token="tok-1", tasks=[{"title": "t", "steps": [{"operation": "water_auto"}]}])
+    assert store.state("save").decision["selected"] is True
+    assert store.claim_next_step("save", "worker") is None
 
     # 2. Token missing / mismatch
     store.set_paused("save", False)

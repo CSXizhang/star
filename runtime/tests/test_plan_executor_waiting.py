@@ -13,6 +13,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from stardew_ai_runtime.chat_bridge import PlanWorker
 from stardew_ai_runtime.plan_executor import (
     PlanExecutor,
     StepExecution,
@@ -42,6 +43,95 @@ def _plan(store: WorkStore, save: str = "Save1", operation: str = "plant_seeds")
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def test_running_result_reconciles_same_native_command_once(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _plan(store)
+    sent = []
+    reconciled = []
+
+    async def dispatch(operation, params, command_id):
+        sent.append(command_id)
+        return {"status": "executing", "terminalState": "running", "commandId": command_id,
+                "effects": []}
+
+    async def reconcile(command_id):
+        reconciled.append(command_id)
+        if len(reconciled) == 1:
+            return None
+        return {"terminalState": "succeeded", "commandId": command_id,
+                "effects": [{"kind": "cleared"}]}
+
+    result = _run(PlanExecutor(store, dispatch=dispatch, reconcile=reconcile).run_once("Save1", "w"))
+    assert result.outcome == "completed"
+    assert result.effects == [{"kind": "cleared"}]
+    assert sent == [reconciled[0]] and len(store.execution_log("Save1")) == 1
+
+
+def test_unconfirmed_previous_command_never_dispatches_new_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _plan(store)
+
+    def old_attempt(state):
+        task = state.tasks[0]
+        task.steps[0].command_id = "old-native-id"
+
+    store._mutate("Save1", old_attempt)
+    sent = []
+
+    async def dispatch(operation, params, command_id):
+        sent.append(command_id)
+        return {"status": "completed"}
+
+    async def reconcile(command_id):
+        return None
+
+    result = _run(PlanExecutor(store, dispatch=dispatch, reconcile=reconcile).run_once("Save1", "w"))
+    assert result.outcome == "unknown"
+    assert result.reason_code == "NATIVE_TERMINAL_UNCONFIRMED"
+    assert sent == []
+    assert store.execution_log("Save1")[0]["command_id"] == "old-native-id"
+
+
+def test_pause_between_claim_and_native_send_returns_step_for_resume(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _plan(store)
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            return {"status": "completed", "terminalState": "succeeded", "effects": []}
+
+    async def scenario():
+        client = Client()
+        worker = PlanWorker(store, client)
+        worker.supplied_save_id = "Save1"
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def progress(execution):
+            if execution.status == "dispatching":
+                started.set()
+                await release.wait()
+
+        worker.progress_callback = progress
+        first = asyncio.create_task(worker.evaluate())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        store.set_paused("Save1", True)
+        release.set()
+        await asyncio.wait_for(first, timeout=2)
+        assert client.calls == []
+        step = store.list_tasks("Save1")[0]["steps"][0]
+        assert step["status"] == "pending" and step["command_id"] is None
+        store.set_paused("Save1", False)
+        await worker.evaluate()
+        assert len(client.calls) == 1
+        assert store.list_tasks("Save1")[0]["status"] == "completed"
+
+    _run(scenario())
 
 
 def test_extract_wait_condition_accepts_only_supported_native_markers() -> None:
@@ -131,7 +221,7 @@ def test_snapshot_gating_blocks_repeat_executions_until_condition_changes(
     assert calls["n"] == 2
 
 
-def test_transport_failure_is_bounded_backoff_then_unknown(tmp_path: Path) -> None:
+def test_transport_failure_never_replays_an_unconfirmed_command(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _plan(store, operation="water_auto")
     calls = {"n": 0}
@@ -151,22 +241,14 @@ def test_transport_failure_is_bounded_backoff_then_unknown(tmp_path: Path) -> No
     assert _run(executor.run_once("Save1", "w")).status == "idle"
     assert calls["n"] == 1
 
-    # Attempt 2 (after the backoff window elapses): still parked, retry budget
-    # not yet exhausted.
+    # After the backoff window, the old id cannot be confirmed.  A new native
+    # id would risk replaying a command that may have reached the Mod.
     store._mutate("Save1", lambda state: _clear_backoff(state, "a", "sa"))
     second = _run(executor.run_once("Save1", "w"))
     assert second.status == "executed"
-    assert second.outcome == "waiting"
-    assert calls["n"] == 2
-
-    # Attempt 3: the bound is reached, so the fault becomes unknown and asks for
-    # exactly one decision instead of retrying forever.
-    store._mutate("Save1", lambda state: _clear_backoff(state, "a", "sa"))
-    third = _run(executor.run_once("Save1", "w"))
-    assert third.status == "deferred"
-    assert third.outcome == "unknown"
-    assert third.needs_model is True
-    assert calls["n"] == 3
+    assert second.outcome == "unknown"
+    assert second.reason_code == "NATIVE_TERMINAL_UNCONFIRMED"
+    assert calls["n"] == 1
     task = store.list_tasks("Save1")[0]
     assert task["status"] == "unknown"
 

@@ -91,7 +91,9 @@ def test_player_request_preempts_autonomy_generation(tmp_path: Path) -> None:
     bridge._active_task = ActiveChatTask("autonomy-old", "save-a", "autonomous work")
     old_generation = bridge._autonomy_generation
     assert bridge._preempt_autonomy_for_player("player-1") is True
-    assert bridge._active_task is None and bridge._autonomy_generation == old_generation + 1
+    # The submit path drains the old turn before accepting the replacement.
+    assert bridge._active_task.request_id == "autonomy-old"
+    assert bridge._autonomy_generation == old_generation + 1
 
 
 def test_quota_failure_pauses_free_mode_and_explains_reason(tmp_path: Path) -> None:

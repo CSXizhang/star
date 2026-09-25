@@ -21,7 +21,10 @@ double-spending.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +35,10 @@ logger = logging.getLogger("stardew_ai_runtime.plan_executor")
 
 Dispatch = Callable[[str, dict[str, Any], str], Awaitable[Any]]
 Reconcile = Callable[[str], Awaitable[Any]]
+
+
+class DispatchDeferred(Exception):
+    """The worker observed a pause or revoked decision before native send."""
 # Returns (world.snapshot payload, game date dict) for the latest native state.
 SnapshotProvider = Callable[[], tuple[dict[str, Any] | None, dict[str, Any] | None]]
 
@@ -154,6 +161,8 @@ def classify_step_outcome(result: Any) -> tuple[str, str | None]:
     outcome = result.get("outcome")
     if result.get("isError") or terminal in {"failed", "rejected"} or status in {"failed", "blocked", "rejected"} or outcome in {"failed", "rejected"}:
         return "partial", reason or "STEP_FAILED"
+    if terminal in {"partially-succeeded", "partial"}:
+        return "partial", reason or "STEP_PARTIAL"
     if terminal in {"cancelled", "canceled"} or outcome == "cancelled":
         return "cancelled", reason or "CANCELLED"
     if status in {"executing", "running"} or terminal == "running":
@@ -292,6 +301,11 @@ class PlanExecutor:
         # have a terminal native result. Reconcile that persisted id before
         # dispatching anything new; a disconnected id is not de-duplication proof.
         previous_id = claim.get("previousCommandId")
+        if claim.get("releasedWait") and claim.get("waitType") != "transportRetry":
+            # A named native precondition returned without performing the action;
+            # after that condition changes, this is an authorized new attempt.
+            previous_id = None
+        native = None
         if previous_id and self.reconcile is not None:
             try:
                 native = await self.reconcile(previous_id)
@@ -317,16 +331,51 @@ class PlanExecutor:
                 step.task_status = committed.get("taskStatus")
                 step.result = {"reconciled": True, "native": native}
                 return step
+        if previous_id:
+            # An unconfirmed previous command is never proof that a new attempt
+            # is safe.  Wait for the same native id, then report explicit unknown
+            # if the bounded reconcile period ends without a terminal.
+            if isinstance(native, dict) and native.get("terminalState") == "running":
+                native = await self._await_native_terminal(save_id, previous_id, native)
+            outcome, reason, effects, revision = normalise_native_result(native)
+            if outcome is None:
+                outcome, reason = "unknown", "NATIVE_TERMINAL_UNCONFIRMED"
+                effects, revision = [], None
+            committed = self.store.commit_step_result(
+                save_id, task_id=claim["taskId"], step_id=claim["stepId"],
+                outcome=outcome, effects=effects, reason_code=reason,
+                snapshot_revision=revision, command_id=previous_id,
+            )
+            step.command_id, step.outcome, step.reason_code = previous_id, outcome, reason
+            step.effects, step.snapshot_revision = effects, revision
+            step.task_status, step.result = committed.get("taskStatus"), native
+            return step
 
         command_id = derive_command_id(save_id, claim["taskId"], claim["stepId"], claim["attempt"])
         step.command_id = command_id
         # Persist the stable id BEFORE dispatch so a crash mid-flight is recoverable.
         self.store.assign_command_id(save_id, claim["taskId"], claim["stepId"], command_id)
 
+        state = self.store.state(save_id)
+        if (state.paused or state.decision.get("taskId") != claim["taskId"]
+                or state.decision.get("finished")):
+            self.store.release_unstarted_claim(save_id, claim["taskId"], claim["stepId"], worker_id, command_id)
+            return StepExecution(status="idle", recovery_decisions=decisions)
+
         try:
             result = await self.dispatch(claim["operation"], claim.get("params") or {}, command_id)
+        except DispatchDeferred:
+            self.store.release_unstarted_claim(save_id, claim["taskId"], claim["stepId"], worker_id, command_id)
+            return StepExecution(status="idle", recovery_decisions=decisions)
         except Exception as ex:
             return self._commit_failure(save_id, step, command_id, ex)
+
+        # A native action can outlive the scheduler's short wait.  Its running
+        # response is not a terminal result: keep the persisted command id and
+        # reconcile that exact command before committing or selecting new work.
+        if isinstance(result, dict) and (result.get("status") in {"executing", "running"}
+                                         or result.get("terminalState") == "running"):
+            result = await self._await_native_terminal(save_id, command_id, result)
 
         # A native result may name an explicit, checkable precondition (e.g. the
         # shop is closed, the player is standing on the tile, seeds are missing).
@@ -360,6 +409,38 @@ class PlanExecutor:
         step.task_status = committed.get("taskStatus")
         step.result = result
         return step
+
+    async def _await_native_terminal(
+        self, save_id: str, command_id: str, initial: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            timeout = max(1.0, float(os.getenv("STARDEW_NATIVE_RECONCILE_TIMEOUT_SECONDS", "300")))
+        except ValueError:
+            timeout = 300.0
+        remaining = timeout
+        last_tick = time.monotonic()
+        while remaining > 0:
+            await asyncio.sleep(min(0.5, remaining))
+            now = time.monotonic()
+            if not self.store.state(save_id).paused:
+                remaining -= now - last_tick
+            last_tick = now
+            if self.reconcile is None:
+                break
+            try:
+                native = await self.reconcile(command_id)
+            except Exception:
+                logger.debug("Reconcile of running native command %s failed", command_id, exc_info=True)
+                continue
+            if isinstance(native, dict):
+                if native.get("terminalState") in {
+                    "succeeded", "partially-succeeded", "partial", "failed",
+                    "rejected", "cancelled", "canceled",
+                }:
+                    return native
+        return {**initial, "status": "unknown", "terminalState": "unknown",
+                "reasonCode": "NATIVE_TERMINAL_UNCONFIRMED",
+                "message": f"Native command {command_id} did not return a terminal result"}
 
     def _park_for_wait(
         self,

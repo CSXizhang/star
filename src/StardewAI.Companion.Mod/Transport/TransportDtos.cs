@@ -489,7 +489,11 @@ public sealed record ChatReplyPayload(
     // Provider usage split (never a fabricated total): input / cache read / cache write / output.
     [property: JsonPropertyName("cacheReadTokens")] long? CacheReadTokens = null,
     [property: JsonPropertyName("cacheWriteTokens")] long? CacheWriteTokens = null,
-    [property: JsonPropertyName("modelCalls")] int? ModelCalls = null
+    [property: JsonPropertyName("modelCalls")] int? ModelCalls = null,
+    // A logical player instruction spans provider turns and native jobs.
+    // Null retains the legacy per-request terminal semantics.
+    [property: JsonPropertyName("commandId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CommandId = null,
+    [property: JsonPropertyName("commandComplete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? CommandComplete = null
 );
 
 public sealed record ChatCancelPayload(

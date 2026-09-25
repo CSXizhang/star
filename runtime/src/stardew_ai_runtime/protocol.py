@@ -892,6 +892,8 @@ class Envelope:
         error: str | None = None,
         usage_source: str | None = None,
         provider: str | None = None,
+        command_id: str | None = None,
+        command_complete: bool | None = None,
     ) -> Envelope:
         payload: dict[str, Any] = {
             "requestId": request_id,
@@ -927,6 +929,10 @@ class Envelope:
             payload["usageSource"] = usage_source
         if provider is not None:
             payload["provider"] = provider
+        if command_id is not None:
+            payload["commandId"] = command_id
+        if command_complete is not None:
+            payload["commandComplete"] = command_complete
         return cls(
             protocol_version="0.1",
             message_type="chat.reply",
@@ -1056,6 +1062,8 @@ class ChatReplyPayload:
     conversation_id: str | None = None
     error: str | None = None
     usage_source: str | None = None
+    command_id: str | None = None
+    command_complete: bool | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> ChatReplyPayload:
@@ -1070,6 +1078,8 @@ class ChatReplyPayload:
             conversation_id=value.get("conversationId"),
             error=value.get("error"),
             usage_source=value.get("usageSource"),
+            command_id=value.get("commandId"),
+            command_complete=value.get("commandComplete"),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -1092,6 +1102,10 @@ class ChatReplyPayload:
             res["error"] = self.error
         if self.usage_source is not None:
             res["usageSource"] = self.usage_source
+        if self.command_id is not None:
+            res["commandId"] = self.command_id
+        if self.command_complete is not None:
+            res["commandComplete"] = self.command_complete
         return res
 
 

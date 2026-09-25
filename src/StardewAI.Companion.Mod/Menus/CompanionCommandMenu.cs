@@ -26,6 +26,11 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
     public static readonly List<ChatMessage> ChatHistory = new();
     public static bool IsProcessing { get; set; }
+    public static bool ControlPending { get; set; }
+    public static string? PendingControlAction { get; set; }
+    public static bool CanSubmitText { get; set; } = true;
+    public static string? SubmissionBlockReason { get; set; }
+    public static string DraftText { get; set; } = string.Empty;
     public static string? CurrentRequestId { get; set; }
     public static string? CurrentRequestSaveId { get; set; }
     public static string CurrentStatusText { get; set; } = "就绪";
@@ -67,10 +72,12 @@ public sealed class CompanionCommandMenu : IClickableMenu
     {
         if (isPaused)
             return Color.DarkGoldenrod;
+        if (currentStatusText?.Contains("失败", StringComparison.Ordinal) == true ||
+            currentStatusText?.Contains("未确认", StringComparison.Ordinal) == true ||
+            currentStatusText?.Contains("异常", StringComparison.Ordinal) == true)
+            return Color.Red;
         if (isProcessing)
             return Color.DarkOrange;
-        if (currentStatusText == "失败")
-            return Color.Red;
         return Color.DarkGreen;
     }
 
@@ -105,13 +112,14 @@ public sealed class CompanionCommandMenu : IClickableMenu
         return true;
     }
 
-    private readonly Action<string> _onSubmitText;
+    private readonly Func<string, bool> _onSubmitText;
     private readonly Action? _onPause;
     private readonly Action? _onResume;
     private readonly Action? _onCancel;
     private readonly Action? _onModeToggle;
     private readonly Action? _onSettings;
     private bool _settingsOpen;
+    private string _draftBeforeSettings = string.Empty;
 
     private TextBox _textBox = null!;
     private Rectangle _sendButtonRect;
@@ -136,12 +144,12 @@ public sealed class CompanionCommandMenu : IClickableMenu
     private const int ChatLineSpacing = 4;
 
     public CompanionCommandMenu(Action<string> onSubmitText)
-        : this(onSubmitText, null, null, null, null, null)
+        : this(text => { onSubmitText(text); return true; }, null, null, null, null, null)
     {
     }
 
     public CompanionCommandMenu(
-        Action<string> onSubmitText,
+        Func<string, bool> onSubmitText,
         Action? onPause = null,
         Action? onResume = null,
         Action? onCancel = null,
@@ -162,6 +170,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
         _lastSeenCount = ChatHistory.Count;
         BuildLayout();
+        _textBox.Text = DraftText;
 
         if (ChatHistory.Count == 0)
         {
@@ -234,6 +243,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
     {
         if (key == Keys.Escape)
         {
+            PreserveDraft();
             exitThisMenu(playSound: false);
             return;
         }
@@ -262,6 +272,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
         if (_closeButtonRect.Contains(x, y))
         {
+            PreserveDraft();
             exitThisMenu(playSound: false);
             return;
         }
@@ -269,6 +280,13 @@ public sealed class CompanionCommandMenu : IClickableMenu
         if (_detailButtonRect.Contains(x, y))
         {
             ShowTechnicalDetail = !ShowTechnicalDetail;
+            return;
+        }
+
+        if (_unreadWhileScrolled > 0 && new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 75, width - 48, 25).Contains(x, y))
+        {
+            _scrollBack = 0;
+            _unreadWhileScrolled = 0;
             return;
         }
 
@@ -295,8 +313,9 @@ public sealed class CompanionCommandMenu : IClickableMenu
         }
         if (new Rectangle(xPositionOnScreen + 182, yPositionOnScreen + 118, 86, 32).Contains(x, y))
         {
+            if (!_settingsOpen) _draftBeforeSettings = _textBox.Text;
             _settingsOpen = !_settingsOpen;
-            _textBox.Text = _settingsOpen ? DailySpendLimit.ToString() : string.Empty;
+            _textBox.Text = _settingsOpen ? DailySpendLimit.ToString() : _draftBeforeSettings;
             _textBox.SelectMe();
             if (Game1.keyboardDispatcher != null) Game1.keyboardDispatcher.Subscriber = _textBox;
             return;
@@ -322,7 +341,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
         if (AutonomyPaused && GetPausedBadgeRect(xPositionOnScreen, yPositionOnScreen, width).Contains(x, y))
         {
-            _onResume?.Invoke();
+            if (!ControlPending) _onResume?.Invoke();
             return;
         }
 
@@ -334,19 +353,19 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
         if (_pauseButtonRect.Contains(x, y))
         {
-            _onPause?.Invoke();
+            if (!ControlPending) _onPause?.Invoke();
             return;
         }
 
         if (_resumeButtonRect.Contains(x, y))
         {
-            _onResume?.Invoke();
+            if (!ControlPending) _onResume?.Invoke();
             return;
         }
 
         if (_cancelButtonRect.Contains(x, y))
         {
-            _onCancel?.Invoke();
+            if (!ControlPending) _onCancel?.Invoke();
             return;
         }
 
@@ -452,7 +471,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
             ? "当前：" + CurrentActionText
             : "当前：" + (IsProcessing ? CurrentStatusText : "待命");
         if (_unreadWhileScrolled > 0)
-            actionLine += $"（还有 {_unreadWhileScrolled} 条新消息，滚轮向下查看）";
+            actionLine += $"（{_unreadWhileScrolled} 条新消息，点击查看）";
         b.DrawString(Game1.smallFont, ClipToWidth(actionLine, width - 48), new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 78), Game1.textColor);
 
         if (ShowTechnicalDetail || !string.IsNullOrEmpty(StructuredProgressText) || !string.IsNullOrEmpty(PlanWaitReason))
@@ -478,13 +497,6 @@ public sealed class CompanionCommandMenu : IClickableMenu
             DrawButton(b, new Rectangle(xPositionOnScreen + 538, yPositionOnScreen + 118, 110, 32), "保存设置", Color.ForestGreen, false);
         }
 
-        if (!string.IsNullOrEmpty(LastTokenInfo))
-        {
-            int maxTokenWidth = AutonomyPaused ? width - 240 - 300 : width - 320;
-            if (maxTokenWidth > 20)
-                b.DrawString(Game1.smallFont, ClipToWidth(LastTokenInfo, maxTokenWidth), new Vector2(xPositionOnScreen + 300, yPositionOnScreen + 54), Color.Teal);
-        }
-
         // 5. Divider line
         b.Draw(Game1.fadeToBlackRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 156, width - 48, 2), Color.Gray * 0.5f);
 
@@ -498,10 +510,10 @@ public sealed class CompanionCommandMenu : IClickableMenu
         int mouseX = Game1.getOldMouseX();
         int mouseY = Game1.getOldMouseY();
 
-        DrawButton(b, _sendButtonRect, "发送", Color.ForestGreen, _sendButtonRect.Contains(mouseX, mouseY));
-        DrawButton(b, _pauseButtonRect, "暂停", Color.DarkGoldenrod, _pauseButtonRect.Contains(mouseX, mouseY));
-        DrawButton(b, _resumeButtonRect, "继续", Color.SeaGreen, _resumeButtonRect.Contains(mouseX, mouseY));
-        DrawButton(b, _cancelButtonRect, "取消", Color.Firebrick, _cancelButtonRect.Contains(mouseX, mouseY));
+        DrawButton(b, _sendButtonRect, "发送", CanSubmitText ? Color.ForestGreen : Color.Gray, _sendButtonRect.Contains(mouseX, mouseY));
+        DrawButton(b, _pauseButtonRect, ControlPending && PendingControlAction == "pause" ? "暂停中" : "暂停", ControlPending ? Color.Gray : Color.DarkGoldenrod, _pauseButtonRect.Contains(mouseX, mouseY));
+        DrawButton(b, _resumeButtonRect, ControlPending && PendingControlAction == "resume" ? "继续中" : "继续", ControlPending ? Color.Gray : Color.SeaGreen, _resumeButtonRect.Contains(mouseX, mouseY));
+        DrawButton(b, _cancelButtonRect, ControlPending && PendingControlAction == "cancel" ? "取消中" : "取消", ControlPending ? Color.Gray : Color.Firebrick, _cancelButtonRect.Contains(mouseX, mouseY));
 
         // 9. Mouse cursor
         drawMouse(b);
@@ -567,6 +579,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
     protected override void cleanupBeforeExit()
     {
+        PreserveDraft();
         base.cleanupBeforeExit();
 
         if (Game1.keyboardDispatcher?.Subscriber == _textBox)
@@ -578,27 +591,34 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
     private void Submit()
     {
+        if (_settingsOpen) return;
         string rawText = _textBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(rawText))
             return;
 
-        if (IsProcessing)
+        if (!CanSubmitText)
         {
-            Game1.addHUDMessage(new HUDMessage("当前任务正在处理中，请稍候或点击[取消]。", HUDMessage.error_type));
+            DraftText = _textBox.Text;
+            Game1.addHUDMessage(new HUDMessage(SubmissionBlockReason ?? "当前任务正在处理中，请稍候或点击[取消]。", HUDMessage.error_type));
+            return;
+        }
+
+        if (!_onSubmitText(rawText))
+        {
+            DraftText = _textBox.Text;
             return;
         }
 
         _textBox.Text = "";
+        DraftText = string.Empty;
         ChatHistory.Add(new ChatMessage("你", rawText, Color.DarkBlue));
         _scrollBack = 0;
         _unreadWhileScrolled = 0;
-        IsProcessing = true;
-        CurrentStatusText = "正在处理...";
-        CurrentActionText = null;
-        CurrentToolName = null;
-        LastTokenInfo = null;
-
-        _onSubmitText(rawText);
         exitThisMenu(playSound: false);
+    }
+
+    public void PreserveDraft()
+    {
+        DraftText = _settingsOpen ? _draftBeforeSettings : _textBox.Text;
     }
 }

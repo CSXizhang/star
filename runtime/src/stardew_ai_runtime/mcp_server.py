@@ -518,7 +518,7 @@ def create_mcp_server(
                 return {k: v for k, v in (step_p or {}).items() if k in allowed} == {k: v for k, v in (call_p or {}).items() if k in allowed}
             return False
 
-        if operation not in {"cancel_task", "pause_task"}:
+        if operation not in {"cancel_task", "pause_task", "resume_task"}:
             sid = await current_save_id()
             state = work_for_run().state(sid)
             d = state.decision
@@ -2652,8 +2652,7 @@ def create_mcp_server(
         async def guarded(*args, **kwargs):
             sid = await current_save_id()
             store = work_for_run()
-            if name == "pause_task":
-                store.revoke_decision(sid)
+            if name in {"pause_task", "resume_task"}:
                 return await fn(*args, **kwargs)
             if name == "cancel_task":
                 # A new turn may ask to stop the previous native action before

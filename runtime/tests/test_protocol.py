@@ -456,3 +456,130 @@ def test_create_execute_purchase_items_envelope() -> None:
     assert wire["expiresAt"] == "2026-08-24T00:01:00.000000Z"
 
 
+
+
+# ---------------------------------------------------------------- life.* (§1)
+def test_life_chat_submit_payload_validation() -> None:
+    from stardew_ai_runtime.protocol import LifeChatSubmitPayload, ProtocolError
+
+    payload = LifeChatSubmitPayload.from_mapping(
+        {"requestId": "r1", "saveId": "Save1", "mode": "plan", "text": "明天做什么？"}
+    )
+    assert payload.mode == "plan"
+    assert payload.source == "life-menu"
+    with pytest.raises(ProtocolError):
+        LifeChatSubmitPayload.from_mapping(
+            {"requestId": "r1", "saveId": "Save1", "mode": "bogus", "text": "x"}
+        )
+    with pytest.raises(ProtocolError):
+        LifeChatSubmitPayload.from_mapping(
+            {"requestId": "r1", "saveId": "Save1", "mode": "chat", "text": ""}
+        )
+    with pytest.raises(ProtocolError):
+        LifeChatSubmitPayload.from_mapping({"requestId": "", "saveId": "s", "text": "x"})
+
+
+def test_life_chat_reply_factory_has_no_token_or_session_fields() -> None:
+    env = Envelope.create_life_chat_reply(
+        sender_instance_id="py-1", request_id="r1", save_id="Save1",
+        status="queued", profile_revision=2, memory_revision=3, queue_position=1,
+    )
+    assert env.message_type == "life.chat.reply"
+    payload = env.payload
+    assert payload["status"] == "queued"
+    assert payload["queuePosition"] == 1
+    assert payload["profileRevision"] == 2
+    assert payload["memoryRevision"] == 3
+    assert payload["requestId"] == "r1"
+    for forbidden in ("tokensUsed", "conversationId", "sessionId", "usage", "provider"):
+        assert forbidden not in payload
+
+
+def test_life_profile_set_payload_validation() -> None:
+    from stardew_ai_runtime.protocol import LifeProfileSetPayload, ProtocolError
+
+    payload = LifeProfileSetPayload.from_mapping(
+        {"requestId": "r1", "saveId": "Save1", "expectedRevision": 0,
+         "patch": {"personality": "calm", "companionName": "小星"}}
+    )
+    assert payload.expected_revision == 0
+    assert payload.patch["personality"] == "calm"
+    with pytest.raises(ProtocolError):
+        LifeProfileSetPayload.from_mapping(
+            {"requestId": "r1", "saveId": "s", "patch": {"playStyle": "bogus"}}
+        )
+    with pytest.raises(ProtocolError):
+        LifeProfileSetPayload.from_mapping(
+            {"requestId": "r1", "saveId": "s", "expectedRevision": "0", "patch": {}}
+        )
+
+
+def test_life_memory_edit_rejects_event_add() -> None:
+    from stardew_ai_runtime.protocol import LifeMemoryEditPayload, ProtocolError
+
+    with pytest.raises(ProtocolError):
+        LifeMemoryEditPayload.from_mapping(
+            {"requestId": "r1", "saveId": "s", "expectedRevision": 0,
+             "op": "add", "kind": "event", "text": "假事件"}
+        )
+    with pytest.raises(ProtocolError):
+        LifeMemoryEditPayload.from_mapping(
+            {"requestId": "r1", "saveId": "s", "expectedRevision": 0, "op": "purge"}
+        )
+    payload = LifeMemoryEditPayload.from_mapping(
+        {"requestId": "r1", "saveId": "s", "expectedRevision": 2,
+         "op": "correct", "id": "mem-1", "text": "纠正后的约定"}
+    )
+    assert payload.entry_id == "mem-1"
+    assert payload.op == "correct"
+
+
+def test_life_profile_state_includes_work_projection() -> None:
+    work = {"mode": "free", "paused": False, "goal": "优先赚钱",
+            "dailySpendLimit": 500, "boxPreference": "shipping", "dailySpend": 120,
+            "hasExecutableWork": True, "lastPlanAction": None, "planWaitReason": None,
+            "lastSettledDay": "1:spring:1", "activeGoals": [], "recentTodos": [],
+            "waitingConditions": []}
+    env = Envelope.create_life_profile_state(
+        sender_instance_id="py-1", request_id="r1", save_id="Save1",
+        profile={"onboarded": True, "skipped": False, "playStyle": "earn",
+                 "personality": "gentle", "careFrequency": "moderate",
+                 "companionName": "阿星"},
+        profile_revision=4, work=work,
+    )
+    payload = env.payload
+    assert payload["status"] == "confirmed"
+    assert payload["profileRevision"] == 4
+    assert payload["profile"]["playStyle"] == "earn"
+    assert payload["work"] == work
+    rejected = Envelope.create_life_profile_state(
+        sender_instance_id="py-1", request_id="r2", save_id="Save1",
+        profile=None, profile_revision=4, status="rejected", reason="STALE_REVISION",
+    )
+    assert rejected.payload["reason"] == "STALE_REVISION"
+
+
+def test_life_memory_state_and_life_care_factories() -> None:
+    state = Envelope.create_life_memory_state(
+        sender_instance_id="py-1", request_id="r1", save_id="Save1",
+        entries=[{"id": "m1", "kind": "agreement", "text": "多喝水",
+                  "source": "player", "gameDate": "1:spring:1",
+                  "createdAt": "2026-09-25T00:00:00Z"}],
+        memory_revision=7, status="confirmed",
+    )
+    assert state.message_type == "life.memory.state"
+    assert state.payload["memoryRevision"] == 7
+    assert state.payload["entries"][0]["kind"] == "agreement"
+
+    care = Envelope.create_life_care(
+        sender_instance_id="py-1", save_id="Save1", kind="morning",
+        event_key="morning:1:spring:2:1:spring:2", text="早上好呀", game_date="1:spring:2",
+    )
+    assert care.message_type == "life.care"
+    assert care.payload == {
+        "saveId": "Save1",
+        "kind": "morning",
+        "eventKey": "morning:1:spring:2:1:spring:2",
+        "text": "早上好呀",
+        "gameDate": "1:spring:2",
+    }

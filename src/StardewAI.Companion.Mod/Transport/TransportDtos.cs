@@ -541,3 +541,183 @@ public sealed record WaitingConditionPayload(
 {
     public string DisplayText => $"{Operation ?? TaskTitle ?? "等待"}：{WaitDescription ?? ReasonCode ?? "条件待确认"}";
 }
+
+// ---------------------------------------------------------------------------
+// §1 Life / companion-day message DTOs
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// §1.1 life.chat.submit (C#→Py).
+/// Initiates a life-chat exchange with the companion.
+/// </summary>
+public sealed record LifeChatSubmitPayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("mode")] string Mode,      // "chat" | "plan"
+    [property: JsonPropertyName("text")] string Text,
+    [property: JsonPropertyName("source")] string Source = "life-menu"
+);
+
+/// <summary>
+/// §1.2 life.chat.reply (Py→C#).
+/// Status: "processing" | "queued" | "completed" | "failed".
+/// </summary>
+public sealed record LifeChatReplyPayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("profileRevision")] int ProfileRevision,
+    [property: JsonPropertyName("memoryRevision")] int MemoryRevision,
+    [property: JsonPropertyName("replyText"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReplyText = null,
+    [property: JsonPropertyName("queuePosition"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? QueuePosition = null,
+    [property: JsonPropertyName("error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null
+);
+
+/// <summary>
+/// §1.3 life.profile.get (C#→Py).
+/// Requests the current companion profile state.
+/// </summary>
+public sealed record LifeProfileGetPayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId
+);
+
+/// <summary>
+/// Companion profile sub-object within <see cref="LifeProfileStatePayload"/>.
+/// Null when the profile has not been configured yet.
+/// </summary>
+public sealed record CompanionProfileDto(
+    [property: JsonPropertyName("onboarded")] bool Onboarded,
+    [property: JsonPropertyName("skipped")] bool Skipped,
+    [property: JsonPropertyName("playStyle")] string PlayStyle,
+    [property: JsonPropertyName("personality")] string Personality,
+    [property: JsonPropertyName("careFrequency")] string CareFrequency,
+    [property: JsonPropertyName("companionName")] string CompanionName
+);
+
+/// <summary>
+/// Work-state sub-object within <see cref="LifeProfileStatePayload"/>.
+/// Read-only projection of the autonomy + WorkStore state.
+/// </summary>
+public sealed record CompanionWorkStateDto(
+    [property: JsonPropertyName("mode")] string Mode,
+    [property: JsonPropertyName("paused")] bool Paused,
+    [property: JsonPropertyName("goal"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Goal = null,
+    [property: JsonPropertyName("dailySpendLimit"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DailySpendLimit = null,
+    [property: JsonPropertyName("boxPreference"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? BoxPreference = null,
+    [property: JsonPropertyName("dailySpend"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DailySpend = null,
+    [property: JsonPropertyName("hasExecutableWork")] bool HasExecutableWork = false,
+    [property: JsonPropertyName("lastPlanAction"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? LastPlanAction = null,
+    [property: JsonPropertyName("planWaitReason"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PlanWaitReason = null,
+    [property: JsonPropertyName("lastSettledDay"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? LastSettledDay = null,
+    [property: JsonPropertyName("activeGoals"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<ActiveGoalDto>? ActiveGoals = null,
+    [property: JsonPropertyName("recentTodos"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<RecentTodoDto>? RecentTodos = null,
+    [property: JsonPropertyName("waitingConditions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<string>? WaitingConditions = null
+);
+
+/// <summary>Active goal entry within <see cref="CompanionWorkStateDto"/>.</summary>
+public sealed record ActiveGoalDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("text")] string Text,
+    [property: JsonPropertyName("status")] string Status
+);
+
+/// <summary>Recent todo entry within <see cref="CompanionWorkStateDto"/>.</summary>
+public sealed record RecentTodoDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("intent")] string Intent,
+    [property: JsonPropertyName("status")] string Status
+);
+
+/// <summary>
+/// §1.3 life.profile.state (Py→C#).
+/// Carries the full companion profile and work projection.
+/// </summary>
+public sealed record LifeProfileStatePayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("profileRevision")] int ProfileRevision,
+    [property: JsonPropertyName("work")] CompanionWorkStateDto Work,
+    [property: JsonPropertyName("profile"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionProfileDto? Profile = null,
+    [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Reason = null
+);
+
+/// <summary>
+/// §1.4 life.profile.set (C#→Py).
+/// Patch-updates the companion profile; responds with life.profile.state.
+/// </summary>
+public sealed record LifeProfileSetPayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("expectedRevision")] int ExpectedRevision,
+    [property: JsonPropertyName("patch")] LifeProfilePatchDto Patch
+);
+
+/// <summary>Partial update to the companion profile (all fields optional).</summary>
+public sealed record LifeProfilePatchDto(
+    [property: JsonPropertyName("onboarded"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? Onboarded = null,
+    [property: JsonPropertyName("skipped"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? Skipped = null,
+    [property: JsonPropertyName("playStyle"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PlayStyle = null,
+    [property: JsonPropertyName("personality"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Personality = null,
+    [property: JsonPropertyName("careFrequency"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CareFrequency = null,
+    [property: JsonPropertyName("companionName"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CompanionName = null
+);
+
+/// <summary>
+/// §1.5 life.memory.list (C#→Py).
+/// Requests the memory entry list.
+/// </summary>
+public sealed record LifeMemoryListPayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId
+);
+
+/// <summary>Single memory entry within <see cref="LifeMemoryStatePayload"/>.</summary>
+public sealed record MemoryEntryDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("text")] string Text,
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("gameDate")] string GameDate,
+    [property: JsonPropertyName("createdAt")] string CreatedAt
+);
+
+/// <summary>
+/// §1.5 life.memory.state (Py→C#).
+/// Carries the full memory entry list and current revision.
+/// </summary>
+public sealed record LifeMemoryStatePayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("memoryRevision")] int MemoryRevision,
+    [property: JsonPropertyName("entries")] List<MemoryEntryDto> Entries,
+    [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Reason = null
+);
+
+/// <summary>
+/// §1.6 life.memory.edit (C#→Py).
+/// Add, correct, or delete a memory entry; responds with life.memory.state.
+/// </summary>
+public sealed record LifeMemoryEditPayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("expectedRevision")] int ExpectedRevision,
+    [property: JsonPropertyName("op")] string Op,  // "add" | "correct" | "delete"
+    [property: JsonPropertyName("id"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Id = null,
+    [property: JsonPropertyName("kind"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Kind = null,
+    [property: JsonPropertyName("text"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Text = null
+);
+
+/// <summary>
+/// §1.7 life.care (Py→C#, single-direction push).
+/// Companion-initiated care hint; no response required.
+/// </summary>
+public sealed record LifeCarePayload(
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("eventKey")] string EventKey,
+    [property: JsonPropertyName("gameDate")] string GameDate,
+    [property: JsonPropertyName("kind")] string Kind,   // "morning" | "work-done" | "evening"
+    [property: JsonPropertyName("text")] string Text
+);

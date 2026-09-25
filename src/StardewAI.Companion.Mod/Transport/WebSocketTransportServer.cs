@@ -63,6 +63,10 @@ public sealed class WebSocketTransportServer : ITransportServer
     private long _chatSocketGeneration;
     private CancellationTokenSource? _chatSocketCts;
     private readonly Queue<ChatReplyPayload> _pendingChatReplies = new();
+    private readonly Queue<LifeChatReplyPayload> _pendingLifeChatReplies = new();
+    private readonly Queue<LifeProfileStatePayload> _pendingLifeProfileStates = new();
+    private readonly Queue<LifeMemoryStatePayload> _pendingLifeMemoryStates = new();
+    private readonly Queue<LifeCarePayload> _pendingLifeCarePayloads = new();
     private readonly object _chatLock = new();
     private readonly SemaphoreSlim _chatSendLock = new(1, 1);
     private WorldSnapshotPayload? _lastSnapshot;
@@ -72,6 +76,10 @@ public sealed class WebSocketTransportServer : ITransportServer
     public event Action<ChatReplyPayload>? OnChatReplyReceived;
     public event Action<AutonomyStatePayload>? OnAutonomyStateReceived;
     public event Action<string?, string?, string>? OnChatChannelProblem;
+    public event Action<LifeChatReplyPayload>? OnLifeChatReplyReceived;
+    public event Action<LifeProfileStatePayload>? OnLifeProfileStateReceived;
+    public event Action<LifeMemoryStatePayload>? OnLifeMemoryStateReceived;
+    public event Action<LifeCarePayload>? OnLifeCareReceived;
 
 
     public static readonly JsonSerializerOptions JsonOptions = new()
@@ -791,6 +799,39 @@ public sealed class WebSocketTransportServer : ITransportServer
                 _logger?.Invoke($"Error delivering OnChatReplyReceived callback: {ex.Message}", "Error");
             }
         }
+
+        // 5. Drain life.* queued payloads and deliver on main thread
+        List<LifeChatReplyPayload> lifeChatReplies = new();
+        List<LifeProfileStatePayload> lifeProfileStates = new();
+        List<LifeMemoryStatePayload> lifeMemoryStates = new();
+        List<LifeCarePayload> lifeCarePayloads = new();
+        lock (_chatLock)
+        {
+            while (_pendingLifeChatReplies.Count > 0) lifeChatReplies.Add(_pendingLifeChatReplies.Dequeue());
+            while (_pendingLifeProfileStates.Count > 0) lifeProfileStates.Add(_pendingLifeProfileStates.Dequeue());
+            while (_pendingLifeMemoryStates.Count > 0) lifeMemoryStates.Add(_pendingLifeMemoryStates.Dequeue());
+            while (_pendingLifeCarePayloads.Count > 0) lifeCarePayloads.Add(_pendingLifeCarePayloads.Dequeue());
+        }
+        foreach (var p in lifeChatReplies)
+        {
+            try { OnLifeChatReplyReceived?.Invoke(p); }
+            catch (Exception ex) { _logger?.Invoke($"Error delivering OnLifeChatReplyReceived: {ex.Message}", "Error"); }
+        }
+        foreach (var p in lifeProfileStates)
+        {
+            try { OnLifeProfileStateReceived?.Invoke(p); }
+            catch (Exception ex) { _logger?.Invoke($"Error delivering OnLifeProfileStateReceived: {ex.Message}", "Error"); }
+        }
+        foreach (var p in lifeMemoryStates)
+        {
+            try { OnLifeMemoryStateReceived?.Invoke(p); }
+            catch (Exception ex) { _logger?.Invoke($"Error delivering OnLifeMemoryStateReceived: {ex.Message}", "Error"); }
+        }
+        foreach (var p in lifeCarePayloads)
+        {
+            try { OnLifeCareReceived?.Invoke(p); }
+            catch (Exception ex) { _logger?.Invoke($"Error delivering OnLifeCareReceived: {ex.Message}", "Error"); }
+        }
     }
 
     private void ProcessMainThreadEnvelope(EnvelopeDto envelope)
@@ -1475,24 +1516,49 @@ public sealed class WebSocketTransportServer : ITransportServer
                         using var doc = JsonDocument.Parse(jsonString);
                         var root = doc.RootElement;
                         ChatReplyPayload? reply = null;
-                        if (root.TryGetProperty("messageType", out var msgTypeProp) &&
-                            string.Equals(msgTypeProp.GetString(), "autonomy.state", StringComparison.OrdinalIgnoreCase) &&
-                            root.TryGetProperty("payload", out var autonomyElem))
+
+                        string? msgType = root.TryGetProperty("messageType", out var mtProp)
+                            ? mtProp.GetString()
+                            : null;
+
+                        bool hasPayload = root.TryGetProperty("payload", out var payloadElem);
+
+                        if (string.Equals(msgType, "autonomy.state", StringComparison.OrdinalIgnoreCase) && hasPayload)
                         {
-                            var state = autonomyElem.Deserialize<AutonomyStatePayload>(JsonOptions);
-                            if (state != null)
-                            {
-                                OnAutonomyStateReceived?.Invoke(state);
-                            }
+                            var state = payloadElem.Deserialize<AutonomyStatePayload>(JsonOptions);
+                            if (state != null) OnAutonomyStateReceived?.Invoke(state);
                         }
-                        else if (root.TryGetProperty("messageType", out msgTypeProp) &&
-                            string.Equals(msgTypeProp.GetString(), "chat.reply", StringComparison.OrdinalIgnoreCase) &&
-                            root.TryGetProperty("payload", out var payloadElem))
+                        else if (string.Equals(msgType, "chat.reply", StringComparison.OrdinalIgnoreCase) && hasPayload)
                         {
                             reply = payloadElem.Deserialize<ChatReplyPayload>(JsonOptions);
                         }
+                        else if (string.Equals(msgType, "life.chat.reply", StringComparison.OrdinalIgnoreCase) && hasPayload)
+                        {
+                            var lifeReply = payloadElem.Deserialize<LifeChatReplyPayload>(JsonOptions);
+                            if (lifeReply != null)
+                                lock (_chatLock) { _pendingLifeChatReplies.Enqueue(lifeReply); }
+                        }
+                        else if (string.Equals(msgType, "life.profile.state", StringComparison.OrdinalIgnoreCase) && hasPayload)
+                        {
+                            var profileState = payloadElem.Deserialize<LifeProfileStatePayload>(JsonOptions);
+                            if (profileState != null)
+                                lock (_chatLock) { _pendingLifeProfileStates.Enqueue(profileState); }
+                        }
+                        else if (string.Equals(msgType, "life.memory.state", StringComparison.OrdinalIgnoreCase) && hasPayload)
+                        {
+                            var memState = payloadElem.Deserialize<LifeMemoryStatePayload>(JsonOptions);
+                            if (memState != null)
+                                lock (_chatLock) { _pendingLifeMemoryStates.Enqueue(memState); }
+                        }
+                        else if (string.Equals(msgType, "life.care", StringComparison.OrdinalIgnoreCase) && hasPayload)
+                        {
+                            var care = payloadElem.Deserialize<LifeCarePayload>(JsonOptions);
+                            if (care != null)
+                                lock (_chatLock) { _pendingLifeCarePayloads.Enqueue(care); }
+                        }
                         else
                         {
+                            // Legacy fallback: try to parse bare ChatReplyPayload
                             reply = JsonSerializer.Deserialize<ChatReplyPayload>(jsonString, JsonOptions);
                         }
 
@@ -1650,5 +1716,150 @@ public sealed class WebSocketTransportServer : ITransportServer
         _socketCts?.Dispose();
         _outboundSignal.Dispose();
         _listener.Close();
+    }
+
+    // -----------------------------------------------------------------------
+    // Life.* send methods (§1, C#→Py direction)
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// §1.1 Sends a life.chat.submit envelope on the /chat channel.
+    /// </summary>
+    public async Task<bool> SendLifeChatSubmitAsync(LifeChatSubmitPayload payload)
+    {
+        WebSocket? socket;
+        lock (_chatLock) { socket = _chatSocket; }
+        if (socket == null || socket.State != WebSocketState.Open) return false;
+
+        var envelope = new EnvelopeDto(
+            ProtocolVersion: "0.1",
+            MessageType: "life.chat.submit",
+            MessageId: $"lcs-{Guid.NewGuid():N}"[..12],
+            SenderInstanceId: _senderInstanceId,
+            SequenceNumber: 0,
+            WorldRevision: 0,
+            SentAt: DateTimeOffset.UtcNow,
+            Payload: JsonSerializer.SerializeToNode(payload, JsonOptions)!.AsObject(),
+            SaveId: _saveId,
+            GameSessionId: _gameSessionId);
+
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// §1.3 Sends a life.profile.get envelope on the /chat channel.
+    /// </summary>
+    public async Task<bool> SendLifeProfileGetAsync(LifeProfileGetPayload payload)
+    {
+        WebSocket? socket;
+        lock (_chatLock) { socket = _chatSocket; }
+        if (socket == null || socket.State != WebSocketState.Open) return false;
+
+        var envelope = new EnvelopeDto(
+            ProtocolVersion: "0.1",
+            MessageType: "life.profile.get",
+            MessageId: $"lpg-{Guid.NewGuid():N}"[..12],
+            SenderInstanceId: _senderInstanceId,
+            SequenceNumber: 0,
+            WorldRevision: 0,
+            SentAt: DateTimeOffset.UtcNow,
+            Payload: JsonSerializer.SerializeToNode(payload, JsonOptions)!.AsObject(),
+            SaveId: _saveId,
+            GameSessionId: _gameSessionId);
+
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// §1.4 Sends a life.profile.set envelope on the /chat channel.
+    /// </summary>
+    public async Task<bool> SendLifeProfileSetAsync(LifeProfileSetPayload payload)
+    {
+        WebSocket? socket;
+        lock (_chatLock) { socket = _chatSocket; }
+        if (socket == null || socket.State != WebSocketState.Open) return false;
+
+        var envelope = new EnvelopeDto(
+            ProtocolVersion: "0.1",
+            MessageType: "life.profile.set",
+            MessageId: $"lps-{Guid.NewGuid():N}"[..12],
+            SenderInstanceId: _senderInstanceId,
+            SequenceNumber: 0,
+            WorldRevision: 0,
+            SentAt: DateTimeOffset.UtcNow,
+            Payload: JsonSerializer.SerializeToNode(payload, JsonOptions)!.AsObject(),
+            SaveId: _saveId,
+            GameSessionId: _gameSessionId);
+
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// §1.5 Sends a life.memory.list envelope on the /chat channel.
+    /// </summary>
+    public async Task<bool> SendLifeMemoryListAsync(LifeMemoryListPayload payload)
+    {
+        WebSocket? socket;
+        lock (_chatLock) { socket = _chatSocket; }
+        if (socket == null || socket.State != WebSocketState.Open) return false;
+
+        var envelope = new EnvelopeDto(
+            ProtocolVersion: "0.1",
+            MessageType: "life.memory.list",
+            MessageId: $"lml-{Guid.NewGuid():N}"[..12],
+            SenderInstanceId: _senderInstanceId,
+            SequenceNumber: 0,
+            WorldRevision: 0,
+            SentAt: DateTimeOffset.UtcNow,
+            Payload: JsonSerializer.SerializeToNode(payload, JsonOptions)!.AsObject(),
+            SaveId: _saveId,
+            GameSessionId: _gameSessionId);
+
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// §1.6 Sends a life.memory.edit envelope on the /chat channel.
+    /// </summary>
+    public async Task<bool> SendLifeMemoryEditAsync(LifeMemoryEditPayload payload)
+    {
+        WebSocket? socket;
+        lock (_chatLock) { socket = _chatSocket; }
+        if (socket == null || socket.State != WebSocketState.Open) return false;
+
+        var envelope = new EnvelopeDto(
+            ProtocolVersion: "0.1",
+            MessageType: "life.memory.edit",
+            MessageId: $"lme-{Guid.NewGuid():N}"[..12],
+            SenderInstanceId: _senderInstanceId,
+            SequenceNumber: 0,
+            WorldRevision: 0,
+            SentAt: DateTimeOffset.UtcNow,
+            Payload: JsonSerializer.SerializeToNode(payload, JsonOptions)!.AsObject(),
+            SaveId: _saveId,
+            GameSessionId: _gameSessionId);
+
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Shared helper: serialise and send an envelope on the /chat WebSocket with a 5-second timeout.
+    /// </summary>
+    private async Task<bool> SendChatEnvelopeAsync(EnvelopeDto envelope)
+    {
+        WebSocket? socket;
+        lock (_chatLock) { socket = _chatSocket; }
+        if (socket == null || socket.State != WebSocketState.Open) return false;
+
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOptions));
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await _chatSendLock.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+        try
+        {
+            if (socket.State != WebSocketState.Open) return false;
+            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeoutCts.Token).ConfigureAwait(false);
+            return true;
+        }
+        finally { _chatSendLock.Release(); }
     }
 }

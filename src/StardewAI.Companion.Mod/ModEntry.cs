@@ -49,6 +49,22 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private DateTime _chatActivityAt = DateTime.UtcNow;
     private string? _watchedChatRequest;
 
+    // -----------------------------------------------------------------------
+    // Life-system fields
+    // -----------------------------------------------------------------------
+
+    private readonly LifeMenuUiState _lifeMenuUiState = new();
+    private readonly CareHintController _careHintController = new();
+    private readonly CompanionInteractionDetector _interactionDetector = new();
+    private bool _lifeSaveProfileFetched;   // true once life.profile.get was sent for this save
+    private bool _lifeOnboardingHudShown;   // avoid repeated HUD nudge
+
+    // §1.8 start-together sequence, ack-chained: ① life.profile.set ②
+    // set_preferences(goal) ③ set_mode(free). Each step waits for its
+    // confirmation; a failure or timeout aborts with the real state kept, so
+    // the player can retry from setup. Ordering lives in LifeStartSequence.
+    private readonly LifeStartSequence _lifeStartSequence = new();
+
     public override void Entry(IModHelper helper)
     {
         Monitor.Log("Stardew AI Companion initializing Stage 0 mechanics and transport.", LogLevel.Info);
@@ -101,6 +117,10 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         {
             InitializeCompanion();
         }
+
+        // Expire care hints from the previous day (§1.7: unread hints are NOT carried over).
+        _careHintController.OnDayStarted(GetCurrentGameDate());
+        _lifeMenuUiState.MarkAllCareHintsRead();
     }
 
     private void InitializeCompanion()
@@ -277,7 +297,18 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _transportServer.OnAutonomyStateReceived += HandleAutonomyStateReceived;
             _transportServer.OnChatChannelProblem += (request, save, problem) =>
                 _mainThreadActions.Enqueue(() => ShowChatChannelProblem(request, save, problem));
+            _transportServer.OnLifeChatReplyReceived += HandleLifeChatReplyReceived;
+            _transportServer.OnLifeProfileStateReceived += HandleLifeProfileStateReceived;
+            _transportServer.OnLifeMemoryStateReceived += HandleLifeMemoryStateReceived;
+            _transportServer.OnLifeCareReceived += HandleLifeCareReceived;
             _transportServer.Start();
+
+            // Reset life-session state for the new save
+            _lifeSaveProfileFetched = false;
+            _lifeOnboardingHudShown = false;
+            _lifeStartSequence.Abort();
+            _lifeMenuUiState.Reset();
+            _careHintController.OnDayStarted(GetCurrentGameDate());
 
             // Persist companion state on every task completion, not only at game-save time:
             // save/exit/reload durability must not depend on save-event timing.
@@ -337,6 +368,38 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _deferredResumeMachine = null;
             _chatUiState.NoteLocalResumed();
             ProjectChatUiState();
+        }
+
+        // 2b. Life profile auto-fetch: once transport is ready and not yet fetched
+        if (!_lifeSaveProfileFetched && _transportServer?.IsChatConnected == true && _actor != null)
+        {
+            _lifeSaveProfileFetched = true;
+            string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+            string reqId = Guid.NewGuid().ToString("N")[..8];
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _transportServer!.SendLifeProfileGetAsync(
+                        new LifeProfileGetPayload(reqId, saveId)).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Monitor.Log($"life.profile.get send failed: {ex.Message}", LogLevel.Warn);
+                }
+            });
+        }
+
+        // 2c. §1.8 start-together timeout: abort with real state kept and retry hint.
+        if (_lifeStartSequence.Step != LifeStartStep.Idle &&
+            DateTime.UtcNow - _lifeStartSequence.StepSentAtUtc > TimeSpan.FromSeconds(30))
+            AbortLifeStart("等待确认超时。");
+
+        // 2d. Drain deferred care hints once nothing blocks the HUD.
+        if (Game1.activeClickableMenu == null && !Game1.eventUp)
+        {
+            foreach (var hint in _careHintController.TryDrainDeferred())
+                Game1.addHUDMessage(new HUDMessage("阿星想和你聊聊 — 打开生活菜单查看"));
         }
 
         if (Game1.activeClickableMenu is CompanionCommandMenu && !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && _coordinator != null && _coordinator.GetActivityStatus() != "idle")
@@ -422,6 +485,13 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _chatUiState.Reset();
             ProjectChatUiState();
             CompanionCommandMenu.DraftText = string.Empty;
+
+            // Life-system reset
+            _lifeMenuUiState.Reset();
+            _lifeSaveProfileFetched = false;
+            _lifeOnboardingHudShown = false;
+            _lifeStartSequence.Abort();
+
             Monitor.Log("Companion actor and transport shutdown cleanly.", LogLevel.Info);
         }
         catch (Exception ex)
@@ -486,6 +556,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
+        // Life menu: detect player interacting with companion
+        if (e.Button.IsActionButton() && Context.IsWorldReady && _actor != null && Game1.activeClickableMenu == null)
+        {
+            TryOpenLifeMenuFromInteraction();
+        }
+
         if (e.Button == SButton.F8)
         {
             if (!Context.IsWorldReady || _actor == null || _coordinator == null)
@@ -813,6 +889,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     {
         _mainThreadActions.Enqueue(() =>
         {
+            // §1.8 start-together acks are tracked outside the F8 pending-control flow.
+            AdvanceLifeStartAfterControl(state.RequestId, state.Status);
+
             string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
             if (!string.Equals(state.SaveId, saveId, StringComparison.Ordinal)) return;
             if (!string.Equals(state.RequestId, _chatUiState.PendingControlId, StringComparison.Ordinal)) return;
@@ -1144,5 +1223,467 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private void OnCommandStatus(string command, string[] args)
     {
         Monitor.Log(GetStatusDetails(), LogLevel.Info);
+    }
+
+    // =========================================================================
+    // Life-system methods
+    // =========================================================================
+
+    /// <summary>
+    /// Checks if the player is close enough to the companion and facing it,
+    /// then opens the life menu.
+    /// </summary>
+    private void TryOpenLifeMenuFromInteraction()
+    {
+        if (_actor == null || !Context.IsWorldReady) return;
+
+        // Get player tile and facing
+        var player = Game1.player;
+        var playerTile = new Domain.TileCoordinate((int)player.Tile.X, (int)player.Tile.Y);
+        var cursorTile = new Domain.TileCoordinate(
+            (int)Game1.currentCursorTile.X,
+            (int)Game1.currentCursorTile.Y);
+        var companionTile = _actor.Tile;
+
+        bool interactionPressed = true; // already inside OnButtonPressed guard
+
+        if (_interactionDetector.ShouldOpenLifeMenu(
+            playerTile, player.FacingDirection, cursorTile, companionTile, interactionPressed))
+        {
+            OpenLifeMenu();
+        }
+    }
+
+    /// <summary>
+    /// Opens the <see cref="CompanionLifeMenu"/>.
+    /// </summary>
+    private void OpenLifeMenu()
+    {
+        if (Game1.activeClickableMenu is CompanionLifeMenu) return;
+
+        Game1.activeClickableMenu = new CompanionLifeMenu(
+            _lifeMenuUiState,
+            onSubmitLifeChat: (text, mode) => DispatchLifeChat(text, mode),
+            onOpenCommandMenu: prefill =>
+            {
+                // Pre-populate F8 draft and open command menu
+                CompanionCommandMenu.DraftText = prefill;
+                string curLoc = !string.IsNullOrWhiteSpace(Game1.currentLocation?.NameOrUniqueName)
+                    ? Game1.currentLocation.NameOrUniqueName
+                    : Game1.currentLocation?.Name ?? "Farm";
+                CompanionCommandMenu.AvailableChestOptions = (_observer?.ScanChests(curLoc) ?? Array.Empty<ChestScanInfo>())
+                    .Select(chest => $"{curLoc}@({chest.Tile.X},{chest.Tile.Y})")
+                    .Prepend("none")
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray();
+                Game1.activeClickableMenu = new CompanionCommandMenu(
+                    ExecuteInGameCommand,
+                    RequestPauseMenuAction,
+                    RequestResumeMenuAction,
+                    RequestCancelMenuAction,
+                    ToggleAutonomyMode,
+                    OpenAutonomySettings);
+                ProjectChatUiState();
+            },
+            onOpenSetup: OpenSetupMenu,
+            onRefreshWork: DispatchLifeProfileRefresh,
+            onRefreshMemory: DispatchMemoryListRefresh,
+            onMemoryEdit: (op, id, kind, text) => DispatchMemoryEdit(op, id, kind, text));
+
+        Monitor.Log("Companion life menu opened.", LogLevel.Info);
+    }
+
+    /// <summary>
+    /// Opens the <see cref="CompanionSetupMenu"/>.
+    /// </summary>
+    private void OpenSetupMenu()
+    {
+        Game1.activeClickableMenu = new CompanionSetupMenu(
+            companionName: _lifeMenuUiState.CompanionName,
+            playStyle: _lifeMenuUiState.PlayStyle,
+            personality: _lifeMenuUiState.Personality,
+            careFrequency: _lifeMenuUiState.CareFrequency,
+            dailySpendLimit: _lifeMenuUiState.DailySpendLimit ?? CompanionCommandMenu.DailySpendLimit,
+            currentWorkMode: _lifeMenuUiState.WorkMode,
+            liveState: _lifeMenuUiState,
+            onSave: (name, style, pers, freq) => SendLifeProfileSetOnly(name, style, pers, freq),
+            onStart: (name, style, pers, freq) => SendLifeStart(name, style, pers, freq),
+            onSkip: () => SendLifeProfileSkip());
+    }
+
+    // -----------------------------------------------------------------------
+    // Life-chat dispatch
+    // -----------------------------------------------------------------------
+
+    private void DispatchLifeProfileRefresh()
+    {
+        if (_transportServer == null || !_transportServer.IsChatConnected) return;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        _ = Task.Run(async () =>
+        {
+            try { await _transportServer.SendLifeProfileGetAsync(new LifeProfileGetPayload(reqId, saveId)).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"life.profile.get refresh failed: {ex.Message}", LogLevel.Warn); }
+        });
+    }
+
+    private bool DispatchLifeChat(string text, string mode)
+    {
+        if (_transportServer == null || !_transportServer.IsChatConnected) return false;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        if (!_lifeMenuUiState.BeginChat(reqId, mode)) return false;
+
+        var payload = new LifeChatSubmitPayload(reqId, saveId, mode, text);
+        _ = Task.Run(async () =>
+        {
+            try { await _transportServer.SendLifeChatSubmitAsync(payload).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"life.chat.submit send failed: {ex.Message}", LogLevel.Warn); }
+        });
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory edit dispatch
+    // -----------------------------------------------------------------------
+
+    private void DispatchMemoryListRefresh()
+    {
+        if (_transportServer == null || !_transportServer.IsChatConnected) return;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        _ = Task.Run(async () =>
+        {
+            try { await _transportServer.SendLifeMemoryListAsync(new LifeMemoryListPayload(reqId, saveId)).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"life.memory.list send failed: {ex.Message}", LogLevel.Warn); }
+        });
+    }
+
+    private bool DispatchMemoryEdit(string op, string? id, string? kind, string? text)
+    {
+        if (_transportServer == null || !_transportServer.IsChatConnected) return false;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        _lifeMenuUiState.BeginMemoryEdit(reqId);
+
+        var payload = new LifeMemoryEditPayload(reqId, saveId, _lifeMenuUiState.MemoryRevision, op, id, kind, text);
+        _ = Task.Run(async () =>
+        {
+            try { await _transportServer.SendLifeMemoryEditAsync(payload).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"life.memory.edit send failed: {ex.Message}", LogLevel.Warn); }
+        });
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile set helpers
+    // -----------------------------------------------------------------------
+
+    private void SendLifeProfileSetOnly(string name, string style, string personality, string careFreq)
+    {
+        if (_transportServer == null) return;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        int expected = _lifeMenuUiState.ProfileRevision;
+        _lifeMenuUiState.BeginProfileSet(reqId, expected);
+
+        var patch = new LifeProfilePatchDto(
+            CompanionName: name,
+            PlayStyle: style,
+            Personality: personality,
+            CareFrequency: careFreq);
+        var payload = new LifeProfileSetPayload(reqId, saveId, expected, patch);
+        _ = Task.Run(async () =>
+        {
+            try { await _transportServer.SendLifeProfileSetAsync(payload).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"life.profile.set send failed: {ex.Message}", LogLevel.Warn); }
+        });
+    }
+
+    private void SendLifeProfileSkip()
+    {
+        if (_transportServer == null) return;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        int expected = _lifeMenuUiState.ProfileRevision;
+        _lifeMenuUiState.BeginProfileSet(reqId, expected);
+
+        var patch = new LifeProfilePatchDto(Skipped: true);
+        var payload = new LifeProfileSetPayload(reqId, saveId, expected, patch);
+        _ = Task.Run(async () =>
+        {
+            try { await _transportServer!.SendLifeProfileSetAsync(payload).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"life.profile.set(skip) send failed: {ex.Message}", LogLevel.Warn); }
+        });
+    }
+
+    /// <summary>
+    /// §1.8 start sequence, ack-chained: ① persist profile (onboarded=true), wait for
+    /// life.profile.state confirmed; ② autonomy set_preferences(goal), wait for ack;
+    /// ③ autonomy set_mode(free), wait for ack. The goal is confirmed before free
+    /// mode so autonomy never dispatches work under a stale goal. The final HUD
+    /// celebration only fires after all three confirmations; any rejection/timeout
+    /// aborts with the real state kept and a retry hint (setup menu can re-trigger).
+    /// Ordering/stepping lives in <see cref="LifeStartSequence"/>; this method only
+    /// wires sends and rendering.
+    /// </summary>
+    private void SendLifeStart(string name, string style, string personality, string careFreq)
+    {
+        if (_transportServer == null) return;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        int expected = _lifeMenuUiState.ProfileRevision;
+        _lifeMenuUiState.BeginProfileSet(reqId, expected);
+
+        _lifeStartSequence.Begin(saveId, name, style, reqId);
+        _lifeStartSequence.StepSentAtUtc = DateTime.UtcNow;
+
+        var patch = new LifeProfilePatchDto(
+            Onboarded: true,
+            Skipped: false,
+            CompanionName: name,
+            PlayStyle: style,
+            Personality: personality,
+            CareFrequency: careFreq);
+        var profilePayload = new LifeProfileSetPayload(reqId, saveId, expected, patch);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                bool ok = await _transportServer.SendLifeProfileSetAsync(profilePayload).ConfigureAwait(false);
+                if (!ok) _mainThreadActions.Enqueue(() => AbortLifeStart("设置保存未送达，请检查连接。"));
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"life.profile.set(start) send failed: {ex.Message}", LogLevel.Warn);
+                _mainThreadActions.Enqueue(() => AbortLifeStart("设置保存发送失败，请检查连接。"));
+            }
+        });
+    }
+
+    private void AdvanceLifeStartAfterProfile(string requestId, string status, string? reason)
+    {
+        var result = _lifeStartSequence.ApplyProfileState(requestId, status, reason);
+        switch (result)
+        {
+            case LifeStartAdvance.Ignore:
+                return;
+            case LifeStartAdvance.Abort:
+                AbortLifeStart(_lifeStartSequence.AbortReason ?? "设置未确认。");
+                return;
+            case LifeStartAdvance.SendGoalPreference:
+                SendLifeStartControl(result, new JsonObject { ["goal"] = _lifeStartSequence.Goal }, "目标设置");
+                return;
+        }
+    }
+
+    private void AdvanceLifeStartAfterControl(string requestId, string status)
+    {
+        var result = _lifeStartSequence.ApplyControlAck(requestId, status);
+        switch (result)
+        {
+            case LifeStartAdvance.Ignore:
+                return;
+            case LifeStartAdvance.Abort:
+                AbortLifeStart(_lifeStartSequence.AbortReason ?? "设置未确认。");
+                return;
+            case LifeStartAdvance.SendModeFree:
+                SendLifeStartControl(result, new JsonObject { ["mode"] = "free" }, "自由模式开启");
+                return;
+            case LifeStartAdvance.Complete:
+                Game1.addHUDMessage(new HUDMessage($"和{_lifeStartSequence.CompanionName}一起生活开始了！"));
+                // The control ack is authoritative, but the setup/life menus read
+                // their mode and plan from life.profile.state. Refresh that view now.
+                DispatchLifeProfileRefresh();
+                return;
+        }
+    }
+
+    /// <summary>
+    /// Sends one §1.8 autonomy control step. The sequence has already advanced to
+    /// the matching await-step; a send failure aborts with the real state kept.
+    /// </summary>
+    private void SendLifeStartControl(LifeStartAdvance step, JsonObject parameters, string failureNoun)
+    {
+        string action = step == LifeStartAdvance.SendGoalPreference ? "set_preferences" : "set_mode";
+        string reqId = step == LifeStartAdvance.SendGoalPreference
+            ? _lifeStartSequence.GoalRequestId!
+            : _lifeStartSequence.ModeRequestId!;
+        var payload = new AutonomyControlPayload(reqId, _lifeStartSequence.SaveId ?? string.Empty, action, parameters);
+        _lifeStartSequence.StepSentAtUtc = DateTime.UtcNow;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                bool ok = await _transportServer!.SendAutonomyControlAsync(payload).ConfigureAwait(false);
+                if (!ok) _mainThreadActions.Enqueue(() => AbortLifeStart($"{failureNoun}未送达，请检查连接。"));
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"life.start {action} send failed: {ex.Message}", LogLevel.Warn);
+                _mainThreadActions.Enqueue(() => AbortLifeStart($"{failureNoun}发送失败，请检查连接。"));
+            }
+        });
+    }
+
+    private void AbortLifeStart(string reason)
+    {
+        if (_lifeStartSequence.Step == LifeStartStep.Idle) return;
+        _lifeStartSequence.Abort();
+        Game1.addHUDMessage(new HUDMessage($"开始一起生活未完成：{reason} 游戏内状态保持真实结果，可在「伙伴设置」中重试。", HUDMessage.error_type));
+    }
+
+    // -----------------------------------------------------------------------
+    // Life event handlers (called from main thread via event dispatch in Update)
+    // -----------------------------------------------------------------------
+
+    private void HandleLifeChatReplyReceived(LifeChatReplyPayload reply)
+    {
+        _mainThreadActions.Enqueue(() =>
+        {
+            _lifeMenuUiState.ApplyChatReply(
+                reply.RequestId,
+                reply.Status,
+                reply.ReplyText,
+                reply.QueuePosition,
+                reply.Error,
+                reply.ProfileRevision,
+                reply.MemoryRevision);
+
+            Monitor.Log($"life.chat.reply: status={reply.Status} reqId={reply.RequestId}", LogLevel.Debug);
+        });
+    }
+
+    private void HandleLifeProfileStateReceived(LifeProfileStatePayload state)
+    {
+        _mainThreadActions.Enqueue(() =>
+        {
+            string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+            if (!string.Equals(state.SaveId, saveId, StringComparison.Ordinal)) return;
+
+            bool isStandaloneSaveReply = _lifeStartSequence.Step == LifeStartStep.Idle &&
+                state.RequestId == _lifeMenuUiState.PendingProfileSetRequestId;
+            _lifeMenuUiState.MarkProfileStateReceived();
+            _lifeMenuUiState.ApplyWorkProjection(
+                state.Work.Goal,
+                state.Work.ActiveGoals?.Select(goal => goal.Text) ?? Enumerable.Empty<string>(),
+                state.Work.RecentTodos?.Select(todo => todo.Intent) ?? Enumerable.Empty<string>(),
+                state.Work.WaitingConditions ?? Enumerable.Empty<string>(),
+                state.Work.PlanWaitReason);
+
+            if (state.Profile != null)
+            {
+                _lifeMenuUiState.ApplyProfileState(
+                    state.Profile.Onboarded,
+                    state.Profile.Skipped,
+                    state.Profile.CompanionName,
+                    state.Profile.PlayStyle,
+                    state.Profile.Personality,
+                    state.Profile.CareFrequency,
+                    state.ProfileRevision,
+                    state.Work.Mode,
+                    state.Work.Paused,
+                    state.Work.DailySpendLimit,
+                    // Keep the memory revision already learned from life.memory.state;
+                    // profile.state does not carry it.
+                    memoryRevision: _lifeMenuUiState.MemoryRevision,
+                    requestId: state.RequestId);
+
+                // HUD onboarding nudge: not onboarded and not skipped
+                if (!state.Profile.Onboarded && !state.Profile.Skipped && !_lifeOnboardingHudShown)
+                {
+                    _lifeOnboardingHudShown = true;
+                    Game1.addHUDMessage(new HUDMessage("走近阿星，按互动键与她聊聊，完成初次设置。"));
+                }
+            }
+            else
+            {
+                // profile null = not onboarded yet
+                if (!_lifeOnboardingHudShown)
+                {
+                    _lifeOnboardingHudShown = true;
+                    Game1.addHUDMessage(new HUDMessage("走近阿星，按互动键与她聊聊，完成初次设置。"));
+                }
+            }
+
+            AdvanceLifeStartAfterProfile(state.RequestId, state.Status, state.Reason);
+
+            if (isStandaloneSaveReply)
+            {
+                string message = state.Status == "confirmed"
+                    ? "伙伴设置已保存。"
+                    : state.Reason == "STALE_REVISION"
+                        ? "伙伴设置已变化，请重新打开设置后重试。"
+                        : "伙伴设置未保存，请重试。";
+                Game1.addHUDMessage(new HUDMessage(message,
+                    state.Status == "confirmed" ? HUDMessage.newQuest_type : HUDMessage.error_type));
+            }
+
+            Monitor.Log($"life.profile.state received: revision={state.ProfileRevision} onboarded={state.Profile?.Onboarded}", LogLevel.Debug);
+        });
+    }
+
+    private void HandleLifeMemoryStateReceived(LifeMemoryStatePayload state)
+    {
+        _mainThreadActions.Enqueue(() =>
+        {
+            string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+            if (!string.Equals(state.SaveId, saveId, StringComparison.Ordinal)) return;
+
+            bool isEditReply = state.RequestId == _lifeMenuUiState.PendingMemoryEditRequestId;
+            _lifeMenuUiState.ApplyMemoryState(
+                state.MemoryRevision,
+                state.Entries.Select(e => new Menus.MemoryEntrySnapshot(
+                    e.Id, e.Kind, e.Text, e.Source, e.GameDate, e.CreatedAt)),
+                state.RequestId, state.Status, state.Reason);
+            if (isEditReply && _lifeMenuUiState.MemoryEditFeedback != null)
+                Game1.addHUDMessage(new HUDMessage(_lifeMenuUiState.MemoryEditFeedback,
+                    state.Status == "confirmed" ? HUDMessage.newQuest_type : HUDMessage.error_type));
+
+            Monitor.Log($"life.memory.state received: revision={state.MemoryRevision} count={state.Entries.Count}", LogLevel.Debug);
+        });
+    }
+
+    private void HandleLifeCareReceived(LifeCarePayload care)
+    {
+        _mainThreadActions.Enqueue(() =>
+        {
+            string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+            if (!string.Equals(care.SaveId, saveId, StringComparison.Ordinal)) return;
+
+            bool menuOpen = Game1.activeClickableMenu != null;
+            bool eventPlaying = Game1.eventUp;
+            bool blocked = menuOpen || eventPlaying;
+
+            var hint = _careHintController.ReceiveCareHint(
+                care.EventKey, care.GameDate, care.Kind, care.Text, blocked);
+
+            if (hint != null)
+            {
+                // Add to life-menu unread list
+                _lifeMenuUiState.AddUnreadCareHint(hint);
+                // Show low-intrusion HUD message
+                Game1.addHUDMessage(new HUDMessage($"阿星想和你聊聊 — 打开生活菜单查看"));
+            }
+            else if (blocked && _careHintController.PendingHints.Any(h => h.EventKey == care.EventKey))
+            {
+                // Still add to pending-read list even if deferred display
+                _lifeMenuUiState.AddUnreadCareHint(
+                    new Domain.PendingCareHint(care.EventKey, care.GameDate, care.Kind, care.Text));
+            }
+
+            Monitor.Log($"life.care received: eventKey={care.EventKey} kind={care.Kind} blocked={blocked}", LogLevel.Debug);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper
+    // -----------------------------------------------------------------------
+
+    private static string GetCurrentGameDate()
+    {
+        if (!Context.IsWorldReady) return string.Empty;
+        return $"{Game1.year}:{Game1.currentSeason}:{Game1.dayOfMonth}";
     }
 }

@@ -100,6 +100,7 @@ MagicMock/
 !/tools/check_release_boundaries.py
 !/tools/detect-game.ps1
 !/tools/export-chat-wire-test.py
+!/tools/export-life-wire-test.py
 !/tools/preflight.ps1
 !/tools/register-mcp.ps1
 !/tools/setup-companion.ps1

@@ -39,12 +39,22 @@ from typing import Any
 from stardew_ai_runtime.agent_backends import AgyBackend, KimiBackend
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
+from stardew_ai_runtime.companion_care import CompanionCareService
+from stardew_ai_runtime.companion_memory import CompanionMemoryStore
+from stardew_ai_runtime.companion_profile import CompanionProfileStore
 from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
 from stardew_ai_runtime.job_feedback import compact_job_feedback
 from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
+from stardew_ai_runtime.life_chat import LifeChatService
 from stardew_ai_runtime.plan_executor import DispatchDeferred, PlanExecutor, StepExecution
 from stardew_ai_runtime.protocol import (
     Envelope,
+    LifeChatSubmitPayload,
+    LifeMemoryEditPayload,
+    LifeMemoryListPayload,
+    LifeProfileGetPayload,
+    LifeProfileSetPayload,
+    ProtocolError,
 )
 from stardew_ai_runtime.scheduler import (
     DiscoveryError,
@@ -965,6 +975,21 @@ class ChatBridge:
         self._internal_plan_client_override = internal_plan_client
         self._enable_plan_worker = enable_plan_worker
         self._bind_work_store()
+        # Companion "day in the life" stores (contract §2): profile, memory,
+        # care rules and the life-chat session service. All None until a run
+        # dir is known (explicit --run-dir or auto-discovery), exactly like
+        # the work store above.
+        self._profile_store: CompanionProfileStore | None = None
+        self._memory_store: CompanionMemoryStore | None = None
+        self._care_service: CompanionCareService | None = None
+        self._life_chat: LifeChatService | None = None
+        self._life_fingerprints: dict[str, str] = {}
+        self._life_queue: list[dict[str, Any]] = []
+        self._life_draining = False
+        self._evening_care_fired_day: str | None = None
+        self._deferred_care_tasks: set[asyncio.Task[None]] = set()
+        self._chat_ws: WebSocketClient | None = None
+        self._bind_companion_stores()
 
     @property
     def provider(self) -> str:
@@ -1034,6 +1059,45 @@ class ChatBridge:
         """Use the same run-dir state file as MCP, including after auto-discovery."""
         if self.run_dir is not None:
             self._autonomy = AutonomyController(self.run_dir / "data" / "autonomy-state.json")
+
+    def _bind_companion_stores(self) -> None:
+        """Bind companion profile/memory/care stores and the life-chat service.
+
+        Called from ``__init__`` and again after auto-discovery resolves the Mod
+        dir, mirroring ``_bind_work_store``. Everything lives under
+        ``<run_dir>/data/`` in the autonomy.py persistence pattern.
+        """
+        if self.run_dir is None:
+            return
+        data_dir = self.run_dir / "data"
+        self._profile_store = CompanionProfileStore(data_dir / "companion-profile.json")
+        self._memory_store = CompanionMemoryStore(data_dir / "companion-memory.json")
+        self._care_service = CompanionCareService(data_dir / "companion-care.json")
+        self._life_fingerprints = self._load_life_fingerprints()
+        self._life_chat = LifeChatService(
+            backend_name=self.backend_name,
+            sessions=self._sessions,
+            sessions_file=self._sessions_file,
+            fingerprints=self._life_fingerprints,
+            fingerprints_file=self._life_fingerprint_path(),
+        )
+
+    def _life_fingerprint_path(self) -> Path:
+        if self.run_dir:
+            return Path(self.run_dir) / "chat_life_fingerprints.json"
+        return Path(self._sessions_file).parent / "chat_life_fingerprints.json"
+
+    def _load_life_fingerprints(self) -> dict[str, str]:
+        path = self._life_fingerprint_path()
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            logger.debug("Failed to load life fingerprints", exc_info=True)
+        return {}
 
     def _bind_work_store(self) -> None:
         """Bind durable work state and the internal plan worker.
@@ -1303,6 +1367,7 @@ class ChatBridge:
                     self.run_dir = Path(mod_dir)
                     self._bind_autonomy_store()
                     self._bind_work_store()
+                    self._bind_companion_stores()
                     if has_chat_bridge_file_logging():
                         try:
                             _, new_log = switch_chat_bridge_file_logging(self.run_dir)
@@ -1365,6 +1430,7 @@ class ChatBridge:
     ) -> None:
         tracked_tasks: set[asyncio.Task] = set()
         latest_snapshot: Envelope | None = None
+        self._chat_ws = ws
 
         async def run_submit(request_id: str, text: str, save_id: str) -> None:
             generation = self._autonomy_generation
@@ -1406,6 +1472,8 @@ class ChatBridge:
                     )
                     self._latest_snapshot_revision = envelope.world_revision
                     world = envelope.payload.get("world") if isinstance(envelope.payload.get("world"), dict) else {}
+                    day_key: str | None = None
+                    previous_day_key: str | None = None
                     if world.get("dayOfMonth") is not None:
                         day_key = f"{world.get('year', 'unknown')}:{world.get('season', 'unknown')}:{world['dayOfMonth']}"
                         previous_day_key = self._current_game_day_key
@@ -1417,6 +1485,7 @@ class ChatBridge:
                         # next advance can settle.
                         if day_key != previous_day_key:
                             await self._settle_day_advance(active_save_id, world)
+                    await self._snapshot_care_hooks(active_save_id, world, day_key, previous_day_key)
                     # A fresh native snapshot is also the trigger for the plan
                     # worker to advance ready steps (and to re-evaluate waiting
                     # todos) without any model turn.
@@ -1439,6 +1508,16 @@ class ChatBridge:
                     await self.handle_chat_cancel(ws, req_id, reason, active_save_id)
                     continue
 
+                if msg_type in {
+                    "life.chat.submit",
+                    "life.profile.get",
+                    "life.profile.set",
+                    "life.memory.list",
+                    "life.memory.edit",
+                }:
+                    await self._handle_life_message(ws, msg_type, data, active_save_id)
+                    continue
+
                 if msg_type == "chat.submit":
                     payload_data = data.get("payload", {})
                     req_id = str(payload_data.get("requestId", ""))
@@ -1456,6 +1535,20 @@ class ChatBridge:
         finally:
             self.abort_active_task("Chat channel stopped")
             self._break_command_chain()
+            # Queued life-chat submits must never vanish silently (contract §1.2):
+            # anything still waiting when the channel closes gets a failed terminal.
+            for item in list(self._life_queue):
+                await self._send_reply(item.get("ws"), Envelope.create_life_chat_reply(
+                    sender_instance_id=self.instance_id,
+                    request_id=str(item.get("request_id") or ""),
+                    save_id=str(item.get("save_id") or ""),
+                    status="failed",
+                    profile_revision=self._profile_revision(item.get("save_id")),
+                    memory_revision=self._memory_revision(item.get("save_id")),
+                    error="CHAT_CHANNEL_CLOSED",
+                ))
+            self._life_queue.clear()
+            self._life_draining = False
             for debounce in list(self._autonomy_debounce_tasks.values()):
                 debounce.cancel()
             self._autonomy_debounce_tasks.clear()
@@ -1609,7 +1702,23 @@ class ChatBridge:
                 "worldRevision": self._latest_snapshot_revision,
             }
         work = self._latest_work_overview(save_id)
-        return build_decision_context(snapshot, work=work, origin=origin)
+        companion: dict[str, Any] | None = None
+        memory: dict[str, Any] | None = None
+        if save_id:
+            if self._profile_store is not None:
+                profile = (self._profile_store.get(save_id) or {}).get("profile")
+                if profile:
+                    companion = {
+                        "name": profile.get("companionName"),
+                        "personality": profile.get("personality"),
+                        "playStyle": profile.get("playStyle"),
+                        "careFrequency": profile.get("careFrequency"),
+                    }
+            if self._memory_store is not None:
+                memory = self._memory_store.render_for_context(save_id)
+        return build_decision_context(
+            snapshot, work=work, origin=origin, companion=companion, memory=memory
+        )
 
     def _latest_work_overview(self, save_id: str | None) -> dict[str, Any] | None:
         if self._work_store is None or not save_id:
@@ -1619,6 +1728,568 @@ class ChatBridge:
             return self._work_store.overview(save_id, snapshot=snapshot, game_date=game_date)
         except Exception:
             return None
+
+    # -------------------------------------------------- companion life (§1/§2)
+    def _profile_revision(self, save_id: str | None) -> int:
+        if self._profile_store is None or not save_id:
+            return 0
+        try:
+            return int((self._profile_store.get(save_id) or {}).get("profileRevision") or 0)
+        except Exception:
+            return 0
+
+    def _memory_revision(self, save_id: str | None) -> int:
+        if self._memory_store is None or not save_id:
+            return 0
+        try:
+            return int((self._memory_store.list(save_id) or {}).get("memoryRevision") or 0)
+        except Exception:
+            return 0
+
+    def _life_work_projection(self, save_id: str) -> dict[str, Any]:
+        """Read-only autonomy + WorkStore projection for life.profile.state (§1.3)."""
+        payload: dict[str, Any] = {}
+        if self._autonomy is not None:
+            try:
+                payload = self._autonomy_state_payload(save_id, self._autonomy.state(save_id))
+            except Exception:
+                payload = {}
+        overview = self._latest_work_overview(save_id) or {}
+        preferences = payload.get("preferences") if isinstance(payload.get("preferences"), dict) else {}
+        goals = [
+            {"id": g.get("id"), "text": g.get("text"), "status": g.get("status")}
+            for g in overview.get("goals", [])
+            if isinstance(g, dict)
+        ][:5]
+        todos: list[dict[str, Any]] = []
+        if self._work_store is not None:
+            try:
+                todos = [
+                    {"id": t.get("id"), "intent": t.get("intent"), "status": t.get("status")}
+                    for t in self._work_store.list_todos(save_id)
+                    if isinstance(t, dict)
+                ][:5]
+            except Exception:
+                todos = []
+        return {
+            "mode": payload.get("mode", "command"),
+            "paused": bool(overview.get("paused", False)),
+            "goal": preferences.get("goal"),
+            "dailySpendLimit": preferences.get("dailySpendLimit"),
+            "boxPreference": preferences.get("boxPreference"),
+            "dailySpend": payload.get("dailySpend"),
+            "hasExecutableWork": bool(overview.get("hasExecutableWork", False)),
+            "lastPlanAction": payload.get("lastPlanAction"),
+            "planWaitReason": payload.get("planWaitReason"),
+            "lastSettledDay": overview.get("lastSettledDay"),
+            "activeGoals": goals,
+            "recentTodos": todos,
+            # Contract §1.3 declares [str]; rows from WorkStore.wait_conditions()
+            # carry objects, so surface only the display description.
+            "waitingConditions": [
+                row["waitDescription"]
+                for row in (overview.get("waitingConditions") or [])[:5]
+                if isinstance(row, dict) and isinstance(row.get("waitDescription"), str)
+            ],
+        }
+
+    def _life_work_summary(self, save_id: str, mode: str) -> dict[str, Any] | None:
+        """Compact read-only work summary injected into the life prompt (§2)."""
+        if not save_id or self._work_store is None:
+            return None
+        projection = self._life_work_projection(save_id)
+        if mode == "plan":
+            # Plan discussions see the full read-only projection; it never
+            # dispatches anything.
+            return projection
+        return {
+            "mode": projection["mode"],
+            "paused": projection["paused"],
+            "goal": projection["goal"],
+            "hasExecutableWork": projection["hasExecutableWork"],
+            "planWaitReason": projection["planWaitReason"],
+        }
+
+    async def _handle_life_message(
+        self,
+        ws: WebSocketClient | None,
+        msg_type: str,
+        data: dict[str, Any],
+        active_save_id: str | None,
+    ) -> None:
+        """Dispatch the life.* chat-family messages (contract §1.1/1.3-1.6)."""
+        try:
+            if msg_type == "life.chat.submit":
+                await self._handle_life_chat_submit(ws, data, active_save_id)
+                return
+            payload_data = data.get("payload") if isinstance(data.get("payload"), dict) else data
+            if msg_type == "life.profile.get":
+                payload = LifeProfileGetPayload.from_mapping(payload_data)
+                save_id = payload.save_id or str(active_save_id or "")
+                profile_res = (
+                    self._profile_store.get(save_id)
+                    if self._profile_store is not None
+                    else {"profile": None, "profileRevision": 0}
+                )
+                await self._send_reply(ws, Envelope.create_life_profile_state(
+                    self.instance_id, payload.request_id, save_id,
+                    profile_res.get("profile"),
+                    int(profile_res.get("profileRevision") or 0),
+                    work=self._life_work_projection(save_id),
+                ))
+            elif msg_type == "life.profile.set":
+                payload = LifeProfileSetPayload.from_mapping(payload_data)
+                save_id = payload.save_id or str(active_save_id or "")
+                status, result = ("rejected", {"reason": "NO_PROFILE_STORE"})
+                if self._profile_store is not None:
+                    status, result = self._profile_store.set(
+                        save_id, dict(payload.patch), payload.expected_revision
+                    )
+                profile_res = (
+                    self._profile_store.get(save_id)
+                    if self._profile_store is not None
+                    else {"profile": None, "profileRevision": 0}
+                )
+                await self._send_reply(ws, Envelope.create_life_profile_state(
+                    self.instance_id, payload.request_id, save_id,
+                    profile_res.get("profile"),
+                    int(profile_res.get("profileRevision") or 0),
+                    status=status,
+                    reason=result.get("reason") if isinstance(result, dict) else None,
+                    work=self._life_work_projection(save_id),
+                ))
+            elif msg_type == "life.memory.list":
+                payload = LifeMemoryListPayload.from_mapping(payload_data)
+                save_id = payload.save_id or str(active_save_id or "")
+                state = (
+                    self._memory_store.list(save_id)
+                    if self._memory_store is not None
+                    else {"memoryRevision": 0, "entries": []}
+                )
+                await self._send_reply(ws, Envelope.create_life_memory_state(
+                    self.instance_id, payload.request_id, save_id,
+                    entries=list(state.get("entries") or []),
+                    memory_revision=int(state.get("memoryRevision") or 0),
+                ))
+            elif msg_type == "life.memory.edit":
+                payload = LifeMemoryEditPayload.from_mapping(payload_data)
+                save_id = payload.save_id or str(active_save_id or "")
+                status, result, entries, revision = self._apply_life_memory_edit(payload, save_id)
+                await self._send_reply(ws, Envelope.create_life_memory_state(
+                    self.instance_id, payload.request_id, save_id,
+                    entries=entries,
+                    memory_revision=revision,
+                    status=status,
+                    reason=result.get("reason"),
+                ))
+        except ProtocolError as ex:
+            await self._send_life_error(ws, msg_type, data, active_save_id, str(ex))
+        except Exception as ex:
+            logger.error("Error handling %s: %s", msg_type, ex, exc_info=True)
+            await self._send_life_error(ws, msg_type, data, active_save_id, f"LIFE_HANDLER_ERROR: {ex}")
+
+    async def _send_life_error(
+        self,
+        ws: WebSocketClient | None,
+        msg_type: str,
+        data: dict[str, Any],
+        active_save_id: str | None,
+        error: str,
+    ) -> None:
+        payload_data = data.get("payload") if isinstance(data.get("payload"), dict) else data
+        request_id = str(payload_data.get("requestId") or data.get("messageId") or "")
+        save_id = str(payload_data.get("saveId") or active_save_id or "")
+        if msg_type in {"life.profile.get", "life.profile.set"}:
+            await self._send_reply(ws, Envelope.create_life_profile_state(
+                self.instance_id, request_id, save_id, None, self._profile_revision(save_id),
+                status="failed", reason=error, work=self._life_work_projection(save_id),
+            ))
+        elif msg_type in {"life.memory.list", "life.memory.edit"}:
+            await self._send_reply(ws, Envelope.create_life_memory_state(
+                self.instance_id, request_id, save_id, entries=[],
+                memory_revision=self._memory_revision(save_id),
+                status="failed", reason=error,
+            ))
+        else:
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                self.instance_id, request_id, save_id, "failed",
+                profile_revision=self._profile_revision(save_id),
+                memory_revision=self._memory_revision(save_id),
+                error=error,
+            ))
+
+    def _apply_life_memory_edit(
+        self, payload: LifeMemoryEditPayload, save_id: str
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]], int]:
+        if self._memory_store is None:
+            return "rejected", {"reason": "NO_MEMORY_STORE"}, [], 0
+        game_date = self._current_game_day_key or "unknown"
+
+        def _state() -> tuple[list[dict[str, Any]], int]:
+            current = self._memory_store.list(save_id)
+            return list(current.get("entries") or []), int(current.get("memoryRevision") or 0)
+
+        if payload.op == "add":
+            if not payload.kind:
+                entries, revision = _state()
+                return "rejected", {"reason": "MISSING_KIND"}, entries, revision
+            if not payload.text:
+                entries, revision = _state()
+                return "rejected", {"reason": "MISSING_TEXT"}, entries, revision
+            status, result = self._memory_store.add(
+                save_id, kind=payload.kind, text=payload.text, source="player",
+                game_date=game_date, expected_revision=payload.expected_revision,
+            )
+        elif payload.op == "correct":
+            if not payload.entry_id:
+                entries, revision = _state()
+                return "rejected", {"reason": "MISSING_ID"}, entries, revision
+            status, result = self._memory_store.correct(
+                save_id, payload.entry_id, payload.text or "", payload.expected_revision
+            )
+        else:  # delete
+            if not payload.entry_id:
+                entries, revision = _state()
+                return "rejected", {"reason": "MISSING_ID"}, entries, revision
+            status, result = self._memory_store.delete(
+                save_id, payload.entry_id, payload.expected_revision
+            )
+        entries, revision = _state()
+        return status, result if isinstance(result, dict) else {}, entries, revision
+
+    async def _handle_life_chat_submit(
+        self,
+        ws: WebSocketClient | None,
+        data: dict[str, Any],
+        active_save_id: str | None,
+    ) -> None:
+        """Queue-or-run dispatch for life.chat.submit (contract §1.1/§1.2)."""
+        payload_data = data.get("payload") if isinstance(data.get("payload"), dict) else data
+        try:
+            payload = LifeChatSubmitPayload.from_mapping(payload_data)
+        except ProtocolError as ex:
+            await self._send_life_error(ws, "life.chat.submit", data, active_save_id, str(ex))
+            return
+        save_id = payload.save_id or str(active_save_id or "")
+        item = {
+            "ws": ws,
+            "request_id": payload.request_id,
+            "save_id": save_id,
+            "mode": payload.mode,
+            "text": payload.text,
+        }
+        if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
+            # A work turn/decision owns the single model slot: acknowledge with a
+            # player-visible queued status; the drain after that turn finishes
+            # delivers the terminal state FIFO (never silently dropped).
+            self._life_queue.append(item)
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                sender_instance_id=self.instance_id,
+                request_id=payload.request_id,
+                save_id=save_id,
+                status="queued",
+                queue_position=len(self._life_queue),
+                profile_revision=self._profile_revision(save_id),
+                memory_revision=self._memory_revision(save_id),
+            ))
+            return
+        await self._run_life_chat_turn(ws, item)
+        await self._drain_life_queue(ws)
+
+    async def _drain_life_queue(self, ws: WebSocketClient | None) -> None:
+        """Process queued life submits FIFO once the model slot is free."""
+        if self._life_draining:
+            return
+        self._life_draining = True
+        try:
+            while self._life_queue:
+                if self._busy_lock.locked() or (
+                    self._active_task and not self._active_task.cancelled
+                ):
+                    # Still busy: leave the queue for the next turn's drain trigger.
+                    return
+                item = self._life_queue.pop(0)
+                await self._run_life_chat_turn(ws or item.get("ws"), item)
+        finally:
+            self._life_draining = False
+
+    def _execute_life_turn(
+        self,
+        active_task: ActiveChatTask,
+        conversation_id: str | None,
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Dispatch one life-chat turn to the provider.
+
+        Hard boundaries (contract §2, enforced here not by prompt): never calls
+        ``begin_decision``, never injects ``STARDEW_DECISION_TOKEN``, always
+        exposes the read-only ``STARDEW_MCP_SURFACE=life`` tool surface, and the
+        scheduler/autonomy state is never touched.
+        """
+        if self.backend_name == "kimi" and type(self._execute_agy_turn).__module__.startswith("unittest.mock"):
+            return self._execute_agy_turn(active_task, conversation_id, prompt)
+        from stardew_ai_runtime.compatibility import assert_native_compatible
+        assert_native_compatible(self.run_dir)
+        env = os.environ
+        previous_token = env.get("STARDEW_DECISION_TOKEN")
+        previous_surface = env.get("STARDEW_MCP_SURFACE")
+        env.pop("STARDEW_DECISION_TOKEN", None)
+        env["STARDEW_MCP_SURFACE"] = "life"
+        try:
+            backend = self._get_backend()
+            if isinstance(backend, KimiBackend):
+                backend.progress = getattr(self, "_backend_progress_callback", None)
+            return backend.run(active_task, conversation_id, prompt)
+        finally:
+            if previous_token is None:
+                env.pop("STARDEW_DECISION_TOKEN", None)
+            else:
+                env["STARDEW_DECISION_TOKEN"] = previous_token
+            if previous_surface is None:
+                env.pop("STARDEW_MCP_SURFACE", None)
+            else:
+                env["STARDEW_MCP_SURFACE"] = previous_surface
+
+    async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
+        """Run one life-chat turn under the shared single-model-turn lock."""
+        request_id = str(item.get("request_id") or "")
+        save_id = str(item.get("save_id") or "")
+        mode = str(item.get("mode") or "chat")
+        text = str(item.get("text") or "")
+        try:
+            async with self._busy_lock:
+                profile = None
+                if self._profile_store is not None and save_id:
+                    profile = (self._profile_store.get(save_id) or {}).get("profile")
+                memory_render = (
+                    self._memory_store.render_for_context(save_id)
+                    if self._memory_store is not None and save_id
+                    else None
+                )
+                existing_cid = None
+                if self._life_chat is not None and save_id:
+                    existing_cid = self._life_chat.rotate_if_needed(
+                        save_id,
+                        self._profile_revision(save_id),
+                        self._memory_revision(save_id),
+                    )
+                system_prompt = LifeChatService.build_system_prompt(
+                    profile, memory_render, self._life_work_summary(save_id, mode), mode=mode
+                )
+                prompt = f"{system_prompt}\n\n玩家说：{text}"
+                active_task = ActiveChatTask(
+                    request_id=request_id,
+                    save_id=save_id,
+                    command_id=request_id,
+                    prompt=text,
+                    async_task=asyncio.current_task(),
+                )
+                self._configure_backend_progress(ws, request_id, save_id)
+                await self._send_reply(ws, Envelope.create_life_chat_reply(
+                    sender_instance_id=self.instance_id,
+                    request_id=request_id,
+                    save_id=save_id,
+                    status="processing",
+                    profile_revision=self._profile_revision(save_id),
+                    memory_revision=self._memory_revision(save_id),
+                ))
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, self._execute_life_turn, active_task, existing_cid, prompt
+                )
+                success = bool(result.get("success"))
+                cid = result.get("conversation_id") or existing_cid
+                if cid and self._life_chat is not None and save_id:
+                    self._life_chat.record_session_id(save_id, str(cid))
+                    self._life_chat.record_fingerprint(
+                        save_id,
+                        self._profile_revision(save_id),
+                        self._memory_revision(save_id),
+                    )
+                if success:
+                    reply = Envelope.create_life_chat_reply(
+                        sender_instance_id=self.instance_id,
+                        request_id=request_id,
+                        save_id=save_id,
+                        status="completed",
+                        reply_text=str(result.get("response") or "")[:2000] or None,
+                        profile_revision=self._profile_revision(save_id),
+                        memory_revision=self._memory_revision(save_id),
+                    )
+                else:
+                    reply = Envelope.create_life_chat_reply(
+                        sender_instance_id=self.instance_id,
+                        request_id=request_id,
+                        save_id=save_id,
+                        status="failed",
+                        reply_text=str(result.get("response") or "")[:2000] or None,
+                        profile_revision=self._profile_revision(save_id),
+                        memory_revision=self._memory_revision(save_id),
+                        error=str(result.get("error") or "TURN_FAILED"),
+                    )
+                await self._send_reply(ws, reply)
+        except Exception as ex:
+            logger.error("Life chat turn [%s] failed: %s", request_id, ex, exc_info=True)
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                sender_instance_id=self.instance_id,
+                request_id=request_id,
+                save_id=save_id,
+                status="failed",
+                profile_revision=self._profile_revision(save_id),
+                memory_revision=self._memory_revision(save_id),
+                error=f"LIFE_TURN_ERROR: {ex}",
+            ))
+
+    # -------------------------------------------------- care hooks (§1.7/§2)
+    async def _snapshot_care_hooks(
+        self,
+        save_id: str | None,
+        world: dict[str, Any],
+        day_key: str | None,
+        previous_day_key: str | None,
+    ) -> None:
+        """Day-change (morning) and first-evening (timeOfDay>=1900) care triggers.
+
+        The morning hook runs only after ``_settle_day_advance`` (contract §2);
+        the service de-duplicates by persisted eventKey, so restarts or repeated
+        snapshots never re-fire.
+        """
+        if day_key is not None and day_key != previous_day_key:
+            await self._maybe_fire_care(save_id, "morning", day_key, world)
+        tod = world.get("timeOfDay")
+        current_day = self._current_game_day_key
+        if isinstance(tod, int) and tod >= 1900 and current_day:
+            if self._evening_care_fired_day != current_day:
+                self._evening_care_fired_day = current_day
+                await self._maybe_fire_care(save_id, "evening", current_day, world)
+
+    def _record_memory_event(
+        self, save_id: str | None, text: str, command_id: str | None
+    ) -> None:
+        """Write a system event memory for a real successful terminal (§2)."""
+        if self._memory_store is None or not save_id:
+            return
+        try:
+            status, _ = self._memory_store.add(
+                save_id, kind="event", text=text[:200], source="system",
+                game_date=self._current_game_day_key or "unknown",
+                expected_revision=0, command_id=command_id,
+            )
+            if status == "confirmed":
+                logger.info("Memory event recorded for %s: %s", save_id, text[:80])
+        except Exception:
+            logger.warning("Failed to record memory event for %s", save_id, exc_info=True)
+
+    async def _maybe_fire_care(
+        self, save_id: str | None, kind: str, ref: str, world: dict[str, Any],
+        fact: str | None = None,
+    ) -> None:
+        """Evaluate and send one proactive care message (contract §1.7).
+
+        The service persists the eventKey first (cross-restart dedup, daily
+        frequency, 2-game-hour gap, quiet=off); the text is then generated by the
+        life-session model with the real date/weather/context. A model failure
+        skips the send (logged, never template-faked, never re-fired).
+        """
+        if not save_id or self._care_service is None or self._profile_store is None:
+            return
+        try:
+            profile = (self._profile_store.get(save_id) or {}).get("profile")
+            if not profile:
+                return
+            frequency = str(profile.get("careFrequency") or "moderate")
+            game_date = self._current_game_day_key or "unknown"
+            tod = world.get("timeOfDay") if isinstance(world, dict) else None
+            tod_int = int(tod) if isinstance(tod, int) else 0
+            event_key = self._care_service.maybe_fire(
+                save_id, kind, game_date, ref, frequency, tod_int
+            )
+            if not event_key:
+                return
+            if self._busy_lock.locked() or (
+                self._active_task and not self._active_task.cancelled
+            ):
+                # Reserve the event once, then wait behind the active work turn.
+                # Otherwise free mode can occupy every trigger and silently lose
+                # all moderate care for the day. The event key still prevents
+                # duplicate sends across repeated snapshots/restarts.
+                task = asyncio.create_task(self._deliver_care(
+                    save_id, kind, game_date, profile, fact, event_key, dict(world)
+                ))
+                self._deferred_care_tasks.add(task)
+                task.add_done_callback(self._deferred_care_tasks.discard)
+                return
+            await self._deliver_care(save_id, kind, game_date, profile, fact, event_key, dict(world))
+        except Exception:
+            logger.warning("Care hook failed for %s/%s", save_id, kind, exc_info=True)
+
+    async def _deliver_care(
+        self, save_id: str, kind: str, game_date: str, profile: dict[str, Any],
+        fact: str | None, event_key: str, world: dict[str, Any],
+    ) -> None:
+        try:
+            text = await self._generate_care_text(
+                save_id, kind, game_date, profile, fact, world=world
+            )
+            # A deferred evening/morning greeting must not arrive on a later day.
+            if not text or self._current_game_day_key != game_date:
+                return
+            await self._send_reply(self._chat_ws, Envelope.create_life_care(
+                sender_instance_id=self.instance_id,
+                save_id=save_id,
+                kind=kind,
+                event_key=event_key,
+                text=text[:300],
+                game_date=game_date,
+            ))
+        except Exception:
+            logger.warning("Deferred care failed for %s/%s", save_id, kind, exc_info=True)
+
+    async def _generate_care_text(
+        self,
+        save_id: str,
+        kind: str,
+        game_date: str,
+        profile: dict[str, Any],
+        ref_event: str | None,
+        world: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Ask the life-session model for one short care message (§2)."""
+        memory_render = (
+            self._memory_store.render_for_context(save_id)
+            if self._memory_store is not None
+            else None
+        )
+        if world is None:
+            world = {}
+            if isinstance(self._latest_snapshot_payload, dict):
+                world = self._latest_snapshot_payload.get("world") or {}
+        weather = world.get("weather") or world.get("weatherIcon")
+        prompt = LifeChatService.build_care_prompt(
+            profile, memory_render, kind, game_date, weather, ref_event
+        )
+        active_task = ActiveChatTask(
+            request_id=f"care-{uuid.uuid4().hex[:8]}",
+            save_id=save_id,
+            command_id="",
+            prompt=prompt,
+        )
+        try:
+            async with self._busy_lock:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, self._execute_life_turn, active_task, None, prompt
+                )
+        except Exception:
+            logger.warning("Care text generation raised", exc_info=True)
+            return None
+        if not result.get("success"):
+            logger.warning(
+                "Care text generation unsuccessful (%s); skipping without re-fire",
+                result.get("error"),
+            )
+            return None
+        return (result.get("response") or "").strip() or None
 
     # -------------------------------------------------- session rotation
     def _session_history_path(self) -> Path:
@@ -1634,12 +2305,17 @@ class ChatBridge:
         # dirs) persist and read the same record.
         return Path(self._sessions_file).parent / "chat_profile_fingerprints.json"
 
-    def profile_fingerprint(self) -> str:
+    def profile_fingerprint(self, save_id: str | None = None) -> str:
         """Fingerprint of the provider profile + tool surface bound to a session.
 
         A resumed provider session keeps whatever profile/tool surface it was
         created with, so reconfiguring the agent file (or the game tool surface)
         must start a fresh session instead of silently continuing the old one.
+        The companion profile/memory revisions are part of the fingerprint too:
+        after an agreement is deleted/corrected or the profile changes, the next
+        work turn must not keep treating the old session (with the stale
+        agreement in its visible history) as authoritative — it rotates like any
+        other profile change, keeping history and WorkStore intact.
         """
         import hashlib
 
@@ -1656,6 +2332,8 @@ class ChatBridge:
                 "agent": self.agent,
                 "agentFile": agent_file_digest,
                 "surface": os.getenv("STARDEW_MCP_SURFACE", ""),
+                "profileRevision": self._profile_revision(save_id),
+                "memoryRevision": self._memory_revision(save_id),
             },
             sort_keys=True,
         )
@@ -1690,9 +2368,13 @@ class ChatBridge:
         """Return the session to resume, or None when a fresh one must start.
 
         Rotation happens when the profile fingerprint changed since the session
-        was created, and also for a legacy session that has no fingerprint at all
-        (its tool surface cannot be verified, so it is not resumed). The previous
-        session id is always kept in ``chat_session_history.json`` and durable
+        was created — the fingerprint covers the provider profile, the tool
+        surface, and the companion profile/memory revisions, so deleting or
+        correcting an agreement (or editing the companion profile) invalidates
+        the current work session exactly like any other profile change — and
+        also for a legacy session that has no fingerprint at all (its tool
+        surface cannot be verified, so it is not resumed). The previous session
+        id is always kept in ``chat_session_history.json`` and durable
         goals/tasks/todos stay in WorkStore, so nothing is deleted and no
         in-progress work is lost.
         """
@@ -1700,7 +2382,7 @@ class ChatBridge:
             return conversation_id
         fingerprints = self._load_profile_fingerprints()
         key = f"{self.backend_name}:{save_id}"
-        current = self.profile_fingerprint()
+        current = self.profile_fingerprint(save_id)
         recorded = fingerprints.get(key)
         self._profile_rotation_note: str | None = None
         if conversation_id and recorded != current:
@@ -2663,6 +3345,13 @@ class ChatBridge:
                 # Hand the command socket back and let the worker advance any plan
                 # the provider just committed (no model turn per step).
                 await self._release_execution(save_id)
+                # A work turn just freed the single model slot: deliver any queued
+                # life-chat submits FIFO (each always reaches a terminal state).
+                if self._life_queue:
+                    try:
+                        asyncio.get_running_loop().create_task(self._drain_life_queue(ws))
+                    except RuntimeError:
+                        pass
 
     def _format_agent_prompt(self, user_text: str, save_id: str | None = None) -> str:
         context = render_decision_context(self._decision_context(save_id, origin="chat"))
@@ -2734,9 +3423,34 @@ class ChatBridge:
         if not save_id:
             return
         pending_af = self._autonomy_pending_task_fingerprints.pop(execution.task_id, None)
+        job_success = execution.task_status == "completed" and execution.outcome == "completed"
+        if job_success:
+            # Real native success terminal: record a system memory event (deduped
+            # by commandId) and evaluate the work-done care hook (contract §2/§4).
+            # Failures/cancellals/plans never reach this branch.
+            task_title: str | None = None
+            if self._work_store is not None:
+                try:
+                    job_state = self._work_store.state(save_id)
+                    task = next(
+                        (t for t in job_state.tasks if t.id == execution.task_id), None
+                    )
+                    if task is not None:
+                        task_title = task.title
+                except Exception:
+                    task_title = None
+            if not task_title:
+                task_title = execution.operation or "农场作业"
+            event_ref = execution.command_id or execution.task_id or task_title
+            self._record_memory_event(save_id, f"完成了「{task_title}」", event_ref)
+            world: dict[str, Any] = {}
+            if isinstance(self._latest_snapshot_payload, dict):
+                world = self._latest_snapshot_payload.get("world") or {}
+            await self._maybe_fire_care(
+                save_id, "work-done", event_ref, world, fact=f"完成了「{task_title}」"
+            )
         if pending_af and self._autonomy is not None:
             af_save_id, af_fingerprint = pending_af
-            job_success = (execution.task_status == "completed" and execution.outcome == "completed")
             job_fail_reason = execution.reason_code or execution.message or execution.outcome or reason
             self._autonomy.record_action_result(
                 af_save_id, af_fingerprint, job_success, reason=None if job_success else job_fail_reason

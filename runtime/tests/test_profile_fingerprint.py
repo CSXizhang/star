@@ -86,3 +86,85 @@ def test_missing_agent_file_does_not_break_fingerprint(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path)
     bridge.agent_file = tmp_path / "does-not-exist.md"
     assert bridge.profile_fingerprint()
+
+
+# ---------------------------------------------------------------- D5: revision-aware rotation
+def test_deleted_agreement_rotates_work_session(tmp_path: Path) -> None:
+    """Deleting an agreement must invalidate the current work session (contract 顶部/§4).
+
+    The old provider session still carries the deleted agreement in its visible
+    history, so the next work turn must rotate instead of resuming it; the old
+    session id stays in history and WorkStore data is untouched.
+    """
+    bridge = ChatBridge(run_dir=tmp_path)
+    # Existing work session bound to the current fingerprint.
+    assert bridge._ensure_session_matches_profile("save-1", None) is None
+    bridge.record_conversation_id("save-1", "conv-work-1")
+    assert bridge._ensure_session_matches_profile("save-1", "conv-work-1") == "conv-work-1"
+
+    # Player records an agreement and later deletes it (memoryRevision bumps).
+    status, result = bridge._memory_store.add(
+        "save-1", kind="agreement", text="每天给南瓜浇水",
+        source="player", game_date="1:spring:1", expected_revision=0,
+    )
+    assert status == "confirmed"
+    entry_id = result["entry"]["id"]
+    rev = bridge._memory_revision("save-1")
+    status, _ = bridge._memory_store.delete("save-1", entry_id, expected_revision=rev)
+    assert status == "confirmed"
+
+    # Next work turn rotates: the stale session must not be resumed.
+    assert bridge._ensure_session_matches_profile("save-1", "conv-work-1") is None
+    assert bridge.get_conversation_id("save-1") is None
+    history = json.loads(
+        (tmp_path / "chat_session_history.json").read_text(encoding="utf-8")
+    )
+    assert history[f"{bridge.backend_name}:save-1"] == ["conv-work-1"]
+    note = bridge.consume_profile_rotation_note() or ""
+    assert "profile-changed" in note
+
+    # The fresh prompt/decision context must not contain the deleted agreement.
+    prompt = bridge._format_agent_prompt("该干活了", "save-1")
+    assert "每天给南瓜浇水" not in prompt
+    context = bridge._decision_context("save-1")
+    assert "每天给南瓜浇水" not in json.dumps(context, ensure_ascii=False)
+
+
+def test_profile_edit_rotates_work_session(tmp_path: Path) -> None:
+    """Editing the companion profile (profileRevision bump) rotates the work session."""
+    bridge = ChatBridge(run_dir=tmp_path)
+    assert bridge._ensure_session_matches_profile("save-1", None) is None
+    bridge.record_conversation_id("save-1", "conv-work-2")
+    assert bridge._ensure_session_matches_profile("save-1", "conv-work-2") == "conv-work-2"
+
+    status, _ = bridge._profile_store.set(
+        "save-1", {"onboarded": True, "personality": "calm"}, expected_revision=0
+    )
+    assert status == "confirmed"
+
+    assert bridge._ensure_session_matches_profile("save-1", "conv-work-2") is None
+    assert bridge.get_conversation_id("save-1") is None
+    history = json.loads(
+        (tmp_path / "chat_session_history.json").read_text(encoding="utf-8")
+    )
+    assert history[f"{bridge.backend_name}:save-1"] == ["conv-work-2"]
+
+
+def test_uncorrected_agreement_keeps_work_session(tmp_path: Path) -> None:
+    """Adding (but not deleting) an agreement also rotates, but a no-op does not."""
+    bridge = ChatBridge(run_dir=tmp_path)
+    assert bridge._ensure_session_matches_profile("save-1", None) is None
+    bridge.record_conversation_id("save-1", "conv-work-3")
+    assert bridge._ensure_session_matches_profile("save-1", "conv-work-3") == "conv-work-3"
+
+    # No revision change -> still resumes.
+    assert bridge._ensure_session_matches_profile("save-1", "conv-work-3") == "conv-work-3"
+
+    # Any successful memory mutate bumps the revision -> rotation.
+    status, _ = bridge._memory_store.add(
+        "save-1", kind="preference", text="喜欢安静",
+        source="player", game_date="1:spring:1", expected_revision=0,
+    )
+    assert status == "confirmed"
+    assert bridge._ensure_session_matches_profile("save-1", "conv-work-3") is None
+    assert bridge.get_conversation_id("save-1") is None

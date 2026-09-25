@@ -268,7 +268,13 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
 #     write entry points, player controls and group discovery. It is what the game
 #     provider profile (.kimi-code/mcp.json) requests.
 #   * ``--surface internal`` is the ChatBridge plan worker's surface: light plus
-#     the read-only reconcile tool, never exposed to the model.
+#     the read-only reconcile tool, never exposed to the model. It always wins
+#     over an inherited env var (the worker must keep its reconcile tool).
+#
+# An explicitly set ``STARDEW_MCP_SURFACE`` env var wins over the CLI
+# ``--surface`` argument: the life-chat bridge injects ``STARDEW_MCP_SURFACE=life``
+# into the model backend environment, and that forced read-only surface must
+# hold even though the installed game profile passes ``--surface light``.
 # The light set is not a fixed tool count; it is this named set.
 BASE_TOOLS = frozenset(
     {
@@ -308,6 +314,29 @@ LIGHT_TOOLS = BASE_TOOLS
 # rejects the harness-only ``command_id`` parameter, which is exactly the round6
 # STEP_DISPATCH_FAILED root cause).
 INTERNAL_TOOLS = LIGHT_TOOLS | {"reconcile_plan_command", "dispatch_plan_operation"}
+
+# Life-chat surface (contract §2): strictly read-only observation/query tools.
+# No write entry points, no submit_plan/remember_intent, no autonomy controls,
+# no discover/call Capability indirection (call_capability could reach writes).
+LIFE_TOOLS = frozenset(
+    {
+        # overview / status
+        "get_work_overview",
+        "get_status",
+        "work_plan_overview",
+        # grouped observation
+        "observe_farming_helpers",
+        "observe_machines",
+        "observe_livestock",
+        # queries
+        "query_chests",
+        "query_farm_work",
+        "query_inventory",
+        "query_planting_options",
+        "query_shop",
+        "query_wiki",
+    }
+)
 
 # Base tools grouped for on-demand disclosure.
 CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
@@ -429,25 +458,44 @@ MEMORY_WRITE_SCHEMA: dict[str, Any] = {
 
 
 def resolve_surface(full: bool | None = None, surface: str | None = None) -> str:
-    """Resolve the exposure surface: "full" (default), "light" or "internal".
+    """Resolve the exposure surface: "full" (default), "light", "internal" or "life".
 
     Generic MCP clients keep the complete legacy tool list by default so no
     existing tool name disappears on upgrade. Only callers that explicitly ask
     for the game surface (CLI flag or env var) get the trimmed list; the internal
-    plan worker additionally selects the harness-only surface.
+    plan worker additionally selects the harness-only surface; the life-chat
+    backend selects the strictly read-only observation/query surface.
+
+    Priority: an explicitly set ``STARDEW_MCP_SURFACE`` process env var wins over
+    the CLI ``--surface`` argument. The life-chat bridge injects
+    ``STARDEW_MCP_SURFACE=life`` into the model backend environment while the
+    installed game provider profile always passes ``--surface light``; the forced
+    read-only life surface must hold anyway, so the env var is the dedicated
+    override mechanism. The harness-only ``internal`` surface is the single
+    exception (``--surface internal`` always wins): the plan worker must never be
+    downgraded by an inherited env var, because it depends on the reconcile tool.
+    When the env var is not set, CLI behaviour is unchanged.
     """
     if full is True:
         return "full"
-    if full is False:
-        # Legacy explicit "full=False" callers asked for the game surface.
-        return "light"
-    candidate = (surface or os.getenv("STARDEW_MCP_SURFACE") or "").strip().lower()
+    env_candidate = (os.getenv("STARDEW_MCP_SURFACE") or "").strip().lower()
+    cli_candidate = (surface or "").strip().lower()
+    if cli_candidate in {"internal", "worker"}:
+        # Harness-only surface: never downgradeable by an inherited env var.
+        return "internal"
+    candidate = env_candidate or cli_candidate
     if candidate in {"light", "game"}:
         return "light"
     if candidate in {"internal", "worker"}:
         return "internal"
+    if candidate in {"life", "companion"}:
+        return "life"
     if candidate in {"full", "legacy", "complete"}:
         return "full"
+    if full is False:
+        # Legacy explicit "full=False" callers asked for the game surface; an
+        # explicitly set env var already had its chance to override above.
+        return "light"
     legacy = os.getenv("STARDEW_MCP_FULL", "").strip().lower()
     if legacy in {"1", "true", "yes", "on"}:
         return "full"
@@ -473,7 +521,14 @@ def create_mcp_server(
     are listed directly and every other base operation stays reachable through
     ``discover_capabilities``/``call_capability`` (same real implementation).
     ``surface="internal"`` adds the harness-only reconcile tool for the plan worker.
+    ``surface="life"`` (``STARDEW_MCP_SURFACE=life``) is the companion life-chat
+    surface: strictly read-only observation/query tools, never any write or
+    autonomy-control tool, and no ``call_capability`` indirection.
     ``full=True``/``STARDEW_MCP_FULL=1`` forces the full list.
+
+    An explicitly set ``STARDEW_MCP_SURFACE`` env var overrides the ``surface``
+    argument (except ``internal``, which always wins); when the env var is unset
+    the argument behaves exactly as before.
     """
     resolved_surface = resolve_surface(full, surface)
     inst = instructions if instructions is not None else "每次模型决策仅选择一个语义短作业。submit_plan只接受一个task，可包含同一业务范围内的导航及多步原生操作。不同业务必须下一次模型选择；remember_intent及旧计划仅记录意图。工具返回job-selected只代表选择，效果未执行；运行时完成后返回真实精简终态。信任作业结果，不重复逐格核查。自由模式自动再次调用模型，不等待玩家逐步审批。"
@@ -2693,6 +2748,8 @@ def create_mcp_server(
         allowed = LIGHT_TOOLS
     elif resolved_surface == "internal":
         allowed = INTERNAL_TOOLS
+    elif resolved_surface == "life":
+        allowed = LIFE_TOOLS
     else:
         allowed = None
     if allowed is not None:
@@ -2704,7 +2761,7 @@ def create_mcp_server(
     return mcp
 
 
-def main(argv: list[str] | None = None) -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stardew-mcp-server",
         description="Model Context Protocol (MCP) Server for Stardew AI Companion",
@@ -2728,16 +2785,20 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--surface",
-        choices=["full", "light", "internal"],
+        choices=["full", "light", "internal", "life"],
         default=None,
-        help="Tool exposure surface: 'full' (generic default), 'light' (game) or 'internal' (plan worker)",
+        help="Tool exposure surface: 'full' (generic default), 'light' (game), 'internal' (plan worker) or 'life' (read-only companion chat)",
     )
     parser.add_argument(
         "--light",
         action="store_true",
         help="Alias for --surface light (game surface, base tools via discover/call)",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _build_arg_parser().parse_args(argv)
 
     run_dir = Path(args.run_dir) if args.run_dir else None
     surface = "light" if args.light else args.surface

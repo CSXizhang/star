@@ -1001,6 +1001,139 @@ class Envelope:
             payload=payload,
         )
 
+    @classmethod
+    def create_life_chat_reply(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        save_id: str,
+        status: str,
+        profile_revision: int,
+        memory_revision: int,
+        reply_text: str | None = None,
+        queue_position: int | None = None,
+        error: str | None = None,
+    ) -> Envelope:
+        """life.chat.reply: no token/session fields (contract §1.2)."""
+        payload: dict[str, Any] = {
+            "requestId": request_id,
+            "saveId": save_id,
+            "status": status,
+            "profileRevision": profile_revision,
+            "memoryRevision": memory_revision,
+        }
+        if reply_text is not None:
+            payload["replyText"] = reply_text
+        if queue_position is not None:
+            payload["queuePosition"] = queue_position
+        if error is not None:
+            payload["error"] = error
+        return cls(
+            protocol_version="0.1", message_type="life.chat.reply",
+            message_id=f"msg-life-reply-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def create_life_profile_state(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        save_id: str,
+        profile: Mapping[str, Any] | None,
+        profile_revision: int,
+        status: str = "confirmed",
+        reason: str | None = None,
+        work: Mapping[str, Any] | None = None,
+    ) -> Envelope:
+        """life.profile.state: response to get/set (contract §1.3/§1.4)."""
+        payload: dict[str, Any] = {
+            "requestId": request_id,
+            "saveId": save_id,
+            "profile": dict(profile) if profile is not None else None,
+            "profileRevision": profile_revision,
+            "status": status,
+        }
+        if work is not None:
+            payload["work"] = dict(work)
+        if reason is not None:
+            payload["reason"] = reason
+        return cls(
+            protocol_version="0.1", message_type="life.profile.state",
+            message_id=f"msg-life-profile-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def create_life_memory_state(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        save_id: str,
+        entries: list[Any],
+        memory_revision: int,
+        status: str = "confirmed",
+        reason: str | None = None,
+        entry: Mapping[str, Any] | None = None,
+    ) -> Envelope:
+        """life.memory.state: response to list/edit (contract §1.5/§1.6)."""
+        payload: dict[str, Any] = {
+            "requestId": request_id,
+            "saveId": save_id,
+            "memoryRevision": memory_revision,
+            "status": status,
+        }
+        if entries is not None:
+            # Strip the internal dedup field; the wire field set is §1.5.
+            payload["entries"] = [
+                {k: v for k, v in e.items() if k != "commandId"}
+                if isinstance(e, dict) else e
+                for e in entries
+            ]
+        if entry is not None:
+            wire_entry = dict(entry)
+            wire_entry.pop("commandId", None)
+            payload["entry"] = wire_entry
+        if reason is not None:
+            payload["reason"] = reason
+        return cls(
+            protocol_version="0.1", message_type="life.memory.state",
+            message_id=f"msg-life-memory-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def create_life_care(
+        cls,
+        sender_instance_id: str,
+        save_id: str,
+        kind: str,
+        event_key: str,
+        text: str,
+        game_date: str,
+    ) -> Envelope:
+        """life.care: proactive companion care message (contract §1.7)."""
+        payload: dict[str, Any] = {
+            "saveId": save_id,
+            "kind": kind,
+            "eventKey": event_key,
+            "text": text,
+            "gameDate": game_date,
+        }
+        return cls(
+            protocol_version="0.1", message_type="life.care",
+            message_id=f"msg-life-care-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id,
+            payload=payload,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ChatSubmitPayload:
@@ -1106,6 +1239,249 @@ class ChatReplyPayload:
             res["commandId"] = self.command_id
         if self.command_complete is not None:
             res["commandComplete"] = self.command_complete
+        return res
+
+
+_LIFE_CHAT_MODES = frozenset({"chat", "plan"})
+_LIFE_CHAT_STATUSES = frozenset({"processing", "queued", "completed", "failed"})
+_LIFE_MEMORY_KINDS = frozenset({"preference", "agreement", "event"})
+_LIFE_MEMORY_OPS = frozenset({"add", "correct", "delete"})
+_LIFE_CARE_KINDS = frozenset({"morning", "work-done", "evening"})
+_LIFE_PLAY_STYLES = frozenset({"earn", "workhorse", "community", "decor"})
+_LIFE_PERSONALITIES = frozenset({"gentle", "lively", "calm", "tsundere"})
+_LIFE_CARE_FREQUENCIES = frozenset({"quiet", "moderate", "chatty"})
+
+
+@dataclass(frozen=True, slots=True)
+class LifeChatSubmitPayload:
+    """life.chat.submit payload (C#->Py): contract §1.1"""
+
+    request_id: str
+    save_id: str
+    mode: str
+    text: str
+    source: str = "life-menu"
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatSubmitPayload:
+        request_id = str(value.get("requestId", ""))
+        save_id = str(value.get("saveId", ""))
+        mode = str(value.get("mode", "chat"))
+        text = str(value.get("text", ""))
+        source = str(value.get("source", "life-menu"))
+        if not request_id:
+            raise ProtocolError("life.chat.submit: requestId is required")
+        if not save_id:
+            raise ProtocolError("life.chat.submit: saveId is required")
+        if mode not in _LIFE_CHAT_MODES:
+            raise ProtocolError(f"life.chat.submit: invalid mode '{mode}'")
+        if not text or not (1 <= len(text) <= 500):
+            raise ProtocolError("life.chat.submit: text must be 1..500 chars")
+        return cls(request_id=request_id, save_id=save_id, mode=mode, text=text, source=source)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "requestId": self.request_id,
+            "saveId": self.save_id,
+            "mode": self.mode,
+            "text": self.text,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LifeChatReplyPayload:
+    """life.chat.reply payload (Py->C#): contract §1.2 (no token/session fields)"""
+
+    request_id: str
+    save_id: str
+    status: str
+    profile_revision: int
+    memory_revision: int
+    reply_text: str | None = None
+    queue_position: int | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatReplyPayload:
+        return cls(
+            request_id=str(value.get("requestId", "")),
+            save_id=str(value.get("saveId", "")),
+            status=str(value.get("status", "completed")),
+            profile_revision=int(value.get("profileRevision", 0)),
+            memory_revision=int(value.get("memoryRevision", 0)),
+            reply_text=value.get("replyText"),
+            queue_position=value.get("queuePosition"),
+            error=value.get("error"),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        res: dict[str, Any] = {
+            "requestId": self.request_id,
+            "saveId": self.save_id,
+            "status": self.status,
+            "profileRevision": self.profile_revision,
+            "memoryRevision": self.memory_revision,
+        }
+        if self.reply_text is not None:
+            res["replyText"] = self.reply_text
+        if self.queue_position is not None:
+            res["queuePosition"] = self.queue_position
+        if self.error is not None:
+            res["error"] = self.error
+        return res
+
+
+@dataclass(frozen=True, slots=True)
+class LifeProfileGetPayload:
+    """life.profile.get payload (C#->Py): contract §1.3"""
+
+    request_id: str
+    save_id: str
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeProfileGetPayload:
+        request_id = str(value.get("requestId", ""))
+        save_id = str(value.get("saveId", ""))
+        if not request_id:
+            raise ProtocolError("life.profile.get: requestId is required")
+        if not save_id:
+            raise ProtocolError("life.profile.get: saveId is required")
+        return cls(request_id=request_id, save_id=save_id)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {"requestId": self.request_id, "saveId": self.save_id}
+
+
+@dataclass(frozen=True, slots=True)
+class LifeProfileSetPayload:
+    """life.profile.set payload (C#->Py): contract §1.4"""
+
+    request_id: str
+    save_id: str
+    expected_revision: int
+    patch: Mapping[str, Any]
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeProfileSetPayload:
+        request_id = str(value.get("requestId", ""))
+        save_id = str(value.get("saveId", ""))
+        if not request_id:
+            raise ProtocolError("life.profile.set: requestId is required")
+        if not save_id:
+            raise ProtocolError("life.profile.set: saveId is required")
+        expected_revision = value.get("expectedRevision")
+        if expected_revision is None or isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+            raise ProtocolError("life.profile.set: expectedRevision must be an integer")
+        patch = value.get("patch", {})
+        if not isinstance(patch, Mapping):
+            raise ProtocolError("life.profile.set: patch must be an object")
+        if "playStyle" in patch and patch["playStyle"] not in _LIFE_PLAY_STYLES:
+            raise ProtocolError(f"life.profile.set: invalid playStyle '{patch['playStyle']}'")
+        if "personality" in patch and patch["personality"] not in _LIFE_PERSONALITIES:
+            raise ProtocolError(f"life.profile.set: invalid personality '{patch['personality']}'")
+        if "careFrequency" in patch and patch["careFrequency"] not in _LIFE_CARE_FREQUENCIES:
+            raise ProtocolError(f"life.profile.set: invalid careFrequency '{patch['careFrequency']}'")
+        if "companionName" in patch:
+            name = str(patch["companionName"]).strip()
+            if not (1 <= len(name) <= 12):
+                raise ProtocolError("life.profile.set: companionName must be 1..12 chars")
+        return cls(
+            request_id=request_id,
+            save_id=save_id,
+            expected_revision=expected_revision,
+            patch=patch,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "requestId": self.request_id,
+            "saveId": self.save_id,
+            "expectedRevision": self.expected_revision,
+            "patch": dict(self.patch),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LifeMemoryListPayload:
+    """life.memory.list payload (C#->Py): contract §1.5"""
+
+    request_id: str
+    save_id: str
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeMemoryListPayload:
+        request_id = str(value.get("requestId", ""))
+        save_id = str(value.get("saveId", ""))
+        if not request_id:
+            raise ProtocolError("life.memory.list: requestId is required")
+        if not save_id:
+            raise ProtocolError("life.memory.list: saveId is required")
+        return cls(request_id=request_id, save_id=save_id)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {"requestId": self.request_id, "saveId": self.save_id}
+
+
+@dataclass(frozen=True, slots=True)
+class LifeMemoryEditPayload:
+    """life.memory.edit payload (C#->Py): contract §1.6"""
+
+    request_id: str
+    save_id: str
+    expected_revision: int
+    op: str
+    entry_id: str | None = None
+    kind: str | None = None
+    text: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeMemoryEditPayload:
+        request_id = str(value.get("requestId", ""))
+        save_id = str(value.get("saveId", ""))
+        if not request_id:
+            raise ProtocolError("life.memory.edit: requestId is required")
+        if not save_id:
+            raise ProtocolError("life.memory.edit: saveId is required")
+        expected_revision = value.get("expectedRevision")
+        if expected_revision is None or isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+            raise ProtocolError("life.memory.edit: expectedRevision must be an integer")
+        op = str(value.get("op", ""))
+        if op not in _LIFE_MEMORY_OPS:
+            raise ProtocolError(f"life.memory.edit: invalid op '{op}'")
+        kind = value.get("kind")
+        if kind is not None and kind not in _LIFE_MEMORY_KINDS:
+            raise ProtocolError(f"life.memory.edit: invalid kind '{kind}'")
+        if op == "add" and kind == "event":
+            raise ProtocolError("life.memory.edit: op=add cannot accept kind=event")
+        text = value.get("text")
+        if text is not None:
+            if not isinstance(text, str) or not (1 <= len(text) <= 200):
+                raise ProtocolError("life.memory.edit: text must be 1..200 chars")
+        entry_id = value.get("id")
+        return cls(
+            request_id=request_id,
+            save_id=save_id,
+            expected_revision=expected_revision,
+            op=op,
+            entry_id=entry_id,
+            kind=kind,
+            text=text,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        res: dict[str, Any] = {
+            "requestId": self.request_id,
+            "saveId": self.save_id,
+            "expectedRevision": self.expected_revision,
+            "op": self.op,
+        }
+        if self.entry_id is not None:
+            res["id"] = self.entry_id
+        if self.kind is not None:
+            res["kind"] = self.kind
+        if self.text is not None:
+            res["text"] = self.text
         return res
 
 

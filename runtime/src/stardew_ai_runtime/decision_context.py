@@ -69,11 +69,21 @@ def build_decision_context(
     *,
     work: dict[str, Any] | None = None,
     origin: str = "chat",
+    companion: dict[str, Any] | None = None,
+    memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the compact, unknown-safe context block for one decision."""
+    """Build the compact, unknown-safe context block for one decision.
+
+    Optional keyword-only args (contract §2):
+      companion: profile dict with name/personality/playStyle/careFrequency
+      memory:    render_for_context() output with agreements/preferences/recentEvents
+    When omitted, the default behaviour is unchanged.
+    """
     payload = _payload_of(snapshot)
     world = payload.get("world") if isinstance(payload.get("world"), dict) else {}
-    companion = payload.get("companion") if isinstance(payload.get("companion"), dict) else {}
+    companion_snapshot = (
+        payload.get("companion") if isinstance(payload.get("companion"), dict) else {}
+    )
     inventory = payload.get("inventory") if isinstance(payload.get("inventory"), dict) else {}
     shop = payload.get("shop") if isinstance(payload.get("shop"), dict) else {}
 
@@ -94,6 +104,7 @@ def build_decision_context(
             "currentTask": {"nextStep": None, "waitingFor": [], "anomalies": []},
             "note": "native snapshot unavailable; fields unknown",
         }
+        _attach_companion_memory(res, companion, memory)
         if isinstance(work, dict):
             if "paused" in work:
                 res["paused"] = bool(work.get("paused"))
@@ -126,17 +137,17 @@ def build_decision_context(
     else:
         weather = UNKNOWN
 
-    stamina = _value(companion, "stamina")
+    stamina = _value(companion_snapshot, "stamina")
     stamina_block: Any = stamina
     if stamina != UNKNOWN:
-        stamina_block = {"current": stamina, "max": _value(companion, "maxStamina")}
+        stamina_block = {"current": stamina, "max": _value(companion_snapshot, "maxStamina")}
 
-    location = _value(companion, "locationId")
+    location = _value(companion_snapshot, "locationId")
     if location == UNKNOWN:
         location = _value(world, "currentLocation")
     location_block: Any = location
-    tile_x = companion.get("tileX")
-    tile_y = companion.get("tileY")
+    tile_x = companion_snapshot.get("tileX")
+    tile_y = companion_snapshot.get("tileY")
     if location != UNKNOWN or tile_x is not None or tile_y is not None:
         location_block = {
             "name": location,
@@ -147,8 +158,8 @@ def build_decision_context(
 
     # Funds: the companion wallet published in the native snapshot. The older
     # shop-section reading is only a fallback for pre-upgrade payloads.
-    money = companion.get("availableMoney")
-    money_status = companion.get("moneyStatus")
+    money = companion_snapshot.get("availableMoney")
+    money_status = companion_snapshot.get("moneyStatus")
     if money is None:
         money = shop.get("availableMoney")
         money_status = shop.get("moneyStatus") if money_status is None else money_status
@@ -179,12 +190,12 @@ def build_decision_context(
     if len(items) > 24:
         inventory_block["itemsTruncated"] = True
 
-    water_can = companion.get("waterCanLevel")
+    water_can = companion_snapshot.get("waterCanLevel")
     tool_resources: dict[str, Any] = {}
     if water_can is not None:
         tool_resources["waterCan"] = {
             "level": water_can,
-            "max": _value(companion, "maxWaterCanLevel"),
+            "max": _value(companion_snapshot, "maxWaterCanLevel"),
         }
     inventory_block["toolResources"] = tool_resources
 
@@ -257,7 +268,45 @@ def build_decision_context(
     last_settled = work.get("lastSettledDay")
     if last_settled is not None:
         context["lastSettledDay"] = last_settled
+    _attach_companion_memory(context, companion, memory)
     return context
+
+
+def _attach_companion_memory(
+    context: dict[str, Any],
+    companion: dict[str, Any] | None,
+    memory: dict[str, Any] | None,
+) -> None:
+    """Attach the optional companion profile and shared-memory blocks (§2).
+
+    ``companion`` is the profile projection (name/personality/playStyle/
+    careFrequency); ``memory`` is ``CompanionMemoryStore.render_for_context``
+    output (agreements/preferences/recentEvents). Both stay absent entirely
+    when not provided, so the default behaviour is unchanged.
+    """
+    if isinstance(companion, dict) and companion:
+        context["companion"] = {
+            "name": companion.get("name"),
+            "personality": companion.get("personality"),
+            "playStyle": companion.get("playStyle"),
+            "careFrequency": companion.get("careFrequency"),
+        }
+    if not isinstance(memory, dict):
+        return
+    agreements = memory.get("agreements")
+    if isinstance(agreements, list) and agreements:
+        context["agreements"] = [
+            {"text": a.get("text"), "gameDate": a.get("gameDate")}
+            for a in agreements
+            if isinstance(a, dict)
+        ]
+    events = memory.get("recentEvents")
+    if isinstance(events, list) and events:
+        context["recentSharedEvents"] = [
+            {"text": e.get("text"), "gameDate": e.get("gameDate")}
+            for e in events
+            if isinstance(e, dict)
+        ]
 
 
 def render_decision_context(context: dict[str, Any]) -> str:

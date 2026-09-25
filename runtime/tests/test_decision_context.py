@@ -175,3 +175,51 @@ def test_context_rebuild_is_bounded_not_append_only() -> None:
     rebuilt = build_decision_context(newer)
     assert rebuilt["date"]["day"] == 7
     assert len(render_decision_context(rebuilt)) <= len(render_decision_context(first)) + 8
+
+
+def test_companion_and_memory_blocks_are_optional() -> None:
+    # Default behaviour is unchanged: no companion/memory keys at all.
+    base = build_decision_context(_snapshot())
+    assert "companion" not in base
+    assert "agreements" not in base
+    assert "recentSharedEvents" not in base
+    empty = build_decision_context({})
+    assert "companion" not in empty
+    assert "agreements" not in empty
+
+
+def test_companion_and_memory_blocks_attach_when_given() -> None:
+    companion = {"name": "阿星", "personality": "lively", "playStyle": "earn",
+                 "careFrequency": "chatty"}
+    memory = {
+        "agreements": [{"text": "每天浇水", "gameDate": "1:spring:1"}],
+        "preferences": [{"text": "喜欢草莓", "gameDate": "1:spring:2"}],
+        "recentEvents": [{"text": "完成了「浇水」", "gameDate": "1:spring:3"}],
+    }
+    context = build_decision_context(_snapshot(), companion=companion, memory=memory)
+    assert context["companion"] == companion
+    assert context["agreements"] == [{"text": "每天浇水", "gameDate": "1:spring:1"}]
+    assert context["recentSharedEvents"] == [
+        {"text": "完成了「浇水」", "gameDate": "1:spring:3"}
+    ]
+    # Rendered prompt carries the effective agreements for the work turn (§4).
+    rendered = render_decision_context(context)
+    assert "每天浇水" in rendered
+    assert "lively" in rendered
+
+
+def test_snapshot_companion_section_does_not_clash_with_profile() -> None:
+    # The native snapshot's own "companion" section (stamina/location) must keep
+    # working while the profile projection lands under the same output key only
+    # when explicitly provided.
+    snapshot = _snapshot()
+    snapshot["payload"]["companion"] = {"stamina": 100, "locationId": "Farm"}
+    context = build_decision_context(snapshot)
+    assert context["stamina"]["current"] == 100
+    assert "companion" not in context
+    context2 = build_decision_context(
+        snapshot, companion={"name": "n", "personality": "calm",
+                             "playStyle": "earn", "careFrequency": "quiet"},
+    )
+    assert context2["stamina"]["current"] == 100
+    assert context2["companion"]["personality"] == "calm"

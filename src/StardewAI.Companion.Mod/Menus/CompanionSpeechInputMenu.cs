@@ -30,7 +30,9 @@ public sealed class CompanionSpeechInputMenu : IClickableMenu
         _input = new TextBox(Game1.content.Load<Texture2D>(@"LooseSprites\textBox"), null, Game1.smallFont, Game1.textColor)
         {
             X = xPositionOnScreen + 24, Y = yPositionOnScreen + 64,
-            Width = width - 48, Height = 44, textLimit = textLimit, limitWidth = true,
+            // Native Draw shows the trailing text that fits without changing Text.
+            // limitWidth=true instead destroys characters in the native setter.
+            Width = width - 48, Height = 44, textLimit = textLimit, limitWidth = false,
         };
         _sendBounds = new Rectangle(xPositionOnScreen + width - 184, yPositionOnScreen + 124, 72, 40);
         _cancelBounds = new Rectangle(xPositionOnScreen + width - 96, yPositionOnScreen + 124, 72, 40);

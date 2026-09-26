@@ -980,3 +980,82 @@ def test_life_provider_borrows_single_mcp_socket_and_returns_it_on_failure(tmp_p
             terminal = _sent_payloads(ws)[-1]["payload"]
             assert terminal["status"] == ("failed" if fails else "completed")
     asyncio.run(run())
+
+
+def test_continuation_context_keeps_fresh_facts_without_repeating_persona(tmp_path):
+    bridge = _bridge(tmp_path)
+    svc = bridge._life_chat
+    profile = {"companionName": "小满", "personality": "gentle", "playStyle": "earn"}
+    memory = {"agreements": [{"text": "不卖木材"}]}
+    live = {"date": {"day": 11}, "resources": {"player": {"money": 500},
+            "companion": {"spendableMoney": 100, "inventory": {"items": []}}},
+            "companion": {"name": "小满"}, "agreements": ["不卖木材"],
+            "inventory": {"items": []}, "funds": 100, "paused": False}
+    kwargs = dict(mode="plan", milestones=[{"id": "strawberry", "status": "suggested"}], live_context=live)
+    first = svc.build_turn_prompt("S", None, profile, memory, {"paused": False}, **kwargs)
+    assert "温柔体贴" in first and "不卖木材" in first
+    # Unacknowledged/failed initialization must not cause the lean continuation.
+    unconfirmed = svc.build_turn_prompt("S", "cid", profile, memory, {"paused": False}, **kwargs)
+    assert "温柔体贴" in unconfirmed
+    svc.mark_prompt_delivered("S", "cid", "plan")
+    live["resources"]["player"]["money"] = "unknown"
+    live["paused"] = True
+    kwargs["milestones"] = []
+    second = svc.build_turn_prompt("S", "cid", profile, memory, {"paused": True}, **kwargs)
+    assert "温柔体贴" not in second and "不卖木材" not in second
+    assert '"money":"unknown"' in second and '"paused":true' in second
+    assert '"milestones":[]' in second and "完整替换" in second
+    assert "node_id" in second and "暂停不得解除" in second
+    assert len(second) < len(first) / 2
+    # A mode transition needs full boundaries; a new session restores personality.
+    kwargs["mode"] = "chat"
+    switched = svc.build_turn_prompt("S", "cid", profile, memory, {}, **kwargs)
+    assert "温柔体贴" in switched and "只读生活对话" in switched
+    assert "温柔体贴" in svc.build_turn_prompt("S", "another-cid", profile, memory, {}, **kwargs)
+    assert "companion" in live and "inventory" in live  # formatter doesn't mutate source facts
+
+
+def test_bridge_only_marks_successful_life_prompt_as_delivered(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        prompts = []
+        def provider(task, cid, prompt, mode="chat"):
+            prompts.append(prompt)
+            return {"success": len(prompts) != 1, "response": "你好", "conversation_id": "same-cid"}
+        with patch.object(bridge, "_execute_life_turn", side_effect=provider):
+            for i in range(3):
+                await bridge._handle_life_chat_submit(AsyncMock(), {
+                    "payload": {"requestId": f"r{i}", "saveId": "S", "mode": "chat", "text": "你好"},
+                }, "S")
+        assert "你是农场伙伴" in prompts[0]
+        assert "你是农场伙伴" in prompts[1]
+        assert "你是农场伙伴" not in prompts[2]
+        assert "本轮是只读闲聊" in prompts[2]
+    asyncio.run(run())
+
+
+def test_memory_correction_and_deletion_reinitialize_without_old_text(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        bridge._memory_store.add("S", kind="agreement", text="旧约定标记", source="player",
+                                 game_date="1:spring:1", expected_revision=0)
+        entry_id = bridge._memory_store.list("S")["entries"][0]["id"]
+        seen = []
+        def provider(task, cid, prompt, mode="chat"):
+            seen.append((cid, prompt))
+            return {"success": True, "response": "好", "conversation_id": f"cid-{len(seen)}"}
+        async def turn(i):
+            await bridge._handle_life_chat_submit(AsyncMock(), {
+                "payload": {"requestId": f"r{i}", "saveId": "S", "mode": "chat", "text": "我们聊聊"},
+            }, "S")
+        with patch.object(bridge, "_execute_life_turn", side_effect=provider):
+            await turn(1)
+            bridge._memory_store.correct("S", entry_id, "新约定标记", expected_revision=1)
+            await turn(2)
+            bridge._memory_store.delete("S", entry_id, expected_revision=2)
+            await turn(3)
+        assert all(cid is None for cid, _ in seen)
+        assert "旧约定标记" in seen[0][1]
+        assert "旧约定标记" not in seen[1][1] and "新约定标记" in seen[1][1]
+        assert "旧约定标记" not in seen[2][1] and "新约定标记" not in seen[2][1]
+    asyncio.run(run())

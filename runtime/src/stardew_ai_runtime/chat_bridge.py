@@ -2201,16 +2201,20 @@ class ChatBridge:
                     if self._milestone_store is not None and save_id
                     else 0
                 )
-                system_prompt = LifeChatService.build_system_prompt(
+                prompt_builder = (self._life_chat.build_turn_prompt
+                                  if self._life_chat is not None else None)
+                prompt_args = (
                     profile,
                     memory_render,
                     self._life_work_summary(save_id, mode),
-                    mode=mode,
-                    milestones=self._life_milestone_summary(save_id, mode),
-                    live_context=self._decision_context(save_id, origin="life-plan" if mode == "plan" else "life-chat"),
-                    discussion=(self._life_chat.discussion_context(save_id, mode)
-                                if self._life_chat is not None else None),
                 )
+                prompt_options = {
+                    "mode": mode,
+                    "milestones": self._life_milestone_summary(save_id, mode),
+                    "live_context": self._decision_context(save_id, origin="life-plan" if mode == "plan" else "life-chat"),
+                }
+                system_prompt = (prompt_builder(save_id, existing_cid, *prompt_args, **prompt_options)
+                                 if prompt_builder else LifeChatService.build_system_prompt(*prompt_args, **prompt_options))
                 prompt = f"{system_prompt}\n\n玩家说：{text}"
                 active_task = ActiveChatTask(
                     request_id=request_id,
@@ -2250,6 +2254,8 @@ class ChatBridge:
                         self._memory_revision(save_id),
                     )
                 if success and self._life_chat is not None:
+                    if cid:
+                        self._life_chat.mark_prompt_delivered(save_id, str(cid), mode)
                     self._life_chat.record_discussion(save_id, mode, text, str(result.get("response") or ""))
                 if success:
                     reply = Envelope.create_life_chat_reply(

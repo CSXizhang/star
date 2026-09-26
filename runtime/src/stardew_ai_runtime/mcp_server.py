@@ -19,10 +19,11 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.companion_milestones import (
@@ -47,6 +48,61 @@ from stardew_ai_runtime.scheduler import (
 )
 from stardew_ai_runtime.wiki import WikiLookup
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+
+
+class ShortJobStep(BaseModel):
+    """One native operation; navigation may accompany one business kind."""
+
+    model_config = ConfigDict(extra="forbid")
+    operation: str = Field(description="Discoverable plan operation, e.g. water_auto or harvest_auto")
+    params: dict[str, Any] = Field(default_factory=dict)
+    id: str | None = None
+    wait: dict[str, Any] | None = Field(default=None, description="Must be absent; future waits are intent")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_bounded_count(cls, value: Any) -> Any:
+        if isinstance(value, dict) and isinstance(value.get("params"), dict):
+            value = {**value, "params": dict(value["params"])}
+            params = value["params"]
+            if "maxTiles" in params:
+                if "max_tiles" in params and params["max_tiles"] != params["maxTiles"]:
+                    raise ValueError("Conflicting maxTiles/max_tiles; supply one max_tiles value")
+                params["max_tiles"] = params.pop("maxTiles")
+        return value
+
+
+class ShortJobTask(BaseModel):
+    """Exactly one current business, with 1..32 bounded native steps."""
+
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1)
+    steps: list[ShortJobStep] = Field(min_length=1, max_length=32)
+    id: str | None = None
+    completionCondition: str = ""
+    dependencies: list[str] = Field(default_factory=list, max_length=0, description="Must be empty; select subsequent business next decision")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_single_operation(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        for alias in ("label", "reason"):
+            if alias in value:
+                if "title" in value and value["title"] != value[alias]:
+                    raise ValueError(f"Conflicting title/{alias}; supply one title")
+                value["title"] = value.pop(alias)
+        if "operation" in value or "type" in value:
+            if "steps" in value:
+                raise ValueError("Ambiguous task: supply steps only, not a second top-level operation/type")
+            operation = value.pop("operation", None)
+            alias = value.pop("type", None)
+            if operation is not None and alias is not None and operation != alias:
+                raise ValueError("Conflicting operation/type; supply one operation")
+            value["steps"] = [{"operation": operation or alias, "params": value.pop("params", {})}]
+        return value
+
 
 # Ensure UTF-8 I/O for Windows consoles
 if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
@@ -437,10 +493,10 @@ MEMORY_WRITE_SCHEMA: dict[str, Any] = {
         ],
     },
     "submit_plan": {
-        "purpose": "Submit or revise a short deterministic plan of allowed operations.",
+        "purpose": "Select exactly ONE current semantic short job; subsequent business requires a new model decision.",
         "parameters": {
-            "tasks": "array, required, >=1 task. Each: {id, title, completionCondition?, dependencies?, steps[]}.",
-            "goal_id": "string | null. Existing active goal id.",
+            "tasks": "array, required, exactly 1 task: {title, steps:[{operation, params}], id?, completionCondition?}. 1..32 steps, one business kind plus navigation; no dependencies or future waits.",
+            "goal_id": "string | null. Existing active goal id from context; may be omitted only when this decision has one bound active goal, or goal_text is supplied.",
             "goal_text": "string | null. Used when goal_id is absent (creates an agent goal).",
             "replace": "boolean (default false). Supersedes the goal's still-pending tasks only.",
         },
@@ -941,6 +997,8 @@ def create_mcp_server(
         terms_note: str | None = None,
         reason: str | None = None,
         preparation: list[str] | None = None,
+        id: str | None = None,
+        nodeId: str | None = None,
     ) -> dict[str, Any]:
         """Milestone plan nodes discussed with the player (near-term key game dates).
 
@@ -949,6 +1007,14 @@ def create_mcp_server(
         actions, allowed only while the player is in 「商量计划」 mode —
         STARDEW_LIFE_MODE=plan — and has explicitly agreed this turn; only say the
         plan is saved after this tool confirms it).
+
+        Use node_id for adopt/revise/defer/reopen, copied from the current node's
+        id. Example: {"action":"adopt","node_id":"spring-egg-festival-strawberry:y1",
+        "planned_count":5}. id and nodeId are compatibility aliases; conflicting
+        values are rejected. Do not guess another parameter spelling.
+        The successful response already contains the authoritative changed node,
+        revision, and manual/capability preparation: do not list again just to
+        confirm that write. Saving is not proof that physical work has run.
 
         For a custom proposal, preparation optionally lists existing capabilities:
         water, harvest, clear, plant (existing seeds), animals or machines.
@@ -1001,6 +1067,27 @@ def create_mcp_server(
                 "PLAN_MODE_REQUIRED: 修改节点需要玩家处于「商量计划」模式；"
                 "闲聊模式只能 list 查看，请引导玩家切换到商量计划后再采纳/修改。"
             )
+        identifiers = {value.strip() for value in (node_id, id, nodeId) if value and value.strip()}
+        if len(identifiers) > 1:
+            raise ToolError("CONFLICTING_NODE_ID: node_id/id/nodeId disagree; pass only node_id from the current node snapshot.")
+        node_id = next(iter(identifiers), None)
+        if action_clean != "propose" and not node_id:
+            raise ToolError(
+                'NODE_ID_REQUIRED: use {"action":"' + action_clean + '","node_id":"<node.id>"}; '
+                "copy id from the injected node snapshot or manage_milestones(action='list')."
+            )
+
+        def saved(node: dict[str, Any]) -> dict[str, Any]:
+            # One complete node is sufficient to acknowledge the write. Omit
+            # absent values, not preparation ownership or observed status.
+            compact = {key: value for key, value in wire_node(node).items() if value is not None}
+            compact["prepItems"] = [
+                {key: value for key, value in prep.items() if value is not None}
+                for prep in compact.get("prepItems", [])
+            ]
+            return {"saveId": sid, "revision": store.revision(sid), "saved": True,
+                    "execution": "not_started_by_this_tool", "node": compact}
+
         try:
             if action_clean == "propose":
                 node = store.propose(
@@ -1012,7 +1099,7 @@ def create_mcp_server(
                     preparation=preparation,
                     game_date=game_date,
                 )
-                return {"saveId": sid, "node": wire_node(node)}
+                return saved(node)
             if action_clean == "adopt":
                 node = store.adopt(
                     sid,
@@ -1024,8 +1111,7 @@ def create_mcp_server(
                     game_date=game_date,
                 )
                 return {
-                    "saveId": sid,
-                    "node": wire_node(node),
+                    **saved(node),
                     "goalId": node.get("goalId"),
                     "todoIds": node.get("todoIds"),
                 }
@@ -1042,7 +1128,7 @@ def create_mcp_server(
                     target_date=target_date,
                     work_store=work_for_run(),
                 )
-                return {"saveId": sid, "node": wire_node(node)}
+                return saved(node)
             if action_clean == "defer":
                 node = store.defer(
                     sid,
@@ -1051,7 +1137,7 @@ def create_mcp_server(
                     work_store=work_for_run(),
                     game_date=game_date,
                 )
-                return {"saveId": sid, "node": wire_node(node)}
+                return saved(node)
             node = store.reopen(
                 sid,
                 node_id or "",
@@ -1059,13 +1145,13 @@ def create_mcp_server(
                 work_store=work_for_run(),
                 game_date=game_date,
             )
-            return {"saveId": sid, "node": wire_node(node)}
+            return saved(node)
         except MilestoneError as ex:
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
     async def submit_plan(
-        tasks: list[dict[str, Any]],
+        tasks: Annotated[list[ShortJobTask], Field(min_length=1, max_length=1, description="Exactly one current short job. Submit remaining business in a new decision, without dependencies.")],
         goal_id: str | None = None,
         goal_text: str | None = None,
         replace: bool = False,
@@ -1087,7 +1173,8 @@ def create_mcp_server(
         unknown operation is rejected with the allowed list. ``params`` should
         contain only that operation's documented keys — unknown keys are stripped
         with a warning before dispatch rather than rejecting the step. Pass an existing
-        active ``goal_id`` or a ``goal_text`` to resolve/create an agent goal. With
+        active ``goal_id`` from context or ``goal_text`` to resolve/create an agent goal.
+        Both may be omitted when the decision has one bound active goal. With
         ``replace=True`` the goal's still-pending tasks are superseded; work already
         running, partial or unknown is preserved. Call
         discover_capabilities("memory") for the same schema.
@@ -1097,7 +1184,9 @@ def create_mcp_server(
         try:
             result = store.submit_plan(
                 sid,
-                tasks=tasks,
+                tasks=[task.model_dump(exclude_none=True) if isinstance(task, ShortJobTask)
+                       else ShortJobTask.model_validate(task).model_dump(exclude_none=True)
+                       for task in tasks],
                 goal_id=goal_id,
                 goal_text=goal_text,
                 replace=replace,

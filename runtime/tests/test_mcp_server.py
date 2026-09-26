@@ -2003,6 +2003,40 @@ def test_get_status_detail_keeps_real_native_sections(mock_scheduler):
 
 
 # ---------------------------------------------------------------- manage_milestones (contract §3.2)
+def test_manage_milestones_aliases_missing_and_conflicting_ids(mock_scheduler, tmp_path, monkeypatch):
+    async def run():
+        mock_scheduler.run_dir = None
+        mock_scheduler.latest_snapshot = {"payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}}
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        schema = tools["manage_milestones"].inputSchema
+        assert {"node_id", "id", "nodeId"} <= set(schema["properties"])
+        assert '"node_id"' in tools["manage_milestones"].description
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "plan")
+        with pytest.raises(ToolError, match="NODE_ID_REQUIRED.*node_id"):
+            await server.call_tool("manage_milestones", {"action": "adopt"})
+        with pytest.raises(ToolError, match="CONFLICTING_NODE_ID"):
+            await server.call_tool("manage_milestones", {"action": "adopt", "node_id": "a", "id": "b"})
+        todo_ids = None
+        for key in ("id", "nodeId", "node_id"):
+            _, saved = await server.call_tool("manage_milestones", {
+                "action": "adopt" if todo_ids is None else "revise",
+                key: "spring-egg-festival-strawberry:y1", "planned_count": 5,
+            })
+            assert saved["saved"] is True
+            assert saved["execution"] == "not_started_by_this_tool"
+            assert saved["node"]["plannedCount"] == 5
+            assert any(p["support"] == "manual" for p in saved["node"]["prepItems"])
+            if todo_ids is None:
+                todo_ids = saved["todoIds"]
+        with pytest.raises(ToolError, match="unknown"):
+            await server.call_tool("manage_milestones", {"action": "adopt", "id": "not-a-node"})
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
+        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+            await server.call_tool("manage_milestones", {"action": "adopt", "id": "spring-egg-festival-strawberry:y1"})
+    asyncio.run(run())
+
+
 def test_manage_milestones_write_actions_require_plan_mode(mock_scheduler, monkeypatch):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)

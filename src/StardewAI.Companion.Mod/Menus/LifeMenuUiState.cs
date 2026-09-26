@@ -301,6 +301,11 @@ public sealed class LifeMenuUiState
         PendingProfileSetExpectedRevision = expectedRevision;
     }
 
+    public void EndProfileSet(string requestId)
+    {
+        if (requestId == PendingProfileSetRequestId) PendingProfileSetRequestId = null;
+    }
+
     // -----------------------------------------------------------------------
     // Memory-state methods
     // -----------------------------------------------------------------------

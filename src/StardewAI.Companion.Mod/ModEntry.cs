@@ -1266,14 +1266,23 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     {
         _companionDialogue ??= new CompanionDialogueController(
             _lifeMenuUiState, DispatchLifeChat,
-            () => { DispatchLifeProfileRefresh(); DispatchLifeMilestonesRefresh(); },
+            () =>
+            {
+                DispatchLifeProfileRefresh(); DispatchLifeMilestonesRefresh();
+                if (!_lifeMenuUiState.IsOnboarded && !_lifeMenuUiState.IsSkipped) DispatchMemoryListRefresh();
+            },
             () =>
             {
                 OpenSetupMenu();
                 if (Game1.activeClickableMenu != null)
                     Game1.activeClickableMenu.exitFunction = () => _companionDialogue?.ReturnToConversation();
             },
-            OpenCompanionMemory, () => _actor?.GameFarmer);
+            OpenCompanionMemory, () => _actor?.GameFarmer,
+            SendFirstMeetingProfile,
+            text => DispatchMemoryEdit("add", null, "preference", text) ? _lifeMenuUiState.PendingMemoryEditRequestId : null,
+            () => !_lifeMenuUiState.WorkPaused && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested &&
+                !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl &&
+                !_lifeMenuUiState.IsChatPending && (_coordinator == null || _coordinator.GetActivityStatus() == "idle"));
         _companionDialogue.Open();
     }
 
@@ -1436,6 +1445,28 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             try { await _transportServer.SendLifeProfileSetAsync(payload).ConfigureAwait(false); }
             catch (Exception ex) { Monitor.Log($"life.profile.set send failed: {ex.Message}", LogLevel.Warn); }
         });
+    }
+
+    private string? SendFirstMeetingProfile(LifeProfilePatchDto patch)
+    {
+        if (_transportServer?.IsChatConnected != true || !_lifeMenuUiState.HasProfileState ||
+            _lifeMenuUiState.PendingProfileSetRequestId != null) return null;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        int expected = _lifeMenuUiState.ProfileRevision;
+        _lifeMenuUiState.BeginProfileSet(reqId, expected);
+        _ = Task.Run(async () =>
+        {
+            bool sent;
+            try { sent = await _transportServer.SendLifeProfileSetAsync(new LifeProfileSetPayload(reqId, saveId, expected, patch)).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"First meeting save failed: {ex.Message}", LogLevel.Warn); sent = false; }
+            if (!sent) _mainThreadActions.Enqueue(() =>
+            {
+                _lifeMenuUiState.EndProfileSet(reqId);
+                _companionDialogue?.ReceiveProfile(reqId, "failed");
+            });
+        });
+        return reqId;
     }
 
     private void SendLifeProfileSkip()
@@ -1634,7 +1665,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 if (!state.Profile.Onboarded && !state.Profile.Skipped && !_lifeOnboardingHudShown)
                 {
                     _lifeOnboardingHudShown = true;
-                    Game1.addHUDMessage(new HUDMessage("走近阿星，按互动键与她聊聊，完成初次设置。"));
+                    Game1.addHUDMessage(new HUDMessage("新伙伴想认识你，走近按互动键聊聊吧。"));
                 }
             }
             else
@@ -1643,11 +1674,13 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 if (!_lifeOnboardingHudShown)
                 {
                     _lifeOnboardingHudShown = true;
-                    Game1.addHUDMessage(new HUDMessage("走近阿星，按互动键与她聊聊，完成初次设置。"));
+                    Game1.addHUDMessage(new HUDMessage("新伙伴想认识你，走近按互动键聊聊吧。"));
                 }
             }
 
             AdvanceLifeStartAfterProfile(state.RequestId, state.Status, state.Reason);
+            _lifeMenuUiState.EndProfileSet(state.RequestId);
+            _companionDialogue?.ReceiveProfile(state.RequestId, state.Status);
 
             if (isStandaloneSaveReply)
             {
@@ -1677,6 +1710,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 state.Entries.Select(e => new Menus.MemoryEntrySnapshot(
                     e.Id, e.Kind, e.Text, e.Source, e.GameDate, e.CreatedAt)),
                 state.RequestId, state.Status, state.Reason);
+            _companionDialogue?.ReceiveMemory(state.RequestId, state.Status);
             if (isEditReply && _lifeMenuUiState.MemoryEditFeedback != null)
                 Game1.addHUDMessage(new HUDMessage(_lifeMenuUiState.MemoryEditFeedback,
                     state.Status == "confirmed" ? HUDMessage.newQuest_type : HUDMessage.error_type));

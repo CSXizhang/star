@@ -5,9 +5,13 @@ param(
     [string]$Model = '', [switch]$AutoInstall, [switch]$DryRun, [switch]$CheckOnly
 )
 $ErrorActionPreference = 'Stop'
+$OutputEncoding = New-Object Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $releaseRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $PSScriptRoot 'release-package.ps1')
+Write-Host '正在检查安装包完整性，请稍候……'
 $package = Read-VerifiedRelease $releaseRoot
+Write-Host '安装包检查完成。'
 $agentSpecified = $PSBoundParameters.ContainsKey('Agent')
 $modelSpecified = $PSBoundParameters.ContainsKey('Model')
 
@@ -25,6 +29,7 @@ if ($CheckOnly) {
     exit 0
 }
 if (-not $GameDir) {
+    Write-Host '正在查找星露谷游戏目录……'
     $parentGame = Split-Path (Split-Path $releaseRoot -Parent) -Parent
     if (Test-Path -LiteralPath (Join-Path $parentGame 'StardewModdingAPI.exe')) { $GameDir = $parentGame }
     else {
@@ -34,6 +39,7 @@ if (-not $GameDir) {
 }
 
 if (-not $AutoInstall -and -not $DryRun) {
+    Write-Host '正在打开设置窗口；如果窗口未显示，请在任务栏查找“星露谷伙伴下载版设置”。'
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [Windows.Forms.Application]::EnableVisualStyles()
@@ -92,6 +98,13 @@ if (-not $AutoInstall -and -not $DryRun) {
     $ok.DialogResult = [Windows.Forms.DialogResult]::OK
     $form.Controls.Add($ok)
     $form.AcceptButton = $ok
+    $form.Add_Shown({
+        $form.TopMost = $true
+        $form.Activate()
+        $form.BringToFront()
+        $form.TopMost = $false
+        Write-Host '设置窗口已打开。关闭窗口即可取消，不会安装或修改配置。'
+    })
     if ($form.ShowDialog() -ne 'OK') { $form.Dispose(); exit 0 }
     $GameDir = $pathBox.Text.Trim()
     $Agent = [string]$backendBox.SelectedItem

@@ -3,6 +3,7 @@ using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using StardewValley;
 using StardewValley.Menus;
+using StardewAI.Companion.Mod.Transport;
 
 namespace StardewAI.Companion.Mod.Menus;
 
@@ -59,6 +60,18 @@ public sealed class CompanionDialogueController
     private readonly Action _settings;
     private readonly Action _memory;
     private readonly Func<Farmer?> _farmer;
+    private readonly Func<LifeProfilePatchDto, string?> _saveProfile;
+    private readonly Func<string, string?> _savePreference;
+    private readonly Func<bool> _canHelp;
+    private string? _meetingProfileRequest;
+    private string? _meetingMemoryRequest;
+    private string? _draftName;
+    private string? _meetingChoice;
+    private string? _meetingFeedback;
+    private bool _helpAfterFeedback;
+    private DateTime _meetingSentAt;
+    private string DisplayName => _state.ProfileRevision == 0 && !_state.IsOnboarded && !_state.IsSkipped
+        ? "新伙伴" : _state.CompanionName;
     private RenderTarget2D? _portrait;
     private readonly CompanionDialogueInbox _inbox = new();
     private IClickableMenu? _ownedMenu;
@@ -68,7 +81,8 @@ public sealed class CompanionDialogueController
     private Action? _afterPages;
 
     public CompanionDialogueController(LifeMenuUiState state, Func<string, string, bool> submit,
-        Action refresh, Action settings, Action memory, Func<Farmer?> farmer)
+        Action refresh, Action settings, Action memory, Func<Farmer?> farmer,
+        Func<LifeProfilePatchDto, string?> saveProfile, Func<string, string?> savePreference, Func<bool> canHelp)
     {
         _state = state;
         _submit = submit;
@@ -76,6 +90,9 @@ public sealed class CompanionDialogueController
         _settings = settings;
         _memory = memory;
         _farmer = farmer;
+        _saveProfile = saveProfile;
+        _savePreference = savePreference;
+        _canHelp = canHelp;
     }
 
     public void Reset()
@@ -87,10 +104,20 @@ public sealed class CompanionDialogueController
         _afterPages = null;
         _portrait?.Dispose();
         _portrait = null;
+        _meetingProfileRequest = _meetingMemoryRequest = _draftName = _meetingChoice = _meetingFeedback = null;
+        _helpAfterFeedback = false;
     }
 
     public void Update()
     {
+        if ((_meetingProfileRequest != null || _meetingMemoryRequest != null) &&
+            DateTime.UtcNow - _meetingSentAt > TimeSpan.FromSeconds(30))
+        {
+            if (_meetingProfileRequest != null) _state.EndProfileSet(_meetingProfileRequest);
+            _meetingProfileRequest = _meetingMemoryRequest = null;
+            _meetingFeedback = "保存的确认还没回来，我先不开始新工作。等连接恢复，我们再核对一下。";
+            MeetingReady();
+        }
         if (Game1.eventUp || Game1.currentLocation?.currentEvent != null)
         {
             _next = null;
@@ -125,7 +152,26 @@ public sealed class CompanionDialogueController
     {
         if (Game1.activeClickableMenu != null || Game1.eventUp) return;
         _refresh();
-        if (_inbox.HasUnreadReply && _inbox.Reply != null)
+        if (_meetingFeedback != null)
+        {
+            ShowSpeech(_meetingFeedback, false);
+            _meetingFeedback = null;
+            if (_helpAfterFeedback)
+            {
+                _helpAfterFeedback = false;
+                _afterPages = () =>
+                {
+                    if (_canHelp()) Submit("我刚刚选择多帮忙。现在请用现有资源安排并做一件眼前能做的农活，不采购、不卖物品、不取消其他工作、不打开自由模式。若暂停或忙碌，只保留我的偏好，不启动。", "plan");
+                    else ShowSpeech("我记下了。眼前的工作或暂停先照旧，等你方便再叫我。", false);
+                };
+            }
+        }
+        else if (_meetingProfileRequest != null || _meetingMemoryRequest != null)
+            ShowSpeech("我正在记下我们的约定，稍等一下。", false);
+        else if (!_state.HasProfileState)
+            ShowSpeech("你好！我还在整理行李，等一下再来聊聊吧。", false);
+        else if (CompanionFirstMeeting.NeedsMeeting(_state)) ShowFirstMeeting();
+        else if (_inbox.HasUnreadReply && _inbox.Reply != null)
         {
             _inbox.MarkRead();
             ShowSpeech(_inbox.Reply, true);
@@ -133,6 +179,94 @@ public sealed class CompanionDialogueController
         else if (_state.IsChatPending)
             ShowSpeech("我还在想这件事。你先忙，想好了我会叫你。", false);
         else ShowGreeting();
+    }
+
+    private void ShowFirstMeeting()
+    {
+        if (!CompanionFirstMeeting.NeedsName(_state)) { ShowFirstPreference(); return; }
+        Ask("你好，很高兴来到这里。你想怎么称呼我？", new[]
+        {
+            new Response("name", "让我想个名字……"),
+            new Response("later", "以后再说吧。"),
+        }, key =>
+        {
+            if (key == "later") SaveFirstMeeting("later");
+            else ShowNameInput();
+        });
+    }
+
+    private void ShowNameInput()
+    {
+        _ownedMenu = new CompanionSpeechInputMenu("伙伴", text =>
+        {
+            _draftName = CompanionFirstMeeting.NormalizeName(text);
+            if (_draftName == null)
+            {
+                ShowSpeech("名字用一到十二个字就好，再想一个吧。", false);
+                _afterPages = ShowNameInput;
+            }
+            else ShowFirstPreference();
+        }, ShowFirstMeeting, "你想怎么称呼我？（1—12个字）", 24);
+        Game1.activeClickableMenu = _ownedMenu;
+    }
+
+    private void ShowFirstPreference()
+    {
+        Ask("以后你希望我们怎么相处？可以慢慢来。", new[]
+        {
+            new Response("help", "多帮帮忙，先做件现有农活。"),
+            new Response("chat", "多聊聊天吧。"),
+            new Response("slow", "先相处看看。"),
+            new Response("later", "稍后再说。"),
+        }, SaveFirstMeeting);
+    }
+
+    private void SaveFirstMeeting(string choice)
+    {
+        _meetingChoice = choice;
+        // Existing profiles retain their chosen name/personality/play style.
+        _meetingProfileRequest = _saveProfile(CompanionFirstMeeting.Patch(
+            CompanionFirstMeeting.NeedsName(_state) ? _draftName : null, choice));
+        _meetingSentAt = DateTime.UtcNow;
+        if (_meetingProfileRequest == null)
+            ShowSpeech("这会儿还没记下来。等连接恢复，我们再接着聊。", false);
+    }
+
+    public void ReceiveProfile(string requestId, string status)
+    {
+        if (requestId != _meetingProfileRequest) return;
+        _meetingProfileRequest = null;
+        if (status != "confirmed")
+            _meetingFeedback = "刚才的设置没能保存，我们再试一次吧。";
+        else if (_meetingChoice == "later")
+            _meetingFeedback = "没关系，先熟悉这里吧。想好了可以从伙伴设置里告诉我。";
+        else
+        {
+            _meetingMemoryRequest = _savePreference(CompanionFirstMeeting.Preference(_meetingChoice!));
+            _meetingSentAt = DateTime.UtcNow;
+            if (_meetingMemoryRequest != null) return;
+            _meetingFeedback = "名字已经记下了，相处的约定暂时没能保存。等连接恢复，我们再聊。";
+        }
+        MeetingReady();
+    }
+
+    public void ReceiveMemory(string requestId, string status)
+    {
+        if (requestId != _meetingMemoryRequest) return;
+        _meetingMemoryRequest = null;
+        _helpAfterFeedback = status == "confirmed" && _meetingChoice == "help";
+        _meetingFeedback = status == "confirmed"
+            ? _helpAfterFeedback ? "我记住了，很高兴和你一起生活。接下来我看看眼前有什么能帮忙的。"
+                : "我记住了，很高兴和你一起生活。以后就照我们说的，慢慢熟悉彼此吧。"
+            : "名字已经记下了，相处的约定没能保存。可以到我们的约定里再告诉我。";
+        MeetingReady();
+    }
+
+    private void MeetingReady()
+    {
+        // Continue only when our own flow is unobstructed; otherwise retain feedback.
+        if (Game1.activeClickableMenu == null && !Game1.eventUp) _next = Open;
+        else Game1.addHUDMessage(new HUDMessage("初次见面的约定有消息了，回来聊聊吧。"));
     }
 
     public void Receive(string requestId, string status, string? text)
@@ -146,7 +280,7 @@ public sealed class CompanionDialogueController
         void ShowChoices()
         {
             // Stardew deliberately uses its separate response layout for choices.
-            Game1.currentLocation.createQuestionDialogue($"{_state.CompanionName}：", responses,
+            Game1.currentLocation.createQuestionDialogue($"{CompanionNpcDialogueBox.LiteralText(DisplayName)}：", responses,
                 (_, key) => _next = () => answer(key));
             _ownedMenu = Game1.activeClickableMenu;
         }
@@ -264,7 +398,7 @@ public sealed class CompanionDialogueController
                 device.Viewport = viewport;
             }
         }
-        var speaker = new NPC { Name = "StardewAI_Companion", displayName = _state.CompanionName, Portrait = _portrait };
+        var speaker = new NPC { Name = "StardewAI_Companion", displayName = CompanionNpcDialogueBox.LiteralText(DisplayName), Portrait = _portrait };
         return new Dialogue(speaker, null, CompanionNpcDialogueBox.LiteralText(text));
     }
 

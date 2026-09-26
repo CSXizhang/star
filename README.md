@@ -2,7 +2,7 @@
 
 给星露谷农场添一个能听懂你说话、一起照料农场的 AI 伙伴。
 
-开发协作模型 · Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash。
+Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash.
 
 ## 能做什么
 
@@ -13,7 +13,7 @@
 | 动物与机器 | 喂养、抚摸、挤奶、剪毛、开关动物门，机器投料与收取成品 |
 | 自由模式 | 按你选择的农活方向照料农场，遵守每日购买上限 |
 | 对话与控制 | 游戏内中文对话、工作进度、暂停、继续和取消 |
-| 伙伴生活 | 名字与性格设置、闲聊、偏好与约定记忆、共同经历和伙伴消息 |
+| 伙伴生活 | 初次见面由你起名、选择相处方式，闲聊、偏好与约定记忆、共同经历和伙伴消息 |
 | 模型接入 | Kimi、agy 聊天后端，以及供其他客户端使用的 MCP 工具 |
 
 在游戏里按 **F8**，可以直接说：
@@ -22,7 +22,7 @@
 >
 > “从箱子里拿防风草种子，种到空地上。”
 
-走近伙伴按交互键，还能打开生活菜单聊聊近况、查看记忆或调整设置。详细用法见[玩家指南](docs/companion-guide.md)。
+走近伙伴按交互键，就能通过原生头像对话认识彼此：第一次给伙伴起个名字，以后聊近况、商量安排或查看约定。详细用法见[玩家指南](docs/companion-guide.md)。
 
 ## 开始使用
 
@@ -76,7 +76,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -
 uv run --project runtime python -m stardew_ai_runtime.chat_bridge --run-dir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" --backend kimi
 ```
 
-保持服务窗口开启，回到游戏按 **F8** 开始交流。agy 和其他客户端的配置、安装细节与故障排查见[接入指南](docs/mcp.md)。
+保持服务窗口开启，回到游戏走近伙伴按交互键，第一次见面时给她起个名字；按 **F8** 可以交代工作。agy 和其他客户端的配置、安装细节与故障排查见[接入指南](docs/mcp.md)。
 
 ## 正在开发
 

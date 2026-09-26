@@ -41,6 +41,10 @@ from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
 from stardew_ai_runtime.companion_care import CompanionCareService
 from stardew_ai_runtime.companion_memory import CompanionMemoryStore
+from stardew_ai_runtime.companion_milestones import (
+    CompanionMilestoneStore,
+    wire_node,
+)
 from stardew_ai_runtime.companion_profile import CompanionProfileStore
 from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
 from stardew_ai_runtime.job_feedback import compact_job_feedback
@@ -52,8 +56,10 @@ from stardew_ai_runtime.protocol import (
     LifeChatSubmitPayload,
     LifeMemoryEditPayload,
     LifeMemoryListPayload,
+    LifeMilestonesGetPayload,
     LifeProfileGetPayload,
     LifeProfileSetPayload,
+    MilestoneNode,
     ProtocolError,
 )
 from stardew_ai_runtime.scheduler import (
@@ -982,6 +988,7 @@ class ChatBridge:
         self._profile_store: CompanionProfileStore | None = None
         self._memory_store: CompanionMemoryStore | None = None
         self._care_service: CompanionCareService | None = None
+        self._milestone_store: CompanionMilestoneStore | None = None
         self._life_chat: LifeChatService | None = None
         self._life_fingerprints: dict[str, str] = {}
         self._life_queue: list[dict[str, Any]] = []
@@ -1061,7 +1068,7 @@ class ChatBridge:
             self._autonomy = AutonomyController(self.run_dir / "data" / "autonomy-state.json")
 
     def _bind_companion_stores(self) -> None:
-        """Bind companion profile/memory/care stores and the life-chat service.
+        """Bind companion profile/memory/care/milestone stores and the life-chat service.
 
         Called from ``__init__`` and again after auto-discovery resolves the Mod
         dir, mirroring ``_bind_work_store``. Everything lives under
@@ -1073,6 +1080,7 @@ class ChatBridge:
         self._profile_store = CompanionProfileStore(data_dir / "companion-profile.json")
         self._memory_store = CompanionMemoryStore(data_dir / "companion-memory.json")
         self._care_service = CompanionCareService(data_dir / "companion-care.json")
+        self._milestone_store = CompanionMilestoneStore(data_dir / "companion-milestones.json")
         self._life_fingerprints = self._load_life_fingerprints()
         self._life_chat = LifeChatService(
             backend_name=self.backend_name,
@@ -1514,6 +1522,7 @@ class ChatBridge:
                     "life.profile.set",
                     "life.memory.list",
                     "life.memory.edit",
+                    "life.milestones.get",
                 }:
                     await self._handle_life_message(ws, msg_type, data, active_save_id)
                     continue
@@ -1675,6 +1684,10 @@ class ChatBridge:
             "goals": [
                 {"text": g["text"], "source": g["source"]} for g in overview.get("goals", [])[:3]
             ],
+            "duePreparation": [
+                {"id": t["id"], "intent": t["intent"], "goalId": t.get("goal_id")}
+                for t in self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date=game_date)
+            ][:6],
             "nextStep": overview.get("nextStep"),
             "anomalies": overview.get("anomalies", [])[:3],
             "waitingFor": [
@@ -1810,6 +1823,91 @@ class ChatBridge:
             "planWaitReason": projection["planWaitReason"],
         }
 
+    # -------------------------------------------------- milestones (contract §2)
+    def _life_game_date_playstyle(self, save_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        """(game date dict, playStyle) from the latest snapshot + companion profile."""
+        game_date: dict[str, Any] | None = None
+        if isinstance(self._latest_snapshot_payload, dict):
+            world = self._latest_snapshot_payload.get("world")
+            if isinstance(world, dict) and world.get("year") is not None:
+                season = world.get("season")
+                day = world.get("dayOfMonth")
+                if season and day is not None:
+                    game_date = {"year": world.get("year"), "season": season, "day": day}
+        play_style = None
+        if self._profile_store is not None and save_id:
+            try:
+                profile = (self._profile_store.get(save_id) or {}).get("profile")
+                if isinstance(profile, dict):
+                    play_style = profile.get("playStyle")
+            except Exception:
+                logger.debug("Failed to read profile playStyle for milestones", exc_info=True)
+        return game_date, play_style
+
+    def _build_milestones_state(
+        self,
+        save_id: str,
+        request_id: str,
+        status: str = "ok",
+        error: str | None = None,
+    ) -> Envelope:
+        """life.milestones.state from the milestone store + current suggestions."""
+        game_date, play_style = self._life_game_date_playstyle(save_id)
+        game_date_str = None
+        if game_date is not None:
+            game_date_str = f"{game_date['year']}:{game_date['season']}:{game_date['day']}"
+        nodes: list[MilestoneNode] = []
+        if self._milestone_store is not None and save_id:
+            merged = self._milestone_store.merged_nodes(save_id, game_date, play_style)
+            nodes = [MilestoneNode.from_mapping(wire_node(n)) for n in merged]
+        return Envelope.create_life_milestones_state(
+            self.instance_id,
+            request_id,
+            save_id,
+            status=status,
+            game_date=game_date_str,
+            nodes=nodes,
+            error=error,
+        )
+
+    def _life_milestone_summary(self, save_id: str, mode: str) -> list[dict[str, Any]] | None:
+        """Compact milestone snapshot injected into the plan-mode prompt (§3.4)."""
+        if mode != "plan" or self._milestone_store is None or not save_id:
+            return None
+        game_date, play_style = self._life_game_date_playstyle(save_id)
+        summary: list[dict[str, Any]] = []
+        for node in self._milestone_store.merged_nodes(save_id, game_date, play_style)[:8]:
+            gap = next(
+                (
+                    p.get("label")
+                    for p in node.get("prepItems", [])
+                    if isinstance(p, dict) and p.get("status") in {"pending", "unknown"}
+                ),
+                None,
+            )
+            summary.append(
+                {
+                    "id": node.get("id"),
+                    "title": node.get("title"),
+                    "status": node.get("status"),
+                    "targetDate": node.get("targetDate"),
+                    "daysUntil": node.get("daysUntil"),
+                    "reservedFunds": node.get("reservedFunds"),
+                    "pendingGap": gap,
+                }
+            )
+        return summary
+
+    def _latest_player_items(self) -> list[dict[str, Any]] | None:
+        """Optional aggregated player backpack from the latest snapshot (§2.4)."""
+        if not isinstance(self._latest_snapshot_payload, dict):
+            return None
+        world = self._latest_snapshot_payload.get("world")
+        if not isinstance(world, dict):
+            return None
+        items = world.get("playerItems")
+        return list(items) if isinstance(items, list) else None
+
     async def _handle_life_message(
         self,
         ws: WebSocketClient | None,
@@ -1882,6 +1980,12 @@ class ChatBridge:
                     status=status,
                     reason=result.get("reason"),
                 ))
+            elif msg_type == "life.milestones.get":
+                payload = LifeMilestonesGetPayload.from_mapping(payload_data)
+                save_id = payload.save_id or str(active_save_id or "")
+                await self._send_reply(
+                    ws, self._build_milestones_state(save_id, payload.request_id)
+                )
         except ProtocolError as ex:
             await self._send_life_error(ws, msg_type, data, active_save_id, str(ex))
         except Exception as ex:
@@ -1910,6 +2014,10 @@ class ChatBridge:
                 memory_revision=self._memory_revision(save_id),
                 status="failed", reason=error,
             ))
+        elif msg_type == "life.milestones.get":
+            await self._send_reply(
+                ws, self._build_milestones_state(save_id, request_id, status="failed", error=error)
+            )
         else:
             await self._send_reply(ws, Envelope.create_life_chat_reply(
                 self.instance_id, request_id, save_id, "failed",
@@ -2018,13 +2126,17 @@ class ChatBridge:
         active_task: ActiveChatTask,
         conversation_id: str | None,
         prompt: str,
+        mode: str = "chat",
     ) -> dict[str, Any]:
         """Dispatch one life-chat turn to the provider.
 
         Hard boundaries (contract §2, enforced here not by prompt): never calls
         ``begin_decision``, never injects ``STARDEW_DECISION_TOKEN``, always
         exposes the read-only ``STARDEW_MCP_SURFACE=life`` tool surface, and the
-        scheduler/autonomy state is never touched.
+        scheduler/autonomy state is never touched. ``STARDEW_LIFE_MODE`` is set to
+        the current life mode (chat/plan) so gated tools such as
+        ``manage_milestones`` can tell plan discussions from casual chat, and is
+        restored afterwards.
         """
         if self.backend_name == "kimi" and type(self._execute_agy_turn).__module__.startswith("unittest.mock"):
             return self._execute_agy_turn(active_task, conversation_id, prompt)
@@ -2033,8 +2145,10 @@ class ChatBridge:
         env = os.environ
         previous_token = env.get("STARDEW_DECISION_TOKEN")
         previous_surface = env.get("STARDEW_MCP_SURFACE")
+        previous_mode = env.get("STARDEW_LIFE_MODE")
         env.pop("STARDEW_DECISION_TOKEN", None)
         env["STARDEW_MCP_SURFACE"] = "life"
+        env["STARDEW_LIFE_MODE"] = mode if mode in {"chat", "plan"} else "chat"
         try:
             backend = self._get_backend()
             if isinstance(backend, KimiBackend):
@@ -2049,6 +2163,10 @@ class ChatBridge:
                 env.pop("STARDEW_MCP_SURFACE", None)
             else:
                 env["STARDEW_MCP_SURFACE"] = previous_surface
+            if previous_mode is None:
+                env.pop("STARDEW_LIFE_MODE", None)
+            else:
+                env["STARDEW_LIFE_MODE"] = previous_mode
 
     async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
         """Run one life-chat turn under the shared single-model-turn lock."""
@@ -2073,8 +2191,25 @@ class ChatBridge:
                         self._profile_revision(save_id),
                         self._memory_revision(save_id),
                     )
+                preparation_before = {
+                    n["id"]: dict(n.get("todoIds") or {})
+                    for n in (self._milestone_store.list_nodes(save_id)
+                              if self._milestone_store is not None and save_id else [])
+                }
+                milestone_revision_before = (
+                    self._milestone_store.revision(save_id)
+                    if self._milestone_store is not None and save_id
+                    else 0
+                )
                 system_prompt = LifeChatService.build_system_prompt(
-                    profile, memory_render, self._life_work_summary(save_id, mode), mode=mode
+                    profile,
+                    memory_render,
+                    self._life_work_summary(save_id, mode),
+                    mode=mode,
+                    milestones=self._life_milestone_summary(save_id, mode),
+                    live_context=self._decision_context(save_id, origin="life-plan" if mode == "plan" else "life-chat"),
+                    discussion=(self._life_chat.discussion_context(save_id, mode)
+                                if self._life_chat is not None else None),
                 )
                 prompt = f"{system_prompt}\n\n玩家说：{text}"
                 active_task = ActiveChatTask(
@@ -2093,10 +2228,18 @@ class ChatBridge:
                     profile_revision=self._profile_revision(save_id),
                     memory_revision=self._memory_revision(save_id),
                 ))
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    None, self._execute_life_turn, active_task, existing_cid, prompt
-                )
+                # Life read/plan tools use the same single native MCP socket
+                # as work turns. Park the worker and release its connection;
+                # recover=False keeps a casual conversation from changing work.
+                claimed = await self._claim_execution(save_id, recover=False)
+                try:
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(
+                        None, self._execute_life_turn, active_task, existing_cid, prompt, mode
+                    )
+                finally:
+                    if claimed:
+                        await self._release_execution(save_id)
                 success = bool(result.get("success"))
                 cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat is not None and save_id:
@@ -2106,6 +2249,8 @@ class ChatBridge:
                         self._profile_revision(save_id),
                         self._memory_revision(save_id),
                     )
+                if success and self._life_chat is not None:
+                    self._life_chat.record_discussion(save_id, mode, text, str(result.get("response") or ""))
                 if success:
                     reply = Envelope.create_life_chat_reply(
                         sender_instance_id=self.instance_id,
@@ -2127,6 +2272,34 @@ class ChatBridge:
                         memory_revision=self._memory_revision(save_id),
                         error=str(result.get("error") or "TURN_FAILED"),
                     )
+                if mode != "plan" or not success:
+                    await self._send_reply(ws, reply)
+                else:
+                    await self._send_reply(ws, Envelope.create_life_chat_reply(
+                        self.instance_id, request_id, save_id, status="processing",
+                        reply_text=str(result.get("response") or "")[:2000] or None,
+                        profile_revision=self._profile_revision(save_id),
+                        memory_revision=self._memory_revision(save_id),
+                    ))
+                if (
+                    self._milestone_store is not None
+                    and save_id
+                    and self._chat_ws is not None
+                    and self._milestone_store.revision(save_id) != milestone_revision_before
+                ):
+                    # The turn changed milestone state (e.g. an adopt/revise was
+                    # confirmed): proactively push the fresh node list (§2.2;
+                    # requestId="" marks a server push, not a reply).
+                    await self._send_reply(
+                        self._chat_ws, self._build_milestones_state(save_id, "")
+                    )
+            # After releasing the life lock, consume only newly accepted due
+            # preparation. Never promote casual chat or reopen into authority.
+            if mode == "plan" and success:
+                execution_note = await self._start_accepted_preparation(ws, save_id, preparation_before)
+                if execution_note:
+                    reply.payload["replyText"] = (str(reply.payload.get("replyText") or "")
+                                                  + "\n" + execution_note)[:2000]
                 await self._send_reply(ws, reply)
         except Exception as ex:
             logger.error("Life chat turn [%s] failed: %s", request_id, ex, exc_info=True)
@@ -2139,6 +2312,57 @@ class ChatBridge:
                 memory_revision=self._memory_revision(save_id),
                 error=f"LIFE_TURN_ERROR: {ex}",
             ))
+
+    async def _start_accepted_preparation(
+        self, ws: WebSocketClient | None, save_id: str, before: dict[str, dict[str, str]]
+    ) -> str | None:
+        """One normal work turn for newly authorized, currently due preparation."""
+        if self._milestone_store is None or self._work_store is None:
+            return
+        new_todo_ids: set[str] = set()
+        for node in self._milestone_store.list_nodes(save_id):
+            todos = node.get("todoIds") or {}
+            if node.get("status") == "adopted" and todos != before.get(node["id"], {}):
+                new_todo_ids.update(todos.values())
+        if not new_todo_ids:
+            return
+        state = self._work_store.state(save_id)
+        autonomy = self._autonomy.state(save_id) if self._autonomy is not None else None
+        if (state.paused or (autonomy is not None and autonomy.paused)
+                or self._active_task is not None or self._busy_lock.locked()
+                or save_id in self._command_chains
+                or (state.decision.get("selected") and not state.decision.get("finished"))):
+            return "准备安排已保存。我会保留这些后续安排；当前暂停或已有工作时，不抢着另开一件事。"
+        snapshot, game_date = self._plan_snapshot_state()
+        due = [t for t in self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date=game_date)
+               if t["id"] in new_todo_ids]
+        if not due:
+            return "安排已保存，眼前还没到这项准备的时间。"
+        if autonomy is not None and autonomy.enabled:
+            self._autonomy.request_job_decision(save_id)
+            return "已把眼前可做的准备交给日常工作安排；完成后会按实际结果告诉你。"
+        prompt = (
+            "玩家刚在商量计划中明确认可了以下准备安排，现交给你执行一个当前可做的短作业。"
+            "这是本次具体安排的执行授权，不开启全局自由模式；不要再问预算/数量或重复确认。"
+            "只处理以下范围，先看真实状态，遵守现有资金/体力/暂停保护，不取消其他工作。"
+            "从中选择一个有用短作业，用现有submit_plan和执行器完成；没有可做工作就自然说明待命。"
+            "保存不等于完成，结果只依据原生终态；用自然中文反馈，不提goal/todo或内部参数。"
+            + json.dumps([{"intent": t["intent"], "goalId": t.get("goal_id")} for t in due], ensure_ascii=False)
+        )
+        # Reuse the existing command path; its ownership and busy checks still
+        # apply. Await it so the turn remains tracked by the life queue task.
+        previous_job = state.last_job
+        await self.handle_chat_submit(ws, f"preparation-{uuid.uuid4().hex}", prompt, save_id)
+        after = self._work_store.state(save_id)
+        if after.last_job and after.last_job != previous_job:
+            outcome = after.last_job.get("status") or after.last_job.get("outcome")
+            if outcome == "completed":
+                return "刚才接手的这一小项已经完成，后续准备仍按约定保留。"
+            if outcome in {"partial", "failed", "cancelled", "unknown", "rejected"}:
+                return "安排已经保存，但刚才这项工作没有确认全部完成；我会保留实际进度，不把它算作做完。"
+        if after.decision.get("selected") and not after.decision.get("finished"):
+            return "已经接下这一项准备，正在处理；完成情况以实际工作结果为准。"
+        return "准备安排已保存，这次还没有确认开始执行，我先保留安排待命。"
 
     # -------------------------------------------------- care hooks (§1.7/§2)
     async def _snapshot_care_hooks(
@@ -2593,8 +2817,52 @@ class ChatBridge:
         # save or a repeated day must not churn the provider session.
         if settlement and settlement.get("settled"):
             self._rotate_provider_session(save_id, reason="game-day-advanced")
+        if self._milestone_store is not None:
+            await self._settle_milestone_nodes(
+                save_id, world, allow_reminders=bool(settlement and settlement.get("settled"))
+            )
         if self._autonomy is not None and save_id:
             self._autonomy.reset_breaker(save_id)
+
+    async def _settle_milestone_nodes(
+        self, save_id: str, world: dict[str, Any], *, allow_reminders: bool = True
+    ) -> None:
+        """Verify milestone nodes on the settled day and fire reminder cares (§2/§3.4).
+
+        Completion is decided here only, from verifiable state (snapshot
+        ``world.playerItems``); suggestion/adoption never completes a node. Nodes
+        0..2 days from their target produce reminder candidates that go through
+        the standard care gate (quiet off, daily budget, 2-game-hour gap, dedup).
+        """
+        if self._milestone_store is None:
+            return
+        try:
+            changed, candidates = await asyncio.to_thread(
+                self._milestone_store.on_day_settled,
+                save_id,
+                year=world.get("year"),
+                season=world.get("season"),
+                day=world.get("dayOfMonth"),
+                player_items=self._latest_player_items(),
+            )
+        except Exception:
+            logger.warning("Milestone day settle failed for %s", save_id, exc_info=True)
+            return
+        if changed:
+            logger.info("Milestone nodes updated for %s on %s", save_id, self._current_game_day_key)
+            if self._chat_ws is not None:
+                await self._send_reply(self._chat_ws, self._build_milestones_state(save_id, ""))
+        if not allow_reminders:
+            return
+        for candidate in candidates:
+            gap = candidate.get("firstGap") or "查看准备事项"
+            fact = (
+                f'节点「{candidate.get("title")}」目标{candidate.get("targetDate")}'
+                f'（还有{candidate.get("daysUntil")}天），首个准备缺口：{gap}'
+            )
+            await self._maybe_fire_care(
+                save_id, "milestone", str(candidate.get("id") or ""), world, fact=fact
+            )
 
     async def _publish_job_progress(self, execution: StepExecution) -> None:
         binding = getattr(self, "_job_reply_binding", None)
@@ -3636,15 +3904,15 @@ class ChatBridge:
         """Executes agy CLI command synchronously in background thread with cancellation support."""
         cmd = [self.agy_cmd]
 
-        # DO NOT re-supply --model when resuming an existing conversation
+        # Keep the configured provider model on resume as well: agy otherwise
+        # may route a saved conversation through its unrelated default model.
         if conversation_id:
             cmd.extend(["--conversation", conversation_id])
-        else:
-            if self.model:
-                cmd.extend(["--model", self.model])
+        if self.model:
+            cmd.extend(["--model", self.model])
 
-        # Support --effort
-        if self.effort:
+        # Explicit provider default supports models whose CLI rejects --effort.
+        if self.effort and self.effort != "default":
             cmd.extend(["--effort", self.effort])
 
         cmd.extend([
@@ -3956,8 +4224,8 @@ def main(argv: list[str] | None = None) -> None:
         "--effort",
         type=str,
         default="medium",
-        choices=["low", "medium", "high"],
-        help="Reasoning effort level for agy CLI session (default: medium)",
+        choices=["default", "low", "medium", "high"],
+        help="Reasoning effort for agy (default: medium); use default to omit the CLI option",
     )
     parser.add_argument(
         "--agy-cmd",

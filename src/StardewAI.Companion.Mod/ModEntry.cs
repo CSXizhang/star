@@ -54,6 +54,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     // -----------------------------------------------------------------------
 
     private readonly LifeMenuUiState _lifeMenuUiState = new();
+    private CompanionDialogueController? _companionDialogue;
     private readonly CareHintController _careHintController = new();
     private readonly CompanionInteractionDetector _interactionDetector = new();
     private bool _lifeSaveProfileFetched;   // true once life.profile.get was sent for this save
@@ -301,6 +302,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _transportServer.OnLifeProfileStateReceived += HandleLifeProfileStateReceived;
             _transportServer.OnLifeMemoryStateReceived += HandleLifeMemoryStateReceived;
             _transportServer.OnLifeCareReceived += HandleLifeCareReceived;
+            _transportServer.OnLifeMilestonesStateReceived += HandleLifeMilestonesStateReceived;
             _transportServer.Start();
 
             // Reset life-session state for the new save
@@ -308,6 +310,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _lifeOnboardingHudShown = false;
             _lifeStartSequence.Abort();
             _lifeMenuUiState.Reset();
+            _companionDialogue?.Reset();
             _careHintController.OnDayStarted(GetCurrentGameDate());
 
             // Persist companion state on every task completion, not only at game-save time:
@@ -330,6 +333,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
         while (_mainThreadActions.TryDequeue(out var action)) action();
+        if (Context.IsWorldReady) _companionDialogue?.Update();
         if (_watchedChatRequest != _chatUiState.CommandId)
         {
             _watchedChatRequest = _chatUiState.CommandId;
@@ -488,6 +492,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
             // Life-system reset
             _lifeMenuUiState.Reset();
+            _companionDialogue?.Reset();
             _lifeSaveProfileFetched = false;
             _lifeOnboardingHudShown = false;
             _lifeStartSequence.Abort();
@@ -1259,6 +1264,21 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     /// </summary>
     private void OpenLifeMenu()
     {
+        _companionDialogue ??= new CompanionDialogueController(
+            _lifeMenuUiState, DispatchLifeChat,
+            () => { DispatchLifeProfileRefresh(); DispatchLifeMilestonesRefresh(); },
+            () =>
+            {
+                OpenSetupMenu();
+                if (Game1.activeClickableMenu != null)
+                    Game1.activeClickableMenu.exitFunction = () => _companionDialogue?.ReturnToConversation();
+            },
+            OpenCompanionMemory, () => _actor?.GameFarmer);
+        _companionDialogue.Open();
+    }
+
+    private void OpenCompanionMemory()
+    {
         if (Game1.activeClickableMenu is CompanionLifeMenu) return;
 
         Game1.activeClickableMenu = new CompanionLifeMenu(
@@ -1288,9 +1308,15 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             onOpenSetup: OpenSetupMenu,
             onRefreshWork: DispatchLifeProfileRefresh,
             onRefreshMemory: DispatchMemoryListRefresh,
+            onRefreshMilestones: DispatchLifeMilestonesRefresh,
             onMemoryEdit: (op, id, kind, text) => DispatchMemoryEdit(op, id, kind, text));
 
-        Monitor.Log("Companion life menu opened.", LogLevel.Info);
+        if (Game1.activeClickableMenu is CompanionLifeMenu memoryMenu)
+        {
+            memoryMenu.OpenMemoryOnly();
+            memoryMenu.exitFunction = () => _companionDialogue?.ReturnToConversation();
+        }
+        Monitor.Log("Companion memory panel opened.", LogLevel.Info);
     }
 
     /// <summary>
@@ -1324,6 +1350,18 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         {
             try { await _transportServer.SendLifeProfileGetAsync(new LifeProfileGetPayload(reqId, saveId)).ConfigureAwait(false); }
             catch (Exception ex) { Monitor.Log($"life.profile.get refresh failed: {ex.Message}", LogLevel.Warn); }
+        });
+    }
+
+    private void DispatchLifeMilestonesRefresh()
+    {
+        if (_transportServer == null || !_transportServer.IsChatConnected) return;
+        string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        string reqId = Guid.NewGuid().ToString("N")[..8];
+        _ = Task.Run(async () =>
+        {
+            try { await _transportServer.SendLifeMilestonesGetAsync(new LifeMilestonesGetPayload(reqId, saveId)).ConfigureAwait(false); }
+            catch (Exception ex) { Monitor.Log($"life.milestones.get send failed: {ex.Message}", LogLevel.Warn); }
         });
     }
 
@@ -1542,7 +1580,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     {
         _mainThreadActions.Enqueue(() =>
         {
-            _lifeMenuUiState.ApplyChatReply(
+            bool accepted = _lifeMenuUiState.ApplyChatReply(
                 reply.RequestId,
                 reply.Status,
                 reply.ReplyText,
@@ -1550,6 +1588,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 reply.Error,
                 reply.ProfileRevision,
                 reply.MemoryRevision);
+            if (accepted)
+                _companionDialogue?.Receive(reply.RequestId, reply.Status, reply.ReplyText);
 
             Monitor.Log($"life.chat.reply: status={reply.Status} reqId={reply.RequestId}", LogLevel.Debug);
         });
@@ -1642,6 +1682,42 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     state.Status == "confirmed" ? HUDMessage.newQuest_type : HUDMessage.error_type));
 
             Monitor.Log($"life.memory.state received: revision={state.MemoryRevision} count={state.Entries.Count}", LogLevel.Debug);
+        });
+    }
+
+    private void HandleLifeMilestonesStateReceived(LifeMilestonesStatePayload state)
+    {
+        _mainThreadActions.Enqueue(() =>
+        {
+            string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+            if (!string.Equals(state.SaveId, saveId, StringComparison.Ordinal)) return;
+
+            if (!string.Equals(state.Status, "ok", StringComparison.Ordinal))
+            {
+                // Keep the previous snapshot; a failed refresh must not wipe known nodes.
+                Monitor.Log($"life.milestones.state failed: {state.Error}", LogLevel.Debug);
+                return;
+            }
+
+            _lifeMenuUiState.ApplyMilestoneState((state.Nodes ?? new List<MilestoneNodeDto>())
+                .Select(n => new Menus.MilestoneNodeSnapshot(
+                    n.Id,
+                    n.Title,
+                    n.Status,
+                    n.Verification,
+                    n.TargetDate,
+                    n.DaysUntil,
+                    n.Summary,
+                    n.SourceUrl,
+                    (n.PrepItems ?? new List<MilestonePrepItemDto>())
+                        .Select(p => new Menus.MilestonePrepItemSnapshot(p.Key, p.Label, p.Support, p.Status, p.Note))
+                        .ToArray(),
+                    n.ReservedFunds,
+                    n.PlannedCount,
+                    n.TermsNote,
+                    n.UpdatedAt)));
+
+            Monitor.Log($"life.milestones.state received: gameDate={state.GameDate} count={state.Nodes?.Count ?? 0} proactive={string.IsNullOrEmpty(state.RequestId)}", LogLevel.Debug);
         });
     }
 

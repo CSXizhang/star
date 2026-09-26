@@ -28,6 +28,15 @@ public sealed class CompanionLifeMenu : IClickableMenu
     private enum Panel { Main, Chat, Memory, Care }
 
     private Panel _activePanel = Panel.Main;
+    private bool _memoryOnly;
+
+    public void OpenMemoryOnly()
+    {
+        _memoryOnly = true;
+        _activePanel = Panel.Memory;
+        _onRefreshMemory();
+    }
+
 
     // -----------------------------------------------------------------------
     // Callbacks
@@ -47,6 +56,9 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     /// <summary>Requests a fresh memory list (§1.5 life.memory.list) when the memory panel opens.</summary>
     private readonly Action _onRefreshMemory;
+
+    /// <summary>Requests a fresh milestone snapshot (§2.1 life.milestones.get) when the plan panel opens.</summary>
+    private readonly Action _onRefreshMilestones;
 
     /// <summary>Sends a memory edit request.</summary>
     private readonly Func<string, string?, string?, string?, bool> _onMemoryEdit;  // op, id, kind, text
@@ -128,6 +140,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
         Action onOpenSetup,
         Action onRefreshWork,
         Action onRefreshMemory,
+        Action onRefreshMilestones,
         Func<string, string?, string?, string?, bool> onMemoryEdit)
         : base(
             Math.Max(0, (Game1.uiViewport.Width - 640) / 2),
@@ -141,6 +154,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
         _onOpenSetup = onOpenSetup ?? throw new ArgumentNullException(nameof(onOpenSetup));
         _onRefreshWork = onRefreshWork ?? throw new ArgumentNullException(nameof(onRefreshWork));
         _onRefreshMemory = onRefreshMemory ?? throw new ArgumentNullException(nameof(onRefreshMemory));
+        _onRefreshMilestones = onRefreshMilestones ?? throw new ArgumentNullException(nameof(onRefreshMilestones));
         _onMemoryEdit = onMemoryEdit ?? throw new ArgumentNullException(nameof(onMemoryEdit));
 
         BuildLayout();
@@ -247,7 +261,8 @@ public sealed class CompanionLifeMenu : IClickableMenu
                         return;
                     }
                 }
-                _activePanel = Panel.Main;
+                if (_memoryOnly) exitThisMenu(playSound: false);
+                else _activePanel = Panel.Main;
                 return;
             }
             exitThisMenu(playSound: false);
@@ -317,6 +332,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
             _chatMode = "plan";
             _activePanel = Panel.Chat;
             _onRefreshWork();
+            _onRefreshMilestones();
             ActivateChatInput();
             return;
         }
@@ -368,7 +384,11 @@ public sealed class CompanionLifeMenu : IClickableMenu
         if (_chatModeToggleRect.Contains(x, y))
         {
             _chatMode = _chatMode == "chat" ? "plan" : "chat";
-            if (_chatMode == "plan") _onRefreshWork();
+            if (_chatMode == "plan")
+            {
+                _onRefreshWork();
+                _onRefreshMilestones();
+            }
             return;
         }
         if (_chatSendRect.Contains(x, y)) { SubmitChat(); return; }
@@ -407,8 +427,77 @@ public sealed class CompanionLifeMenu : IClickableMenu
     private int MaxChatScroll()
     {
         int total = _chatHistory.Sum(m => ChatEntryHeight(m.Speaker, m.Text));
-        int height = _chatViewport.Height - (_chatMode == "plan" ? 64 : 0);
+        int height = _chatViewport.Height - PlanInfoBandHeight();
         return Math.Max(0, total - height);
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan-mode milestone info band (§2)
+    // -----------------------------------------------------------------------
+
+    /// <summary>Vertical space the fixed work-projection lines occupy at the top of the plan band.</summary>
+    private const int PlanInfoLinesHeight = 64;
+
+    /// <summary>At most this many milestone nodes are rendered in the plan info band.</summary>
+    private const int MaxVisibleMilestoneNodes = 3;
+
+    /// <summary>Total height of the plan-mode info band (work lines + milestone nodes).</summary>
+    private int PlanInfoBandHeight()
+    {
+        if (_chatMode != "plan") return 0;
+        int nodesHeight = 0;
+        int shown = Math.Min(_state.MilestoneNodes.Count, MaxVisibleMilestoneNodes);
+        for (int i = 0; i < shown; i++)
+            nodesHeight += MilestoneNodeHeight(_state.MilestoneNodes[i]);
+        if (_state.MilestoneNodes.Count > 0)
+            nodesHeight += 4 + (_state.MilestoneNodes.Count > MaxVisibleMilestoneNodes ? 20 : 0);
+        return PlanInfoLinesHeight + nodesHeight;
+    }
+
+    private static bool HasPendingGap(MilestoneNodeSnapshot node) =>
+        node.PrepItems.Any(p => p.Status is "pending" or "unknown");
+
+    private static int MilestoneNodeHeight(MilestoneNodeSnapshot node) => HasPendingGap(node) ? 40 : 20;
+
+    private static string MilestoneDaysLabel(int? daysUntil) => daysUntil switch
+    {
+        null => string.Empty,
+        0 => "就是今天",
+        > 0 => $"还有{daysUntil}天",
+        _ => "已过期"
+    };
+
+    /// <summary>Renders up to <see cref="MaxVisibleMilestoneNodes"/> milestone nodes, two lines each.</summary>
+    private void DrawMilestoneInfoBand(SpriteBatch b, int startY)
+    {
+        float ny = startY;
+        int shown = Math.Min(_state.MilestoneNodes.Count, MaxVisibleMilestoneNodes);
+        for (int i = 0; i < shown; i++)
+        {
+            var node = _state.MilestoneNodes[i];
+            string line1 = $"[{LifeMenuUiState.MilestoneStatusLabel(node.Status, node.Verification)}] {node.Title}";
+            if (!string.IsNullOrWhiteSpace(node.TargetDate))
+                line1 += $" · {FormatGameDate(node.TargetDate)}";
+            string days = MilestoneDaysLabel(node.DaysUntil);
+            if (!string.IsNullOrEmpty(days))
+                line1 += $" · {days}";
+            b.DrawString(Game1.smallFont, ClipToWidth(Game1.smallFont, line1, _chatViewport.Width - 8),
+                new Vector2(_chatViewport.X + 4, ny), Color.DarkSlateGray);
+
+            var gap = node.PrepItems.FirstOrDefault(p => p.Status is "pending" or "unknown");
+            if (gap != null)
+            {
+                string line2 = $"缺口：{gap.Label}";
+                b.DrawString(Game1.smallFont, ClipToWidth(Game1.smallFont, line2, _chatViewport.Width - 8),
+                    new Vector2(_chatViewport.X + 4, ny + 18), Color.DimGray);
+            }
+            ny += MilestoneNodeHeight(node);
+        }
+        if (_state.MilestoneNodes.Count > MaxVisibleMilestoneNodes)
+        {
+            b.DrawString(Game1.smallFont, $"共{_state.MilestoneNodes.Count}条，可在对话中详谈",
+                new Vector2(_chatViewport.X + 4, ny + 2), Color.DimGray);
+        }
     }
 
     private string CareEntryText(PendingCareHint hint)
@@ -418,6 +507,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
             "morning" => "早晨",
             "evening" => "傍晚",
             "work-done" => "工作后",
+            "milestone" => "计划提醒",
             _ => "消息"
         };
         return $"[{FormatGameDate(hint.GameDate)} · {kind}] {hint.Text}";
@@ -441,7 +531,12 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     private void HandleMemoryClick(int x, int y)
     {
-        if (_memBackRect.Contains(x, y)) { _activePanel = Panel.Main; return; }
+        if (_memBackRect.Contains(x, y))
+        {
+            if (_memoryOnly) exitThisMenu(playSound: false);
+            else _activePanel = Panel.Main;
+            return;
+        }
 
         // Wait for the persisted edit response before accepting another change.
         if (_state.PendingMemoryEditRequestId != null) return;
@@ -668,10 +763,13 @@ public sealed class CompanionLifeMenu : IClickableMenu
             for (int i = 0; i < lines.Length; i++)
                 b.DrawString(Game1.smallFont, ClipToWidth(Game1.smallFont, lines[i], _chatViewport.Width - 8),
                     new Vector2(_chatViewport.X + 4, _chatViewport.Y + i * 20), Color.DarkSlateGray);
+
+            DrawMilestoneInfoBand(b, _chatViewport.Y + PlanInfoLinesHeight);
         }
 
+        int infoBandHeight = PlanInfoBandHeight();
         Rectangle historyViewport = _chatMode == "plan"
-            ? new Rectangle(_chatViewport.X, _chatViewport.Y + 64, _chatViewport.Width, _chatViewport.Height - 64)
+            ? new Rectangle(_chatViewport.X, _chatViewport.Y + infoBandHeight, _chatViewport.Width, _chatViewport.Height - infoBandHeight)
             : _chatViewport;
         // Chat history
         float cy = historyViewport.Y - _scrollBack;

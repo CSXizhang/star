@@ -211,7 +211,7 @@ def test_execute_agy_turn_empty_response_not_falsified() -> None:
 
 
 def test_execute_agy_turn_effort_and_model_rules() -> None:
-    """On resume, DO NOT re-supply --model; pass --effort medium."""
+    """On resume, retain the configured model and effort."""
     bridge = ChatBridge(model="gemini-3.8-flash", effort="medium")
 
     with patch("subprocess.Popen") as mock_popen:
@@ -230,7 +230,7 @@ def test_execute_agy_turn_effort_and_model_rules() -> None:
         assert "medium" in cmd_new
         assert "--conversation" not in cmd_new
 
-        # 2. Resumed conversation: --conversation AND --effort present, --model MUST NOT be present
+        # 2. Resumed conversation retains the explicitly configured model.
         task2 = ActiveChatTask(request_id="r2", save_id="s1")
         bridge._execute_agy_turn(task2, conversation_id="existing-cid-999", prompt="test prompt")
         cmd_resume = mock_popen.call_args[0][0]
@@ -238,7 +238,8 @@ def test_execute_agy_turn_effort_and_model_rules() -> None:
         assert "existing-cid-999" in cmd_resume
         assert "--effort" in cmd_resume
         assert "medium" in cmd_resume
-        assert "--model" not in cmd_resume
+        assert "--model" in cmd_resume
+        assert "gemini-3.8-flash" in cmd_resume
 
 
 def test_execute_agy_turn_quota_exhaustion() -> None:
@@ -1482,3 +1483,20 @@ def test_chat_bridge_uncaught_exception_flushed_to_file(
     finally:
         remove_chat_bridge_file_logging()
 
+
+
+@pytest.mark.parametrize("conversation_id", [None, "existing-session"])
+def test_provider_default_effort_omits_unsupported_cli_option(conversation_id):
+    bridge = ChatBridge(model="claude-sonnet-4-6", effort="default")
+    with patch("subprocess.Popen") as popen:
+        process = MagicMock()
+        process.returncode = 0
+        process.communicate.return_value = (json.dumps({"status": "SUCCESS", "response": "ok"}), "")
+        popen.return_value = process
+        result = bridge._execute_agy_turn(
+            ActiveChatTask(request_id="effort-default", save_id="s1"),
+            conversation_id=conversation_id, prompt="hello",
+        )
+        assert result["success"]
+        assert "--effort" not in popen.call_args[0][0]
+        assert ("--conversation" in popen.call_args[0][0]) == bool(conversation_id)

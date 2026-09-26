@@ -1,7 +1,7 @@
-"""Offline cross-language fixture: contract §1 life.* wire messages.
+"""Offline cross-language fixture: contract §1/§2 life.* wire messages.
 
-Real ChatBridge stores (work/autonomy/profile/memory) + protocol.py Envelope
-factories produce the example JSON consumed by LifeWireContractTests.
+Real ChatBridge stores (work/autonomy/profile/memory/milestones) + protocol.py
+Envelope factories produce the example JSON consumed by LifeWireContractTests.
 No sockets, provider, game, or native execution. Writes only the supplied dir.
 """
 import json
@@ -10,17 +10,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from stardew_ai_runtime.chat_bridge import ChatBridge
+from stardew_ai_runtime.companion_milestones import wire_node
 from stardew_ai_runtime.protocol import (
     Envelope,
     LifeChatSubmitPayload,
     LifeMemoryEditPayload,
     LifeMemoryListPayload,
+    LifeMilestonesGetPayload,
     LifeProfileGetPayload,
     LifeProfileSetPayload,
+    MilestoneNode,
+    MilestonePrepItem,
 )
 
 SAVE = "wire-save"
 REQ = "wire-req-1"
+LMG_REQ = "lmg-wire-1"
 
 
 def main() -> None:
@@ -193,6 +198,121 @@ def main() -> None:
     dump("life-care.json", Envelope.create_life_care(
         "wire-py", SAVE, "work-done", "work-done:1:spring:2:cmd-42",
         "辛苦啦，喝口水吧", "1:spring:2",
+    ))
+
+    # ------------------------------------------------------------------
+    # §2.1 life.milestones.get (C#→Py, lmg- request prefix)
+    # ------------------------------------------------------------------
+    dump("life-milestones-get.json", cs_to_py(
+        "life.milestones.get", LifeMilestonesGetPayload(LMG_REQ, SAVE).to_mapping(),
+    ))
+
+    # ------------------------------------------------------------------
+    # §2.2 life.milestones.state (Py→C#), built from the real milestone
+    # store: the player adopted the Egg Festival strawberry node in plan
+    # mode, so the state carries the real goal/todo wiring result.
+    # ------------------------------------------------------------------
+    milestone_store = bridge._milestone_store
+    milestone_store.adopt(
+        SAVE,
+        "spring-egg-festival-strawberry:y1",
+        reserved_funds=1000,
+        planned_count=10,
+        terms_note="预留1000g仅用于蛋蛋节当天购买草莓种子",
+        work_store=bridge._work_store,
+        game_date={"year": 1, "season": "spring", "day": 11},
+    )
+    merged = milestone_store.merged_nodes(
+        SAVE, {"year": 1, "season": "spring", "day": 11}, "earn"
+    )
+    wire_nodes = [MilestoneNode.from_mapping(wire_node(n)) for n in merged]
+    completed_node = MilestoneNode(
+        id="spring-crops-bundle-retention:y1",
+        title="春季作物收集包保留",
+        status="completed",
+        verification="verified",
+        target_date="1:spring:28",
+        days_until=0,
+        summary="春季作物收集包（储藏室）：防风草、青豆、花椰菜、土豆各1；献祭实际进度读不到，属未知。",
+        source_url="https://stardewvalleywiki.com/Bundles",
+        prep_items=(
+            MilestonePrepItem(
+                key="retain-parsnip", label="保留防风草×1（献祭用，先别卖掉）",
+                support="manual", status="done", note="背包中已确认",
+            ),
+        ),
+        reserved_funds=0,
+        planned_count=4,
+        terms_note="季末核对",
+        # Non-integral on purpose: whole-number floats re-serialize differently
+        # across Python json (1727340000.0) and System.Text.Json (1727340000),
+        # which would break the byte-stable cross-language lock.
+        updated_at=1727340000.5,
+    )
+    dump("life-milestones-state.json", Envelope.create_life_milestones_state(
+        "wire-py", LMG_REQ, SAVE, status="ok", game_date="1:spring:11",
+        nodes=wire_nodes + [completed_node],
+    ))
+    # Failure surface: status=failed carries error and an empty node list.
+    dump("life-milestones-state-failed.json", Envelope.create_life_milestones_state(
+        "wire-py", LMG_REQ, SAVE, status="failed", error="MILESTONE_STORE_UNAVAILABLE",
+    ))
+    # Null-omitted variant / proactive push example: requestId="", no gameDate,
+    # and a bare suggested node carrying only the required field set.
+    minimal_node = MilestoneNode(
+        id="spring-egg-festival-strawberry:y1",
+        title="蛋蛋节买草莓种子",
+        status="suggested",
+        target_date="1:spring:13",
+        summary="春13蛋蛋节摊位100g/个；8天成熟后每4天结果",
+        updated_at=1727340000.5,
+    )
+    dump("life-milestones-state-minimal.json", Envelope.create_life_milestones_state(
+        "wire-py", "", SAVE, status="ok", nodes=[minimal_node],
+    ))
+    dump("life-care-milestone.json", Envelope.create_life_care(
+        "wire-py", SAVE, "milestone",
+        "milestone:1:spring:12:spring-egg-festival-strawberry:y1",
+        "明天就是蛋蛋节啦，记得预留好买草莓种子的钱，到广场摊位亲自买哦", "1:spring:12",
+    ))
+
+    # ------------------------------------------------------------------
+    # §2.4 world.snapshot (C#→Py) world block with the playerItems
+    # aggregate the runtime verifies milestones against. Authored here on
+    # the Python side so the C# LockPayload pins the same field surface.
+    # ------------------------------------------------------------------
+    dump("world-snapshot-player-items.json", cs_to_py(
+        "world.snapshot",
+        {
+            "capturedRevision": 7,
+            "companion": {
+                "locationId": "Farm",
+                "tileX": 64,
+                "tileY": 10,
+                "facingDirection": 2,
+                "stamina": 270,
+                "maxStamina": 270,
+                "waterCanLevel": 40,
+                "maxWaterCanLevel": 40,
+                "hasWateringCan": True,
+                "activity": "idle",
+            },
+            "world": {
+                "currentLocation": "Farm",
+                "timeOfDay": 600,
+                "season": "spring",
+                "dayOfMonth": 13,
+                "isRaining": False,
+                "year": 1,
+                "playerMoney": 500,
+                "playerStamina": 180.5,
+                "playerMaxStamina": 270,
+                "playerItems": [
+                    {"name": "Strawberry Seeds", "quantity": 10},
+                    {"name": "Parsnip", "quantity": 3},
+                ],
+            },
+        },
     ))
 
 

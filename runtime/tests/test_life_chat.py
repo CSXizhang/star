@@ -80,6 +80,45 @@ def test_life_system_prompt_contains_profile_memory_and_work() -> None:
     assert "不要代为派发" in plan_prompt
 
 
+def test_plan_prompt_injects_milestone_snapshot_and_rules() -> None:
+    profile = {"companionName": "小星", "personality": "gentle", "playStyle": "earn",
+               "careFrequency": "moderate", "onboarded": True, "skipped": False}
+    milestones = [
+        {"id": "spring-egg-festival-strawberry:y1", "title": "蛋蛋节买草莓种子",
+         "status": "suggested", "targetDate": "1:spring:13", "daysUntil": 2,
+         "reservedFunds": None, "pendingGap": "预留购买草莓种子的资金"},
+    ]
+    prompt = LifeChatService.build_system_prompt(
+        profile, None, {"mode": "free"}, mode="plan", milestones=milestones
+    )
+    assert "节点快照" in prompt
+    assert "spring-egg-festival-strawberry:y1" in prompt
+    assert "manage_milestones" in prompt
+    assert "未确认前不得声称" in prompt
+    assert "不会冻结资金" in prompt
+    assert "query_wiki" in prompt
+    # Casual chat must redirect plan edits to the plan mode instead.
+    chat_prompt = LifeChatService.build_system_prompt(profile, None, None, mode="chat")
+    assert "商量计划" in chat_prompt
+    assert "节点快照" not in chat_prompt
+
+
+def test_milestone_care_prompt_mentions_node_details() -> None:
+    profile = {"companionName": "阿星", "personality": "gentle", "playStyle": "earn",
+               "careFrequency": "chatty", "onboarded": True, "skipped": False}
+    prompt = LifeChatService.build_care_prompt(
+        profile,
+        None,
+        "milestone",
+        "1:spring:12",
+        None,
+        "节点「蛋蛋节买草莓种子」目标1:spring:13（还有1天），首个准备缺口：预留资金",
+    )
+    assert "计划提醒" in prompt
+    assert "蛋蛋节买草莓种子" in prompt
+    assert "刚刚完成的事情" not in prompt
+
+
 # ---------------------------------------------------------------- mcp life surface
 def test_mcp_life_surface_is_readonly() -> None:
     async def run() -> None:
@@ -95,7 +134,7 @@ def test_mcp_life_surface_is_readonly() -> None:
             assert forbidden not in tools, forbidden
         for expected in (
             "get_work_overview", "get_status", "observe_machines",
-            "query_farm_work", "query_wiki",
+            "query_farm_work", "query_wiki", "manage_milestones",
         ):
             assert expected in tools, expected
 
@@ -197,7 +236,7 @@ def test_life_session_rotates_when_memory_changes(tmp_path) -> None:
         ws = AsyncMock()
         seen_cids: list[object] = []
 
-        def _fake_turn(task, cid, prompt):
+        def _fake_turn(task, cid, prompt, mode="chat"):
             seen_cids.append(cid)
             return {"success": True, "response": "好", "conversation_id": f"cid-{len(seen_cids)}"}
 
@@ -662,4 +701,282 @@ def test_decision_context_carries_companion_profile(tmp_path) -> None:
             "playStyle": "workhorse", "careFrequency": "moderate",
         }
 
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- milestones (§2)
+def test_life_turn_injects_life_mode_env_and_restores(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        bridge = _bridge(tmp_path)
+        captured: dict[str, object] = {}
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
+
+        class _FakeBackend:
+            def run(self, active_task, session_id, prompt):
+                captured["mode"] = os.environ.get("STARDEW_LIFE_MODE")
+                captured["surface"] = os.environ.get("STARDEW_MCP_SURFACE")
+                return {"success": True, "response": "好", "conversation_id": None}
+
+        monkeypatch.setattr(bridge, "_get_backend", lambda: _FakeBackend())
+        with patch("stardew_ai_runtime.compatibility.assert_native_compatible"):
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                bridge._execute_life_turn,
+                ActiveChatTask(request_id="life-2", save_id="Save1"),
+                None,
+                "prompt",
+                "plan",
+            )
+        assert result["success"] is True
+        assert captured["mode"] == "plan"
+        assert captured["surface"] == "life"
+        # The surrounding chat-mode env value is restored after the life turn.
+        assert os.environ.get("STARDEW_LIFE_MODE") == "chat"
+
+    asyncio.run(run())
+
+
+def test_life_milestones_get_returns_suggestions(tmp_path) -> None:
+    async def run() -> None:
+        bridge = _bridge(tmp_path)
+        bridge._profile_store.set(
+            "Save1", {"onboarded": True, "playStyle": "earn"}, expected_revision=0
+        )
+        bridge._latest_snapshot_payload = {
+            "world": {"year": 1, "season": "spring", "dayOfMonth": 11, "timeOfDay": 1200}
+        }
+        ws = AsyncMock()
+        await bridge._handle_life_message(ws, "life.milestones.get", {
+            "payload": {"requestId": "lmg-1", "saveId": "Save1"},
+        }, "Save1")
+        state = _sent_payloads(ws)[-1]
+        assert state["messageType"] == "life.milestones.state"
+        payload = state["payload"]
+        assert payload["requestId"] == "lmg-1"
+        assert payload["status"] == "ok"
+        assert payload["gameDate"] == "1:spring:11"
+        assert payload["nodes"][0]["id"] == "spring-egg-festival-strawberry:y1"
+        assert payload["nodes"][0]["status"] == "suggested"
+        assert payload["nodes"][0]["daysUntil"] == 2
+        assert payload["nodes"][0]["sourceUrl"] == "https://stardewvalleywiki.com/Egg_Festival"
+
+    asyncio.run(run())
+
+
+def test_life_milestones_get_bad_payload_gets_failed_state(tmp_path) -> None:
+    async def run() -> None:
+        bridge = _bridge(tmp_path)
+        ws = AsyncMock()
+        await bridge._handle_life_message(ws, "life.milestones.get", {
+            "payload": {"requestId": "", "saveId": "Save1"},
+        }, "Save1")
+        state = _sent_payloads(ws)[-1]
+        assert state["messageType"] == "life.milestones.state"
+        assert state["payload"]["status"] == "failed"
+        assert "error" in state["payload"]
+
+    asyncio.run(run())
+
+
+def test_plan_turn_pushes_milestones_state_after_revision_change(tmp_path) -> None:
+    async def run() -> None:
+        bridge = _bridge(tmp_path)
+        bridge._profile_store.set(
+            "Save1", {"onboarded": True, "playStyle": "earn"}, expected_revision=0
+        )
+        bridge._latest_snapshot_payload = {
+            "world": {"year": 1, "season": "spring", "dayOfMonth": 11, "timeOfDay": 1200}
+        }
+        chat_ws = AsyncMock()
+        bridge._chat_ws = chat_ws
+
+        def _fake_turn(task, cid, prompt, mode="chat"):
+            # The model confirmed an adopt during the plan turn.
+            bridge._milestone_store.adopt(
+                "Save1", "spring-egg-festival-strawberry:y1",
+                reserved_funds=1000, game_date={"year": 1, "season": "spring", "day": 11},
+            )
+            return {"success": True, "response": "好，已记下", "conversation_id": None}
+
+        with patch.object(bridge, "_execute_life_turn", side_effect=_fake_turn):
+            await bridge._handle_life_chat_submit(AsyncMock(), {
+                "payload": {"requestId": "p1", "saveId": "Save1",
+                            "mode": "plan", "text": "就按这个计划办吧"},
+            }, "Save1")
+        pushes = [
+            r for r in _sent_payloads(chat_ws)
+            if r["messageType"] == "life.milestones.state"
+        ]
+        assert len(pushes) == 1
+        assert pushes[0]["payload"]["requestId"] == ""
+        assert pushes[0]["payload"]["nodes"][0]["status"] == "adopted"
+        assert pushes[0]["payload"]["nodes"][0]["reservedFunds"] == 1000
+
+    asyncio.run(run())
+
+
+def test_chat_turn_without_milestone_change_pushes_nothing(tmp_path) -> None:
+    async def run() -> None:
+        bridge = _bridge(tmp_path)
+        bridge._profile_store.set(
+            "Save1", {"onboarded": True, "playStyle": "earn"}, expected_revision=0
+        )
+        chat_ws = AsyncMock()
+        bridge._chat_ws = chat_ws
+        with patch.object(
+            bridge, "_execute_life_turn",
+            return_value={"success": True, "response": "在的", "conversation_id": None},
+        ):
+            await bridge._handle_life_chat_submit(AsyncMock(), {
+                "payload": {"requestId": "c1", "saveId": "Save1",
+                            "mode": "chat", "text": "在吗"},
+            }, "Save1")
+        assert [
+            r for r in _sent_payloads(chat_ws) if r["messageType"] == "life.milestones.state"
+        ] == []
+
+    asyncio.run(run())
+
+
+def test_day_settle_verifies_nodes_and_fires_milestone_reminder(tmp_path) -> None:
+    async def run() -> None:
+        bridge = _bridge(tmp_path)
+        bridge._profile_store.set(
+            "Save1", {"onboarded": True, "careFrequency": "chatty"}, expected_revision=0
+        )
+        ws = AsyncMock()
+        bridge._chat_ws = ws
+        bridge._milestone_store.adopt(
+            "Save1", "spring-egg-festival-strawberry:y1", reserved_funds=1000,
+            game_date={"year": 1, "season": "spring", "day": 11},
+        )
+        # Day 11 is the first observation (recorded, not settled)...
+        bridge._current_game_day_key = "1:spring:11"
+        bridge._latest_snapshot_payload = {
+            "world": {"year": 1, "season": "spring", "dayOfMonth": 11, "timeOfDay": 600}
+        }
+        await bridge._settle_day_advance("Save1", {"year": 1, "season": "spring", "dayOfMonth": 11})
+        assert [
+            r for r in _sent_payloads(ws) if r["messageType"] == "life.care"
+        ] == []
+        # ...day 12 really settles: daysUntil 1 -> reminder care via the model.
+        bridge._current_game_day_key = "1:spring:12"
+        bridge._latest_snapshot_payload = {
+            "world": {"year": 1, "season": "spring", "dayOfMonth": 12, "timeOfDay": 800}
+        }
+        with patch.object(
+            bridge, "_generate_care_text", new=AsyncMock(return_value="明天就是蛋蛋节啦")
+        ) as generate:
+            await bridge._settle_day_advance("Save1", {"year": 1, "season": "spring", "dayOfMonth": 12})
+        cares = [r["payload"] for r in _sent_payloads(ws) if r["messageType"] == "life.care"]
+        assert len(cares) == 1
+        assert cares[0]["kind"] == "milestone"
+        assert cares[0]["gameDate"] == "1:spring:12"
+        assert cares[0]["eventKey"] == "milestone:1:spring:12:spring-egg-festival-strawberry:y1"
+        fact = generate.await_args.args[4]
+        assert "蛋蛋节草莓种子准备" in fact
+        assert "1:spring:13" in fact
+        # And the model turn for the care text ran in chat (non-plan) mode.
+        assert generate.await_args.args[1] == "milestone"
+
+    asyncio.run(run())
+
+
+def test_plan_context_exposes_separate_wallets_and_proposal_continuity(tmp_path):
+    bridge = _bridge(tmp_path)
+    bridge._latest_snapshot_payload = {
+        "world": {"year": 1, "season": "spring", "dayOfMonth": 11,
+                  "playerMoney": 500, "playerStamina": 200, "playerMaxStamina": 270,
+                  "playerItems": [{"name": "Parsnip Seeds", "quantity": 4}]},
+        "companion": {"availableMoney": 120, "moneyStatus": "ok", "stamina": 80},
+    }
+    bridge._life_chat.rotate_if_needed("S", 1, 0)
+    bridge._life_chat.record_discussion("S", "plan", "今天你觉得做什么？", "我先把缺水的菜浇一小片。")
+    context = bridge._decision_context("S", origin="life-plan")
+    assert context["resources"]["player"]["money"] == 500
+    assert context["resources"]["companion"]["spendableMoney"] == 120
+    prompt = LifeChatService.build_system_prompt(
+        {"personality": "calm"}, None, None, mode="plan", live_context=context,
+        discussion=bridge._life_chat.discussion_context("S", "plan"),
+    )
+    assert '"money":500' in prompt and '"spendableMoney":120' in prompt
+    assert "我先把缺水的菜浇一小片" in prompt and "你看着办" in prompt
+    assert "不把预算、数量、保留金额当必填项" in prompt
+    assert bridge._life_chat.discussion_context("S", "chat") == []
+    bridge._life_chat.rotate_if_needed("S", 2, 0)
+    assert bridge._life_chat.discussion_context("S", "plan") == []
+
+
+def test_confirmed_current_preparation_uses_existing_work_path_once(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+        proposal = bridge._milestone_store.propose("S", title="先照料菜地", target_date="1:spring:11",
+                                                    preparation=["water"])
+        bridge.handle_chat_submit = AsyncMock()
+        # A proposal has no execution authority.
+        await bridge._start_accepted_preparation(None, "S", {})
+        bridge.handle_chat_submit.assert_not_awaited()
+        bridge._milestone_store.adopt("S", proposal["id"], work_store=bridge._work_store)
+        before = {n["id"]: n["todoIds"] for n in bridge._milestone_store.list_nodes("S")}
+        await bridge._start_accepted_preparation(None, "S", {})
+        bridge.handle_chat_submit.assert_awaited_once()
+        prompt = bridge.handle_chat_submit.await_args.args[2]
+        assert "浇水" in prompt and "不取消其他工作" in prompt
+        # An unchanged next conversation does not repeat the work.
+        await bridge._start_accepted_preparation(None, "S", before)
+        bridge.handle_chat_submit.assert_awaited_once()
+        bridge._milestone_store.defer("S", proposal["id"], work_store=bridge._work_store)
+        bridge._milestone_store.reopen("S", proposal["id"], work_store=bridge._work_store)
+        await bridge._start_accepted_preparation(None, "S", {})
+        bridge.handle_chat_submit.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_preparation_keeps_pause_and_unrelated_active_work(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+        node = bridge._milestone_store.propose("S", title="浇水", target_date="1:spring:11", preparation=["water"])
+        bridge._milestone_store.adopt("S", node["id"], work_store=bridge._work_store)
+        bridge.handle_chat_submit = AsyncMock()
+        bridge._work_store.set_paused("S", True)
+        assert "当前暂停" in await bridge._start_accepted_preparation(None, "S", {})
+        bridge.handle_chat_submit.assert_not_awaited()
+        bridge._work_store.set_paused("S", False)
+        bridge._active_task = ActiveChatTask(request_id="unrelated", save_id="S")
+        await bridge._start_accepted_preparation(None, "S", {})
+        bridge.handle_chat_submit.assert_not_awaited()
+        assert not bridge._active_task.cancelled
+    asyncio.run(run())
+
+
+def test_life_provider_borrows_single_mcp_socket_and_returns_it_on_failure(tmp_path):
+    async def run():
+        for mode, fails in [("chat", False), ("plan", False), ("plan", True)]:
+            bridge = _bridge(tmp_path / f"{mode}-{fails}")
+            worker = MagicMock()
+            worker.client.close = AsyncMock()
+            bridge._plan_worker = worker
+            bridge._work_store.recover = MagicMock()
+            def provider(*args, worker=worker, bridge=bridge, fails=fails):
+                worker.client.close.assert_awaited_once()
+                assert bridge._execution_lock.locked()
+                worker.set_provider_active.assert_called_once_with(True)
+                if fails:
+                    raise RuntimeError("provider failed after taking socket")
+                return {"success": True, "response": "我看到了现在的农场。"}
+            with (patch.object(bridge, "_execute_life_turn", side_effect=provider),
+                  patch.object(bridge, "_life_work_summary", return_value=None),
+                  patch.object(bridge, "_decision_context", return_value={})):
+                ws = AsyncMock()
+                await bridge._run_life_chat_turn(ws, {
+                    "request_id": "socket-life", "save_id": "S", "mode": mode, "text": "看看农场",
+                })
+            assert not bridge._execution_lock.locked()
+            assert [call.args for call in worker.set_provider_active.call_args_list] == [(True,), (False,)]
+            worker.notify.assert_called_once()
+            bridge._work_store.recover.assert_not_called()
+            terminal = _sent_payloads(ws)[-1]["payload"]
+            assert terminal["status"] == ("failed" if fails else "completed")
     asyncio.run(run())

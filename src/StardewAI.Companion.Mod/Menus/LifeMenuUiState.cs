@@ -125,6 +125,40 @@ public sealed class LifeMenuUiState
         Array.Empty<MemoryEntrySnapshot>();
 
     // -----------------------------------------------------------------------
+    // Milestone state (§2, mirrored from life.milestones.state)
+    // -----------------------------------------------------------------------
+
+    /// <summary>Maximum number of milestone nodes kept from <c>life.milestones.state</c>.</summary>
+    public const int MaxMilestoneNodes = 12;
+
+    /// <summary>Snapshot of milestone nodes for the current save (runtime-ordered).</summary>
+    public IReadOnlyList<MilestoneNodeSnapshot> MilestoneNodes { get; private set; } =
+        Array.Empty<MilestoneNodeSnapshot>();
+
+    /// <summary>Applies a <c>life.milestones.state</c> payload snapshot, capping at <see cref="MaxMilestoneNodes"/>.</summary>
+    public void ApplyMilestoneState(IEnumerable<MilestoneNodeSnapshot> nodes)
+    {
+        MilestoneNodes = nodes.Take(MaxMilestoneNodes).ToArray();
+    }
+
+    /// <summary>Player-facing status label for a milestone node (§2.3/§4).</summary>
+    public static string MilestoneStatusLabel(string status, string? verification)
+    {
+        string label = status switch
+        {
+            "suggested" => "建议",
+            "adopted" => "已采纳",
+            "deferred" => "暂缓",
+            "completed" => "已完成",
+            "missed" => "已错过",
+            _ => status
+        };
+        if (string.Equals(verification, "unverified", StringComparison.Ordinal))
+            label += "（未确认）";
+        return label;
+    }
+
+    // -----------------------------------------------------------------------
     // Care hint pending list
     // -----------------------------------------------------------------------
 
@@ -344,6 +378,7 @@ public sealed class LifeMenuUiState
         RecentTodoSummaries = Array.Empty<string>();
         WaitingConditions = Array.Empty<string>();
         PlanWaitReason = null;
+        MilestoneNodes = Array.Empty<MilestoneNodeSnapshot>();
         _unreadCareHints.Clear();
         _recentCareHints.Clear();
     }
@@ -380,3 +415,32 @@ public sealed record MemoryEntrySnapshot(
     string Source,
     string GameDate,
     string CreatedAt);
+
+/// <summary>Snapshot of a single milestone preparation item from <c>life.milestones.state</c>.</summary>
+/// <param name="Key">Stable item key (e.g. <c>"buy-at-festival"</c>).</param>
+/// <param name="Label">Player-facing description of the preparation step.</param>
+/// <param name="Support"><c>"manual"</c> (player-only) or <c>"capability"</c> (companion can help).</param>
+/// <param name="Status"><c>"pending"</c>, <c>"done"</c>, or <c>"unknown"</c>.</param>
+/// <param name="Note">Optional clarification, null when absent.</param>
+public sealed record MilestonePrepItemSnapshot(
+    string Key,
+    string Label,
+    string Support,
+    string Status,
+    string? Note);
+
+/// <summary>Snapshot of a single milestone node from <c>life.milestones.state</c> (§2.2).</summary>
+public sealed record MilestoneNodeSnapshot(
+    string Id,
+    string Title,
+    string Status,
+    string? Verification,
+    string? TargetDate,
+    int? DaysUntil,
+    string? Summary,
+    string? SourceUrl,
+    IReadOnlyList<MilestonePrepItemSnapshot> PrepItems,
+    int? ReservedFunds,
+    int? PlannedCount,
+    string? TermsNote,
+    double? UpdatedAt);

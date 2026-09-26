@@ -129,3 +129,88 @@ def test_life_profile_state_work_projection_matches_contract(tmp_path) -> None:
         "hasExecutableWork", "lastPlanAction", "planWaitReason", "lastSettledDay",
         "activeGoals", "recentTodos", "waitingConditions",
     }
+
+
+def test_life_milestones_state_wire_node_field_set(tmp_path) -> None:
+    """§2.2: life.milestones.state nodes must carry exactly the documented fields."""
+    bridge = ChatBridge(run_dir=tmp_path, backend="agy", enable_plan_worker=False)
+    bridge._profile_store.set(
+        SAVE,
+        {"onboarded": True, "skipped": False, "playStyle": "earn", "personality": "gentle",
+         "careFrequency": "moderate", "companionName": "阿星"},
+        expected_revision=0,
+    )
+    bridge._milestone_store.adopt(
+        SAVE,
+        "spring-egg-festival-strawberry:y1",
+        reserved_funds=1000,
+        planned_count=10,
+        terms_note="预留1000g",
+        game_date={"year": 1, "season": "spring", "day": 11},
+    )
+    # A live date is required for the relative countdown; settlement alone is not
+    # a current game snapshot. Evidence must cover all ten planned seeds.
+    bridge._latest_snapshot_payload = {
+        "world": {"year": 1, "season": "spring", "dayOfMonth": 14}
+    }
+    bridge._milestone_store.on_day_settled(
+        SAVE, year=1, season="spring", day=14,
+        player_items=[{"name": "Strawberry Seeds", "quantity": 10}],
+    )
+    envelope = bridge._build_milestones_state(SAVE, "lmg-it-1")
+    payload = envelope.to_mapping()["payload"]
+    assert payload["requestId"] == "lmg-it-1"
+    assert payload["status"] == "ok"
+    assert len(payload["nodes"]) == 1
+    node = payload["nodes"][0]
+    expected_keys = {
+        "id", "title", "status", "verification", "targetDate", "daysUntil",
+        "summary", "sourceUrl", "prepItems", "reservedFunds", "plannedCount",
+        "termsNote", "updatedAt",
+    }
+    assert set(node.keys()) == expected_keys, (
+        f"wire node carries non-contract fields: {sorted(set(node.keys()) - expected_keys)}"
+    )
+    assert node["status"] == "completed"
+    assert node["verification"] == "verified"
+    assert node["daysUntil"] == -1
+    # prepItems serialize null `note` as omitted; the buy item carries one.
+    noteless = next(p for p in node["prepItems"] if p["key"] == "reserve-funds")
+    assert set(noteless.keys()) == {"key", "label", "support", "status"}
+    noted = next(p for p in node["prepItems"] if p["key"] == "buy-at-festival")
+    assert set(noted.keys()) == {"key", "label", "support", "status", "note"}
+    statuses = {p["key"]: p["status"] for p in node["prepItems"]}
+    assert statuses["buy-at-festival"] == "done"
+    assert statuses["plant-after"] == "pending"  # Seeds in the bag do not prove planting.
+    json.dumps(payload)  # must be plain JSON-serializable wire data
+    bridge._latest_snapshot_payload = {}
+    undated = bridge._build_milestones_state(SAVE, "lmg-it-undated").to_mapping()["payload"]
+    assert "daysUntil" not in undated["nodes"][0]  # Unknown current date is not a stale countdown.
+    assert undated["nodes"][0]["status"] == "completed"
+
+
+def test_life_milestones_state_payload_roundtrips_through_protocol(tmp_path) -> None:
+    """§2.2: the wire payload must parse back through LifeMilestonesStatePayload."""
+    from stardew_ai_runtime.protocol import LifeMilestonesStatePayload
+
+    bridge = ChatBridge(run_dir=tmp_path, backend="agy", enable_plan_worker=False)
+    bridge._profile_store.set(
+        SAVE, {"onboarded": True, "playStyle": "earn"}, expected_revision=0
+    )
+    bridge._latest_snapshot_payload = {
+        "world": {"year": 1, "season": "spring", "dayOfMonth": 11}
+    }
+    envelope = bridge._build_milestones_state(SAVE, "lmg-it-2")
+    payload = LifeMilestonesStatePayload.from_mapping(envelope.to_mapping()["payload"])
+    assert payload.status == "ok"
+    assert payload.game_date == "1:spring:11"
+    assert len(payload.nodes) == 1
+    node = payload.nodes[0]
+    assert node.id == "spring-egg-festival-strawberry:y1"
+    assert node.status == "suggested"
+    assert node.days_until == 2
+    assert node.source_url == "https://stardewvalleywiki.com/Egg_Festival"
+    # verification is null on a fresh suggestion: omitted on the wire.
+    assert node.verification is None
+    assert "verification" not in envelope.to_mapping()["payload"]["nodes"][0]
+    assert node.prep_items[0].support == "manual"

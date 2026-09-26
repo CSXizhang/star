@@ -221,4 +221,89 @@ public class LifeMenuUiStateTests
         Assert.Equal("小星", state.CompanionName);
         Assert.Equal(5, state.ProfileRevision);
     }
+
+    // ------------------------------------------------------------ milestone state (§2)
+
+    private static MilestoneNodeSnapshot Node(
+        string id, string status, string? verification = null, int? daysUntil = null) =>
+        new(
+            Id: id,
+            Title: $"节点{id}",
+            Status: status,
+            Verification: verification,
+            TargetDate: "1:spring:13",
+            DaysUntil: daysUntil,
+            Summary: null,
+            SourceUrl: null,
+            PrepItems: Array.Empty<MilestonePrepItemSnapshot>(),
+            ReservedFunds: null,
+            PlannedCount: null,
+            TermsNote: null,
+            UpdatedAt: null);
+
+    [Fact]
+    public void ApplyMilestoneState_ProjectsNodes_InOrder()
+    {
+        var state = NewState();
+        state.ApplyMilestoneState(new[]
+        {
+            Node("a", "adopted", "verified", 2),
+            Node("b", "suggested", null, 0)
+        });
+        Assert.Equal(2, state.MilestoneNodes.Count);
+        Assert.Equal("a", state.MilestoneNodes[0].Id);
+        Assert.Equal("adopted", state.MilestoneNodes[0].Status);
+        Assert.Equal("verified", state.MilestoneNodes[0].Verification);
+        Assert.Equal(2, state.MilestoneNodes[0].DaysUntil);
+        Assert.Equal("b", state.MilestoneNodes[1].Id);
+    }
+
+    [Fact]
+    public void ApplyMilestoneState_CapsAtTwelve_DroppingTail()
+    {
+        var state = NewState();
+        state.ApplyMilestoneState(Enumerable.Range(1, 15).Select(i => Node($"n{i}", "suggested")));
+        Assert.Equal(LifeMenuUiState.MaxMilestoneNodes, state.MilestoneNodes.Count);
+        Assert.Equal("n1", state.MilestoneNodes[0].Id);
+        Assert.Equal("n12", state.MilestoneNodes[^1].Id);
+    }
+
+    [Fact]
+    public void ApplyMilestoneState_ReplacesPreviousSnapshot()
+    {
+        var state = NewState();
+        state.ApplyMilestoneState(new[] { Node("old", "suggested") });
+        state.ApplyMilestoneState(new[] { Node("new", "adopted") });
+        var single = Assert.Single(state.MilestoneNodes);
+        Assert.Equal("new", single.Id);
+    }
+
+    [Fact]
+    public void MilestoneStatusLabel_MapsAllStatuses()
+    {
+        Assert.Equal("建议", LifeMenuUiState.MilestoneStatusLabel("suggested", null));
+        Assert.Equal("已采纳", LifeMenuUiState.MilestoneStatusLabel("adopted", "verified"));
+        Assert.Equal("暂缓", LifeMenuUiState.MilestoneStatusLabel("deferred", null));
+        Assert.Equal("已完成", LifeMenuUiState.MilestoneStatusLabel("completed", "verified"));
+        Assert.Equal("已错过", LifeMenuUiState.MilestoneStatusLabel("missed", "verified"));
+        Assert.Equal("自定义", LifeMenuUiState.MilestoneStatusLabel("自定义", null));
+    }
+
+    [Fact]
+    public void MilestoneStatusLabel_Unverified_AppendsSuffix_OnlyForUnverified()
+    {
+        Assert.Equal("已错过（未确认）", LifeMenuUiState.MilestoneStatusLabel("missed", "unverified"));
+        Assert.Equal("已采纳", LifeMenuUiState.MilestoneStatusLabel("adopted", "verified"));
+        Assert.Equal("已采纳", LifeMenuUiState.MilestoneStatusLabel("adopted", null));
+    }
+
+    [Fact]
+    public void Reset_ClearsMilestoneNodes()
+    {
+        var state = NewState();
+        state.ApplyMilestoneState(new[] { Node("a", "suggested"), Node("b", "adopted") });
+        Assert.Equal(2, state.MilestoneNodes.Count);
+        state.Reset();
+        Assert.Empty(state.MilestoneNodes);
+    }
 }

@@ -92,3 +92,13 @@ def test_profile_survives_restart_and_save_switch(tmp_path: Path) -> None:
     assert got["profile"]["personality"] == "tsundere"
     # A different save is untouched (no cross-save leakage).
     assert reopened.get("Save2") == {"profile": None, "profileRevision": 0}
+
+
+def test_save_preferences_before_onboarding_remains_visible(tmp_path):
+    store = _store(tmp_path)
+    store.set("S", {"playStyle": "earn", "personality": "calm", "careFrequency": "quiet"}, expected_revision=0)
+    result = _store(tmp_path).get("S")
+    assert result["profileRevision"] == 1
+    assert result["profile"]["onboarded"] is False
+    assert result["profile"]["careFrequency"] == "quiet"
+    assert result["profile"]["personality"] == "calm"

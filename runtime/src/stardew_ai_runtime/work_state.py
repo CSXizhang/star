@@ -522,6 +522,50 @@ class WorkStore:
 
         return self._mutate(save_id, mutate)
 
+    def sync_milestone_work(
+        self, save_id: str, milestone_id: str, *, text: str,
+        constraints: dict[str, Any], todos: list[dict[str, Any]], active: bool,
+        existing_goal_id: str | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        """Atomically reconcile a milestone's authorization, including retry recovery.
+
+        Stable milestone identity prevents duplicate goals after a failed milestone
+        file write. Changed terms invalidate old child plans before replacement.
+        """
+        def mutate(state: SaveWorkState) -> tuple[str, dict[str, str]]:
+            goal = next((g for g in state.goals
+                         if g.constraints.get("milestoneId") == milestone_id
+                         or g.id == existing_goal_id), None)
+            desired = {**constraints, "milestoneId": milestone_id}
+            signature = {"text": text, "constraints": desired, "todos": todos}
+            if goal is None:
+                goal = Goal(id=_new_id("goal"), text=text, source="user", constraints=desired)
+                state.goals.append(goal)
+            unchanged = goal.constraints.get("milestoneSpec") == signature
+            if unchanged and goal.status == ("active" if active else "paused"):
+                return goal.id, {
+                    t.intent.split("：", 1)[0]: t.id for t in state.todos
+                    if t.goal_id == goal.id and t.status in {"pending", "due", "done"}
+                }
+            self._cancel_goal_children(state, goal.id)
+            goal.text = text
+            goal.constraints = {**desired, "milestoneSpec": signature}
+            goal.status = "active" if active else "paused"
+            goal.epoch += 1
+            goal.updated_at = _now_iso()
+            state.scheduler_epoch += 1
+            ids: dict[str, str] = {}
+            if active:
+                for spec in todos:
+                    todo = Todo(id=_new_id("todo"), intent=spec["intent"],
+                                trigger=dict(spec["trigger"]), goal_id=goal.id,
+                                expiry=dict(spec["expiry"]))
+                    state.todos.append(todo)
+                    ids[spec["key"]] = todo.id
+            return goal.id, ids
+
+        return self._mutate(save_id, mutate)
+
     def cancel_goal(self, save_id: str, goal_id: str) -> Goal:
         return self.revise_goal(save_id, goal_id, status="cancelled")
 

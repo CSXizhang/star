@@ -24,6 +24,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
     private const int MaxReportedRefillTiles = 16;
     private const int MaxReportedGroundItems = 48;
     private const int MaxReportedChoppableTrees = 24;
+    private const int MaxReportedPlayerItems = 40;
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -1252,6 +1253,48 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
         }
     }
 
+    /// <summary>
+    /// §2.4 Player backpack aggregate for milestone-completion verification:
+    /// stacks summed per distinct item name, empty/null slots skipped, capped at
+    /// <paramref name="maxItems"/>. Never throws: a partially readable inventory
+    /// degrades to fewer (or zero) entries and verification just lacks evidence.
+    /// </summary>
+    private static List<PlayerItemDto> BuildPlayerItemsSnapshot(int maxItems)
+    {
+        var result = new List<PlayerItemDto>();
+        if (maxItems <= 0) return result;
+
+        try
+        {
+            var items = Game1.player?.Items;
+            if (items == null) return result;
+
+            var index = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var item in items)
+            {
+                if (item == null) continue;
+                string name = item.Name;
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                if (index.TryGetValue(name, out int pos))
+                {
+                    long summed = (long)result[pos].Quantity + item.Stack;
+                    result[pos] = result[pos] with { Quantity = (int)Math.Min(summed, int.MaxValue) };
+                }
+                else
+                {
+                    index[name] = result.Count;
+                    result.Add(new PlayerItemDto(name, Math.Max(item.Stack, 1)));
+                    if (result.Count >= maxItems) break;
+                }
+            }
+        }
+        catch
+        {
+            // Verification simply runs without item evidence.
+        }
+        return result;
+    }
+
     public WorldSnapshotPayload CaptureCurrentSnapshot(long worldRevision)
     {
         lock (_taskLock)
@@ -1364,7 +1407,11 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 IsRaining: _observer.IsRaining,
                 FarmWork: farmWork,
                 Year: Game1.year > 0 ? Game1.year : 1,
-                WeatherIcon: _observer.WeatherIcon
+                WeatherIcon: _observer.WeatherIcon,
+                PlayerItems: BuildPlayerItemsSnapshot(MaxReportedPlayerItems),
+                PlayerMoney: Game1.player?.Money,
+                PlayerStamina: Game1.player?.Stamina,
+                PlayerMaxStamina: Game1.player?.MaxStamina
             );
 
             // Companion inventory section

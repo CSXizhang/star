@@ -572,10 +572,11 @@ def test_mcp_server_tool_registration(mock_scheduler):
         assert "feed_animals" in tool_names
         assert "toggle_animal_door" in tool_names
         assert "chop_tree" in tool_names
-        assert len(tools) == 51
+        assert len(tools) == 52
         assert "autonomy_status" in tool_names
         assert "set_autonomy" in tool_names
         assert "query_wiki" in tool_names
+        assert "manage_milestones" in tool_names
 
         # Check plant_crop_workflow schema
         workflow_tool = next(t for t in tools if t.name == "plant_crop_workflow")
@@ -1997,5 +1998,142 @@ def test_get_status_detail_keeps_real_native_sections(mock_scheduler):
         assert detail["inventory"]["slots"][0]["name"] == "Parsnip"
         assert detail["world"]["weatherIcon"] == "0"
         assert detail["companion"]["availableMoney"] == 500
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- manage_milestones (contract §3.2)
+def test_manage_milestones_write_actions_require_plan_mode(mock_scheduler, monkeypatch):
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        monkeypatch.delenv("STARDEW_LIFE_MODE", raising=False)
+        # list is always allowed, even in casual chat.
+        _, result = await server.call_tool("manage_milestones", {"action": "list"})
+        assert result["saveId"] == "mock-save-123"
+        assert result["nodes"] == []
+        # adopt without plan mode is rejected with guidance to the plan mode.
+        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+            await server.call_tool(
+                "manage_milestones",
+                {"action": "adopt", "node_id": "spring-egg-festival-strawberry:y1"},
+            )
+        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+            await server.call_tool(
+                "manage_milestones",
+                {"action": "propose", "title": "自定义", "target_date": "1:spring:13"},
+            )
+        with pytest.raises(ToolError, match="unsupported milestones action"):
+            await server.call_tool("manage_milestones", {"action": "explode"})
+
+    asyncio.run(run())
+
+
+def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
+    mock_scheduler, tmp_path, monkeypatch
+):
+    from stardew_ai_runtime.autonomy import AutonomyController
+
+    mock_scheduler.run_dir = None
+    mock_scheduler.latest_snapshot = {
+        "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+    }
+    autonomy = AutonomyController(tmp_path / "data" / "autonomy-state.json")
+    autonomy.set_preferences(
+        "mock-save-123", goal="优先赚钱", budget_limit=500, box_preference="shipping"
+    )
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "plan")
+        _, result = await server.call_tool("manage_milestones", {
+            "action": "adopt",
+            "node_id": "spring-egg-festival-strawberry:y1",
+            "reserved_funds": 1000,
+            "planned_count": 10,
+            "terms_note": "预留1000g只用于买种子",
+        })
+        node = result["node"]
+        assert node["status"] == "adopted"
+        assert node["reservedFunds"] == 1000
+        assert node["plannedCount"] == 10
+        assert result["goalId"]
+        assert set(result["todoIds"]) == {"pre-till", "plant-after"}
+
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        goal = next(g for g in store.list_goals("mock-save-123") if g["id"] == result["goalId"])
+        assert goal["source"] == "user"
+        assert goal["constraints"]["reservedFunds"] == 1000
+        assert "不冻结资金" in goal["constraints"]["reservedFundsNote"]
+        todos = {t["id"]: t for t in store.list_todos("mock-save-123")}
+        pre_till = todos[result["todoIds"]["pre-till"]]
+        assert pre_till["trigger"] == {"type": "calendar", "year": 1, "season": "spring", "day": 12}
+        assert pre_till["expiry"] == {"year": 1, "season": "spring", "day": 13}
+        plant_after = todos[result["todoIds"]["plant-after"]]
+        assert plant_after["trigger"] == {"type": "calendar", "year": 1, "season": "spring", "day": 13}
+
+        # The one-time reservation never becomes a per-day purchase budget.
+        state = autonomy.state("mock-save-123")
+        assert state.budget_limit == 500
+        assert state.daily_spend == 0
+        # No decision/plan machinery was involved.
+        assert store.state("mock-save-123").decision == {}
+
+    asyncio.run(run())
+
+
+def test_manage_milestones_defer_cancels_todos_and_pauses_goal(
+    mock_scheduler, tmp_path, monkeypatch
+):
+    mock_scheduler.run_dir = None
+    mock_scheduler.latest_snapshot = {
+        "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+    }
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "plan")
+        _, adopted = await server.call_tool("manage_milestones", {
+            "action": "adopt",
+            "node_id": "spring-egg-festival-strawberry:y1",
+            "reserved_funds": 1000,
+        })
+        _, deferred = await server.call_tool("manage_milestones", {
+            "action": "defer",
+            "node_id": "spring-egg-festival-strawberry:y1",
+            "reason": "先攒钱",
+        })
+        assert deferred["node"]["status"] == "deferred"
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        todos = {t["id"]: t for t in store.list_todos("mock-save-123")}
+        assert all(todos[tid]["status"] == "cancelled" for tid in adopted["todoIds"].values())
+        goal = next(g for g in store.list_goals("mock-save-123") if g["id"] == adopted["goalId"])
+        assert goal["status"] == "paused"
+
+    asyncio.run(run())
+
+
+def test_manage_milestones_on_life_surface_is_not_job_wrapped(
+    mock_scheduler, tmp_path, monkeypatch
+):
+    mock_scheduler.run_dir = None
+    mock_scheduler.latest_snapshot = {
+        "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+    }
+
+    async def run():
+        monkeypatch.setenv("STARDEW_MCP_SURFACE", "life")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        tools = {t.name for t in await server.list_tools()}
+        assert "manage_milestones" in tools
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "plan")
+        _, result = await server.call_tool("manage_milestones", {
+            "action": "adopt",
+            "node_id": "spring-egg-festival-strawberry:y1",
+        })
+        # Exempt from protect_job: a real node result, not a "job-selected" wrapper.
+        assert result["node"]["status"] == "adopted"
+        assert result.get("status") != "job-selected"
+        _, listed = await server.call_tool("manage_milestones", {"action": "list"})
+        assert listed["nodes"][0]["status"] == "adopted"
 
     asyncio.run(run())

@@ -179,10 +179,121 @@ entry fields:
 | `saveId` | str | |
 | `eventKey` | str | dedup key; `{kind}:{gameDate}:{ref}` |
 | `gameDate` | str | `"y:season:d"` |
-| `kind` | str | `"morning"` \| `"work-done"` \| `"evening"` |
+| `kind` | str | `"morning"` \| `"work-done"` \| `"evening"` \| `"milestone"` (计划提醒) |
 | `text` | str | 1..300 chars, model-generated natural language |
 
 The Mod deduplicates by `eventKey`, shows low-distraction HUD hints only when no
 menu/event is active (otherwise defers and stores the body in the life menu's
 unread list, capacity 5), and discards unread hints on day change without
 back-filling.
+
+## Life-channel milestone messages (`life.milestones.*`, contract §2)
+
+The two `life.milestones.*` message types ride the same `/chat` WebSocket
+channel and Envelope as the rest of the `life.*` family. They are likewise
+**not** part of `schemas/protocol-v0.1.schema.json`; the wire shape is locked by
+this documentation plus the cross-language wire contract tests
+(`tools/export-life-wire-test.py` ↔ `LifeWireContractTests`). `requestId` uses
+the `lmg-` prefix on requests.
+
+### `life.milestones.get` (C#→Py, §2.1)
+
+| field | type |
+| --- | --- |
+| `requestId` | str (`lmg-` prefix) |
+| `saveId` | str |
+
+### `life.milestones.state` (Py→C#, §2.2, reply or proactive push)
+
+Reply to `life.milestones.get`, or a proactive push after a plan turn changed
+milestone state, or after date/progress reconciliation — a push carries `requestId: ""`.
+
+| field | type | notes |
+| --- | --- | --- |
+| `requestId` | str | echo of the `lmg-` request, or `""` on push |
+| `saveId` | str | |
+| `status` | str | `"ok"` \| `"failed"` |
+| `gameDate` | str? | `"y:season:d"` from the latest snapshot, null when unknown |
+| `nodes` | array | ≤12, ordering: adopted → suggested (daysUntil asc) → deferred → completed/missed (most recently updated first) |
+| `error` | str? | present on failed |
+
+`MilestoneNodeDto`:
+
+| field | type | notes |
+| --- | --- | --- |
+| `id` | str | catalogue id + `:y<N>` year, or `custom-<hex>` for proposed nodes |
+| `title` | str | |
+| `status` | str | `"suggested"` \| `"adopted"` \| `"deferred"` \| `"completed"` \| `"missed"` |
+| `verification` | str? | `"verified"` \| `"unverified"`; omitted when never verified |
+| `targetDate` | str | `"y:season:d"` |
+| `daysUntil` | int? | omitted when the game date is unknown |
+| `summary` | str | planning summary with source and evidence limitations, incl. "献祭实际进度读不到，属未知" where relevant |
+| `sourceUrl` | str? | official English Wiki page |
+| `prepItems` | array | see below |
+| `reservedFunds` | int? | planning reminder only; does not freeze funds or block spending; NOT a per-day budget |
+| `plannedCount` | int? | positive agreed quantity when supplied; used for strawberry seed-readiness verification |
+| `termsNote` | str? | |
+| `updatedAt` | number | epoch seconds |
+
+`prepItems` entry (`MilestonePrepItemDto`):
+
+| field | type | notes |
+| --- | --- | --- |
+| `key` | str | |
+| `label` | str | manual items state the player must do it themselves |
+| `support` | str | `"manual"` (player-only) \| `"capability"` (companion can take over) |
+| `status` | str | `"pending"` \| `"done"` \| `"unknown"` |
+| `note` | str? | |
+
+Date observations (including save reload) reconcile progress from snapshot
+`playerItems`; reminders are gated by real day settlement and existing care
+preferences. Neither suggestion nor adoption completes a node. Strawberry
+completion means enough visible seeds for the agreed quantity, not completed
+planting or watering. Bundle item readiness does not prove bundle donation.
+Insufficient backpack evidence leaves the node `adopted`/`suggested` with
+`verification: "unverified"`, even after the date: items may be stored or planted.
+It must not be interpreted as a verified missed event.
+
+Casual chat is read-only. In plan mode, explicit player confirmation authorizes
+saving, revising or deferring subsequent preparation. Revisions reconcile the
+linked goal/todos and invalidate old child plans; defer stops their future work;
+reopen returns to a suggestion and requires adoption before work resumes. This
+does not instantly interrupt an already dispatched native action; current work
+uses the existing pause/cancel controls.
+
+`query_wiki` reads at most three official English Wiki pages, returning at most
+12,000 characters of wikitext per page with source and fetch/query/cache times.
+`page-excerpt` evidence is distinguished from `search-snippet`; failed body reads
+fall back to explicitly unverified search summaries. A source URL alone does
+not establish a verified fact. Wiki content is untrusted reference material,
+never tool instructions, and language/version differences remain visible.
+
+## `world.snapshot` addition (contract §2.4)
+
+The snapshot payload `world` block carries an optional aggregated player
+backpack used for milestone completion verification:
+
+```json
+"playerItems": [{"name": "Strawberry Seeds", "quantity": 10}]
+```
+
+Aggregated by `name` from `Game1.player.Items` (null/empty slots skipped),
+capped at 40 entries. Older Mods do not send it; readers must degrade
+verification to `unverified` instead of failing. `schemas/protocol-v0.1.schema.json`
+declares it as an optional `world` property.
+
+
+The optional snapshot fields `world.playerMoney`, `world.playerStamina`, and
+`world.playerMaxStamina` describe the actual player. They are independent of
+`companion.availableMoney` and companion stamina; missing fields mean unknown,
+not zero or a shared wallet. Plan dialogue receives both resource views and
+compact current farm counts without requiring the player to re-enter them.
+
+A plan turn that explicitly adopts/re-adopts or materially revises current due
+preparation may hand one short job to the existing work command path. It never
+promotes casual chat, mere proposals or reopen to execution authority. Paused
+or busy work is preserved, global free mode is not enabled, and future-dated
+preparation is retained for existing scheduling. Plan replies distinguish saved
+arrangements from observed native results. Custom proposals may name existing
+preparation capabilities (`water`, `harvest`, `clear`, `plant`, `animals`,
+`machines`); these are bounded intents, not arbitrary executable operations.

@@ -132,6 +132,15 @@ public sealed record ChestsSnapshot(
     [property: JsonPropertyName("items")] List<ChestSnapshot> Items
 );
 
+/// <summary>
+/// Player backpack aggregate (§2.4): one entry per distinct item name with the
+/// summed stack, used by the runtime to verify milestone completion.
+/// </summary>
+public sealed record PlayerItemDto(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("quantity")] int Quantity
+);
+
 public sealed record WorldStateSnapshot(
     [property: JsonPropertyName("currentLocation")] string CurrentLocation,
     [property: JsonPropertyName("timeOfDay")] int TimeOfDay,
@@ -144,7 +153,14 @@ public sealed record WorldStateSnapshot(
     // NOT imply clear (snow/storm/etc), so the actual weather is published.
     // Nullable: a snapshot written before this field existed stays unknown rather
     // than guessing "clear".
-    [property: JsonPropertyName("weatherIcon"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? WeatherIcon = null
+    [property: JsonPropertyName("weatherIcon"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? WeatherIcon = null,
+    // §2.4 player backpack aggregate for milestone-completion verification.
+    // Nullable: snapshots written before this field existed must stay readable
+    // and simply leave verification without item evidence.
+    [property: JsonPropertyName("playerItems"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<PlayerItemDto>? PlayerItems = null,
+    [property: JsonPropertyName("playerMoney"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? PlayerMoney = null,
+    [property: JsonPropertyName("playerStamina"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] float? PlayerStamina = null,
+    [property: JsonPropertyName("playerMaxStamina"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? PlayerMaxStamina = null
 );
 
 public sealed record SeedItemSnapshot(
@@ -718,6 +734,55 @@ public sealed record LifeCarePayload(
     [property: JsonPropertyName("saveId")] string SaveId,
     [property: JsonPropertyName("eventKey")] string EventKey,
     [property: JsonPropertyName("gameDate")] string GameDate,
-    [property: JsonPropertyName("kind")] string Kind,   // "morning" | "work-done" | "evening"
+    [property: JsonPropertyName("kind")] string Kind,   // "morning" | "work-done" | "evening" | "milestone"
     [property: JsonPropertyName("text")] string Text
+);
+
+/// <summary>
+/// §2.1 life.milestones.get (C#→Py).
+/// Requests the milestone node snapshot for the current save.
+/// </summary>
+public sealed record LifeMilestonesGetPayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId
+);
+
+/// <summary>
+/// §2.2 life.milestones.state (Py→C#, reply or proactive push with requestId "").
+/// Status: "ok" | "failed". Nodes are runtime-ordered (adopted → suggested by
+/// daysUntil → deferred → completed/missed most-recent-first), capped at 12.
+/// </summary>
+public sealed record LifeMilestonesStatePayload(
+    [property: JsonPropertyName("requestId")] string RequestId,
+    [property: JsonPropertyName("saveId")] string SaveId,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("gameDate"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? GameDate = null,
+    [property: JsonPropertyName("nodes"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<MilestoneNodeDto>? Nodes = null,
+    [property: JsonPropertyName("error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null
+);
+
+/// <summary>Single preparation item within <see cref="MilestoneNodeDto"/>.</summary>
+public sealed record MilestonePrepItemDto(
+    [property: JsonPropertyName("key")] string Key,
+    [property: JsonPropertyName("label")] string Label,
+    [property: JsonPropertyName("support")] string Support,   // "manual" | "capability"
+    [property: JsonPropertyName("status")] string Status,     // "pending" | "done" | "unknown"
+    [property: JsonPropertyName("note"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Note = null
+);
+
+/// <summary>Single milestone node within <see cref="LifeMilestonesStatePayload"/>.</summary>
+public sealed record MilestoneNodeDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("status")] string Status,   // "suggested" | "adopted" | "deferred" | "completed" | "missed"
+    [property: JsonPropertyName("verification"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Verification = null,
+    [property: JsonPropertyName("targetDate"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? TargetDate = null,
+    [property: JsonPropertyName("daysUntil"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DaysUntil = null,
+    [property: JsonPropertyName("summary"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Summary = null,
+    [property: JsonPropertyName("sourceUrl"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? SourceUrl = null,
+    [property: JsonPropertyName("prepItems"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<MilestonePrepItemDto>? PrepItems = null,
+    [property: JsonPropertyName("reservedFunds"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? ReservedFunds = null,
+    [property: JsonPropertyName("plannedCount"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? PlannedCount = null,
+    [property: JsonPropertyName("termsNote"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? TermsNote = null,
+    [property: JsonPropertyName("updatedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? UpdatedAt = null
 );

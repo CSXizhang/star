@@ -1134,6 +1134,39 @@ class Envelope:
             payload=payload,
         )
 
+    @classmethod
+    def create_life_milestones_state(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        save_id: str,
+        status: str = "ok",
+        game_date: str | None = None,
+        nodes: Any = (),
+        error: str | None = None,
+    ) -> Envelope:
+        """life.milestones.state: reply to get, or proactive push with requestId="" (§2.2)."""
+        payload: dict[str, Any] = {
+            "requestId": request_id,
+            "saveId": save_id,
+            "status": status,
+            "nodes": [
+                n.to_mapping() if isinstance(n, MilestoneNode) else dict(n)
+                for n in list(nodes or [])[:_LIFE_MILESTONES_MAX_NODES]
+            ],
+        }
+        if game_date is not None:
+            payload["gameDate"] = game_date
+        if error is not None:
+            payload["error"] = error
+        return cls(
+            protocol_version="0.1", message_type="life.milestones.state",
+            message_id=f"msg-life-milestones-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id,
+            payload=payload,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ChatSubmitPayload:
@@ -1246,7 +1279,7 @@ _LIFE_CHAT_MODES = frozenset({"chat", "plan"})
 _LIFE_CHAT_STATUSES = frozenset({"processing", "queued", "completed", "failed"})
 _LIFE_MEMORY_KINDS = frozenset({"preference", "agreement", "event"})
 _LIFE_MEMORY_OPS = frozenset({"add", "correct", "delete"})
-_LIFE_CARE_KINDS = frozenset({"morning", "work-done", "evening"})
+_LIFE_CARE_KINDS = frozenset({"morning", "work-done", "evening", "milestone"})
 _LIFE_PLAY_STYLES = frozenset({"earn", "workhorse", "community", "decor"})
 _LIFE_PERSONALITIES = frozenset({"gentle", "lively", "calm", "tsundere"})
 _LIFE_CARE_FREQUENCIES = frozenset({"quiet", "moderate", "chatty"})
@@ -1482,6 +1515,221 @@ class LifeMemoryEditPayload:
             res["kind"] = self.kind
         if self.text is not None:
             res["text"] = self.text
+        return res
+
+
+# ---------------------------------------------------------------------------
+# life.milestones.* (contract §2): milestone planning nodes on the life channel.
+# ---------------------------------------------------------------------------
+
+_MILESTONE_STATUSES = frozenset({"suggested", "adopted", "deferred", "completed", "missed"})
+_MILESTONE_VERIFICATIONS = frozenset({"verified", "unverified"})
+_MILESTONE_SUPPORTS = frozenset({"manual", "capability"})
+_MILESTONE_PREP_STATUSES = frozenset({"pending", "done", "unknown"})
+_LIFE_MILESTONES_MAX_NODES = 12
+
+
+@dataclass(frozen=True, slots=True)
+class MilestonePrepItem:
+    """MilestoneNodeDto.prepItems entry (contract §2.2)."""
+
+    key: str
+    label: str
+    support: str
+    status: str
+    note: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> MilestonePrepItem:
+        key = str(value.get("key", ""))
+        label = str(value.get("label", ""))
+        support = str(value.get("support", ""))
+        status = str(value.get("status", ""))
+        if not key:
+            raise ProtocolError("milestone prepItem: key is required")
+        if not label:
+            raise ProtocolError("milestone prepItem: label is required")
+        if support not in _MILESTONE_SUPPORTS:
+            raise ProtocolError(f"milestone prepItem: invalid support '{support}'")
+        if status not in _MILESTONE_PREP_STATUSES:
+            raise ProtocolError(f"milestone prepItem: invalid status '{status}'")
+        note = value.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ProtocolError("milestone prepItem: note must be a string or null")
+        return cls(key=key, label=label, support=support, status=status, note=note)
+
+    def to_mapping(self) -> dict[str, Any]:
+        res: dict[str, Any] = {
+            "key": self.key,
+            "label": self.label,
+            "support": self.support,
+            "status": self.status,
+        }
+        if self.note is not None:
+            res["note"] = self.note
+        return res
+
+
+@dataclass(frozen=True, slots=True)
+class MilestoneNode:
+    """MilestoneNodeDto (contract §2.2); optional null fields are omitted on the wire."""
+
+    id: str
+    title: str
+    status: str
+    target_date: str
+    summary: str
+    updated_at: float
+    verification: str | None = None
+    days_until: int | None = None
+    source_url: str | None = None
+    prep_items: tuple[MilestonePrepItem, ...] = ()
+    reserved_funds: int | None = None
+    planned_count: int | None = None
+    terms_note: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> MilestoneNode:
+        node_id = str(value.get("id", ""))
+        title = str(value.get("title", ""))
+        status = str(value.get("status", ""))
+        target_date = str(value.get("targetDate", ""))
+        if not node_id:
+            raise ProtocolError("milestone node: id is required")
+        if not title:
+            raise ProtocolError("milestone node: title is required")
+        if status not in _MILESTONE_STATUSES:
+            raise ProtocolError(f"milestone node: invalid status '{status}'")
+        parts = target_date.split(":")
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[2].isdigit() or not parts[1]:
+            raise ProtocolError("milestone node: targetDate must look like '1:spring:13'")
+        verification = value.get("verification")
+        if verification is not None and verification not in _MILESTONE_VERIFICATIONS:
+            raise ProtocolError(f"milestone node: invalid verification '{verification}'")
+        days_until = value.get("daysUntil")
+        if days_until is not None and (isinstance(days_until, bool) or not isinstance(days_until, int)):
+            raise ProtocolError("milestone node: daysUntil must be an integer or null")
+        updated_at = value.get("updatedAt")
+        if isinstance(updated_at, bool) or not isinstance(updated_at, (int, float)):
+            raise ProtocolError("milestone node: updatedAt must be an epoch-seconds number")
+        prep_items = value.get("prepItems")
+        if not isinstance(prep_items, list):
+            raise ProtocolError("milestone node: prepItems must be an array")
+        reserved_funds = value.get("reservedFunds")
+        planned_count = value.get("plannedCount")
+        for field_name, field_value in (
+            ("reservedFunds", reserved_funds),
+            ("plannedCount", planned_count),
+        ):
+            if field_value is not None and (
+                isinstance(field_value, bool) or not isinstance(field_value, int)
+            ):
+                raise ProtocolError(f"milestone node: {field_name} must be an integer or null")
+        return cls(
+            id=node_id,
+            title=title,
+            status=status,
+            target_date=target_date,
+            summary=str(value.get("summary", "")),
+            updated_at=float(updated_at),
+            verification=verification,
+            days_until=days_until,
+            source_url=value.get("sourceUrl"),
+            prep_items=tuple(
+                MilestonePrepItem.from_mapping(p) for p in prep_items if isinstance(p, Mapping)
+            ),
+            reserved_funds=reserved_funds,
+            planned_count=planned_count,
+            terms_note=value.get("termsNote"),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        res: dict[str, Any] = {
+            "id": self.id,
+            "title": self.title,
+            "status": self.status,
+            "targetDate": self.target_date,
+            "summary": self.summary,
+            "prepItems": [p.to_mapping() for p in self.prep_items],
+            "updatedAt": self.updated_at,
+        }
+        if self.verification is not None:
+            res["verification"] = self.verification
+        if self.days_until is not None:
+            res["daysUntil"] = self.days_until
+        if self.source_url is not None:
+            res["sourceUrl"] = self.source_url
+        if self.reserved_funds is not None:
+            res["reservedFunds"] = self.reserved_funds
+        if self.planned_count is not None:
+            res["plannedCount"] = self.planned_count
+        if self.terms_note is not None:
+            res["termsNote"] = self.terms_note
+        return res
+
+
+@dataclass(frozen=True, slots=True)
+class LifeMilestonesGetPayload:
+    """life.milestones.get payload (C#->Py): contract §2.1 (requestId prefix ``lmg-``)"""
+
+    request_id: str
+    save_id: str
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeMilestonesGetPayload:
+        request_id = str(value.get("requestId", ""))
+        save_id = str(value.get("saveId", ""))
+        if not request_id:
+            raise ProtocolError("life.milestones.get: requestId is required")
+        if not save_id:
+            raise ProtocolError("life.milestones.get: saveId is required")
+        return cls(request_id=request_id, save_id=save_id)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {"requestId": self.request_id, "saveId": self.save_id}
+
+
+@dataclass(frozen=True, slots=True)
+class LifeMilestonesStatePayload:
+    """life.milestones.state payload (Py->C#): contract §2.2 (push uses requestId="")"""
+
+    request_id: str
+    save_id: str
+    status: str
+    game_date: str | None = None
+    nodes: tuple[MilestoneNode, ...] = ()
+    error: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> LifeMilestonesStatePayload:
+        request_id = str(value.get("requestId", ""))
+        save_id = str(value.get("saveId", ""))
+        status = str(value.get("status", "ok"))
+        if status not in {"ok", "failed"}:
+            raise ProtocolError(f"life.milestones.state: invalid status '{status}'")
+        nodes = value.get("nodes")
+        if not isinstance(nodes, list):
+            raise ProtocolError("life.milestones.state: nodes must be an array")
+        return cls(
+            request_id=request_id,
+            save_id=save_id,
+            status=status,
+            game_date=value.get("gameDate"),
+            nodes=tuple(MilestoneNode.from_mapping(n) for n in nodes if isinstance(n, Mapping)),
+            error=value.get("error"),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        res: dict[str, Any] = {
+            "requestId": self.request_id,
+            "saveId": self.save_id,
+            "status": self.status,
+            "nodes": [n.to_mapping() for n in self.nodes],
+        }
+        if self.game_date is not None:
+            res["gameDate"] = self.game_date
+        if self.error is not None:
+            res["error"] = self.error
         return res
 
 

@@ -244,4 +244,170 @@ public class LifeWireContractTests
         Assert.Equal("1:spring:2", care.GameDate);
         Assert.Equal("辛苦啦，喝口水吧", care.Text);
     }
+
+    // ------------------------------------------------------------ §2 life.milestones.*
+    // Cross-language fixtures (life-milestones-*.json, world-snapshot-player-items.json)
+    // are exported by tools/export-life-wire-test.py; these tests lock the C#
+    // serialization surface against them (canonical JSON, C# omitting nulls).
+
+    [Fact]
+    public void LifeMilestonesGet_LocksPythonFixture()
+    {
+        var dir = ExportFixtures();
+        var payload = LockPayload<LifeMilestonesGetPayload>(dir, "life-milestones-get.json", "life.milestones.get");
+        Assert.Equal("lmg-wire-1", payload.RequestId);
+        Assert.Equal("wire-save", payload.SaveId);
+
+        using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(dir, "life-milestones-get.json")));
+        var root = doc.RootElement.GetProperty("payload");
+        Assert.Equal(2, root.EnumerateObject().Count());
+    }
+
+    [Fact]
+    public void LifeMilestonesState_FullFields_LockPythonFixture()
+    {
+        var dir = ExportFixtures();
+        var state = LockPayload<LifeMilestonesStatePayload>(dir, "life-milestones-state.json", "life.milestones.state");
+        Assert.Equal("ok", state.Status);
+        Assert.Equal("lmg-wire-1", state.RequestId);
+        Assert.Equal("1:spring:11", state.GameDate);
+        Assert.Null(state.Error);
+        Assert.Equal(2, state.Nodes!.Count);
+
+        // Node 1: the Egg Festival strawberry node as adopted through the real
+        // plan-mode store (goal/todo wiring already applied by the exporter).
+        var node = state.Nodes[0];
+        Assert.Equal("spring-egg-festival-strawberry:y1", node.Id);
+        Assert.Equal("蛋蛋节草莓种子准备", node.Title);
+        Assert.Equal("adopted", node.Status);
+        Assert.Null(node.Verification);
+        Assert.Equal("1:spring:13", node.TargetDate);
+        Assert.Equal(2, node.DaysUntil);
+        Assert.Equal("https://stardewvalleywiki.com/Egg_Festival", node.SourceUrl);
+        Assert.Equal(1000, node.ReservedFunds);
+        Assert.Equal(10, node.PlannedCount);
+        Assert.Equal("预留1000g仅用于蛋蛋节当天购买草莓种子", node.TermsNote);
+        Assert.True(node.UpdatedAt > 1_700_000_000);
+        Assert.Equal(4, node.PrepItems!.Count);
+        Assert.Equal("reserve-funds", node.PrepItems[0].Key);
+        Assert.Equal("manual", node.PrepItems[0].Support);
+        Assert.Equal("pending", node.PrepItems[0].Status);
+        Assert.Null(node.PrepItems[0].Note);
+        Assert.Equal("buy-at-festival", node.PrepItems[1].Key);
+        Assert.Equal("仅核验种子准备，不代表种植完成；彩蛋寻宝后无法再购买",
+            node.PrepItems[1].Note);
+        Assert.All(node.PrepItems, p => Assert.NotEqual("done", p.Status));
+
+        // Node 2: a completed/verified retention node exercising verification
+        // plus a zero reservedFunds that must survive the roundtrip.
+        var completed = state.Nodes[1];
+        Assert.Equal("spring-crops-bundle-retention:y1", completed.Id);
+        Assert.Equal("completed", completed.Status);
+        Assert.Equal("verified", completed.Verification);
+        Assert.Equal(0, completed.DaysUntil);
+        Assert.Equal(0, completed.ReservedFunds);
+        Assert.Equal(4, completed.PlannedCount);
+        Assert.Equal("季末核对", completed.TermsNote);
+        var prep = Assert.Single(completed.PrepItems!);
+        Assert.Equal("retain-parsnip", prep.Key);
+        Assert.Equal("done", prep.Status);
+        Assert.Equal("背包中已确认", prep.Note);
+    }
+
+    [Fact]
+    public void LifeMilestonesState_NullFields_AreOmittedOnWrite()
+    {
+        var dir = ExportFixtures();
+        var state = LockPayload<LifeMilestonesStatePayload>(dir, "life-milestones-state-minimal.json", "life.milestones.state");
+        Assert.Equal("ok", state.Status);
+        // Proactive push shape: requestId "" and no gameDate in the fixture.
+        Assert.Equal(string.Empty, state.RequestId);
+        Assert.Null(state.GameDate);
+
+        var node = Assert.Single(state.Nodes!);
+        Assert.Equal("spring-egg-festival-strawberry:y1", node.Id);
+        Assert.Equal("suggested", node.Status);
+        Assert.Null(node.Verification);
+        Assert.Equal("1:spring:13", node.TargetDate);
+        Assert.Equal(1727340000.5, node.UpdatedAt!.Value);
+        Assert.Empty(node.PrepItems!);
+
+        // The C# re-serialization must keep omitting every optional the
+        // Python fixture omits (LockPayload already canonical-compared; this
+        // pins the omission on the actual written bytes).
+        var once = JsonSerializer.Serialize(state);
+        using var doc = JsonDocument.Parse(once);
+        var root = doc.RootElement;
+        Assert.False(root.TryGetProperty("gameDate", out _), "null gameDate must be omitted");
+        Assert.False(root.TryGetProperty("error", out _), "null error must be omitted");
+        var written = root.GetProperty("nodes")[0];
+        foreach (var omitted in new[]
+        {
+            "verification", "daysUntil", "sourceUrl",
+            "reservedFunds", "plannedCount", "termsNote",
+        })
+            Assert.False(written.TryGetProperty(omitted, out _), $"null {omitted} must be omitted");
+    }
+
+    [Fact]
+    public void LifeMilestonesState_Failed_LocksPythonFixture()
+    {
+        var dir = ExportFixtures();
+        var state = LockPayload<LifeMilestonesStatePayload>(dir, "life-milestones-state-failed.json", "life.milestones.state");
+        Assert.Equal("lmg-wire-1", state.RequestId);
+        Assert.Equal("failed", state.Status);
+        Assert.Equal("MILESTONE_STORE_UNAVAILABLE", state.Error);
+        Assert.Empty(state.Nodes!);
+        Assert.Null(state.GameDate);
+    }
+
+    [Fact]
+    public void LifeCare_MilestoneKind_LocksPythonFixture()
+    {
+        var dir = ExportFixtures();
+        var care = LockPayload<LifeCarePayload>(dir, "life-care-milestone.json", "life.care");
+        Assert.Equal("wire-save", care.SaveId);
+        Assert.Equal("milestone", care.Kind);
+        Assert.Equal("milestone:1:spring:12:spring-egg-festival-strawberry:y1", care.EventKey);
+        Assert.Equal("1:spring:12", care.GameDate);
+        Assert.Contains("蛋蛋节", care.Text);
+    }
+
+    [Fact]
+    public void WorldStateSnapshot_PlayerItems_OldPayloadWithoutField_Deserializes()
+    {
+        // §2.4 compatibility: a snapshot written before playerItems existed must
+        // still deserialize, leaving the aggregate unknown (null).
+        const string oldPayload =
+            "{\"currentLocation\":\"Farm\",\"timeOfDay\":600,\"season\":\"spring\",\"dayOfMonth\":13,\"isRaining\":false,\"year\":1}";
+        var snapshot = JsonSerializer.Deserialize<WorldStateSnapshot>(oldPayload);
+        Assert.NotNull(snapshot);
+        Assert.Equal("Farm", snapshot!.CurrentLocation);
+        Assert.Equal(13, snapshot.DayOfMonth);
+        Assert.Null(snapshot.PlayerItems);
+        Assert.Null(snapshot.PlayerMoney);
+        Assert.Null(snapshot.PlayerStamina);
+
+        var roundtripped = JsonSerializer.Serialize(snapshot);
+        Assert.DoesNotContain("playerItems", roundtripped);
+    }
+
+    [Fact]
+    public void WorldStateSnapshot_PlayerItems_LockPythonFixture()
+    {
+        var dir = ExportFixtures();
+        var payload = LockPayload<WorldSnapshotPayload>(dir, "world-snapshot-player-items.json", "world.snapshot");
+        Assert.Equal(7, payload.CapturedRevision);
+        Assert.Equal("Farm", payload.World.CurrentLocation);
+
+        Assert.Equal(500, payload.World.PlayerMoney);
+        Assert.Equal(180.5f, payload.World.PlayerStamina);
+        Assert.Equal(270, payload.World.PlayerMaxStamina);
+        var items = payload.World.PlayerItems!;
+        Assert.Equal(2, items.Count);
+        Assert.Equal("Strawberry Seeds", items[0].Name);
+        Assert.Equal(10, items[0].Quantity);
+        Assert.Equal("Parsnip", items[1].Name);
+        Assert.Equal(3, items[1].Quantity);
+    }
 }

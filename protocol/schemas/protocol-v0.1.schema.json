@@ -147,7 +147,27 @@
               "properties": {
                 "capturedRevision": { "type": "integer", "minimum": 0 },
                 "companion": { "type": "object" },
-                "world": { "type": "object" },
+                "world": {
+                  "type": "object",
+                  "properties": {
+                    "playerMoney": { "type": "integer", "minimum": 0 },
+                    "playerStamina": { "type": "number" },
+                    "playerMaxStamina": { "type": "integer", "minimum": 0 },
+                    "playerItems": {
+                      "type": "array",
+                      "maxItems": 40,
+                      "items": {
+                        "type": "object",
+                        "required": ["name", "quantity"],
+                        "properties": {
+                          "name": { "type": "string", "minLength": 1 },
+                          "quantity": { "type": "integer", "minimum": 1 }
+                        },
+                        "additionalProperties": false
+                      }
+                    }
+                  }
+                },
                 "farmWork": {
                   "type": "object",
                   "required": [

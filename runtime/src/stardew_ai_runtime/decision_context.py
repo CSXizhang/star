@@ -253,6 +253,20 @@ def build_decision_context(
         "playerLocation": player_location,
         "stamina": stamina_block,
         "funds": funds,
+        "resources": {
+            "player": {"money": _value(world, "playerMoney"),
+                       "stamina": _value(world, "playerStamina"),
+                       "maxStamina": _value(world, "playerMaxStamina"),
+                       "items": world.get("playerItems", UNKNOWN)},
+            "companion": {"spendableMoney": funds, "moneyStatus": money_status or UNKNOWN,
+                          "stamina": stamina_block, "inventory": inventory_block},
+            "note": "玩家金币和伙伴可花钱包分别观察，不能相加或推定同一钱包；未知不是零",
+        },
+        "farmWork": {
+            key: (payload.get("farmWork") or world.get("farmWork") or {}).get(key, UNKNOWN)
+            for key in ("tilledUnwateredCount", "cropUnwateredCount", "matureCropCount")
+        },
+        "duePreparation": work.get("duePreparation", []),
         "inventory": inventory_block,
         "goals": goals,
         "currentTask": current_task,

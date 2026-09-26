@@ -138,8 +138,8 @@ class CompanionProfileStore:
         """Return profile dict for save_id.
 
         Returns ``{"profile": None, "profileRevision": 0}`` when the save
-        has not been onboarded yet (missing or onboarded=False and skipped=False).
-        Returns ``{"profile": {...}, "profileRevision": N}`` when onboarded or skipped.
+        has no saved preferences yet.
+        Returns ``{"profile": {...}, "profileRevision": N}`` when explicitly saved, onboarded or skipped.
         """
         self._load()
         record = self._data.get(save_id)
@@ -147,7 +147,7 @@ class CompanionProfileStore:
         if record is None:
             return {"profile": None, "profileRevision": 0}
         revision = int(record.get("profile_revision", 0))
-        if not record.get("onboarded") and not record.get("skipped"):
+        if revision == 0 and not record.get("onboarded") and not record.get("skipped"):
             return {"profile": None, "profileRevision": revision}
         profile = {
             "onboarded": bool(record.get("onboarded", False)),

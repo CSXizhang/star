@@ -26,67 +26,25 @@ Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash.
 
 ## 开始使用
 
-目前以 **Windows、Stardew Valley 1.6.15、SMAPI 4.2.1** 为开发环境，从源码构建安装。需要游戏与 SMAPI、Python 3.11～3.13、[uv](https://docs.astral.sh/uv/)、.NET 6 SDK，以及已安装并登录的 Kimi CLI 或 agy。
+Windows 64 位发行包已包含编译好的 Mod 和独立 Python 环境，无需安装 Python、uv 或 .NET SDK。需要你已有 **Stardew Valley 1.6.15、SMAPI 4.2.1**，以及可用的 Kimi CLI 或 agy 模型账号。
 
-### 1. 准备与构建
+1. 到 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.2.0-windows-x64.zip`，解压到一个普通文件夹。请选择这个安装包，而非 GitHub 自动生成的 Source code。
+2. 关闭游戏，双击解压目录中的 **设置星露谷伙伴.cmd**。选择游戏目录，按向导将伙伴安装到 `Mods`，再选择聊天后端和模型。
+3. 按所选模型客户端自己的流程完成安装与登录。Kimi 首次连接还需在已安装的伙伴目录确认项目信任；设置时选择 agy 会注册它的伙伴 MCP 工具。
+4. 通过 **SMAPI 启动游戏并进入存档**。伙伴服务会随存档载入自动启动。走近伙伴按交互键，第一次见面时给她起个名字；按 **F8** 可以交代工作。
 
-克隆仓库后，在仓库根目录打开 PowerShell：
-
-```powershell
-Copy-Item .env.example .env.local
-uv sync --project runtime --locked
-```
-
-编辑 `.env.local`，填写本机游戏与 SMAPI 路径。没有 .NET SDK 时先运行 `tools/bootstrap-dotnet.ps1`，然后检查环境并构建：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/preflight.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/build-mod.ps1 -Configuration Release
-```
-
-### 2. 安装伙伴
-
-关闭游戏，运行设置向导完成 Mod 安装与本地配对：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/setup-companion.ps1 -AutoInstall
-```
-
-也可以双击 `设置星露谷伙伴.bat`。以后重新构建 Mod，再运行一次向导同步安装与配对即可。
-
-### 3. 配置模型
-
-以下以 Kimi 为例。完成 CLI 登录后，复制模型配置，按所用账号调整其中的模型名称：
-
-```powershell
-Copy-Item config/chat-backend.example.json config/chat-backend.json
-```
-
-通过 **SMAPI 启动游戏并进入存档**，再注册工具。把下面的路径替换为实际 Mod 安装目录：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -RunDir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" -Agent kimi -Install
-```
-
-首次使用，在仓库根目录运行 `kimi`，核对 MCP 启动命令和 Mod 路径后确认项目信任。输入 `/mcp`，确认 `stardew-companion` 已连接，然后退出这个检查会话。
-
-### 4. 启动服务
-
-```powershell
-uv run --project runtime python -m stardew_ai_runtime.chat_bridge --run-dir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" --backend kimi
-```
-
-保持服务窗口开启，回到游戏走近伙伴按交互键，第一次见面时给她起个名字；按 **F8** 可以交代工作。agy 和其他客户端的配置、安装细节与故障排查见[接入指南](docs/mcp.md)。
+安装、模型信任、升级与连接问题见[发行包安装指南](docs/release-guide.md)。已有源码开发环境的构建和安装步骤见[参与开发](CONTRIBUTING.md#从源码构建)。
 
 ## 正在开发
 
 - 更自然的“看现状、商量方案、一句认可后接手准备”交互，以及节日与季节节点规划、Wiki 依据查询。
 - 更长时间的跨天陪伴、界面与断线恢复体验。
-- 正式发布包、升级流程和更多环境兼容。
+- 更顺畅的升级流程和更多环境兼容。
 - 跟随陪伴；矿洞、战斗、钓鱼和语音等新能力。
 
 ## 更多文档
 
+- [发行包安装](docs/release-guide.md)：下载、设置、模型登录与升级。
 - [玩家指南](docs/companion-guide.md)：生活菜单、自由模式、记忆、规划与工作控制。
 - [模型与 MCP 接入](docs/mcp.md)：模型配置、配对、连接和故障排查。
 - [参与开发](CONTRIBUTING.md)：代码结构、构建检查和贡献方式。

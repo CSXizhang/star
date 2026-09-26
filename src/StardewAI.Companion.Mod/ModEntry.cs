@@ -48,6 +48,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private DateTime _autonomySentAt;
     private DateTime _chatActivityAt = DateTime.UtcNow;
     private string? _watchedChatRequest;
+    private DateTime _lastBridgeStartAttempt = DateTime.MinValue;
 
     // -----------------------------------------------------------------------
     // Life-system fields
@@ -321,6 +322,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
             // 5. Publish local restricted discovery (never log sessionToken!)
             _discoveryService?.Publish(saveId, gameSessionId, _transportServer.Port, sessionToken);
+            TryAutoStartChatBridge();
 
             Monitor.Log($"Companion Mechanics Actor and Transport online on port {_transportServer.Port} (Save: {saveId}).", LogLevel.Info);
         }
@@ -676,7 +678,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             TryAutoStartChatBridge();
 
             CompanionCommandMenu.CurrentStatusText = "桥接未连接";
-            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", "提示：后台 AI 伙伴桥接尚未连接。已尝试启动桥接服务，或请双击根目录『启动伙伴服务.cmd』。", Microsoft.Xna.Framework.Color.DarkOrange));
+            CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", "伙伴服务正在连接。稍后再试；若仍未连接，请在已安装的伙伴目录运行『设置星露谷伙伴.cmd』检查模型配置。", Microsoft.Xna.Framework.Color.DarkOrange));
             Game1.addHUDMessage(new HUDMessage("AI 伙伴桥接服务未连接，请启动服务。", HUDMessage.error_type));
             return false;
         }
@@ -1003,23 +1005,14 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void TryAutoStartChatBridge()
     {
+        if (_transportServer?.IsChatConnected == true || DateTime.UtcNow - _lastBridgeStartAttempt < TimeSpan.FromSeconds(30)) return;
         try
         {
-            string repoRoot = Path.GetFullPath(Path.Combine(Helper.DirectoryPath, "..", "..", "..", ".."));
-            string scriptPath = Path.Combine(repoRoot, "启动伙伴服务.cmd");
-            if (File.Exists(scriptPath))
-            {
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = scriptPath,
-                    Arguments = $"--run-dir \"{Helper.DirectoryPath}\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = repoRoot
-                };
-                System.Diagnostics.Process.Start(psi);
-                Monitor.Log("Auto-started companion chat bridge via 启动伙伴服务.cmd", LogLevel.Info);
-            }
+            var start = ReleaseBridgeLauncher.CreateStartInfo(Helper.DirectoryPath);
+            if (start == null) return; // Source builds use the documented developer launcher.
+            _lastBridgeStartAttempt = DateTime.UtcNow;
+            using var process = System.Diagnostics.Process.Start(start);
+            Monitor.Log("Started installed companion service launcher; waiting for connection.", LogLevel.Info);
         }
         catch (Exception ex)
         {
@@ -1264,6 +1257,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     /// </summary>
     private void OpenLifeMenu()
     {
+        TryAutoStartChatBridge();
         _companionDialogue ??= new CompanionDialogueController(
             _lifeMenuUiState, DispatchLifeChat,
             () =>

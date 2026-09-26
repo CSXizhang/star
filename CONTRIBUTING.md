@@ -1,6 +1,25 @@
 # 参与开发
 
-欢迎提交问题和修复。当前项目主要在 Windows 上开发，游戏版本基线为 Stardew Valley 1.6.15、SMAPI 4.2.1；构建步骤见[首页](README.md)。
+欢迎提交问题和修复。当前项目主要在 Windows 上开发，游戏版本基线为 Stardew Valley 1.6.15、SMAPI 4.2.1。玩家安装请看[首页](README.md)，以下步骤面向源码开发。
+
+## 从源码构建
+
+需要游戏与 SMAPI、Python 3.11～3.13、uv、.NET 6 SDK，以及已安装并登录的 Kimi CLI 或 agy。在克隆的仓库根目录打开 PowerShell：
+
+```powershell
+Copy-Item .env.example .env.local
+uv sync --project runtime --locked
+```
+
+编辑 `.env.local` 填写游戏与 SMAPI 路径。没有 .NET SDK 时先运行 `tools/bootstrap-dotnet.ps1`，然后检查、构建并安装：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/preflight.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/build-mod.ps1 -Configuration Release
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/setup-companion.ps1 -AutoInstall
+```
+
+安装时关闭游戏。重新构建后再运行设置向导，同步 DLL 与本地配对清单。开发环境的模型配置、MCP 注册和手动启动命令见[接入指南](docs/mcp.md)。
 
 ## 代码结构
 

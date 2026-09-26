@@ -28,8 +28,8 @@ public sealed class CompanionSetupMenu : IClickableMenu
     {
         ("earn",      "优先赚钱",            "收获出货、按需补种，遵守每日购买上限"),
         ("workhorse", "任劳任怨",            "浇水除草收获、喂动物、收机器成品等日常杂务"),
-        ("community", "社区献祭（规划中）",  "规划中能力，本版本不会自动完成"),
-        ("decor",     "农场装修（规划中）",  "规划中能力，本版本不会自动完成"),
+        ("community", "社区献祭",  "商量方案，确认可帮忙的准备与需你完成的部分"),
+        ("decor",     "农场装修",  "商量方案，确认可帮忙的准备与需你完成的部分"),
     };
 
     private static readonly (string Key, string Label)[] Personalities = new[]
@@ -268,12 +268,6 @@ public sealed class CompanionSetupMenu : IClickableMenu
         // Start together (only for earn/workhorse)
         if (_startButtonRect.Contains(x, y))
         {
-            bool canStart = _playStyle is "earn" or "workhorse";
-            if (!canStart)
-            {
-                Game1.addHUDMessage(new HUDMessage("献祭/装修为规划中能力，本版本不会自动完成。请选择赚钱或任劳任怨后再开始。", HUDMessage.error_type));
-                return;
-            }
             string name = GetValidName();
             _onStart(name, _playStyle, _personality, _careFrequency);
             exitThisMenu(playSound: false);
@@ -393,11 +387,10 @@ public sealed class CompanionSetupMenu : IClickableMenu
         }
 
         // Action buttons
-        bool canStart = _playStyle is "earn" or "workhorse";
         int mx = Game1.getOldMouseX(), my = Game1.getOldMouseY();
 
-        DrawButton(b, _startButtonRect, ProfileLoaded ? "开始一起生活" : "加载中…",
-            ProfileLoaded && canStart ? Color.ForestGreen : Color.Gray,
+        DrawButton(b, _startButtonRect, ProfileLoaded ? "保存并商量" : "加载中…",
+            ProfileLoaded ? Color.ForestGreen : Color.Gray,
             ProfileLoaded && _startButtonRect.Contains(mx, my));
 
         DrawButton(b, _saveButtonRect, ProfileLoaded ? "仅保存" : "加载中…",
@@ -411,9 +404,9 @@ public sealed class CompanionSetupMenu : IClickableMenu
         if (_playStyle is "community" or "decor")
         {
             int ttY = yPositionOnScreen + height - 104;
-            b.DrawString(Game1.smallFont, "提示：献祭/装修为规划中能力，本版本不会自动完成；",
+            b.DrawString(Game1.smallFont, "提示：献祭/装修为商量方案，确认可帮忙的准备与需你完成的部分；",
                 new Vector2(xPositionOnScreen + 24, ttY), Color.DarkOrange);
-            b.DrawString(Game1.smallFont, "选后仍可保存偏好，但「开始一起生活」需选其他模式。",
+            b.DrawString(Game1.smallFont, "实际放置与献祭由你完成，伙伴说明能帮的部分。",
                 new Vector2(xPositionOnScreen + 24, ttY + 22), Color.DarkOrange);
         }
 

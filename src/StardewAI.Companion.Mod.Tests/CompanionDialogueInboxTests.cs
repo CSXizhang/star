@@ -5,6 +5,24 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class CompanionDialogueInboxTests
 {
+    [Theory]
+    [InlineData("plan", "completed", true, "node", true)]
+    [InlineData("chat", "completed", true, "node", false)]
+    [InlineData("plan", "failed", true, "node", false)]
+    [InlineData("plan", "completed", false, "node", false)]
+    [InlineData("plan", "completed", true, "", false)]
+    public void ApprovalNeedsSuccessfulConcretePlan(string mode, string status, bool ready, string node, bool expected)
+    {
+        var inbox = new CompanionDialogueInbox();
+        inbox.Begin("current", mode, "帮忙照料作物");
+        Assert.True(inbox.Receive("current", status, "实际回复", ready, node));
+        Assert.Equal(expected, inbox.ProposalReady);
+        Assert.Equal("帮忙照料作物", inbox.PlayerText);
+        inbox.Begin("next", "chat", "谢谢");
+        Assert.False(inbox.ProposalReady);
+        Assert.Null(inbox.ProposalNodeId);
+    }
+
     [Fact]
     public void ModelSpeechCannotExecuteNativeDialogueCommandsOrGrantItems()
     {

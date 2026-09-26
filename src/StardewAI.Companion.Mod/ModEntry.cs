@@ -311,6 +311,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _lifeOnboardingHudShown = false;
             _lifeStartSequence.Abort();
             _lifeMenuUiState.Reset();
+            CompanionCommandMenu.TaskState.Reset();
             _companionDialogue?.Reset();
             _careHintController.OnDayStarted(GetCurrentGameDate());
 
@@ -360,6 +361,15 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
         // 2. Only advance game action if not cancelled or paused
         _coordinator?.Update(Game1.currentGameTime, e.Ticks);
+        if (e.IsMultipleOf(15) && _coordinator != null)
+        {
+            var water = _coordinator.StateMachine;
+            var harvest = _coordinator.HarvestMachine;
+            if (water.IsExecuting)
+                CompanionCommandMenu.TaskState.NativeProgress("浇水", water.IsPaused ? "已暂停" : water.CurrentState.ToString() == "Navigating" ? "前往作物" : "照料作物", water.WateredCount, water.TotalTargets);
+            else if (harvest?.IsExecuting == true)
+                CompanionCommandMenu.TaskState.NativeProgress("收获", harvest.IsPaused ? "已暂停" : harvest.CurrentState.ToString() == "Navigating" ? "前往作物" : "收获作物", harvest.HarvestedCount, harvest.TotalTargets);
+        }
         if (_deferredResumeMachine != null && _deferredResumeMachine.IsPaused)
         {
             _deferredResumeMachine.Resume();
@@ -494,6 +504,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
             // Life-system reset
             _lifeMenuUiState.Reset();
+            CompanionCommandMenu.TaskState.Reset();
             _companionDialogue?.Reset();
             _lifeSaveProfileFetched = false;
             _lifeOnboardingHudShown = false;
@@ -546,6 +557,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
         CompanionCommandMenu.StructuredProgressText = text;
         CompanionCommandMenu.CurrentToolName = progress.Action;
+        CompanionCommandMenu.TaskState.NativeProgress(actionName, phaseName, progress.Completed, progress.Total);
     }
 
     private void OnRenderedHud(object? sender, RenderedHudEventArgs e)
@@ -601,7 +613,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 RequestResumeMenuAction,
                 RequestCancelMenuAction,
                 ToggleAutonomyMode,
-                OpenAutonomySettings
+                OpenAutonomySettings,
+                OpenLifeMenu,
+                OpenLifeDirections
             );
             ProjectChatUiState();
             if (!_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && _coordinator.GetActivityStatus() != "idle")
@@ -609,6 +623,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             if (!_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested && _transportServer?.IsChatConnected != true)
                 CompanionCommandMenu.CurrentStatusText = "桥接未连接，输入会保留";
             Monitor.Log("Companion command menu opened (F8).", LogLevel.Info);
+            DispatchLifeProfileRefresh();
+            if (_transportServer?.IsChatConnected != true) CompanionCommandMenu.TaskState.Disconnected();
         }
     }
 
@@ -694,6 +710,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         CompanionCommandMenu.StructuredProgressText = null;
         CompanionCommandMenu.LastTokenInfo = null;
         var payload = new ChatSubmitPayload(reqId, rawInput, "text", saveId);
+        CompanionCommandMenu.TaskState.Begin(rawInput, planning: false);
 
         _ = Task.Run(async () =>
         {
@@ -724,9 +741,24 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             string.Equals(reply.SaveId, currentSave, StringComparison.Ordinal))
             _chatUiState.BeginCommand(reply.CommandId ?? reply.RequestId, currentSave, "模型正在思考");
 
+        // NPC preparation jobs share the panel without pretending they were F8 commands.
+        if (string.Equals(reply.SaveId, currentSave, StringComparison.Ordinal) && reply.Status.StartsWith("job-", StringComparison.Ordinal))
+        {
+            if (reply.Status is "job-completed" or "job-failed")
+                CompanionCommandMenu.TaskState.Complete(reply.ReplyText, reply.Status == "job-failed");
+            else CompanionCommandMenu.TaskState.SetPlanning("正在干活", reply.ReplyText, "关闭面板，让伙伴继续；需要时可暂停或取消。");
+        }
         string? previousTurn = _chatUiState.TurnId;
         if (!_chatUiState.ApplyReply(reply.RequestId, reply.CommandId, reply.SaveId, reply.Status, reply.CommandComplete))
             return;
+        if (reply.Status is "job-completed" or "job-failed" or "completed" or "failed" or "cancelled")
+            CompanionCommandMenu.TaskState.Complete(reply.ReplyText, reply.Status is "failed" or "job-failed");
+        else if (reply.Status == "processing")
+            CompanionCommandMenu.TaskState.SetPlanning("正在安排", reply.ReplyText, "关闭面板让游戏继续；有进展会更新这里。");
+        else if (reply.Status is "job-started" or "job-progress")
+            CompanionCommandMenu.TaskState.SetPlanning("正在干活", reply.ReplyText);
+        else if (reply.Status is "selected" or "decision-completed")
+            CompanionCommandMenu.TaskState.SetPlanning(reply.CommandComplete == true ? "本次结果" : "正在安排", reply.ReplyText);
         _chatActivityAt = DateTime.UtcNow;
         ProjectChatUiState();
         if (previousTurn != null && previousTurn != reply.RequestId)
@@ -1258,6 +1290,17 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private void OpenLifeMenu()
     {
         TryAutoStartChatBridge();
+        GetCompanionDialogue().Open();
+    }
+
+    private void OpenLifeDirections()
+    {
+        TryAutoStartChatBridge();
+        GetCompanionDialogue().OpenDirections();
+    }
+
+    private CompanionDialogueController GetCompanionDialogue()
+    {
         _companionDialogue ??= new CompanionDialogueController(
             _lifeMenuUiState, DispatchLifeChat,
             () =>
@@ -1276,8 +1319,19 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             text => DispatchMemoryEdit("add", null, "preference", text) ? _lifeMenuUiState.PendingMemoryEditRequestId : null,
             () => !_lifeMenuUiState.WorkPaused && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested &&
                 !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl &&
-                !_lifeMenuUiState.IsChatPending && (_coordinator == null || _coordinator.GetActivityStatus() == "idle"));
-        _companionDialogue.Open();
+                !_lifeMenuUiState.IsChatPending && (_coordinator == null || _coordinator.GetActivityStatus() == "idle"),
+            OpenTaskPanel);
+        return _companionDialogue;
+    }
+
+    private void OpenTaskPanel()
+    {
+        DispatchLifeProfileRefresh();
+        Game1.activeClickableMenu = new CompanionCommandMenu(ExecuteInGameCommand,
+            RequestPauseMenuAction, RequestResumeMenuAction, RequestCancelMenuAction,
+            ToggleAutonomyMode, OpenAutonomySettings, OpenLifeMenu, OpenLifeDirections);
+        ProjectChatUiState();
+        if (_transportServer?.IsChatConnected != true) CompanionCommandMenu.TaskState.Disconnected();
     }
 
     private void OpenCompanionMemory()
@@ -1305,7 +1359,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     RequestResumeMenuAction,
                     RequestCancelMenuAction,
                     ToggleAutonomyMode,
-                    OpenAutonomySettings);
+                    OpenAutonomySettings, OpenLifeMenu, OpenLifeDirections);
                 ProjectChatUiState();
             },
             onOpenSetup: OpenSetupMenu,
@@ -1336,7 +1390,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             currentWorkMode: _lifeMenuUiState.WorkMode,
             liveState: _lifeMenuUiState,
             onSave: (name, style, pers, freq) => SendLifeProfileSetOnly(name, style, pers, freq),
-            onStart: (name, style, pers, freq) => SendLifeStart(name, style, pers, freq),
+            onStart: (name, style, pers, freq) => GetCompanionDialogue().SaveSettingsAndPlan(name, style, pers, freq),
             onSkip: () => SendLifeProfileSkip());
     }
 
@@ -1368,14 +1422,15 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         });
     }
 
-    private bool DispatchLifeChat(string text, string mode)
+    private bool DispatchLifeChat(string text, string mode, string? acceptedNodeId = null)
     {
         if (_transportServer == null || !_transportServer.IsChatConnected) return false;
         string saveId = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
         string reqId = Guid.NewGuid().ToString("N")[..8];
         if (!_lifeMenuUiState.BeginChat(reqId, mode)) return false;
 
-        var payload = new LifeChatSubmitPayload(reqId, saveId, mode, text);
+        var payload = new LifeChatSubmitPayload(reqId, saveId, mode, text, AcceptedNodeId: acceptedNodeId);
+        if (mode == "plan") CompanionCommandMenu.TaskState.Begin(acceptedNodeId == null ? "正在结合农场现状商量方案。" : "正在保存你认可的方案。", planning: true);
         _ = Task.Run(async () =>
         {
             try { await _transportServer.SendLifeChatSubmitAsync(payload).ConfigureAwait(false); }
@@ -1614,7 +1669,11 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 reply.ProfileRevision,
                 reply.MemoryRevision);
             if (accepted)
-                _companionDialogue?.Receive(reply.RequestId, reply.Status, reply.ReplyText);
+            {
+                _companionDialogue?.Receive(reply.RequestId, reply.Status, reply.ReplyText, reply.ProposalReady, reply.ProposalNodeId);
+                if (reply.Activity != null)
+                    CompanionCommandMenu.TaskState.ApplyActivity(reply.Activity.Phase, reply.Activity.Summary, reply.Activity.NextStep);
+            }
 
             Monitor.Log($"life.chat.reply: status={reply.Status} reqId={reply.RequestId}", LogLevel.Debug);
         });
@@ -1673,6 +1732,11 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             }
 
             AdvanceLifeStartAfterProfile(state.RequestId, state.Status, state.Reason);
+            CompanionCommandMenu.TaskState.ApplyProjection(_lifeMenuUiState.PlayStyle,
+                state.Work.ActiveGoals?.FirstOrDefault()?.Text ?? state.Work.Goal,
+                state.Work.WaitingConditions ?? new List<string>(), state.Work.PlanWaitReason, state.Work.Paused);
+            if (state.Work.Activity != null)
+                CompanionCommandMenu.TaskState.ApplyActivity(state.Work.Activity.Phase, state.Work.Activity.Summary, state.Work.Activity.NextStep);
             _lifeMenuUiState.EndProfileSet(state.RequestId);
             _companionDialogue?.ReceiveProfile(state.RequestId, state.Status);
 

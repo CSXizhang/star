@@ -175,6 +175,9 @@ _PREPARATION_LABELS = {
     "plant": "用现有可用种子小规模补种并浇水；不因此自动买种子",
     "animals": "照料现有动物的日常喂食和抚摸，不购买动物",
     "machines": "收取现有机器成品，不自动出售或追加采购",
+    "store": "把玩家指定保留的物品整理进获准使用的箱子，不出售",
+    "ship": "仅出货玩家已明确认可可出售的物品，保留献祭和其他约定保留品",
+    "pickup": "拾取授权范围内可见掉落物，保留材料，不自动砍树或出售",
 }
 
 
@@ -534,7 +537,7 @@ class CompanionMilestoneStore:
             raise MilestoneError("propose: title must be at most 60 chars")
         preparation = list(dict.fromkeys(preparation or []))
         if any(key not in _PREPARATION_LABELS for key in preparation):
-            raise MilestoneError("preparation must use water|harvest|clear|plant|animals|machines")
+            raise MilestoneError("preparation must use " + "|".join(_PREPARATION_LABELS))
         target = _parse_target_date(target_date)
         current_key = _game_date_key(game_date)
         now = time.time()
@@ -752,6 +755,7 @@ class CompanionMilestoneStore:
             specs.append({
                 "key": prep["key"],
                 "intent": f'{prep["key"]}：{node["title"]}：{prep["label"]}；'
+                          f'范围={node.get("summary") or "仅当前可确认范围，不扩大到其他工作"}；'
                           f'计划数量={node.get("plannedCount") or "待商量"}；'
                           f'约定={node.get("termsNote") or "无"}',
                 "trigger": {"type": "calendar", **trigger}, "expiry": dict(target),

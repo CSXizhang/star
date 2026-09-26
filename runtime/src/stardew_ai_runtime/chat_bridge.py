@@ -989,6 +989,10 @@ class ChatBridge:
         self._memory_store: CompanionMemoryStore | None = None
         self._care_service: CompanionCareService | None = None
         self._milestone_store: CompanionMilestoneStore | None = None
+        # A button may accept only the exact proposal shown in this discussion,
+        # at the same profile/node revision. Restart or direction change requires
+        # a fresh discussion, never automatic adoption of an old suggestion.
+        self._life_proposals: dict[str, tuple[str, int, float]] = {}
         self._life_chat: LifeChatService | None = None
         self._life_fingerprints: dict[str, str] = {}
         self._life_queue: list[dict[str, Any]] = []
@@ -1804,7 +1808,63 @@ class ChatBridge:
                 for row in (overview.get("waitingConditions") or [])[:5]
                 if isinstance(row, dict) and isinstance(row.get("waitDescription"), str)
             ],
+            "activity": self._player_activity(save_id),
         }
+
+    def _current_life_proposal(self, save_id: str) -> dict[str, Any] | None:
+        binding = self._life_proposals.get(save_id)
+        if not binding or binding[1] != self._profile_revision(save_id) or self._milestone_store is None:
+            return None
+        return next((node for node in self._milestone_store.list_nodes(save_id)
+                     if node["id"] == binding[0] and node.get("status") == "suggested"
+                     and node.get("updatedAt") == binding[2]), None)
+
+    def _player_activity(self, save_id: str) -> dict[str, str]:
+        """Small player-facing projection of persisted work, never provider prose."""
+        def activity(phase: str, summary: str, next_step: str) -> dict[str, str]:
+            return {"phase": phase, "summary": summary[:240], "nextStep": next_step[:160]}
+
+        state = self._work_store.state(save_id) if self._work_store else None
+        autonomy = self._autonomy.state(save_id) if self._autonomy else None
+        if (state and state.paused) or (autonomy and autonomy.paused):
+            return activity("paused", "伙伴工作已暂停，已保存的安排仍保留。", "准备好后点继续；不会自行解除暂停。")
+        decision = state.decision if state else {}
+        selected = next((task for task in state.tasks if task.id == decision.get("taskId")), None) if state else None
+        if selected and selected.status == "waiting":
+            waits = self._work_store.wait_conditions(save_id)
+            reason = next((row.get("waitDescription") for row in waits if row.get("taskId") == selected.id), None)
+            return activity("waiting", f"{selected.title}：{reason or '正在等待执行条件'}", "条件满足后继续；可以暂停或取消。")
+        if (decision.get("selected") and not decision.get("finished")) or save_id in self._command_chains:
+            return activity("working", f"正在处理：{selected.title if selected else '已认可的工作安排'}", "完成后会按实际结果更新。")
+        if self._active_task and not self._active_task.cancelled:
+            return activity("working", "伙伴正在处理已有工作。", "新安排会保留，不抢占当前任务。")
+        proposal = self._current_life_proposal(save_id)
+        if proposal:
+            return activity("proposed", proposal.get("summary") or proposal["title"], "认可后接手可做的准备；也可以继续商量。")
+        nodes = self._milestone_store.list_nodes(save_id) if self._milestone_store else []
+        adopted = max((node for node in nodes if node.get("status") == "adopted"),
+                      key=lambda node: node.get("updatedAt", 0), default=None)
+        last = state.last_job if state else {}
+        last_task_id = last.get("taskId") or decision.get("taskId")
+        last_task = next((task for task in state.tasks if task.id == last_task_id), None) if state else None
+        if last and (adopted is None or (last_task and last_task.goal_id == adopted.get("goalId"))):
+            title = last_task.title if last_task else "上一项工作"
+            if last.get("status") == "completed":
+                return activity("completed", f"已完成：{title}。", "这是实际完成的一项；其余安排仍按约定进行。")
+            if last.get("status") in {"failed", "partial", "unknown", "rejected", "cancelled"}:
+                detail = str(last.get("message") or last.get("error") or "尚未确认全部完成")
+                return activity("failed", f"{title}：{detail}", "保留实际进度，可调整安排后重试。")
+            if last.get("status") == "waiting":
+                return activity("waiting", str(last.get("message") or "当前工作在等待条件满足。"), "不会把等待当成完成。")
+        if adopted:
+            if not adopted.get("todoIds"):
+                return activity("waiting", f"已记下：{adopted['title']}。这项安排需玩家完成。", "可以继续商量伙伴能接手的准备。")
+            snapshot, game_date = self._plan_snapshot_state()
+            due_ids = {row["id"] for row in self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date=game_date)} if self._work_store else set()
+            due = bool(due_ids.intersection((adopted.get("todoIds") or {}).values()))
+            return activity("waiting", f"已保存：{adopted['title']}。" + ("等待接手可做的准备。" if due else "还没到约定的准备时间。"),
+                            "可继续商量或从工作面板查看安排；不会提前宣称完成。")
+        return activity("idle", "还没有正在执行的工作。", "选择想发展的方向，一起商量下一步。")
 
     def _life_work_summary(self, save_id: str, mode: str) -> dict[str, Any] | None:
         """Compact read-only work summary injected into the life prompt (§2)."""
@@ -2085,6 +2145,7 @@ class ChatBridge:
             "save_id": save_id,
             "mode": payload.mode,
             "text": payload.text,
+            "accepted_node_id": payload.accepted_node_id,
         }
         if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
             # A work turn/decision owns the single model slot: acknowledge with a
@@ -2099,6 +2160,7 @@ class ChatBridge:
                 queue_position=len(self._life_queue),
                 profile_revision=self._profile_revision(save_id),
                 memory_revision=self._memory_revision(save_id),
+                activity={"phase": "waiting", "summary": "伙伴正忙，这次对话已排队。", "nextStep": "当前工作告一段落后继续。"},
             ))
             return
         await self._run_life_chat_turn(ws, item)
@@ -2146,9 +2208,12 @@ class ChatBridge:
         previous_token = env.get("STARDEW_DECISION_TOKEN")
         previous_surface = env.get("STARDEW_MCP_SURFACE")
         previous_mode = env.get("STARDEW_LIFE_MODE")
+        previous_proposal = env.get("STARDEW_LIFE_PROPOSAL_ID")
         env.pop("STARDEW_DECISION_TOKEN", None)
         env["STARDEW_MCP_SURFACE"] = "life"
         env["STARDEW_LIFE_MODE"] = mode if mode in {"chat", "plan"} else "chat"
+        proposal = self._current_life_proposal(active_task.save_id) if mode == "plan" else None
+        env["STARDEW_LIFE_PROPOSAL_ID"] = proposal["id"] if proposal else ""
         try:
             backend = self._get_backend()
             if isinstance(backend, KimiBackend):
@@ -2167,6 +2232,10 @@ class ChatBridge:
                 env.pop("STARDEW_LIFE_MODE", None)
             else:
                 env["STARDEW_LIFE_MODE"] = previous_mode
+            if previous_proposal is None:
+                env.pop("STARDEW_LIFE_PROPOSAL_ID", None)
+            else:
+                env["STARDEW_LIFE_PROPOSAL_ID"] = previous_proposal
 
     async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
         """Run one life-chat turn under the shared single-model-turn lock."""
@@ -2175,6 +2244,9 @@ class ChatBridge:
         mode = str(item.get("mode") or "chat")
         text = str(item.get("text") or "")
         try:
+            if item.get("accepted_node_id"):
+                await self._accept_life_proposal(ws, item)
+                return
             async with self._busy_lock:
                 profile = None
                 if self._profile_store is not None and save_id:
@@ -2196,6 +2268,8 @@ class ChatBridge:
                     for n in (self._milestone_store.list_nodes(save_id)
                               if self._milestone_store is not None and save_id else [])
                 }
+                proposals_before = {node["id"]: node.get("updatedAt") for node in
+                                    (self._milestone_store.list_nodes(save_id) if self._milestone_store else [])}
                 milestone_revision_before = (
                     self._milestone_store.revision(save_id)
                     if self._milestone_store is not None and save_id
@@ -2231,6 +2305,7 @@ class ChatBridge:
                     status="processing",
                     profile_revision=self._profile_revision(save_id),
                     memory_revision=self._memory_revision(save_id),
+                    activity={"phase": "planning", "summary": "伙伴正在结合眼前情况想下一步。", "nextStep": "先商量，认可后才接手工作。"} if mode == "plan" else None,
                 ))
                 # Life read/plan tools use the same single native MCP socket
                 # as work turns. Park the worker and release its connection;
@@ -2245,6 +2320,13 @@ class ChatBridge:
                     if claimed:
                         await self._release_execution(save_id)
                 success = bool(result.get("success"))
+                if success and mode == "plan" and self._milestone_store:
+                    changed = [node for node in self._milestone_store.list_nodes(save_id)
+                               if node.get("status") == "suggested" and
+                               node.get("updatedAt") != proposals_before.get(node["id"])]
+                    if changed:
+                        proposed = max(changed, key=lambda node: node.get("updatedAt", 0))
+                        self._life_proposals[save_id] = (proposed["id"], self._profile_revision(save_id), proposed["updatedAt"])
                 cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat is not None and save_id:
                     self._life_chat.record_session_id(save_id, str(cid))
@@ -2306,6 +2388,11 @@ class ChatBridge:
                 if execution_note:
                     reply.payload["replyText"] = (str(reply.payload.get("replyText") or "")
                                                   + "\n" + execution_note)[:2000]
+                proposal = self._current_life_proposal(save_id)
+                reply.payload["proposalReady"] = proposal is not None
+                if proposal:
+                    reply.payload["proposalNodeId"] = proposal["id"]
+                reply.payload["activity"] = self._player_activity(save_id)
                 await self._send_reply(ws, reply)
         except Exception as ex:
             logger.error("Life chat turn [%s] failed: %s", request_id, ex, exc_info=True)
@@ -2317,7 +2404,35 @@ class ChatBridge:
                 profile_revision=self._profile_revision(save_id),
                 memory_revision=self._memory_revision(save_id),
                 error=f"LIFE_TURN_ERROR: {ex}",
+                activity={"phase": "failed", "summary": "这次安排没有接手成功。", "nextStep": "请重新商量当前方案；已有工作保持原样。"},
             ))
+
+    async def _accept_life_proposal(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
+        """Explicit NPC button -> existing milestone -> existing command chain."""
+        save_id, request_id = str(item["save_id"]), str(item["request_id"])
+        async with self._busy_lock:
+            proposal = self._current_life_proposal(save_id)
+            if item.get("mode") != "plan" or not proposal or proposal["id"] != item["accepted_node_id"]:
+                raise ValueError("建议已更新、暂缓或方向已改变，请先重新商量；没有派发工作。")
+            before = {node["id"]: dict(node.get("todoIds") or {})
+                      for node in self._milestone_store.list_nodes(save_id)}
+            _, game_date = self._plan_snapshot_state()
+            adopted = self._milestone_store.adopt(
+                save_id, proposal["id"], work_store=self._work_store, game_date=game_date,
+            )
+            self._life_proposals.pop(save_id, None)
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                self.instance_id, request_id, save_id, "processing",
+                self._profile_revision(save_id), self._memory_revision(save_id),
+                reply_text=f"已记下：{adopted['title']}。我看看眼前能接手哪一步。",
+                proposal_ready=False, activity=self._player_activity(save_id)))
+            await self._send_reply(ws, self._build_milestones_state(save_id, ""))
+        note = await self._start_accepted_preparation(ws, save_id, before)
+        await self._send_reply(ws, Envelope.create_life_chat_reply(
+            self.instance_id, request_id, save_id, "completed",
+            self._profile_revision(save_id), self._memory_revision(save_id),
+            reply_text=note or "已保留这个安排。需要玩家完成的部分，我会和你继续商量可接手的准备。",
+            proposal_ready=False, activity=self._player_activity(save_id)))
 
     async def _start_accepted_preparation(
         self, ws: WebSocketClient | None, save_id: str, before: dict[str, dict[str, str]]
@@ -2879,8 +2994,10 @@ class ChatBridge:
         phase = "job-running" if execution.status == "dispatching" else (
             "job-waiting" if execution.outcome == "waiting" else
             "job-completed" if execution.task_status == "completed" and execution.outcome == "completed" else
-            "job-failed" if execution.outcome in {"partial", "unknown", "cancelled"} or execution.status == "deferred" else "job-running")
-        labels = {"job-running": "原生作业执行", "job-waiting": "作业等待", "job-completed": "作业已完成", "job-failed": "作业未完成"}
+            "job-failed" if execution.outcome in {"failed", "partial", "unknown", "cancelled", "rejected"} or execution.status == "deferred" else "job-running")
+        labels = {"job-running": "正在处理", "job-waiting": "正在等待", "job-completed": "已完成", "job-failed": "未能完成"}
+        task = next((task for task in self._work_store.state(save_id).tasks if task.id == execution.task_id), None) if self._work_store else None
+        title = task.title if task else "这项农场工作"
         detail = execution.message or execution.reason_code or ""
         if execution.result and isinstance(execution.result, dict):
             detail = detail or str(execution.result.get("error") or execution.result.get("message") or "")
@@ -2889,7 +3006,7 @@ class ChatBridge:
             chain is not None and chain.root_request_id == command_id
         )
         await self._send_reply(ws, Envelope.create_chat_reply(self.instance_id, request_id,
-            status=phase, reply_text=f"{labels[phase]}：{execution.operation or ''} {detail[:400]}", save_id=save_id,
+            status=phase, reply_text=f"{labels[phase]}：{title}。{detail[:400]}", save_id=save_id,
             command_id=command_id, command_complete=command_complete))
 
     def _plan_status_line(self) -> str | None:

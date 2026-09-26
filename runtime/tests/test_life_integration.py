@@ -127,7 +127,7 @@ def test_life_profile_state_work_projection_matches_contract(tmp_path) -> None:
     assert set(work.keys()) == {
         "mode", "paused", "goal", "dailySpendLimit", "boxPreference", "dailySpend",
         "hasExecutableWork", "lastPlanAction", "planWaitReason", "lastSettledDay",
-        "activeGoals", "recentTodos", "waitingConditions",
+        "activeGoals", "recentTodos", "waitingConditions", "activity",
     }
 
 

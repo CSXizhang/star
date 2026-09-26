@@ -9,9 +9,9 @@ $OutputEncoding = New-Object Text.UTF8Encoding($false)
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $releaseRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $PSScriptRoot 'release-package.ps1')
-Write-Host '正在检查安装包完整性，请稍候……'
+Write-Host '正在检查伙伴版本与必要文件……'
 $package = Read-VerifiedRelease $releaseRoot
-Write-Host '安装包检查完成。'
+Write-Host '版本配对检查完成。'
 $agentSpecified = $PSBoundParameters.ContainsKey('Agent')
 $modelSpecified = $PSBoundParameters.ContainsKey('Model')
 

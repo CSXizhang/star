@@ -37,8 +37,8 @@ _PERSONALITY_PROMPTS: dict[str, str] = {
 _PLAY_STYLE_SUMMARIES: dict[str, str] = {
     "earn": "优先赚钱：收获出货、按需补种，遵守每日购买上限",
     "workhorse": "任劳任怨：浇水除草收获、喂动物、收机器成品等日常杂务",
-    "community": "优先社区中心所需物品的收集与保留；献祭提交仍由玩家完成",
-    "decor": "农场装修（规划中能力）",
+    "community": "献祭：优先收集、保留与种植准备；无法读取的献祭进度说未知，最后提交仍由玩家完成",
+    "decor": "装修：结合地形商量布局，可准备材料和清理玩家明确授权的位置；现有能力不能摆放家具，不冒充已经装修",
 }
 
 
@@ -188,7 +188,7 @@ class LifeChatService:
                 discussion=self.discussion_context(save_id, mode) if not conversation_id else None,
             )
         permission = (
-            "本轮是商量计划：只在玩家当轮明确认可后调用manage_milestones；"
+            "本轮是商量计划：先用manage_milestones(propose)保存具体未授权建议供玩家选择；只有玩家当轮明确认可才adopt；"
             "用node_id复制节点id。可以承接刚才的方案，不要求玩家复述参数；"
             "暂停不得解除，不扩大授权。保存不等于动作完成；手动准备仍由玩家做。"
             if mode == "plan" else
@@ -238,7 +238,7 @@ class LifeChatService:
             parts.append(
                 "这是只读生活对话：你不能派工、取消或暂停工作，也不能把任务加入队列。"
                 "即使玩家在闲聊中说了‘去浇水’或‘取消现在的工作’，也绝不能说任务已执行、已取消、已安排或稍后会自动执行。"
-                "需要实际操作时，请明确告诉玩家从‘帮我做件事’入口提出；此处只可讨论建议。"
+                "需要实际操作时，可以自然说明点本次回复的‘就这件事商量’即可接着安排，不用重说；‘帮我做件事’也可直达工作入口。此处只可讨论建议。"
                 "此处也不能保存、纠正或删除记忆；需要记约定时请指向‘查看记忆’，不要声称会替玩家记下。"
             )
             parts.append(
@@ -246,7 +246,7 @@ class LifeChatService:
                 "请引导玩家切换到「商量计划」模式，在那里经玩家确认后才能修改。"
             )
         else:
-            parts.append("商量计划可在玩家当轮明确同意后保存、修改或暂缓节点及关联待办；不能直接派发动作。其他记忆编辑仍请使用查看记忆。")
+            parts.append("商量计划先保存未授权建议（propose），让玩家直接认可或修改；采纳（adopt）及关联工作只在当轮明确认可后进行。选择方向本身不是工作授权；不能直接派发动作。其他记忆编辑仍请使用查看记忆。")
         parts.append("在星露谷原生NPC对话窗口中交谈：每回合通常2到4句简短自然中文，像面对面说话；细节等玩家追问再展开。不用Markdown、粗体星号、标题、表格、分工清单或emoji装饰。不要显示 JSON、token、会话 ID、reservedFunds、goal/todo 或其他内部字段；用自然话说明你准备做什么。")
 
         if live_context:
@@ -284,9 +284,12 @@ class LifeChatService:
                 "【一起决定下一步】先根据眼前资源、人格和玩家偏好主动提出一两个可行的准备动作。"
                 "不要问快照已有的金币量。数量和预算没有指定时，你自己提出保守的小规模默认方案；"
                 "优先已有种子和不花钱的眼前农活，不把预算、数量、保留金额当必填项，也不默认花光钱包。"
+                "赚钱、干活、献祭、装修是软偏好，不是硬能力屏蔽；都应落到现有能力可做的准备，不能因没有摆家具或献祭提交工具就拒绝整个方向。"
+                "有具体可行建议时，本轮先调用manage_milestones(action='propose',title=简短名称,summary=明确范围与保留条件,preparation=[能力])，返回的真实建议才能显示认可按钮。"
+                "这只是待认可建议，不建立执行授权。一般今天的农活无需另找节日节点，省略target_date会使用当前真实游戏日期。"
                 "玩家说‘行’‘你看着办’‘按这个来’即认可刚才的方案，调用manage_milestones(action='adopt', node_id=节点id)采纳；参数是node_id。"
                 "无现成节点时自行propose再adopt，日期和preparation由你填写，玩家不用懂参数或切其他菜单。"
-                "自定义preparation可选water/harvest/clear/plant/animals/machines，只选玩家认可范围内、当前能力支持的项目。"
+                "自定义preparation可选water/harvest/clear/plant/animals/machines/store/ship/pickup，只选当前能力支持的项目；出货必须明确哪些物品可卖，献祭保留物不得出售；清理必须限定玩家认可的位置。"
                 "已有授权日常工作无需再反复确认。不能凭一句认可扩大到无边界花钱或取消无关工作；"
                 "如果当前暂停，保存后自然说明待恢复，不擅自解除暂停。"
                 "工具成功后用一两句反馈实际已安排什么、哪部分需要玩家；执行结果只依据真实完成记录，不能把保存当完成。"
@@ -295,7 +298,7 @@ class LifeChatService:
             parts.append("玩家正在和你商量近期重要节点。以下是当前节点快照（JSON，字段含 id/title/status/targetDate/daysUntil/reservedFunds/pendingGap）：")
             parts.append(json.dumps(milestones or [], ensure_ascii=False, separators=(",", ":")))
             parts.append(
-                "节点规则：只有玩家当轮明确同意采纳或修改后，才调用 manage_milestones 落盘；"
+                "节点规则：propose仅记录未授权建议；只有玩家当轮明确同意后才adopt或修改已采纳安排。"
                 "工具确认成功后才可对玩家说已保存，未确认前不得声称已记录或已完成。"
                 "manual 准备项必须明说需要玩家自己完成（例如节日当天亲自到摊位购买，节日购物伙伴无法代劳）；"
                 "capability 准备项才说明伙伴可以接手。"

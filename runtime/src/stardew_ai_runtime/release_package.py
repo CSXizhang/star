@@ -24,7 +24,8 @@ def managed_path(root: Path, relative: str) -> Path:
     return target
 
 
-def verify_release(root: Path) -> dict:
+def verify_release(root: Path, *, full: bool = True) -> dict:
+    """Full audit for publishing/explicit verification; normal use checks the pair only."""
     root = root.resolve()
     package = json.loads((root / "release-manifest.json").read_text(encoding="utf-8-sig"))
     if package.get("manifestType") != "windows-release" or package.get("schemaVersion") != 1:
@@ -39,6 +40,8 @@ def verify_release(root: Path) -> dict:
         if canonical in seen:
             raise ValueError(f"Duplicate release file: {relative}")
         seen.add(canonical)
+        if not full and relative not in REQUIRED:
+            continue
         target = managed_path(root, relative)
         if not target.is_file():
             raise ValueError(f"Release file missing: {relative}")

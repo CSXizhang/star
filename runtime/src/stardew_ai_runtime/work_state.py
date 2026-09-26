@@ -751,6 +751,8 @@ class WorkStore:
                 return
             state.last_job = dict(feedback)
             state.last_job["decisionId"] = state.decision.get("token")
+            if task_id:
+                state.last_job["taskId"] = task_id
             state.decision["finished"] = True
         self._mutate(save_id, mutate)
 

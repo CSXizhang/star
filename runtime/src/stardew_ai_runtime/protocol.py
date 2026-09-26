@@ -1013,6 +1013,9 @@ class Envelope:
         reply_text: str | None = None,
         queue_position: int | None = None,
         error: str | None = None,
+        proposal_ready: bool | None = None,
+        proposal_node_id: str | None = None,
+        activity: Mapping[str, Any] | None = None,
     ) -> Envelope:
         """life.chat.reply: no token/session fields (contract §1.2)."""
         payload: dict[str, Any] = {
@@ -1028,6 +1031,12 @@ class Envelope:
             payload["queuePosition"] = queue_position
         if error is not None:
             payload["error"] = error
+        if proposal_ready is not None:
+            payload["proposalReady"] = proposal_ready
+        if proposal_node_id is not None:
+            payload["proposalNodeId"] = proposal_node_id
+        if activity is not None:
+            payload["activity"] = dict(activity)
         return cls(
             protocol_version="0.1", message_type="life.chat.reply",
             message_id=f"msg-life-reply-{uuid.uuid4().hex[:8]}",
@@ -1294,6 +1303,7 @@ class LifeChatSubmitPayload:
     mode: str
     text: str
     source: str = "life-menu"
+    accepted_node_id: str | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatSubmitPayload:
@@ -1310,7 +1320,11 @@ class LifeChatSubmitPayload:
             raise ProtocolError(f"life.chat.submit: invalid mode '{mode}'")
         if not text or not (1 <= len(text) <= 500):
             raise ProtocolError("life.chat.submit: text must be 1..500 chars")
-        return cls(request_id=request_id, save_id=save_id, mode=mode, text=text, source=source)
+        accepted = value.get("acceptedNodeId")
+        if accepted is not None and (mode != "plan" or not isinstance(accepted, str) or not accepted.strip()):
+            raise ProtocolError("acceptedNodeId requires plan mode and a non-empty proposal id")
+        return cls(request_id=request_id, save_id=save_id, mode=mode, text=text, source=source,
+                   accepted_node_id=accepted)
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -1319,6 +1333,7 @@ class LifeChatSubmitPayload:
             "mode": self.mode,
             "text": self.text,
             "source": self.source,
+            **({"acceptedNodeId": self.accepted_node_id} if self.accepted_node_id else {}),
         }
 
 
@@ -1334,6 +1349,9 @@ class LifeChatReplyPayload:
     reply_text: str | None = None
     queue_position: int | None = None
     error: str | None = None
+    proposal_ready: bool | None = None
+    proposal_node_id: str | None = None
+    activity: dict[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatReplyPayload:
@@ -1346,6 +1364,9 @@ class LifeChatReplyPayload:
             reply_text=value.get("replyText"),
             queue_position=value.get("queuePosition"),
             error=value.get("error"),
+            proposal_ready=value.get("proposalReady"),
+            proposal_node_id=value.get("proposalNodeId"),
+            activity=value.get("activity"),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -1362,6 +1383,12 @@ class LifeChatReplyPayload:
             res["queuePosition"] = self.queue_position
         if self.error is not None:
             res["error"] = self.error
+        if self.proposal_ready is not None:
+            res["proposalReady"] = self.proposal_ready
+        if self.proposal_node_id is not None:
+            res["proposalNodeId"] = self.proposal_node_id
+        if self.activity is not None:
+            res["activity"] = dict(self.activity)
         return res
 
 

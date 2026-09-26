@@ -202,7 +202,8 @@ def build_decision_context(
     work = work if isinstance(work, dict) else {}
     overview_goals = work.get("goals") if isinstance(work.get("goals"), list) else []
     goals = [
-        {"text": g.get("text"), "source": g.get("source")}
+        {**({"id": g["id"]} if g.get("id") else {}),
+         "text": g.get("text"), "source": g.get("source")}
         for g in overview_goals
         if isinstance(g, dict) and g.get("text")
     ][:3]

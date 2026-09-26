@@ -711,6 +711,9 @@ class WorkStore:
             state.scheduler_epoch += 1
             state.decision = {"token": token, "epoch": state.scheduler_epoch,
                               "expires": _time.time() + 1200, "selected": False}
+            active_goals = [goal for goal in state.goals if goal.status == "active"]
+            if len(active_goals) == 1:
+                state.decision["goalId"] = active_goals[0].id
         self._mutate(save_id, mutate)
 
     @staticmethod
@@ -754,7 +757,7 @@ class WorkStore:
     @staticmethod
     def validate_short_job(tasks: list[dict[str, Any]]) -> None:
         if len(tasks) != 1:
-            raise WorkStateError("ONE_SHORT_JOB_REQUIRED: record future business as intent, not executable tasks")
+            raise WorkStateError('ONE_SHORT_JOB_REQUIRED: nothing selected. Submit exactly one task without dependencies, e.g. tasks=[{"title":"浇水","steps":[{"operation":"water_auto","params":{"max_tiles":10}}]}]. Record remaining business with remember_intent; select it in the next decision.')
         task = tasks[0]
         steps = task.get("steps") or []
         if not 1 <= len(steps) <= 32 or task.get("dependencies"):
@@ -831,7 +834,12 @@ class WorkStore:
                     state.goals.append(goal)
                     created_goal = True
             else:
-                raise WorkStateError("submit_plan requires goal_id or goal_text")
+                bound_goal_id = state.decision.get("goalId")
+                if not bound_goal_id:
+                    raise WorkStateError("submit_plan requires goal_id or goal_text: this decision has no uniquely bound active goal. Use an active goal id from context or provide goal_text; nothing selected.")
+                goal = self._find_goal(state, bound_goal_id)
+                if goal.status != "active":
+                    raise WorkStateError(f"Bound goal '{bound_goal_id}' is no longer active; supply an active goal_id or goal_text. Nothing selected.")
 
             if replace:
                 for existing in state.tasks:

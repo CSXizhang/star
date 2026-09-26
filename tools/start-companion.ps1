@@ -2,6 +2,18 @@
 param([switch]$CheckOnly, [Parameter(ValueFromRemainingArguments=$true)][string[]]$ForwardArgs)
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'release-manifest.json')) {
+    . (Join-Path $PSScriptRoot 'release-package.ps1')
+    try {
+        Start-ReleaseCompanion $repoRoot -CheckOnly:$CheckOnly -ForwardArgs $ForwardArgs
+        exit 0
+    } catch {
+        $logDir = Join-Path $repoRoot 'data'
+        [void][IO.Directory]::CreateDirectory($logDir)
+        Add-Content -LiteralPath (Join-Path $logDir 'release-start.log') -Value ("$(Get-Date -Format o) $_") -Encoding UTF8
+        throw
+    }
+}
 . (Join-Path $PSScriptRoot 'candidate-package.ps1')
 $python = Join-Path $repoRoot 'runtime\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { $python = (Get-Command python.exe -ErrorAction Stop).Source }

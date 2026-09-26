@@ -1,10 +1,10 @@
 # MCP 与聊天接入
 
-本项目通过本地 MCP 服务向模型客户端提供游戏观察和动作工具。游戏内聊天另由 Python 聊天服务转发。模型客户端需要自行安装和登录。
+本项目通过本地 MCP 服务向模型客户端提供游戏观察和动作工具。游戏内聊天另由伙伴服务转发。发行包玩家先看[安装指南](release-guide.md)；本页保留源码开发与高级客户端的手动接入步骤。模型客户端需要自行安装和登录。
 
 ## 接入前
 
-先按[首页](../README.md)编译和安装 Mod，通过 SMAPI 启动游戏并进入存档。Mod 会在自己的 `data` 目录下生成 `transport-discovery.json`，供 Runtime 发现本地连接。
+源码开发者先按[参与开发](../CONTRIBUTING.md#从源码构建)构建和安装 Mod，通过 SMAPI 启动游戏并进入存档。Mod 会在自己的 `data` 目录下生成 `transport-discovery.json`，供 Runtime 发现本地连接。
 
 当前动作执行依赖 Mod DLL 与本地配对清单一致：干净克隆可从源码编译后运行 `tools/setup-companion.ps1` 生成 `local-dev` 绑定完成安装；缺少清单时返回 `COMPATIBILITY_UNKNOWN`，DLL 与清单不一致时返回 `MOD_RUNTIME_MISMATCH`（重新运行设置向导同步）。
 

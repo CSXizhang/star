@@ -11,6 +11,16 @@ def assert_native_compatible(run_dir):
     if not run_dir:
         raise CompatibilityError("COMPATIBILITY_UNKNOWN：尚未绑定游戏实例，未执行动作。")
     root = Path(__file__).resolve().parents[3]
+    if (root / "release-manifest.json").is_file():
+        from stardew_ai_runtime.release_package import verify_release
+
+        if Path(run_dir).resolve() != root:
+            raise CompatibilityError("MOD_RUNTIME_MISMATCH：下载版必须绑定它所在的Mod目录，未执行动作。")
+        try:
+            verify_release(root)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise CompatibilityError(f"MOD_RUNTIME_MISMATCH：下载版文件不完整或不配套，请重新安装。{error}") from error
+        return
     releases_dir = (root / "artifacts/releases").resolve()
     installed = root / "config/installed-candidate.json"
     manifest = None

@@ -14,14 +14,22 @@ public sealed class CompanionDialogueInbox
     public string? PendingRequestId { get; private set; }
     public string? Reply { get; private set; }
     public bool HasUnreadReply { get; private set; }
+    public bool ProposalReady { get; private set; }
+    public string? ProposalNodeId { get; private set; }
+    public string? PlayerText { get; private set; }
+    public bool ReplySucceeded { get; private set; }
 
-    public void Begin(string requestId, string mode)
+    public void Begin(string requestId, string mode, string? playerText = null)
     {
         PendingRequestId = requestId;
         Mode = mode == "plan" ? "plan" : "chat";
+        ProposalReady = false;
+        ProposalNodeId = null;
+        PlayerText = playerText;
+        ReplySucceeded = false;
     }
 
-    public bool Receive(string requestId, string status, string? text)
+    public bool Receive(string requestId, string status, string? text, bool proposalReady = false, string? proposalNodeId = null)
     {
         if (requestId != PendingRequestId || status is not ("completed" or "failed")) return false;
         PendingRequestId = null;
@@ -29,6 +37,9 @@ public sealed class CompanionDialogueInbox
             ? "我这边暂时没能接上话。等一下再来找我，好吗？"
             : PlainText(text);
         HasUnreadReply = true;
+        ReplySucceeded = status == "completed";
+        ProposalReady = Mode == "plan" && ReplySucceeded && proposalReady && !string.IsNullOrWhiteSpace(proposalNodeId);
+        ProposalNodeId = ProposalReady ? proposalNodeId : null;
         return true;
     }
 
@@ -39,6 +50,9 @@ public sealed class CompanionDialogueInbox
         Reply = null;
         HasUnreadReply = false;
         Mode = "chat";
+        ProposalReady = false;
+        ProposalNodeId = PlayerText = null;
+        ReplySucceeded = false;
     }
 
     public static string PlainText(string text)
@@ -55,7 +69,7 @@ public sealed class CompanionDialogueInbox
 public sealed class CompanionDialogueController
 {
     private readonly LifeMenuUiState _state;
-    private readonly Func<string, string, bool> _submit;
+    private readonly Func<string, string, string?, bool> _submit;
     private readonly Action _refresh;
     private readonly Action _settings;
     private readonly Action _memory;
@@ -63,6 +77,11 @@ public sealed class CompanionDialogueController
     private readonly Func<LifeProfilePatchDto, string?> _saveProfile;
     private readonly Func<string, string?> _savePreference;
     private readonly Func<bool> _canHelp;
+    private readonly Action _progress;
+    private string? _directionRequest;
+    private DateTime _directionSentAt;
+    private string? _directionFeedback;
+    private bool _directionConfirmed;
     private string? _meetingProfileRequest;
     private string? _meetingMemoryRequest;
     private string? _draftName;
@@ -80,9 +99,10 @@ public sealed class CompanionDialogueController
     private bool _returnAfterPages;
     private Action? _afterPages;
 
-    public CompanionDialogueController(LifeMenuUiState state, Func<string, string, bool> submit,
+    public CompanionDialogueController(LifeMenuUiState state, Func<string, string, string?, bool> submit,
         Action refresh, Action settings, Action memory, Func<Farmer?> farmer,
-        Func<LifeProfilePatchDto, string?> saveProfile, Func<string, string?> savePreference, Func<bool> canHelp)
+        Func<LifeProfilePatchDto, string?> saveProfile, Func<string, string?> savePreference, Func<bool> canHelp,
+        Action progress)
     {
         _state = state;
         _submit = submit;
@@ -93,6 +113,7 @@ public sealed class CompanionDialogueController
         _saveProfile = saveProfile;
         _savePreference = savePreference;
         _canHelp = canHelp;
+        _progress = progress;
     }
 
     public void Reset()
@@ -106,6 +127,8 @@ public sealed class CompanionDialogueController
         _portrait = null;
         _meetingProfileRequest = _meetingMemoryRequest = _draftName = _meetingChoice = _meetingFeedback = null;
         _helpAfterFeedback = false;
+        _directionRequest = _directionFeedback = null;
+        _directionConfirmed = false;
     }
 
     public void Update()
@@ -116,6 +139,13 @@ public sealed class CompanionDialogueController
             if (_meetingProfileRequest != null) _state.EndProfileSet(_meetingProfileRequest);
             _meetingProfileRequest = _meetingMemoryRequest = null;
             _meetingFeedback = "保存的确认还没回来，我先不开始新工作。等连接恢复，我们再核对一下。";
+            MeetingReady();
+        }
+        if (_directionRequest != null && DateTime.UtcNow - _directionSentAt > TimeSpan.FromSeconds(30))
+        {
+            _state.EndProfileSet(_directionRequest);
+            _directionRequest = null;
+            _directionFeedback = "保存的确认还没回来。连接恢复后再核对方向，暂时不开始新安排。";
             MeetingReady();
         }
         if (Game1.eventUp || Game1.currentLocation?.currentEvent != null)
@@ -146,16 +176,38 @@ public sealed class CompanionDialogueController
         next();
     }
 
+    public void SaveSettingsAndPlan(string name, string style, string personality, string frequency)
+    {
+        _directionRequest = _saveProfile(new LifeProfilePatchDto(PlayStyle: style,
+            Personality: personality, CareFrequency: frequency, CompanionName: name));
+        _directionSentAt = DateTime.UtcNow;
+        if (_directionRequest == null) _directionFeedback = "设置还没保存成功，等连接恢复再试一次吧。";
+    }
+
     public void ReturnToConversation() => _next = Open;
 
     public void Open()
     {
         if (Game1.activeClickableMenu != null || Game1.eventUp) return;
         _refresh();
-        if (_meetingFeedback != null)
+        if (_directionConfirmed)
+        {
+            _directionConfirmed = false;
+            SubmitDirectionPlan();
+        }
+        else if (_directionFeedback != null)
+        {
+            ShowSpeech(_directionFeedback, false);
+            _directionFeedback = null;
+            _afterPages = OpenDirections;
+        }
+        else if (_directionRequest != null)
+            ShowSpeech("我正在记下这个方向，确认后就一起看看眼前能做什么。", false);
+        else if (_meetingFeedback != null)
         {
             ShowSpeech(_meetingFeedback, false);
             _meetingFeedback = null;
+            _afterPages = ShowGreeting;
             if (_helpAfterFeedback)
             {
                 _helpAfterFeedback = false;
@@ -234,6 +286,14 @@ public sealed class CompanionDialogueController
 
     public void ReceiveProfile(string requestId, string status)
     {
+        if (requestId == _directionRequest)
+        {
+            _directionRequest = null;
+            _directionConfirmed = status == "confirmed";
+            if (!_directionConfirmed) _directionFeedback = "方向还没保存成功，原来的安排不变。我们再试一次吧。";
+            MeetingReady();
+            return;
+        }
         if (requestId != _meetingProfileRequest) return;
         _meetingProfileRequest = null;
         if (status != "confirmed")
@@ -269,9 +329,9 @@ public sealed class CompanionDialogueController
         else Game1.addHUDMessage(new HUDMessage("初次见面的约定有消息了，回来聊聊吧。"));
     }
 
-    public void Receive(string requestId, string status, string? text)
+    public void Receive(string requestId, string status, string? text, bool proposalReady = false, string? proposalNodeId = null)
     {
-        if (_inbox.Receive(requestId, status, text))
+        if (_inbox.Receive(requestId, status, text, proposalReady, proposalNodeId))
             Game1.addHUDMessage(new HUDMessage($"{_state.CompanionName}有话想告诉你，走近聊聊吧。", HUDMessage.newQuest_type));
     }
 
@@ -296,25 +356,63 @@ public sealed class CompanionDialogueController
     {
         var choices = new List<Response>
         {
-            new("chat", "随便聊聊"),
-            new("plan", "接下来做什么？"),
-            new("say", "我想说……"),
+            new("plan", "按现在的方向商量下一步"),
+            new("direction", "选个方向：赚钱、干活、献祭、装修"),
+            new("progress", "看看任务进度"),
+            new("say", "随便聊聊……"),
         };
-        if (_inbox.Reply != null) choices.Add(new Response("again", "接着刚才聊"));
+        if (_inbox.Reply != null) choices.Add(new Response("again", "接着刚才的方案"));
         choices.Add(new Response("other", "说点别的……"));
         choices.Add(new Response("bye", "先去忙了"));
-        Ask("我在。", choices.ToArray(), key =>
+        Ask($"我在。我们现在的方向是{CompanionTaskPanelState.DirectionName(_state.PlayStyle)}，也可以先随便聊聊。", choices.ToArray(), key =>
         {
             switch (key)
             {
                 case "chat": Submit("今天过得怎么样？", "chat"); break;
-                case "plan": Submit("看看眼前的农场，你觉得接下来怎么安排？", "plan"); break;
+                case "plan": SubmitDirectionPlan(); break;
+                case "direction": OpenDirections(); break;
+                case "progress": _progress(); break;
                 case "say": ShowInput("chat"); break;
                 case "again": ShowSpeech(_inbox.Reply!, true); break;
                 case "other": ShowOtherTopics(); break;
             }
         });
     }
+
+    public void OpenDirections()
+    {
+        if (Game1.activeClickableMenu != null || Game1.eventUp) return;
+        _refresh();
+        if (!_state.HasProfileState)
+        {
+            ShowSpeech("还在读取你的设置，稍后我们再选方向。", false);
+            _afterPages = ShowGreeting;
+            return;
+        }
+        Ask("想一起往哪个方向走？选好后先商量具体安排，不会马上花钱或改掉正在做的事。", new[]
+        {
+            new Response("earn", "赚钱经营：照料作物、收获与出货"),
+            new Response("workhorse", "日常干活：浇水、清杂物、动物和机器"),
+            new Response("community", "社区献祭：找材料与保留物品"),
+            new Response("decor", "农场装修：商量布局与清理准备"),
+            new Response("chat", "先随便聊聊"),
+            new Response("back", "回到刚才"),
+        }, key =>
+        {
+            if (key == "chat") { ShowInput("chat"); return; }
+            if (key == "back") { ShowGreeting(); return; }
+            _directionRequest = _saveProfile(new LifeProfilePatchDto(PlayStyle: key));
+            _directionSentAt = DateTime.UtcNow;
+            if (_directionRequest == null)
+            {
+                ShowSpeech("这会儿还没能保存方向，等连接恢复再试。", false);
+                _afterPages = ShowGreeting;
+            }
+        });
+    }
+
+    private void SubmitDirectionPlan() => Submit(
+        $"我们接下来按{CompanionTaskPanelState.DirectionName(_state.PlayStyle)}这个方向。请先读取眼前真实情况，给我一个能力范围内可行的小方案，说明我需要亲自做的部分。现在只商量，先不要采纳、派工、花钱或取消旧安排。", "plan");
 
     private void ShowOtherTopics()
     {
@@ -343,21 +441,28 @@ public sealed class CompanionDialogueController
     private void ShowResponses()
     {
         var responses = new List<Response>();
-        if (_inbox.Mode == "plan")
+        if (_inbox.ProposalReady)
         {
-            responses.Add(new Response("agree", "行，你看着办。"));
-            responses.Add(new Response("change", "换个打算吧。"));
+            responses.Add(new Response("agree", "按这个安排。"));
         }
-        responses.Add(new Response("say", "我想说……"));
-        responses.Add(new Response("plan", "聊聊接下来的安排"));
+        if (_inbox.Mode == "chat" && _inbox.ReplySucceeded && !string.IsNullOrWhiteSpace(_inbox.PlayerText))
+            responses.Add(new Response("discuss", "就这件事商量安排"));
+        responses.Add(new Response("say", _inbox.Mode == "plan" ? "调整一下……" : "我想说……"));
+        responses.Add(new Response("progress", "看看任务进度"));
+        responses.Add(new Response("direction", "换个方向商量"));
+        responses.Add(new Response("chat", "随便聊聊"));
         responses.Add(new Response("bye", "好，等会儿再聊。"));
         Ask("", responses.ToArray(), key =>
         {
             switch (key)
             {
-                case "agree": Submit("行，你看着办。", "plan"); break;
+                case "agree": if (_inbox.ProposalReady) Submit("按刚才这个具体方案安排吧。只采纳这个方案，不扩大花钱或取消无关工作。", "plan", _inbox.ProposalNodeId); break;
+                case "discuss": Submit($"我们刚才聊的是：{_inbox.PlayerText}\n你的回复是：{_inbox.Reply}\n现在就这件事商量一个具体可行的小方案。先不要采纳、派工或消费。", "plan"); break;
                 case "change": Submit("先不采纳刚才的方案，换个打算吧。", "plan"); break;
                 case "say": ShowInput(_inbox.Mode); break;
+                case "progress": _progress(); break;
+                case "direction": OpenDirections(); break;
+                case "chat": ShowInput("chat"); break;
                 case "plan": Submit("看看眼前的农场，你觉得接下来怎么安排？", "plan"); break;
             }
         });
@@ -409,11 +514,11 @@ public sealed class CompanionDialogueController
         Game1.activeClickableMenu = _ownedMenu;
     }
 
-    private void Submit(string text, string mode)
+    private void Submit(string text, string mode, string? acceptedNodeId = null)
     {
-        if (_submit(text, mode) && _state.PendingChatRequestId != null)
+        if (_submit(text, mode, acceptedNodeId) && _state.PendingChatRequestId != null)
         {
-            _inbox.Begin(_state.PendingChatRequestId, mode);
+            _inbox.Begin(_state.PendingChatRequestId, mode, text);
             // Leave the game unpaused while the model and real work continue.
             _ownedMenu = _pages = null;
             Game1.addHUDMessage(new HUDMessage($"{_state.CompanionName}：让我看看，等会儿告诉你。", HUDMessage.newQuest_type));

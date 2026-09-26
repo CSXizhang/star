@@ -20,22 +20,24 @@ function Get-ReleasePath([string]$Root, [string]$Relative) {
     return $path
 }
 
-function Read-VerifiedRelease([string]$Root) {
+function Read-VerifiedRelease([string]$Root, [switch]$FullVerify) {
     $manifest = Join-Path $Root 'release-manifest.json'
     $package = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($package.manifestType -ne 'windows-release' -or $package.schemaVersion -ne 1 -or
         $package.platform -ne 'windows-x64' -or $package.python -ne 'runtime/python/python.exe') { throw 'Unsupported release package.' }
     $seen = @{}
+    $requiredFiles = @('manifest.json', 'stardewai.companion.mod.dll', 'runtime/python/python.exe', 'runtime/src/stardew_ai_runtime/chat_bridge.py', 'tools/start-companion.ps1')
     foreach ($entry in $package.files) {
         $key = $entry.path.Replace('\', '/').ToLowerInvariant()
         if ($seen.ContainsKey($key)) { throw "Duplicate release file: $key" }
         $seen[$key] = $entry.sha256
+        if (-not $FullVerify -and $key -notin $requiredFiles) { continue }
         $path = Get-ReleasePath $Root $entry.path
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Release file missing: $($entry.path)" }
         if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Linked release file not allowed.' }
         if ((Get-ReleaseHash $path) -ne $entry.sha256) { throw "Release file changed: $($entry.path). Reinstall the matching package." }
     }
-    foreach ($required in @('manifest.json', 'stardewai.companion.mod.dll', 'runtime/python/python.exe', 'runtime/src/stardew_ai_runtime/chat_bridge.py', 'tools/start-companion.ps1')) {
+    foreach ($required in $requiredFiles) {
         if (-not $seen.ContainsKey($required)) { throw "Required release file omitted: $required" }
     }
     $native = Get-Content -LiteralPath (Join-Path $Root 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -45,7 +47,7 @@ function Read-VerifiedRelease([string]$Root) {
 }
 
 function Start-ReleaseCompanion([string]$Root, [switch]$CheckOnly, [string[]]$ForwardArgs) {
-    $package = Read-VerifiedRelease $Root
+    $package = Read-VerifiedRelease $Root -FullVerify:$CheckOnly
     $python = Get-ReleasePath $Root $package.python
     if ($CheckOnly) {
         & $python -B -c "import sqlite3,ssl,mcp,win32job; import stardew_ai_runtime.chat_bridge; print('Portable runtime imports OK')"

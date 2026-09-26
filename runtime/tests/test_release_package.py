@@ -62,6 +62,29 @@ def test_manifest_cannot_omit_native_pairing(tmp_path):
         verify_release(tmp_path)
 
 
+def test_normal_pairing_reads_only_required_files_but_explicit_verify_audits_all(tmp_path, monkeypatch):
+    from stardew_ai_runtime.release_package import REQUIRED
+
+    doc = package_at(tmp_path)
+    doc["files"].append({"path": "runtime/python/unused-package-file.txt", "sha256": "0" * 64})
+    (tmp_path / "release-manifest.json").write_text(json.dumps(doc))
+    read = []
+    original = Path.read_bytes
+
+    def counted(path):
+        read.append(path.relative_to(tmp_path).as_posix())
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted)
+    verify_release(tmp_path, full=False)
+    assert set(read) == REQUIRED and len(read) == len(REQUIRED)
+    with pytest.raises(ValueError, match="missing"):
+        verify_release(tmp_path)
+    (tmp_path / "StardewAI.Companion.Mod.dll").write_bytes(b"mismatch")
+    with pytest.raises(ValueError, match="changed"):
+        verify_release(tmp_path, full=False)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer")
 def test_installer_isolated_upgrade_preserves_configuration_and_uses_bundled_python(tmp_path):
     root = tmp_path / "包 空格"

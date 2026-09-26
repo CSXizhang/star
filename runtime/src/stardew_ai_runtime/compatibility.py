@@ -17,7 +17,7 @@ def assert_native_compatible(run_dir):
         if Path(run_dir).resolve() != root:
             raise CompatibilityError("MOD_RUNTIME_MISMATCH：下载版必须绑定它所在的Mod目录，未执行动作。")
         try:
-            verify_release(root)
+            verify_release(root, full=False)
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise CompatibilityError(f"MOD_RUNTIME_MISMATCH：下载版文件不完整或不配套，请重新安装。{error}") from error
         return

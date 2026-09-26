@@ -1005,7 +1005,9 @@ def create_mcp_server(
         Facts come from the official English Wiki with sourceUrl on every node.
         Actions: list (always allowed), propose/adopt/revise/defer/reopen (write
         actions, allowed only while the player is in 「商量计划」 mode —
-        STARDEW_LIFE_MODE=plan — and has explicitly agreed this turn; only say the
+        STARDEW_LIFE_MODE=plan. propose records an UNAPPROVED suggestion for the
+        player's accept button; adopt and changing accepted work require explicit
+        agreement this turn. Only say the
         plan is saved after this tool confirms it).
 
         Use node_id for adopt/revise/defer/reopen, copied from the current node's
@@ -1017,7 +1019,10 @@ def create_mcp_server(
         confirm that write. Saving is not proof that physical work has run.
 
         For a custom proposal, preparation optionally lists existing capabilities:
-        water, harvest, clear, plant (existing seeds), animals or machines.
+        water, harvest, clear, plant (existing seeds), animals, machines, store,
+        ship (explicitly approved sale items only) or pickup. Summary must retain
+        location, scope and protected items. For today's ordinary work, omit
+        target_date to use the observed game date; no festival node is required.
         Infer a modest proposal from the live snapshot; budget/count are optional,
         never ask the player to fill internal parameters. A clear "you decide" in
         response to the current proposal authorizes adoption in plan mode.
@@ -1071,6 +1076,9 @@ def create_mcp_server(
         if len(identifiers) > 1:
             raise ToolError("CONFLICTING_NODE_ID: node_id/id/nodeId disagree; pass only node_id from the current node snapshot.")
         node_id = next(iter(identifiers), None)
+        if action_clean == "adopt" and "STARDEW_LIFE_PROPOSAL_ID" in os.environ:
+            if not node_id or node_id != os.environ["STARDEW_LIFE_PROPOSAL_ID"]:
+                raise ToolError("PROPOSAL_APPROVAL_REQUIRED: first propose the current suggestion and let the player review it. Choosing a direction does not authorize work; do not adopt a new or stale node in the same turn.")
         if action_clean != "propose" and not node_id:
             raise ToolError(
                 'NODE_ID_REQUIRED: use {"action":"' + action_clean + '","node_id":"<node.id>"}; '
@@ -1093,7 +1101,7 @@ def create_mcp_server(
                 node = store.propose(
                     sid,
                     title=title or "",
-                    target_date=target_date or "",
+                    target_date=target_date or (f"{game_date['year']}:{game_date['season']}:{game_date['day']}" if game_date else ""),
                     summary=summary,
                     source_url=source_url,
                     preparation=preparation,

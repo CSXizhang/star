@@ -22,7 +22,8 @@ public sealed record ChatMessage(string Speaker, string Text, Color Color, strin
 /// </summary>
 public sealed class CompanionCommandMenu : IClickableMenu
 {
-    public const string MenuTitle = "星露谷 AI 伙伴对话 (F8)";
+    public const string MenuTitle = "伙伴任务 (F8)";
+    public static CompanionTaskPanelState TaskState { get; } = new();
 
     public static readonly List<ChatMessage> ChatHistory = new();
     public static bool IsProcessing { get; set; }
@@ -118,6 +119,8 @@ public sealed class CompanionCommandMenu : IClickableMenu
     private readonly Action? _onCancel;
     private readonly Action? _onModeToggle;
     private readonly Action? _onSettings;
+    private readonly Action? _onConversation;
+    private readonly Action? _onDirection;
     private bool _settingsOpen;
     private string _draftBeforeSettings = string.Empty;
 
@@ -128,6 +131,8 @@ public sealed class CompanionCommandMenu : IClickableMenu
     private Rectangle _cancelButtonRect;
     private Rectangle _closeButtonRect;
     private Rectangle _detailButtonRect;
+    private Rectangle _conversationButtonRect;
+    private Rectangle _directionButtonRect;
     private Rectangle _chatViewport;
     private Rectangle _scrollTrackRect;
     private Rectangle _scrollThumbRect;
@@ -154,7 +159,9 @@ public sealed class CompanionCommandMenu : IClickableMenu
         Action? onResume = null,
         Action? onCancel = null,
         Action? onModeToggle = null,
-        Action? onSettings = null)
+        Action? onSettings = null,
+        Action? onConversation = null,
+        Action? onDirection = null)
         : base(
             Math.Max(0, (Game1.uiViewport.Width - 720) / 2),
             Math.Max(0, (Game1.uiViewport.Height - 480) / 2),
@@ -167,10 +174,13 @@ public sealed class CompanionCommandMenu : IClickableMenu
         _onCancel = onCancel;
         _onModeToggle = onModeToggle;
         _onSettings = onSettings;
+        _onConversation = onConversation;
+        _onDirection = onDirection;
 
         _lastSeenCount = ChatHistory.Count;
         BuildLayout();
         _textBox.Text = DraftText;
+        _scrollBack = MaxScrollBack(); // Task summary starts at the top, not the latest chat line.
 
         if (ChatHistory.Count == 0)
         {
@@ -184,8 +194,8 @@ public sealed class CompanionCommandMenu : IClickableMenu
     {
         _layoutViewportWidth = Game1.uiViewport.Width;
         _layoutViewportHeight = Game1.uiViewport.Height;
-        int minWidth = Math.Min(720, Math.Max(480, Game1.uiViewport.Width - 32));
-        int minHeight = Math.Min(480, Math.Max(360, Game1.uiViewport.Height - 32));
+        int minWidth = Math.Min(840, Math.Max(320, Game1.uiViewport.Width - 32));
+        int minHeight = Math.Min(620, Math.Max(320, Game1.uiViewport.Height - 32));
         width = minWidth;
         height = minHeight;
         xPositionOnScreen = Math.Max(0, (Game1.uiViewport.Width - width) / 2);
@@ -214,7 +224,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
 
         _textBox.X = xPositionOnScreen + 24;
         _textBox.Y = inputY;
-        _textBox.Width = Math.Max(200, width - 300);
+        _textBox.Width = Math.Max(40, width - 300);
         _textBox.Height = 44;
 
         _sendButtonRect = new Rectangle(xPositionOnScreen + width - 258, inputY, 68, 44);
@@ -224,7 +234,9 @@ public sealed class CompanionCommandMenu : IClickableMenu
         _closeButtonRect = new Rectangle(xPositionOnScreen + width - 40, yPositionOnScreen + 12, 28, 28);
         _detailButtonRect = new Rectangle(xPositionOnScreen + width - 140, yPositionOnScreen + 50, 116, 28);
 
-        int chatTop = yPositionOnScreen + 168;
+        _conversationButtonRect = new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 156, 148, 32);
+        _directionButtonRect = new Rectangle(xPositionOnScreen + 182, yPositionOnScreen + 156, 148, 32);
+        int chatTop = yPositionOnScreen + 202;
         int chatBottom = yPositionOnScreen + height - 76;
         _chatViewport = new Rectangle(xPositionOnScreen + 24, chatTop, width - 64, Math.Max(40, chatBottom - chatTop));
 
@@ -282,6 +294,14 @@ public sealed class CompanionCommandMenu : IClickableMenu
             ShowTechnicalDetail = !ShowTechnicalDetail;
             return;
         }
+        if (_conversationButtonRect.Contains(x, y) || _directionButtonRect.Contains(x, y))
+        {
+            bool direction = _directionButtonRect.Contains(x, y);
+            PreserveDraft();
+            exitThisMenu(playSound: false);
+            if (direction) _onDirection?.Invoke(); else _onConversation?.Invoke();
+            return;
+        }
 
         if (_unreadWhileScrolled > 0 && new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 75, width - 48, 25).Contains(x, y))
         {
@@ -320,7 +340,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
             if (Game1.keyboardDispatcher != null) Game1.keyboardDispatcher.Subscriber = _textBox;
             return;
         }
-        if (_settingsOpen && new Rectangle(xPositionOnScreen + 280, yPositionOnScreen + 118, 250, 32).Contains(x, y))
+        if (_settingsOpen && new Rectangle(xPositionOnScreen + 280, yPositionOnScreen + 118, Math.Max(70, width - 424), 32).Contains(x, y))
         {
             IReadOnlyList<string> options = AvailableChestOptions.Count == 0 ? new[] { "any" } : AvailableChestOptions;
             int index = 0;
@@ -329,7 +349,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
             BoxPreference = options[(index + 1) % options.Count];
             return;
         }
-        if (_settingsOpen && new Rectangle(xPositionOnScreen + 538, yPositionOnScreen + 118, 110, 32).Contains(x, y))
+        if (_settingsOpen && new Rectangle(xPositionOnScreen + width - 134, yPositionOnScreen + 118, 110, 32).Contains(x, y))
         {
             if (int.TryParse(_textBox.Text, out int limit) && limit >= 0)
             {
@@ -411,7 +431,7 @@ public sealed class CompanionCommandMenu : IClickableMenu
         {
             // Bottom-relative pixel offset: new content/reflow keeps the top anchor.
             _scrollBack = ChatScrollMetrics.PreserveAnchor(_scrollBack, _lastContentHeight, contentHeight, _chatViewport.Height);
-            _unreadWhileScrolled += Math.Max(0, count - _lastSeenCount);
+
         }
         _lastContentHeight = contentHeight;
         _lastSeenCount = count;
@@ -424,10 +444,18 @@ public sealed class CompanionCommandMenu : IClickableMenu
         int contentWidth = Math.Max(120, _chatViewport.Width - 24);
         var rendered = new List<RenderedMessage>();
 
-        int start = 0;
-        for (int i = start; i < ChatHistory.Count; i++)
+        var rows = new List<ChatMessage>
         {
-            var msg = ChatHistory[i];
+            new("方向", CompanionTaskPanelState.DirectionName(TaskState.Direction), Color.DarkBlue),
+            new("安排", TaskState.Goal ?? "还没有保存的长期安排，可以先选方向商量。", Game1.textColor),
+            new("当前", TaskState.Current, Game1.textColor),
+        };
+        if (!string.IsNullOrWhiteSpace(TaskState.Progress)) rows.Add(new("进度", TaskState.Progress, Color.DarkGreen));
+        if (!string.IsNullOrWhiteSpace(TaskState.WaitReason)) rows.Add(new("等待", TaskState.WaitReason, Color.DarkGoldenrod));
+        if (!string.IsNullOrWhiteSpace(TaskState.LastResult)) rows.Add(new("最近结果", TaskState.LastResult, Color.DarkGreen));
+        rows.Add(new("下一步", TaskState.NextStep, Color.DarkBlue));
+        foreach (var msg in rows)
+        {
             string wrapped = Game1.parseText($"[{msg.Speaker}]: {msg.Text ?? string.Empty}", Game1.smallFont, contentWidth);
             string? tokens = string.IsNullOrEmpty(msg.TokenInfo) ? null : Game1.parseText(msg.TokenInfo, Game1.smallFont, contentWidth);
             int height = (int)Game1.smallFont.MeasureString(wrapped).Y + ChatLineSpacing;
@@ -456,10 +484,10 @@ public sealed class CompanionCommandMenu : IClickableMenu
         b.DrawString(Game1.smallFont, "X", new Vector2(_closeButtonRect.X + 8, _closeButtonRect.Y + 2), Color.Red);
 
         // 4. Fixed status + two-line progress header.
-        Color statusColor = GetStatusColor(IsProcessing, CurrentStatusText, AutonomyPaused);
-        string statusPrefix = IsProcessing ? "● [处理中] " : "● [状态] ";
+        Color statusColor = GetStatusColor(TaskState.Running, TaskState.Stage, AutonomyPaused);
+        string statusPrefix = "状态：";
         int maxStatusWidth = GetStatusMaxTextWidth(width, AutonomyPaused);
-        b.DrawString(Game1.smallFont, ClipToWidth(statusPrefix + CurrentStatusText, maxStatusWidth), new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 54), statusColor);
+        b.DrawString(Game1.smallFont, ClipToWidth(statusPrefix + (AutonomyPaused ? "已暂停" : TaskState.Stage), maxStatusWidth), new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 54), statusColor);
         if (AutonomyPaused)
         {
             Rectangle pausedRect = GetPausedBadgeRect(xPositionOnScreen, yPositionOnScreen, width);
@@ -467,14 +495,13 @@ public sealed class CompanionCommandMenu : IClickableMenu
         }
         DrawButton(b, _detailButtonRect, ShowTechnicalDetail ? "隐藏详情" : "显示详情", Color.SteelBlue, _detailButtonRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
 
-        string actionLine = !string.IsNullOrEmpty(CurrentActionText)
-            ? "当前：" + CurrentActionText
-            : "当前：" + (IsProcessing ? CurrentStatusText : "待命");
-        if (_unreadWhileScrolled > 0)
-            actionLine += $"（{_unreadWhileScrolled} 条新消息，点击查看）";
-        b.DrawString(Game1.smallFont, ClipToWidth(actionLine, width - 48), new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 78), Game1.textColor);
+        string actionLine = "方向：" + CompanionTaskPanelState.DirectionName(TaskState.Direction);
 
-        if (ShowTechnicalDetail || !string.IsNullOrEmpty(StructuredProgressText) || !string.IsNullOrEmpty(PlanWaitReason))
+        b.DrawString(Game1.smallFont, ClipToWidth(actionLine, width - 48), new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 78), Game1.textColor);
+        DrawButton(b, _conversationButtonRect, "回到伙伴对话", Color.SteelBlue, _conversationButtonRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
+        DrawButton(b, _directionButtonRect, "换个方向商量", Color.SeaGreen, _directionButtonRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
+
+        if (ShowTechnicalDetail)
         {
             string detail = ShowTechnicalDetail && !string.IsNullOrEmpty(CurrentToolName) ? "工具：" + CurrentToolName : "";
             if (!string.IsNullOrEmpty(StructuredProgressText))
@@ -493,12 +520,12 @@ public sealed class CompanionCommandMenu : IClickableMenu
         if (_settingsOpen)
         {
             b.DrawString(Game1.smallFont, "每日购买上限", new Vector2(xPositionOnScreen + 280, yPositionOnScreen + 98), Game1.textColor);
-            DrawButton(b, new Rectangle(xPositionOnScreen + 280, yPositionOnScreen + 118, 250, 32), "箱子：" + BoxPreference + "（点击切换）", Color.SaddleBrown, false);
-            DrawButton(b, new Rectangle(xPositionOnScreen + 538, yPositionOnScreen + 118, 110, 32), "保存设置", Color.ForestGreen, false);
+            DrawButton(b, new Rectangle(xPositionOnScreen + 280, yPositionOnScreen + 118, Math.Max(70, width - 424), 32), ClipToWidth("箱子：" + BoxPreference, Math.Max(50, width - 444)), Color.SaddleBrown, false);
+            DrawButton(b, new Rectangle(xPositionOnScreen + width - 134, yPositionOnScreen + 118, 110, 32), "保存设置", Color.ForestGreen, false);
         }
 
         // 5. Divider line
-        b.Draw(Game1.fadeToBlackRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 156, width - 48, 2), Color.Gray * 0.5f);
+        b.Draw(Game1.fadeToBlackRect, new Rectangle(xPositionOnScreen + 24, yPositionOnScreen + 194, width - 48, 2), Color.Gray * 0.5f);
 
         // 6. Independent, clipped, scrollable chat area.
         DrawChatArea(b);

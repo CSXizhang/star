@@ -13,6 +13,9 @@
     { "$ref": "#/$defs/skillResult" },
     { "$ref": "#/$defs/autonomyControl" },
     { "$ref": "#/$defs/autonomyState" },
+    { "$ref": "#/$defs/lifeChatSubmit" },
+    { "$ref": "#/$defs/lifeChatReply" },
+    { "$ref": "#/$defs/lifeProfileState" },
     { "$ref": "#/$defs/protocolError" }
   ],
   "$defs": {
@@ -657,6 +660,61 @@
               "paused": { "type": "boolean" }, "preferences": { "type": "object" }, "preferencesRevision": { "type": "integer", "minimum": 0 },
               "decisionEpoch": { "type": "integer", "minimum": 0 }, "gameDate": { "type": ["string", "null"] }, "dailySpend": { "type": "integer", "minimum": 0 },
               "status": { "enum": ["confirmed", "rejected"] }, "reason": { "type": ["string", "null"] } }, "additionalProperties": false }
+        } }
+      ], "unevaluatedProperties": false
+    },
+    "playerActivity": {
+      "type": "object", "required": ["phase", "summary", "nextStep"],
+      "properties": {
+        "phase": { "enum": ["planning", "proposed", "working", "waiting", "paused", "completed", "failed", "idle"] },
+        "summary": { "type": "string" }, "nextStep": { "type": "string" }
+      }, "additionalProperties": false
+    },
+    "lifeChatSubmit": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "properties": {
+          "messageType": { "const": "life.chat.submit" },
+          "payload": { "type": "object", "required": ["requestId", "saveId", "mode", "text"],
+            "properties": {
+              "requestId": { "type": "string", "minLength": 1 }, "saveId": { "type": "string", "minLength": 1 },
+              "mode": { "enum": ["chat", "plan"] }, "text": { "type": "string", "minLength": 1, "maxLength": 500 },
+              "source": { "type": "string" }, "acceptedNodeId": { "type": "string", "minLength": 1 }
+            },
+            "if": { "required": ["acceptedNodeId"] }, "then": { "properties": { "mode": { "const": "plan" } } },
+            "additionalProperties": false }
+        } }
+      ], "unevaluatedProperties": false
+    },
+    "lifeChatReply": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "properties": {
+          "messageType": { "const": "life.chat.reply" },
+          "payload": { "type": "object", "required": ["requestId", "saveId", "status", "profileRevision", "memoryRevision"],
+            "properties": {
+              "requestId": { "type": "string" }, "saveId": { "type": "string" },
+              "status": { "enum": ["queued", "processing", "completed", "failed", "rejected"] },
+              "profileRevision": { "type": "integer" }, "memoryRevision": { "type": "integer" },
+              "replyText": { "type": ["string", "null"] }, "error": { "type": ["string", "null"] },
+              "queuePosition": { "type": "integer" }, "proposalReady": { "type": "boolean" },
+              "proposalNodeId": { "type": "string" }, "activity": { "$ref": "#/$defs/playerActivity" }
+            }, "additionalProperties": false }
+        } }
+      ], "unevaluatedProperties": false
+    },
+    "lifeProfileState": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "properties": {
+          "messageType": { "const": "life.profile.state" },
+          "payload": { "type": "object", "required": ["requestId", "saveId", "status", "profile", "profileRevision"],
+            "properties": {
+              "requestId": { "type": "string" }, "saveId": { "type": "string" },
+              "status": { "type": "string" }, "profile": { "type": ["object", "null"] },
+              "profileRevision": { "type": "integer" }, "reason": { "type": ["string", "null"] },
+              "work": { "type": "object", "properties": { "activity": { "$ref": "#/$defs/playerActivity" } } }
+            }, "additionalProperties": false }
         } }
       ], "unevaluatedProperties": false
     },

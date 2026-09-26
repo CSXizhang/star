@@ -571,7 +571,8 @@ public sealed record LifeChatSubmitPayload(
     [property: JsonPropertyName("saveId")] string SaveId,
     [property: JsonPropertyName("mode")] string Mode,      // "chat" | "plan"
     [property: JsonPropertyName("text")] string Text,
-    [property: JsonPropertyName("source")] string Source = "life-menu"
+    [property: JsonPropertyName("source")] string Source = "life-menu",
+    [property: JsonPropertyName("acceptedNodeId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AcceptedNodeId = null
 );
 
 /// <summary>
@@ -586,7 +587,16 @@ public sealed record LifeChatReplyPayload(
     [property: JsonPropertyName("memoryRevision")] int MemoryRevision,
     [property: JsonPropertyName("replyText"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReplyText = null,
     [property: JsonPropertyName("queuePosition"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? QueuePosition = null,
-    [property: JsonPropertyName("error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null
+    [property: JsonPropertyName("error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null,
+    [property: JsonPropertyName("proposalReady"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ProposalReady = false,
+    [property: JsonPropertyName("proposalNodeId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ProposalNodeId = null,
+    [property: JsonPropertyName("activity"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionActivityDto? Activity = null
+);
+
+public sealed record CompanionActivityDto(
+    [property: JsonPropertyName("phase")] string Phase,
+    [property: JsonPropertyName("summary")] string Summary,
+    [property: JsonPropertyName("nextStep")] string NextStep
 );
 
 /// <summary>
@@ -628,7 +638,8 @@ public sealed record CompanionWorkStateDto(
     [property: JsonPropertyName("lastSettledDay"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? LastSettledDay = null,
     [property: JsonPropertyName("activeGoals"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<ActiveGoalDto>? ActiveGoals = null,
     [property: JsonPropertyName("recentTodos"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<RecentTodoDto>? RecentTodos = null,
-    [property: JsonPropertyName("waitingConditions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<string>? WaitingConditions = null
+    [property: JsonPropertyName("waitingConditions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<string>? WaitingConditions = null,
+    [property: JsonPropertyName("activity"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionActivityDto? Activity = null
 );
 
 /// <summary>Active goal entry within <see cref="CompanionWorkStateDto"/>.</summary>

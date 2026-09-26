@@ -48,6 +48,14 @@ if (-not $discoveryFound) {
 
 $serverName = "stardew-companion"
 $uvArgs = @("run", "--project", (Join-Path $repoRoot "runtime"), "python", "-m", "stardew_ai_runtime.mcp_server", "--run-dir", $runDirAbs, "--surface", "light")
+$mcpCommand = 'uv'
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'release-manifest.json')) {
+    . (Join-Path $scriptDir 'release-package.ps1')
+    $release = Read-VerifiedRelease $repoRoot
+    if ($runDirAbs.TrimEnd('\') -ne $repoRoot.TrimEnd('\')) { throw 'Release MCP must bind to its own installed Mod directory.' }
+    $mcpCommand = Get-ReleasePath $repoRoot $release.python
+    $uvArgs = @('-B', '-m', 'stardew_ai_runtime.mcp_server', '--run-dir', $runDirAbs, '--surface', 'light')
+}
 
 function Format-CliArg([string]$arg) {
     if ($arg -match '[\s"''`$]') {
@@ -60,33 +68,33 @@ $formattedArgs = ($uvArgs | ForEach-Object { Format-CliArg $_ }) -join ' '
 
 function Show-Agy {
     Write-Host "`n=== agy ==="
-    Write-Host "agy mcp add $serverName -- uv $formattedArgs"
+    Write-Host "agy mcp add $serverName -- $(Format-CliArg $mcpCommand) $formattedArgs"
     Write-Host "（agy 客户端在接收自然语言指令时会自动启动后台 MCP 进程）"
 }
 
 function Show-Kimi {
     Write-Host "`n=== Kimi Code (.kimi-code/mcp.json，项目级) ==="
-    $doc = @{ mcpServers = @{ $serverName = @{ command = "uv"; args = $uvArgs } } }
+    $doc = @{ mcpServers = @{ $serverName = @{ command = $mcpCommand; args = $uvArgs } } }
     Write-Host ($doc | ConvertTo-Json -Depth 5)
 }
 
 function Show-Claude {
     Write-Host "`n=== Claude Desktop (claude_desktop_config.json) ==="
-    $doc = @{ mcpServers = @{ $serverName = @{ command = "uv"; args = $uvArgs } } }
+    $doc = @{ mcpServers = @{ $serverName = @{ command = $mcpCommand; args = $uvArgs } } }
     Write-Host ($doc | ConvertTo-Json -Depth 5)
 }
 
 function Show-Codex {
     Write-Host "`n=== Codex (~/.codex/config.toml) ==="
     Write-Host "[mcp_servers.$serverName]"
-    Write-Host 'command = "uv"'
+    Write-Host ('command = "' + ($mcpCommand -replace '\\', '\\') + '"')
     $tomlArgs = ($uvArgs | ForEach-Object { '"' + ($_ -replace '\\', '\\') + '"' }) -join ", "
     Write-Host "args = [ $tomlArgs ]"
 }
 
 function Show-Dsh {
     Write-Host "`n=== dsh / 其它 MCP stdio 客户端 ==="
-    Write-Host "command: uv"
+    Write-Host "command: $mcpCommand"
     Write-Host "args:    $formattedArgs"
     Write-Host "按该客户端的 MCP stdio server 配置格式填入即可。"
 }
@@ -97,7 +105,8 @@ function Install-Agy {
     if ($configured -match $serverName) {
         & agy mcp remove $serverName 2>&1 | Out-Null
     }
-    & agy mcp add $serverName -- uv @uvArgs
+    & agy mcp add $serverName -- $mcpCommand @uvArgs
+    if ($LASTEXITCODE -ne 0) { throw 'agy MCP registration failed.' }
     & agy mcp list
 }
 
@@ -112,17 +121,15 @@ function Install-Kimi {
             $parsed = ConvertFrom-Json -InputObject $raw
             if ($parsed.mcpServers) {
                 foreach ($prop in $parsed.mcpServers.PSObject.Properties) {
-                    $serverMap[$prop.Name] = @{
-                        command = [string]$prop.Value.command
-                        args = @($prop.Value.args | ForEach-Object { [string]$_ })
-                    }
+                    $serverMap[$prop.Name] = $prop.Value
                 }
             }
         } catch {
+            if ($release) { throw 'Existing project MCP configuration is invalid; repair it before setup. It was not replaced.' }
             Write-Warning "读取已有 $mcpFile 失败，将新建: $_"
         }
     }
-    $serverMap[$serverName] = @{ command = "uv"; args = $uvArgs }
+    $serverMap[$serverName] = @{ command = $mcpCommand; args = $uvArgs }
     $config = @{ mcpServers = $serverMap }
     ($config | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $mcpFile -Encoding utf8
     Write-Host ">>> 已写入 $mcpFile（重启客户端或新会话生效）"

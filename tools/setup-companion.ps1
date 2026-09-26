@@ -10,6 +10,7 @@ param(
     [string]$GameDir = "",
     [string]$TargetModDir = "",
     [ValidateSet('agy', 'kimi', 'claude', 'all', 'none')][string]$Agent = 'kimi',
+    [string]$Model = "",
     [switch]$AutoInstall,
     [switch]$DryRun,
     [switch]$CheckOnly,
@@ -23,6 +24,15 @@ $OutputEncoding = (New-Object System.Text.UTF8Encoding($false))
 # 1. 路径与常量解析 (基于脚本位置动态推导，杜绝个人绝对路径常量)
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'release-manifest.json')) {
+    if ($Agent -notin @('kimi', 'agy', 'none')) { throw 'Release chat supports kimi or agy; use register-mcp.ps1 for other MCP clients.' }
+    $releaseArgs = @{}
+    foreach ($key in @('GameDir', 'TargetModDir', 'Agent', 'Model', 'AutoInstall', 'DryRun', 'CheckOnly')) {
+        if ($PSBoundParameters.ContainsKey($key)) { $releaseArgs[$key] = $PSBoundParameters[$key] }
+    }
+    & (Join-Path $scriptDir 'install-release.ps1') @releaseArgs
+    exit 0
+}
 $distSourceDir = Join-Path $repoRoot "artifacts\dist\StardewAI.Companion.Mod"
 $runtimeDir = Join-Path $repoRoot "runtime"
 $detectScript = Join-Path $scriptDir "detect-game.ps1"

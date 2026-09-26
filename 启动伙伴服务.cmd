@@ -3,17 +3,6 @@ setlocal
 cd /d "%~dp0"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
-set "PYTHON_EXE=%~dp0runtime\.venv\Scripts\python.exe"
-if not exist "%PYTHON_EXE%" (
-    where python.exe >nul 2>nul
-    if errorlevel 1 (
-        echo [ERROR] Python executable not found. Please install Python or run setup first.
-        pause
-        exit /b 1
-    )
-    set "PYTHON_EXE=python.exe"
-)
-
 echo ================================================================
 echo  Stardew AI Companion - Background Chat Service
 echo ================================================================

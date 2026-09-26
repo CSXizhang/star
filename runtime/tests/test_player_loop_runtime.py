@@ -159,3 +159,16 @@ def test_wire_schema_and_four_preferences():
         assert "propose" in prompt and "软偏好" in prompt and "选择方向本身不是工作授权" in prompt
     assert "不能摆放家具" in LifeChatService.build_system_prompt({"playStyle": "decor"}, {}, {}, mode="plan")
     assert "提交仍由玩家完成" in LifeChatService.build_system_prompt({"playStyle": "community"}, {}, {}, mode="plan")
+
+
+def test_release_bridge_uses_selected_agy_model_and_provider_effort(tmp_path, monkeypatch):
+    config = tmp_path / "chat-backend.json"
+    config.write_text('{"backend":"agy","model":"claude-sonnet-4-6"}', encoding="utf-8")
+    monkeypatch.setenv("STARDEW_CHAT_BACKEND_CONFIG", str(config))
+    bridge = ChatBridge(run_dir=tmp_path)
+    assert (bridge.backend_name, bridge.model, bridge.effort) == ("agy", "claude-sonnet-4-6", "default")
+    config.write_text('{"backend":"agy","model":"claude-sonnet-4-6","effort":"high"}', encoding="utf-8")
+    assert ChatBridge(run_dir=tmp_path).effort == "high"
+    override = ChatBridge(run_dir=tmp_path, model="explicit-model", effort="low")
+    assert (override.model, override.effort) == ("explicit-model", "low")
+    assert ChatBridge(run_dir=tmp_path, backend="kimi").model == "kimi-code/k3"

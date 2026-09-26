@@ -885,7 +885,7 @@ class ChatBridge:
         self,
         run_dir: str | Path | None = None,
         model: str | None = None,
-        effort: str = "medium",
+        effort: str | None = None,
         sessions_file: Path | None = None,
         commands_file: Path | None = None,
         instance_id: str | None = None,
@@ -899,8 +899,8 @@ class ChatBridge:
         self.run_dir = Path(run_dir) if run_dir else None
         configured = load_chat_backend_config()
         self.backend_name = backend or configured["backend"]
-        self.model = backend_model or model or (configured["model"] if self.backend_name == "kimi" else "gemini-3.8-flash")
-        self.effort = effort
+        self.model = backend_model or model or (configured["model"] if self.backend_name == configured["backend"] else ("kimi-code/k3" if self.backend_name == "kimi" else "gemini-3.8-flash"))
+        self.effort = effort or configured.get("effort", "default")
         self.instance_id = instance_id or f"chat-bridge-{uuid.uuid4().hex[:8]}"
         self.agy_cmd = agy_cmd or "agy.exe"
         self.kimi_cmd = kimi_cmd or "kimi.exe"
@@ -4346,9 +4346,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--effort",
         type=str,
-        default="medium",
+        default=None,
         choices=["default", "low", "medium", "high"],
-        help="Reasoning effort for agy (default: medium); use default to omit the CLI option",
+        help="Reasoning effort for agy (uses configuration or provider default); default omits the CLI option",
     )
     parser.add_argument(
         "--agy-cmd",
@@ -4384,7 +4384,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"日志文件: {log_file_path}")
     print(f"实际后端: {bridge.provider} | 模型标识: {bridge.model}")
     if bridge.provider == "agy":
-        print(f"agy 思考强度: {args.effort}")
+        print(f"agy 思考强度: {bridge.effort}")
     print("在游戏中按 F8 开启伙伴窗口，输入中文指令即可直接交互！")
     print("================================================================")
 

@@ -941,6 +941,8 @@ def create_mcp_server(
         terms_note: str | None = None,
         reason: str | None = None,
         preparation: list[str] | None = None,
+        id: str | None = None,
+        nodeId: str | None = None,
     ) -> dict[str, Any]:
         """Milestone plan nodes discussed with the player (near-term key game dates).
 
@@ -949,6 +951,14 @@ def create_mcp_server(
         actions, allowed only while the player is in 「商量计划」 mode —
         STARDEW_LIFE_MODE=plan — and has explicitly agreed this turn; only say the
         plan is saved after this tool confirms it).
+
+        Use node_id for adopt/revise/defer/reopen, copied from the current node's
+        id. Example: {"action":"adopt","node_id":"spring-egg-festival-strawberry:y1",
+        "planned_count":5}. id and nodeId are compatibility aliases; conflicting
+        values are rejected. Do not guess another parameter spelling.
+        The successful response already contains the authoritative changed node,
+        revision, and manual/capability preparation: do not list again just to
+        confirm that write. Saving is not proof that physical work has run.
 
         For a custom proposal, preparation optionally lists existing capabilities:
         water, harvest, clear, plant (existing seeds), animals or machines.
@@ -1001,6 +1011,27 @@ def create_mcp_server(
                 "PLAN_MODE_REQUIRED: 修改节点需要玩家处于「商量计划」模式；"
                 "闲聊模式只能 list 查看，请引导玩家切换到商量计划后再采纳/修改。"
             )
+        identifiers = {value.strip() for value in (node_id, id, nodeId) if value and value.strip()}
+        if len(identifiers) > 1:
+            raise ToolError("CONFLICTING_NODE_ID: node_id/id/nodeId disagree; pass only node_id from the current node snapshot.")
+        node_id = next(iter(identifiers), None)
+        if action_clean != "propose" and not node_id:
+            raise ToolError(
+                'NODE_ID_REQUIRED: use {"action":"' + action_clean + '","node_id":"<node.id>"}; '
+                "copy id from the injected node snapshot or manage_milestones(action='list')."
+            )
+
+        def saved(node: dict[str, Any]) -> dict[str, Any]:
+            # One complete node is sufficient to acknowledge the write. Omit
+            # absent values, not preparation ownership or observed status.
+            compact = {key: value for key, value in wire_node(node).items() if value is not None}
+            compact["prepItems"] = [
+                {key: value for key, value in prep.items() if value is not None}
+                for prep in compact.get("prepItems", [])
+            ]
+            return {"saveId": sid, "revision": store.revision(sid), "saved": True,
+                    "execution": "not_started_by_this_tool", "node": compact}
+
         try:
             if action_clean == "propose":
                 node = store.propose(
@@ -1012,7 +1043,7 @@ def create_mcp_server(
                     preparation=preparation,
                     game_date=game_date,
                 )
-                return {"saveId": sid, "node": wire_node(node)}
+                return saved(node)
             if action_clean == "adopt":
                 node = store.adopt(
                     sid,
@@ -1024,8 +1055,7 @@ def create_mcp_server(
                     game_date=game_date,
                 )
                 return {
-                    "saveId": sid,
-                    "node": wire_node(node),
+                    **saved(node),
                     "goalId": node.get("goalId"),
                     "todoIds": node.get("todoIds"),
                 }
@@ -1042,7 +1072,7 @@ def create_mcp_server(
                     target_date=target_date,
                     work_store=work_for_run(),
                 )
-                return {"saveId": sid, "node": wire_node(node)}
+                return saved(node)
             if action_clean == "defer":
                 node = store.defer(
                     sid,
@@ -1051,7 +1081,7 @@ def create_mcp_server(
                     work_store=work_for_run(),
                     game_date=game_date,
                 )
-                return {"saveId": sid, "node": wire_node(node)}
+                return saved(node)
             node = store.reopen(
                 sid,
                 node_id or "",
@@ -1059,7 +1089,7 @@ def create_mcp_server(
                 work_store=work_for_run(),
                 game_date=game_date,
             )
-            return {"saveId": sid, "node": wire_node(node)}
+            return saved(node)
         except MilestoneError as ex:
             raise ToolError(str(ex)) from None
 

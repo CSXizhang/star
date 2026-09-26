@@ -74,6 +74,9 @@ class LifeChatService:
         self._sessions_file = sessions_file
         self._fingerprints = fingerprints
         self._fingerprints_file = fingerprints_file
+        # Process-local only: after restart, a resumed provider receives a full
+        # initialization again rather than assuming which rules it has seen.
+        self._prompt_sessions: dict[str, tuple[str, str]] = {}
 
     def get_session_id(self, save_id: str) -> str | None:
         key = _life_session_key(self.backend_name, save_id)
@@ -153,6 +156,56 @@ class LifeChatService:
         temporary.replace(path)
 
     # ---------------------------------------------------------------- prompts
+    def mark_prompt_delivered(self, save_id: str, conversation_id: str, mode: str) -> None:
+        """Call only after a successful provider turn with a resumable session."""
+        self._prompt_sessions[save_id] = (conversation_id, mode)
+
+    @staticmethod
+    def compact_live_context(context: dict[str, Any] | None) -> dict[str, Any]:
+        """Remove duplicated projections, retaining fresh facts and unknowns."""
+        live = dict(context or {})
+        for key in ("companion", "agreements", "recentSharedEvents", "goals"):
+            live.pop(key, None)  # profile/memory/work have dedicated blocks
+        if isinstance(live.get("resources"), dict):
+            for key in ("funds", "fundsStatus", "stamina", "inventory"):
+                live.pop(key, None)  # same facts under resources, wallets kept separate
+        return live
+
+    def build_turn_prompt(
+        self, save_id: str, conversation_id: str | None,
+        profile: dict[str, Any] | None, memory_render: dict[str, Any] | None,
+        work_summary: dict[str, Any] | None, *, mode: str,
+        milestones: list[dict[str, Any]] | None, live_context: dict[str, Any] | None,
+    ) -> str:
+        live = self.compact_live_context(live_context)
+        continuing = bool(conversation_id) and self._prompt_sessions.get(save_id) == (conversation_id, mode)
+        if not continuing:
+            return self.build_system_prompt(
+                profile, memory_render, work_summary, mode=mode, milestones=milestones,
+                live_context=live,
+                # A provider continuation already contains its actual dialogue.
+                # This local fallback is needed only for a new/stateless session.
+                discussion=self.discussion_context(save_id, mode) if not conversation_id else None,
+            )
+        permission = (
+            "本轮是商量计划：只在玩家当轮明确认可后调用manage_milestones；"
+            "用node_id复制节点id。可以承接刚才的方案，不要求玩家复述参数；"
+            "暂停不得解除，不扩大授权。保存不等于动作完成；手动准备仍由玩家做。"
+            if mode == "plan" else
+            "本轮是只读闲聊：不能派工、改计划、取消/暂停工作或编辑记忆，也不能承诺已安排。"
+        )
+        facts = {"live": live, "work": work_summary,
+                 **({"milestones": milestones or []} if mode == "plan" else {})}
+        return (
+            permission + "\n继续使用已确认的人格和偏好；本轮明确意愿优先。"
+            "用2到4句自然中文，不用Markdown或内部字段。\n"
+            "【本轮最新事实：完整替换此前状态块】空列表表示当前没有，unknown/null表示未知，"
+            "不能沿用旧金币、背包、日期、暂停或工作结果补全。玩家与伙伴钱包分别理解。"
+            "已有事实不要重复查询；仅缺少且影响当前决定时查询一次对应工具。"
+            "成功工具回包就是操作确认，不为确认保存再list；按真实执行结果说话。\n"
+            + json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
+        )
+
     @staticmethod
     def build_system_prompt(
         profile: dict[str, Any] | None,
@@ -180,6 +233,7 @@ class LifeChatService:
             parts.append("你是农场伙伴阿星，一个友善的星露谷伙伴。")
 
         parts.append("你和玩家一起经营农场，主动分担，先看现状再商量。不要把伙伴交流变成让玩家填预算、数量和约束的表单。")
+        parts.append("每轮最新事实完整替换旧状态：unknown/null是未知，空列表表示当前没有，不沿用旧数据补全。已提供的实时事实不要重复查询；只有缺少且影响决定时才查对应工具。成功工具回包已经确认操作，不为确认保存再次list。")
         if mode != "plan":
             parts.append(
                 "这是只读生活对话：你不能派工、取消或暂停工作，也不能把任务加入队列。"
@@ -230,7 +284,7 @@ class LifeChatService:
                 "【一起决定下一步】先根据眼前资源、人格和玩家偏好主动提出一两个可行的准备动作。"
                 "不要问快照已有的金币量。数量和预算没有指定时，你自己提出保守的小规模默认方案；"
                 "优先已有种子和不花钱的眼前农活，不把预算、数量、保留金额当必填项，也不默认花光钱包。"
-                "玩家说‘行’‘你看着办’‘按这个来’即认可刚才的方案，使用内部节点id调用manage_milestones采纳；"
+                "玩家说‘行’‘你看着办’‘按这个来’即认可刚才的方案，调用manage_milestones(action='adopt', node_id=节点id)采纳；参数是node_id。"
                 "无现成节点时自行propose再adopt，日期和preparation由你填写，玩家不用懂参数或切其他菜单。"
                 "自定义preparation可选water/harvest/clear/plant/animals/machines，只选玩家认可范围内、当前能力支持的项目。"
                 "已有授权日常工作无需再反复确认。不能凭一句认可扩大到无边界花钱或取消无关工作；"

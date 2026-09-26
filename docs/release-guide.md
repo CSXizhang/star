@@ -4,7 +4,7 @@
 
 ## 下载与安装
 
-1. 在 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.2.0-windows-x64.zip`。GitHub 自动提供的 Source code 是开发源码，不是玩家安装包。
+1. 在 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.2.1-windows-x64.zip`。GitHub 自动提供的 Source code 是开发源码，不是玩家安装包。
 2. 解压，打开其中的 `StardewAI.Companion.Mod` 文件夹。关闭游戏，双击 **设置星露谷伙伴.cmd**，选择游戏目录并按提示安装。
 3. 向导把整包安装到 `游戏目录\Mods\StardewAI.Companion.Mod`，然后让你选择 Kimi 或 agy，以及使用的模型。已有配置和 `data` 会保留。
 

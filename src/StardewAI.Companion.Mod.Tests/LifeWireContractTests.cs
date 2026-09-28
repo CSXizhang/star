@@ -168,6 +168,27 @@ public class LifeWireContractTests
     }
 
     [Fact]
+    public void LifeProfileState_AfterExternalJobAcceptsStructuredLastPlanAction()
+    {
+        var wire = JsonSerializer.Serialize(new
+        {
+            requestId = "refresh-1", saveId = "farm-1", status = "confirmed", profileRevision = 2,
+            work = new
+            {
+                mode = "command", paused = false,
+                lastPlanAction = new { operation = "harvest_auto", outcome = "completed", taskId = "harvest-one" },
+                activity = new { phase = "completed", summary = "Harvest complete", nextStep = "Ready" },
+            },
+        });
+        var state = JsonSerializer.Deserialize<LifeProfileStatePayload>(wire);
+        Assert.NotNull(state);
+        Assert.Equal("harvest_auto", state!.Work.LastPlanAction?["operation"]?.ToString());
+        Assert.Equal("completed", state.Work.Activity?.Phase);
+        var roundtrip = JsonSerializer.Serialize(state);
+        Assert.Equal("harvest-one", JsonNode.Parse(roundtrip)?["work"]?["lastPlanAction"]?["taskId"]?.ToString());
+    }
+
+    [Fact]
     public void LifeProfileState_NullProfile_Roundtrips()
     {
         var dir = ExportFixtures();

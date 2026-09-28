@@ -1128,6 +1128,39 @@ def test_cancel_without_active_job_preserves_new_decision_token(tmp_path: Path, 
     asyncio.run(run())
 
 
+def test_external_codex_releases_command_socket_after_submit(tmp_path: Path, mock_scheduler, monkeypatch):
+    """The bridge worker can own the native socket while Codex reads work state."""
+    async def run():
+        mock_scheduler.run_dir = str(tmp_path)
+        mock_scheduler.close = AsyncMock()
+        monkeypatch.setenv("STARDEW_EXTERNAL_CODEX", "1")
+        monkeypatch.delenv("STARDEW_DECISION_TOKEN", raising=False)
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+
+        await server.call_tool("get_status", {})
+        await server.call_tool("begin_game_turn", {})
+        _, selected = await server.call_tool("submit_plan", {
+            "goal_text": "收获一株成熟作物",
+            "tasks": [{"id": "harvest-one", "title": "收获", "steps": [
+                {"id": "harvest-step", "operation": "harvest_auto", "params": {"max_tiles": 1}}
+            ]}],
+        })
+        assert selected["tasks"][0]["status"] == "pending"
+        mock_scheduler.close.assert_awaited_once()
+
+        before_status = mock_scheduler.get_status.await_count
+        _, overview = await server.call_tool("get_work_overview", {})
+        _, status = await server.call_tool("get_status", {})
+        _, plan = await server.call_tool("work_plan_overview", {})
+        assert overview["tasks"][0]["id"] == "harvest-one"
+        assert status["gameSnapshotStale"] is True
+        assert plan["tasks"][0]["id"] == "harvest-one"
+        assert mock_scheduler.get_status.await_count == before_status
+        mock_scheduler.get_work_overview.assert_not_awaited()
+
+    asyncio.run(run())
+
+
 def test_cancel_selected_pending_job_revokes_dispatch_authority(tmp_path: Path, mock_scheduler):
     """Cancelling a selected but not yet dispatched job must stop its worker claim."""
     async def run():
@@ -1627,6 +1660,7 @@ def test_external_codex_turn_uses_existing_executor_and_blocks_overlap(mock_sche
     monkeypatch.setenv("STARDEW_EXTERNAL_CODEX", "1")
     monkeypatch.delenv("STARDEW_DECISION_TOKEN", raising=False)
     mock_scheduler.run_dir = None
+    mock_scheduler.close = AsyncMock()
 
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)

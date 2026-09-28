@@ -633,7 +633,7 @@ public sealed record CompanionWorkStateDto(
     [property: JsonPropertyName("boxPreference"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? BoxPreference = null,
     [property: JsonPropertyName("dailySpend"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DailySpend = null,
     [property: JsonPropertyName("hasExecutableWork")] bool HasExecutableWork = false,
-    [property: JsonPropertyName("lastPlanAction"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? LastPlanAction = null,
+    [property: JsonPropertyName("lastPlanAction"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] JsonObject? LastPlanAction = null,
     [property: JsonPropertyName("planWaitReason"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PlanWaitReason = null,
     [property: JsonPropertyName("lastSettledDay"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? LastSettledDay = null,
     [property: JsonPropertyName("activeGoals"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<ActiveGoalDto>? ActiveGoals = null,

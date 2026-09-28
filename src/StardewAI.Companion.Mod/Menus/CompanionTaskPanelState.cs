@@ -1,3 +1,5 @@
+using StardewAI.Companion.Mod.Transport;
+
 namespace StardewAI.Companion.Mod.Menus;
 
 /// <summary>One player-facing projection shared by NPC planning and the task panel.</summary>
@@ -12,6 +14,30 @@ public sealed class CompanionTaskPanelState
     public string NextStep { get; private set; } = "找伙伴聊聊，或在下面输入工作。";
     public string? Goal { get; private set; }
     public bool Running { get; private set; }
+    public IReadOnlyList<RecentExecutionDto> RecentExecutions { get; private set; } = Array.Empty<RecentExecutionDto>();
+
+    public void ApplyExecutionHistory(IEnumerable<RecentExecutionDto>? records)
+    {
+        // Old runtimes omit this projection; don't erase a displayed log on unrelated refreshes.
+        if (records is null) return;
+        RecentExecutions = records.Where(r => !string.IsNullOrWhiteSpace(r.CommandId))
+            .GroupBy(r => r.CommandId, StringComparer.Ordinal).Select(g => g.Last()).TakeLast(8).ToList();
+    }
+
+    public static string ExecutionOutcomeName(string outcome) => outcome switch
+    {
+        "succeeded" or "completed" => "完成", "partially-succeeded" or "partial" => "部分完成", "failed" => "失败",
+        "rejected" => "未执行", "cancelled" => "已取消", _ => "结果待核对",
+    };
+
+    public static string ExecutionDateName(string? date)
+    {
+        var parts = date?.Split(':');
+        if (parts is not { Length: 3 } || !int.TryParse(parts[0], out int year) || !int.TryParse(parts[2], out int day))
+            return "日期未记录";
+        string season = parts[1].ToLowerInvariant() switch { "spring" => "春", "summer" => "夏", "fall" => "秋", "winter" => "冬", _ => "" };
+        return season.Length == 0 ? "日期未记录" : $"第{year}年 {season}{day}日";
+    }
 
     public void ApplyActivity(string phase, string? summary, string? nextStep)
     {
@@ -115,5 +141,6 @@ public sealed class CompanionTaskPanelState
         Progress = WaitReason = LastResult = Goal = null;
         NextStep = "找伙伴聊聊，或在下面输入工作。";
         Running = false;
+        RecentExecutions = Array.Empty<RecentExecutionDto>();
     }
 }

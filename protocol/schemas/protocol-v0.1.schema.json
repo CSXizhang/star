@@ -445,7 +445,18 @@
                     "seedItemId": { "type": "string", "minLength": 1 },
                     "fertilizerItemId": { "type": "string", "minLength": 1 },
                     "itemId": { "type": "string", "minLength": 1 },
-                    "itemCount": { "type": "integer", "minimum": 1, "maximum": 36 },
+                    "itemCount": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "recipeName": { "type": "string", "minLength": 1 },
+                    "region": {
+                      "type": "object", "required": ["x", "y", "width", "height"],
+                      "properties": {
+                        "x": { "type": "integer", "minimum": 0 },
+                        "y": { "type": "integer", "minimum": 0 },
+                        "width": { "type": "integer", "minimum": 1 },
+                        "height": { "type": "integer", "minimum": 1 }
+                      },
+                      "additionalProperties": false
+                    },
                     "animalName": { "type": "string", "minLength": 1 },
                     "buildingName": { "type": "string", "minLength": 1 }
                   },

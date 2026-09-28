@@ -775,7 +775,7 @@ def test_autonomy_chat_channel_lifecycle_replays_initial_snapshot_and_enable(tmp
 
     asyncio.run(exercise())
     assert len(bridge._autonomy_requests) == 1
-    assert json.loads(sent[-1])["messageType"] == "chat.reply"
+    assert sent == []  # Routine autonomous completion stays in the log.
 
 
 def test_autonomy_cancel_disables_future_work(tmp_path: Path) -> None:

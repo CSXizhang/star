@@ -14,6 +14,7 @@ public delegate void TransportLogger(string message, string level = "Info");
 public sealed class WebSocketTransportServer : ITransportServer
 {
     private const int MaxMessageSizeBytes = 65536; // 64 KB
+    private const int MaxObservationResultBytes = 2 * 1024 * 1024;
     private const int MaxJsonDepth = 32;
 
     private readonly int _maxNormalOutboundCapacity;
@@ -552,7 +553,10 @@ public sealed class WebSocketTransportServer : ITransportServer
                 var json = JsonSerializer.Serialize(envelopeToSend, JsonOptions);
                 var bytes = Encoding.UTF8.GetBytes(json);
 
-                if (bytes.Length > MaxMessageSizeBytes)
+                int outboundLimit = envelopeToSend.MessageType == "skill.result" &&
+                    IsObservationSkill(envelopeToSend.Payload["skillId"]?.ToString())
+                    ? MaxObservationResultBytes : MaxMessageSizeBytes;
+                if (bytes.Length > outboundLimit)
                 {
                     _logger?.Invoke("Outgoing envelope exceeds max frame size. Dropping.", "Warn");
                     continue;
@@ -1135,7 +1139,13 @@ public sealed class WebSocketTransportServer : ITransportServer
         }
         // Unknown skills pass shape validation here; the handler rejects them as UNSUPPORTED_SKILL.
 
-        bool isNativeTiled = string.Equals(skillId, "refill-watering-can", StringComparison.OrdinalIgnoreCase) ||
+        if ((skillId == "place-items" || skillId == "remove-items") &&
+            (string.IsNullOrWhiteSpace(payload.Parameters.ItemId) || payload.Parameters.Tiles is not { Count: > 0 and <= 64 }))
+        {
+            error = "Construction requires itemId and 1-64 explicit tiles.";
+            return false;
+        }
+        bool isNativeTiled = skillId is "place-items" or "remove-items" or "chop-tree" || string.Equals(skillId, "refill-watering-can", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(skillId, "apply-fertilizer", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(skillId, "clear-debris", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(skillId, "pickup-items", StringComparison.OrdinalIgnoreCase) ||
@@ -1379,6 +1389,14 @@ public sealed class WebSocketTransportServer : ITransportServer
     {
         ArgumentNullException.ThrowIfNull(result);
 
+        int resultLimit = IsObservationSkill(result.SkillId) ? MaxObservationResultBytes : MaxMessageSizeBytes;
+        // Reserve envelope metadata overhead. Never silently drop a terminal result: doing so leaves
+        // the runtime waiting forever for a command the game has already completed.
+        if (JsonSerializer.SerializeToUtf8Bytes(result, JsonOptions).Length > resultLimit - 4096)
+            result = result with { TerminalState = "failed", Details = null, Effects = new(),
+                Error = new SkillResultError("RESPONSE_TOO_LARGE", "Result exceeds the bounded transport size; inspect a smaller region.", null, false),
+                RetryRecommended = false };
+
         if (idempotencyKey != null)
         {
             _idempotencyManager.MarkCompleted(idempotencyKey, result);
@@ -1401,6 +1419,8 @@ public sealed class WebSocketTransportServer : ITransportServer
         EnqueueOutbound(envelope, isCritical: true, _socketGeneration);
         return Task.CompletedTask;
     }
+
+    private static bool IsObservationSkill(string? skillId) => skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting";
 
     public Task SendProtocolErrorAsync(string code, string message, string? correlationId = null)
     {

@@ -572,7 +572,8 @@ def test_mcp_server_tool_registration(mock_scheduler):
         assert "feed_animals" in tool_names
         assert "toggle_animal_door" in tool_names
         assert "chop_tree" in tool_names
-        assert len(tools) == 52
+        assert {"observe_farm_space", "place_items", "remove_items"} <= set(tool_names)
+        assert len(tools) == 60
         assert "autonomy_status" in tool_names
         assert "set_autonomy" in tool_names
         assert "query_wiki" in tool_names
@@ -1661,6 +1662,7 @@ def test_external_codex_turn_uses_existing_executor_and_blocks_overlap(mock_sche
     monkeypatch.delenv("STARDEW_DECISION_TOKEN", raising=False)
     mock_scheduler.run_dir = None
     mock_scheduler.close = AsyncMock()
+    mock_scheduler.query_farm_space = AsyncMock(return_value={"width": 80})
 
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
@@ -1679,6 +1681,9 @@ def test_external_codex_turn_uses_existing_executor_and_blocks_overlap(mock_sche
         })
         with pytest.raises(ToolError, match="GAME_BUSY"):
             await server.call_tool("begin_game_turn", {})
+        with pytest.raises(ToolError, match="JOB_IN_PROGRESS"):
+            await server.call_tool("observe_farm_space", {})
+        mock_scheduler.query_farm_space.assert_not_awaited()
         _, executed = await server.call_tool("run_next_step", {})
         assert executed["outcome"] == "completed"
         assert executed["taskStatus"] == "completed"
@@ -1686,6 +1691,8 @@ def test_external_codex_turn_uses_existing_executor_and_blocks_overlap(mock_sche
         # Match the existing bridge's terminal handoff, without creating a new executor.
         store = WorkStore(tmp_path / "data" / "work-state.json")
         store.finish_job("mock-save-123", executed, task_id=plan["tasks"][0]["id"])
+        await server.call_tool("observe_farm_space", {})
+        mock_scheduler.query_farm_space.assert_awaited_once()
         await server.call_tool("begin_game_turn", {})
         assert store.state("mock-save-123").decision["token"] != first_token
         store.revoke_decision("mock-save-123")

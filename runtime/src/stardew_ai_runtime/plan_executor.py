@@ -29,6 +29,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
+
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 logger = logging.getLogger("stardew_ai_runtime.plan_executor")
@@ -178,7 +180,7 @@ def classify_step_outcome(result: Any) -> tuple[str, str | None]:
 
 def is_transient_transport_error(ex: Exception) -> bool:
     # Only typed transport failures or known wrapping from the MCP transport.
-    if isinstance(ex, (ConnectionError, TimeoutError)):
+    if isinstance(ex, (ConnectionError, TimeoutError, EOFError, BrokenResourceError, ClosedResourceError, EndOfStream)):
         return True
     text = str(ex).lower()
     return any(marker in text for marker in (
@@ -401,6 +403,7 @@ class PlanExecutor:
             reason_code=reason,
             snapshot_revision=revision,
             command_id=native_command_id or command_id,
+            game_date=self._fresh_state()[1],
         )
         step.outcome = outcome
         step.reason_code = reason
@@ -473,9 +476,11 @@ class PlanExecutor:
     def _commit_failure(
         self, save_id: str, step: StepExecution, command_id: str, ex: Exception
     ) -> StepExecution:
+        message = str(ex) or type(ex).__name__
+        logger.warning("Plan dispatch failed for %s (%s): %s", command_id, type(ex).__name__, message, exc_info=True)
         transient = is_transient_transport_error(ex)
         reason = "TRANSPORT_RETRY_EXHAUSTED" if transient else "STEP_DISPATCH_REJECTED"
-        step.result = {"status": "unknown" if transient else "rejected", "reasonCode": reason, "message": str(ex)}
+        step.result = {"status": "unknown" if transient else "rejected", "reasonCode": reason, "message": message}
         # A transport/dispatch fault is the one transient case: park it behind a
         # bounded backoff so the worker cannot spin, then it is claimable once the
         # backoff window elapses. The bound is what makes it explicit, not endless.
@@ -501,8 +506,8 @@ class PlanExecutor:
                 step.status = "executed"
                 step.outcome = "waiting"
                 step.reason_code = reason
-                step.message = str(ex)
-                step.result = {"message": str(ex), "waitCondition": {"type": "transportRetry"}}
+                step.message = message
+                step.result = {"message": message, "waitCondition": {"type": "transportRetry"}}
                 return step
             self.store.commit_step_result(
                 save_id,
@@ -517,5 +522,5 @@ class PlanExecutor:
         step.outcome = "unknown" if transient else "partial"
         step.reason_code = reason
         step.status = "deferred"
-        step.message = str(ex)
+        step.message = message
         return step

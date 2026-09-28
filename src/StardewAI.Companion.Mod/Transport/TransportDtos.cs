@@ -389,6 +389,12 @@ public sealed record WaterZoneParameters(
     [JsonPropertyName("itemId")]
     public string? ItemId { get; init; }
 
+    [JsonPropertyName("recipeName")]
+    public string? RecipeName { get; init; }
+
+    [JsonPropertyName("region")]
+    public SpatialRegion? Region { get; init; }
+
     [JsonPropertyName("itemCount")]
     public int? ItemCount { get; init; }
 
@@ -639,7 +645,8 @@ public sealed record CompanionWorkStateDto(
     [property: JsonPropertyName("activeGoals"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<ActiveGoalDto>? ActiveGoals = null,
     [property: JsonPropertyName("recentTodos"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<RecentTodoDto>? RecentTodos = null,
     [property: JsonPropertyName("waitingConditions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<string>? WaitingConditions = null,
-    [property: JsonPropertyName("activity"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionActivityDto? Activity = null
+    [property: JsonPropertyName("activity"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionActivityDto? Activity = null,
+    [property: JsonPropertyName("recentExecutions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<RecentExecutionDto>? RecentExecutions = null
 );
 
 /// <summary>Active goal entry within <see cref="CompanionWorkStateDto"/>.</summary>
@@ -797,3 +804,16 @@ public sealed record MilestoneNodeDto(
     [property: JsonPropertyName("termsNote"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? TermsNote = null,
     [property: JsonPropertyName("updatedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? UpdatedAt = null
 );
+
+public sealed record SpatialRegion(
+    [property: JsonPropertyName("x")] int X,
+    [property: JsonPropertyName("y")] int Y,
+    [property: JsonPropertyName("width")] int Width,
+    [property: JsonPropertyName("height")] int Height);
+
+public sealed record RecentExecutionDto(
+    [property: JsonPropertyName("commandId")] string CommandId,
+    [property: JsonPropertyName("taskTitle")] string TaskTitle,
+    [property: JsonPropertyName("gameDate")] string? GameDate,
+    [property: JsonPropertyName("outcome")] string Outcome,
+    [property: JsonPropertyName("summary")] string Summary);

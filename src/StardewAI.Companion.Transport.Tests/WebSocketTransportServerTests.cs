@@ -10,6 +10,29 @@ namespace StardewAI.Companion.Mod.Transport.Tests;
 
 public class WebSocketTransportServerTests
 {
+    [Fact]
+    public async Task SpatialResultAbove64KbIsDeliveredAndOversizeResultBecomesTerminalError()
+    {
+        using var server = new WebSocketTransportServer(0, "test-token", new TestTransportHandler(), saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        var result = new SkillResultPayload("cmd-map", "task-map", "succeeded", 0, 0, 0, 1, new(),
+            SkillId: "inspect-location", Details: new() { ["farmSpace"] = new string('.', 100000) });
+        await server.SendSkillResultAsync(result, "map-correlation");
+        var received = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("succeeded", received.Payload["terminalState"]!.ToString());
+        Assert.Equal(100000, received.Payload["details"]!["farmSpace"]!.ToString().Length);
+        await server.SendSkillResultAsync(result with { Details = new() { ["farmSpace"] = new string('.', 3 * 1024 * 1024) } }, "large-map-correlation");
+        var rejected = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("failed", rejected.Payload["terminalState"]!.ToString());
+        Assert.Equal("RESPONSE_TOO_LARGE", rejected.Payload["error"]!["code"]!.ToString());
+        Assert.Null(server.ActiveCommandId);
+    }
+
     private sealed class TestTransportHandler : ITransportHandler
     {
         public int AcceptCount { get; private set; }

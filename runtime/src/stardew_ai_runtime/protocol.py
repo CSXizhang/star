@@ -16,6 +16,13 @@ class ProtocolError(ValueError):
 # here, schedule, transport, MCP schema and the C# handler all validate the same
 # contract, and an unknown skill/parameter is rejected instead of being forwarded.
 NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
+    "inspect-crafting": frozenset({"locationId"}),
+    "craft-items": frozenset({"locationId", "recipeName", "itemCount"}),
+    "move-building": frozenset({"locationId", "buildingName", "tile"}),
+    "inspect-map-image": frozenset({"locationId"}),
+    "inspect-location": frozenset({"locationId", "region"}),
+    "place-items": frozenset({"locationId", "tiles", "itemId"}),
+    "remove-items": frozenset({"locationId", "tiles", "itemId"}),
     "refill-watering-can": frozenset({"locationId", "tiles"}),
     "apply-fertilizer": frozenset({"locationId", "tiles", "fertilizerItemId"}),
     "clear-debris": frozenset({"locationId", "tiles"}),
@@ -30,6 +37,9 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
 }
 
 NATIVE_ACTION_TASK_PREFIXES: dict[str, str] = {
+    "inspect-location": "task-space-",
+    "place-items": "task-place-",
+    "remove-items": "task-remove-",
     "refill-watering-can": "task-refill-",
     "apply-fertilizer": "task-fert-",
     "clear-debris": "task-clear-",

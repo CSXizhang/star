@@ -22,7 +22,7 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// 4. Actions happen at the companion's own position using the companion's own
 ///    inventory; no global state is edited from a distance.
 /// </summary>
-public sealed class NormalNativeActionAdapter : INativeActionAdapter
+public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
 {
     private readonly IWorldObserver _observer;
     private readonly IMonitor _monitor;
@@ -63,6 +63,10 @@ public sealed class NormalNativeActionAdapter : INativeActionAdapter
                 NativeActionKind.ToggleAnimalDoor => ToggleAnimalDoor(actor, request, target),
                 NativeActionKind.CollectAnimalProduce => CollectAnimalProduce(actor, request, target),
                 NativeActionKind.ChopTree => ChopTree(actor, request, target),
+                NativeActionKind.PlaceItems => PlaceItems(actor, request, target),
+                NativeActionKind.RemoveItems => RemoveItems(actor, request, target),
+                NativeActionKind.CraftItems => CraftItems(actor, request, target),
+                NativeActionKind.MoveBuilding => MoveBuilding(actor, request, target),
                 _ => NativeActionStepResult.Precondition($"unsupported native action '{request.Kind}'", "unsupported")
             };
         }

@@ -6,6 +6,38 @@ namespace StardewAI.Companion.Mod.Tests;
 public class CompanionTaskPanelStateTests
 {
     [Fact]
+    public void RecentExecutionProjectionIsBoundedDeduplicatedAndClearedBetweenSaves()
+    {
+        var state = new CompanionTaskPanelState();
+        var records = Enumerable.Range(0, 10).Select(i => new Transport.RecentExecutionDto(i.ToString(), "工作", null, "completed", "真实结果")).ToList();
+        records.Add(records[^1]);
+        state.ApplyExecutionHistory(records);
+        Assert.Equal(8, state.RecentExecutions.Count);
+        Assert.Equal("2", state.RecentExecutions[0].CommandId);
+        Assert.Equal("9", state.RecentExecutions[^1].CommandId);
+        state.ApplyExecutionHistory(null);
+        Assert.Equal(8, state.RecentExecutions.Count);
+        state.Reset();
+        Assert.Empty(state.RecentExecutions);
+    }
+
+    [Fact]
+    public void ImportantNoticeIsSaveScopedAndShownOnlyOnceWithoutOwningAChatRequest()
+    {
+        var state = new LifeMenuUiState();
+        Assert.False(state.TryAddDecisionNotice("save-a", "save-b", "notice-1", "1:spring:3", "材料用完了。"));
+        Assert.True(state.TryAddDecisionNotice("save-a", "save-a", "notice-1", "1:spring:3", "材料用完了。"));
+        Assert.False(state.TryAddDecisionNotice("save-a", "save-a", "notice-1", "1:spring:3", "材料用完了。"));
+        Assert.Single(state.RecentCareHints);
+        Assert.Equal("材料用完了。", state.RecentCareHints[0].Text);
+        state.MarkDecisionNoticesRead();
+        Assert.Empty(state.UnreadCareHints);
+        Assert.Single(state.RecentCareHints);
+        state.Reset();
+        Assert.Empty(state.RecentCareHints);
+    }
+
+    [Fact]
     public void RealProgressAndResultRemainVisibleAcrossProfileRefresh()
     {
         var state = new CompanionTaskPanelState();

@@ -637,8 +637,36 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 "toggle-animal-door" => NativeActionKind.ToggleAnimalDoor,
                 "collect-animal-produce" => NativeActionKind.CollectAnimalProduce,
                 "chop-tree" => NativeActionKind.ChopTree,
+                "place-items" => NativeActionKind.PlaceItems,
+                "remove-items" => NativeActionKind.RemoveItems,
+                "craft-items" => NativeActionKind.CraftItems,
+                "move-building" => NativeActionKind.MoveBuilding,
                 _ => null
             };
+
+            if (skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting")
+            {
+                try
+                {
+                    var space = skillId == "inspect-location"
+                        ? _observer.InspectLocation(payload.Parameters.LocationId, payload.Parameters.Region is { } region ? new Rectangle(region.X, region.Y, region.Width, region.Height) : null)
+                        : skillId == "inspect-crafting" ? _observer.InspectCrafting(_actor)
+                        : _observer.InspectMapImage(payload.Parameters.LocationId);
+                    var result = new SkillResultPayload(payload.CommandId, payload.TaskId, "succeeded", 0, 0, 0,
+                        _observer.WorldRevision, new(), new SkillResultResources(0, 0, 0), SkillId: skillId,
+                        Details: new Dictionary<string, object> { [skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-crafting" ? "crafting" : "mapImage"] = space });
+                    _lastSkillResultPayload = result;
+                    if (_transportServer is not null)
+                        _ = _transportServer.SendSkillResultAsync(result, envelope.MessageId, envelope.IdempotencyKey);
+                    rejectResult = null;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    rejectResult = BuildRejection(payload, "SPATIAL_OBSERVATION_UNAVAILABLE", ex.Message, retryable: false);
+                    return false;
+                }
+            }
 
             // 1. Validate skill identifier
             if (!isWater && !isHarvest && !isDeposit && !isOrganize && !isWithdraw && !isHoe && !isPlant && !isShip && !isNavigate && !isPurchase && nativeKind is null)
@@ -705,11 +733,30 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
 
             if (nativeKind is not null)
             {
+                if (nativeKind is NativeActionKind.PlaceItems or NativeActionKind.RemoveItems &&
+                    (string.IsNullOrWhiteSpace(payload.Parameters.ItemId) || payload.Parameters.Tiles is not { Count: > 0 and <= 64 }))
+                {
+                    rejectResult = BuildRejection(payload, "INVALID_PARAMETERS", "Construction requires itemId and 1-64 explicit tiles.", retryable: false);
+                    return false;
+                }
+                if (nativeKind == NativeActionKind.CraftItems &&
+                    (string.IsNullOrWhiteSpace(payload.Parameters.RecipeName) || (payload.Parameters.ItemCount ?? 1) is < 1 or > 64))
+                {
+                    rejectResult = BuildRejection(payload, "INVALID_PARAMETERS", "Crafting requires recipeName and itemCount 1-64 (craft iterations).", retryable: false);
+                    return false;
+                }
+                if (nativeKind == NativeActionKind.MoveBuilding &&
+                    (payload.Parameters.Tile is null || string.IsNullOrWhiteSpace(payload.Parameters.BuildingName)))
+                {
+                    rejectResult = BuildRejection(payload, "INVALID_PARAMETERS", "Building relocation requires buildingName (observed id) and tile.", retryable: false);
+                    return false;
+                }
                 bool needsTiles = nativeKind is NativeActionKind.RefillWateringCan
                     or NativeActionKind.ApplyFertilizer or NativeActionKind.ClearDebris
                     or NativeActionKind.PickupItems or NativeActionKind.CollectMachine
                     or NativeActionKind.PetAnimal or NativeActionKind.CollectAnimalProduce
-                    or NativeActionKind.ToggleAnimalDoor or NativeActionKind.ChopTree;
+                    or NativeActionKind.ToggleAnimalDoor or NativeActionKind.ChopTree
+                    or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems;
 
                 if (needsTiles && (payload.Parameters.Tiles is null || payload.Parameters.Tiles.Count == 0))
                 {
@@ -906,14 +953,23 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             else if (nativeKind is not null)
             {
                 var targets = new List<NativeActionTarget>();
-                if (payload.Parameters.Tiles is { Count: > 0 })
+                if (nativeKind == NativeActionKind.MoveBuilding)
+                {
+                    var destination = payload.Parameters.Tile!;
+                    targets.Add(new NativeActionTarget(new TileCoordinate(destination.X, destination.Y), payload.Parameters.BuildingName));
+                }
+                else if (nativeKind == NativeActionKind.CraftItems)
+                {
+                    for (int i = 0; i < (payload.Parameters.ItemCount ?? 1); i++) targets.Add(new NativeActionTarget(_actor.Tile));
+                }
+                else if (payload.Parameters.Tiles is { Count: > 0 })
                 {
                     foreach (var tile in payload.Parameters.Tiles)
                         targets.Add(new NativeActionTarget(new TileCoordinate(tile.X, tile.Y), payload.Parameters.AnimalName));
                 }
                 else if (payload.Parameters.Tile is { } single)
                 {
-                    targets.Add(new NativeActionTarget(new TileCoordinate(single.X, single.Y), null));
+                    targets.Add(new NativeActionTarget(new TileCoordinate(single.X, single.Y), payload.Parameters.BuildingName));
                 }
                 else if (nativeKind == NativeActionKind.FeedAnimals)
                 {
@@ -934,7 +990,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     Targets: targets,
                     ItemId: nativeKind == NativeActionKind.ApplyFertilizer
                         ? payload.Parameters.FertilizerItemId
-                        : payload.Parameters.ItemId,
+                        : nativeKind == NativeActionKind.CraftItems ? payload.Parameters.RecipeName : payload.Parameters.ItemId,
                     ItemCount: payload.Parameters.ItemCount ?? 1,
                     MaxStamina: payload.Budgets?.MaxStamina > 0 ? payload.Budgets.MaxStamina : 50f,
                     MaxWater: payload.Budgets?.MaxWater ?? 0,

@@ -9,6 +9,17 @@ namespace StardewAI.Companion.Mod.Menus;
 /// </summary>
 public sealed class LifeMenuUiState
 {
+    private readonly HashSet<string> _decisionNoticeKeys = new(StringComparer.Ordinal);
+
+    /// <summary>Independent, save-scoped important messages; never changes a chat command's state.</summary>
+    public bool TryAddDecisionNotice(string currentSaveId, string? noticeSaveId, string noticeId, string gameDate, string text)
+    {
+        if (string.IsNullOrWhiteSpace(currentSaveId) || !string.Equals(currentSaveId, noticeSaveId, StringComparison.Ordinal)
+            || string.IsNullOrWhiteSpace(noticeId) || string.IsNullOrWhiteSpace(text)) return false;
+        if (!_decisionNoticeKeys.Add(currentSaveId + ":" + noticeId)) return false;
+        AddUnreadCareHint(new PendingCareHint("decision:" + noticeId, gameDate, "player-decision", text));
+        return true;
+    }
     // -----------------------------------------------------------------------
     // Life chat state
     // -----------------------------------------------------------------------
@@ -361,6 +372,8 @@ public sealed class LifeMenuUiState
         _unreadCareHints.Clear();
     }
 
+    public void MarkDecisionNoticesRead() => _unreadCareHints.RemoveAll(h => h.Kind == "player-decision");
+
     // -----------------------------------------------------------------------
     // Reset
     // -----------------------------------------------------------------------
@@ -368,6 +381,7 @@ public sealed class LifeMenuUiState
     /// <summary>Resets transient state (e.g. on return-to-title).</summary>
     public void Reset()
     {
+        _decisionNoticeKeys.Clear();
         PendingChatRequestId = null;
         PendingChatMode = null;
         ChatStatus = LifeChatStatus.Idle;

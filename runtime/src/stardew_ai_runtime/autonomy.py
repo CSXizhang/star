@@ -8,6 +8,7 @@ execution to the existing scheduler/MCP path.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import time
@@ -40,6 +41,7 @@ class SaveAutonomyState:
     mode: str = "command"
     paused: bool = False
     goal: str = ""
+    goal_scope: str | None = None
     budget_limit: int | None = None
     box_preference: str = "none"
     preferences_revision: int = 0
@@ -52,6 +54,7 @@ class SaveAutonomyState:
     day: int | None = None
     completed: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
+    last_job_decision_id: str | None = None
     last_event_key: str | None = None
     daily_tokens: dict[str, dict[str, int | None]] = field(default_factory=dict)
     last_action_fingerprint: str | None = None
@@ -211,6 +214,7 @@ class AutonomyController:
             state.breaker_tripped = False
             state.breaker_cooldown_until = None
             state.breaker_reason = None
+            state.goal_scope = None
             state.mode = mode
             state.enabled = value
             if not value:
@@ -243,6 +247,12 @@ class AutonomyController:
                 box_preference=params.get("box_preference"),
             )
         raise ValueError("unsupported autonomy control action")
+
+    def set_goal_scope(self, save_id: str, goal_id: str) -> None:
+        def mutate(state: SaveAutonomyState) -> None:
+            state.goal_scope = goal_id
+            state.decision_epoch += 1
+        self._mutate(save_id, mutate)
 
     def set_preferences(
         self, save_id: str, *, goal: str | None = None, budget_limit: int | None = None,
@@ -288,8 +298,12 @@ class AutonomyController:
             state.breaker_reason = None
         return self._mutate(save_id, mutate)
 
-    def request_job_decision(self, save_id: str) -> None:
+    def request_job_decision(self, save_id: str, decision_id: str | None = None) -> None:
         def mutate(state: SaveAutonomyState) -> None:
+            if decision_id is not None:
+                if state.last_job_decision_id == decision_id:
+                    return
+                state.last_job_decision_id = decision_id
             state.decision_epoch += 1
             state.last_decision_fingerprint = None
         self._mutate(save_id, mutate)
@@ -309,7 +323,7 @@ class AutonomyController:
             state.breaker_reason = None
         return self._mutate(save_id, mutate)
 
-    def next_candidate(self, save_id: str, snapshot: dict[str, Any], *, now: float | None = None) -> dict[str, Any] | None:
+    def next_candidate(self, save_id: str, snapshot: dict[str, Any], *, now: float | None = None, work_signal: str = "") -> dict[str, Any] | None:
         """Return one explainable task from fresh native data, or None when idle."""
         state = self.state(save_id)
         if not state.enabled or state.paused or self.is_cooling_down(save_id, now=now):
@@ -331,9 +345,9 @@ class AutonomyController:
             return {"kind": "water", "reason": "作物需要浇水", "tiles": crops[:64]}
         # One agent decision at enable/new-day/goal change is useful for
         # planting or other saved goals; it is not a recurring idle planner.
-        decision_key = self.fingerprint(save_id, snapshot, {"kind": "decision", "reason": "daily-decision", "goal": state.goal}, state)
+        decision_key = self.fingerprint(save_id, snapshot, {"kind": "decision", "reason": "daily-decision", "goal": state.goal, "workSignal": work_signal}, state)
         if state.last_decision_fingerprint != f"{state.decision_epoch}:{decision_key}":
-            return {"kind": "decision", "reason": "daily-decision", "goal": state.goal}
+            return {"kind": "decision", "reason": "daily-decision", "goal": state.goal, "workSignal": work_signal}
         return None
 
     @staticmethod
@@ -343,7 +357,7 @@ class AutonomyController:
         tiles = candidate.get("tiles") or []
         inventory_raw = snapshot.get("inventory") or {}
         slots = inventory_raw.get("slots", []) if isinstance(inventory_raw, dict) else []
-        items = sorted((x.get("itemId"), x.get("stack", x.get("count", 0))) for x in slots if isinstance(x, dict) and not x.get("isTool"))
+        items = sorted((x.get("itemId"), x.get("stack", x.get("count", 0))) for x in slots if isinstance(x, dict))
         chests_raw = snapshot.get("chests") or []
         if isinstance(chests_raw, dict):
             chests_raw = chests_raw.get("items", [])
@@ -356,13 +370,17 @@ class AutonomyController:
         pending = farm.get("cropUnwateredTiles", []) if isinstance(farm, dict) else []
         pending = pending if isinstance(pending, list) else []
         pending_summary = sorted((x.get("x"), x.get("y")) for x in pending if isinstance(x, dict))
-        return (
+        signature = (
             f"{save_id}:{world.get('year', '?')}:{world.get('season', '?')}:{world.get('dayOfMonth', '?')}:"
             f"{candidate.get('kind')}:{candidate.get('reason')}:{mature_summary}:{pending_summary}:"
-            f"{candidate.get('goal', '')}:{json.dumps(tiles, sort_keys=True, ensure_ascii=False)}:"
+            f"{candidate.get('goal', '')}:{candidate.get('workSignal', '')}:{json.dumps(tiles, sort_keys=True, ensure_ascii=False)}:"
             f"{json.dumps(items, sort_keys=True)}:{json.dumps(chest_summary)}:{shop.get('isOpen', shop.get('open'))}:"
-            f"{state.budget_limit if state else None}:{state.preferences_revision if state else None}"
+            f"{state.budget_limit if state else None}:{state.preferences_revision if state else None}:"
+            f"{world.get('weatherIcon')}:{world.get('isRaining')}:"
+            f"{(snapshot.get('companion') or {}).get('availableMoney')}"
         )
+
+        return hashlib.sha256(signature.encode("utf-8")).hexdigest()
 
     def record_world_event(self, save_id: str, fingerprint: str, revision: int) -> bool:
         """Accept only meaningful native state changes, with bounded retries."""

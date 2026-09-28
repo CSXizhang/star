@@ -203,7 +203,9 @@ def build_decision_context(
     overview_goals = work.get("goals") if isinstance(work.get("goals"), list) else []
     goals = [
         {**({"id": g["id"]} if g.get("id") else {}),
-         "text": g.get("text"), "source": g.get("source")}
+         "text": g.get("text"), "source": g.get("source"),
+         **({"constraints": {key: value for key, value in g["constraints"].items() if key != "milestoneSpec"}} if g.get("constraints") else {}),
+         **({"project": {key: g["project"].get(key) for key in ("phase", "summary", "openQuestions") if key in g["project"]}} if g.get("project") else {})}
         for g in overview_goals
         if isinstance(g, dict) and g.get("text")
     ][:3]

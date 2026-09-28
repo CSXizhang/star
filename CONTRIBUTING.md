@@ -4,7 +4,7 @@
 
 ## 从源码构建
 
-需要游戏与 SMAPI、Python 3.11～3.13、uv、.NET 6 SDK，以及已安装并登录的 Kimi CLI 或 agy。在克隆的仓库根目录打开 PowerShell：
+需要游戏与 SMAPI、Python 3.11～3.13、uv、.NET 6 SDK，以及已安装并登录的 Codex CLI、Kimi CLI 或 agy。在克隆的仓库根目录打开 PowerShell：
 
 ```powershell
 Copy-Item .env.example .env.local

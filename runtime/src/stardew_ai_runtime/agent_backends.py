@@ -73,6 +73,141 @@ class AgyBackend:
         return self._execute(active_task, session_id, prompt)
 
 
+class CodexBackend:
+    """Use the locally authenticated Codex CLI and bind MCP to this game run."""
+
+    name = "codex"
+
+    @staticmethod
+    def terminate(proc: Any) -> None:
+        KimiBackend.terminate(proc)
+
+    def __init__(self, run_dir: Path, model: str = "", command: str = "codex.exe",
+                 progress: ProgressCallback | None = None, timeout_seconds: float = 600.0):
+        self.run_dir = Path(run_dir)
+        self.model = model
+        self.command = command
+        self.progress = progress
+        self.timeout_seconds = timeout_seconds
+
+    def run(self, active_task: ActiveTaskLike, session_id: str | None, prompt: str) -> dict[str, Any]:
+        start = time.monotonic()
+        python = self.run_dir / "runtime" / "python" / "python.exe"
+        if not python.is_file():
+            return BackendResult(False, "游戏运行环境不完整。", session_id,
+                                 error={"code": "BACKEND_START_FAILED", "message": "bundled Python missing"},
+                                 provider=self.name).as_dict()
+        # CLI -c overrides only this invocation. Never edit the user's MCP config.
+        mcp = [
+            "-c", f'mcp_servers.stardew-companion.command={json.dumps(str(python))}',
+            "-c", 'mcp_servers.stardew-companion.args=' + json.dumps([
+                "-B", "-m", "stardew_ai_runtime.mcp_server", "--run-dir", str(self.run_dir),
+                "--surface", "light",
+            ]),
+        ]
+        # Codex sanitizes the environment inherited by MCP servers. Pass the
+        # bridge's turn-scoped authority explicitly to this invocation only.
+        for key in ("STARDEW_MCP_SURFACE", "STARDEW_LIFE_MODE",
+                    "STARDEW_LIFE_PROPOSAL_ID", "STARDEW_DECISION_TOKEN"):
+            value = os.environ.get(key)
+            if value is not None:
+                mcp.extend(["-c", f'mcp_servers.stardew-companion.env.{key}={json.dumps(value)}'])
+        cmd = [self.command, "exec"]
+        if session_id:
+            cmd.extend(["resume", session_id])
+        cmd.extend(["--json", "--skip-git-repo-check", "-c", "approval_policy=never", *mcp])
+        if self.model:
+            cmd.extend(["-m", self.model])
+        if not session_id:
+            cmd.extend(["-s", "danger-full-access"])
+        cmd.append(prompt)
+        proc: Any = None
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(self.run_dir), stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+            active_task.process = proc
+            if self.progress:
+                self.progress(BackendProgress(self.name, "started", "已启动 GPT"))
+            events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+            def read(stream: Any, channel: str) -> None:
+                try:
+                    for line in stream:
+                        events.put((channel, line))
+                finally:
+                    events.put((channel, None))
+
+            readers = [threading.Thread(target=read, args=(stream, channel), daemon=True)
+                       for stream, channel in ((proc.stdout, "stdout"), (proc.stderr, "stderr"))]
+            for reader in readers:
+                reader.start()
+            done = set()
+            reply = ""
+            usage = None
+            errors: list[str] = []
+            deadline = start + self.timeout_seconds
+            while len(done) < 2 and time.monotonic() < deadline:
+                if active_task.cancelled:
+                    KimiBackend.terminate(proc)
+                    return BackendResult(False, "任务已取消。", session_id, provider=self.name,
+                                         duration=time.monotonic() - start).as_dict()
+                try:
+                    channel, line = events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    done.add(channel)
+                    continue
+                if channel == "stderr":
+                    errors.append(line[:500])
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = event.get("type")
+                if kind == "thread.started":
+                    session_id = event.get("thread_id") or session_id
+                elif kind == "item.completed":
+                    item = event.get("item") or {}
+                    if item.get("type") == "agent_message":
+                        reply = str(item.get("text") or reply)
+                    elif item.get("type") == "mcp_tool_call" and self.progress:
+                        self.progress(BackendProgress(self.name, "tool_started", "正在处理游戏任务",
+                                                      item.get("tool")))
+                elif kind == "turn.completed":
+                    usage = event.get("usage")
+                elif kind == "turn.failed":
+                    errors.append(str(event.get("error") or "Codex turn failed"))
+            if len(done) < 2:
+                KimiBackend.terminate(proc)
+                return BackendResult(False, "GPT 执行超时，操作已中止。", session_id,
+                                     error={"code": "TIMEOUT", "message": "Codex process deadline exceeded"},
+                                     provider=self.name, duration=time.monotonic() - start).as_dict()
+            proc.wait(timeout=2)
+            if proc.returncode != 0 or not reply:
+                detail = "".join(errors)[-500:]
+                return BackendResult(False, "GPT 请求失败，请稍后重试。", session_id, usage,
+                                     {"code": "CODEX_REQUEST_FAILED", "message": detail}, self.name,
+                                     time.monotonic() - start).as_dict()
+            if self.progress:
+                self.progress(BackendProgress(self.name, "completed", "GPT 已完成回复"))
+            return BackendResult(True, reply, session_id, usage, provider=self.name,
+                                 duration=time.monotonic() - start).as_dict()
+        except Exception as ex:
+            return BackendResult(False, "GPT 后端启动失败。", session_id,
+                                 error={"code": "BACKEND_START_FAILED", "message": str(ex)},
+                                 provider=self.name, duration=time.monotonic() - start).as_dict()
+        finally:
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        self.terminate(proc)
+                except Exception:
+                    logger.exception("Failed to clean up Codex process")
+            active_task.process = None
+
+
 class KimiBackend:
     name = "kimi"
 

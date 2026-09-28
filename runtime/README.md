@@ -10,4 +10,4 @@ uv run --project runtime pytest runtime/tests
 uv run --project runtime ruff check runtime
 ```
 
-启动聊天服务时，`--run-dir` 指向已安装的 Mod 目录。模型后端在本地 `config/chat-backend.json` 中配置，可从 `config/chat-backend.example.json` 复制。游戏需已进入存档，所选模型客户端需先完成登录和 MCP 注册。
+启动聊天服务时，`--run-dir` 指向已安装的 Mod 目录。模型后端在本地 `config/chat-backend.json` 中配置，可从 `config/chat-backend.example.json` 复制。游戏需已进入存档，所选模型客户端需先完成登录；Codex 后端使用本轮隔离的 MCP 配置，无需全局注册。

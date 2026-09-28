@@ -6,7 +6,7 @@
 
 1. 在 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.2.1-windows-x64.zip`。GitHub 自动提供的 Source code 是开发源码，不是玩家安装包。
 2. 解压，打开其中的 `StardewAI.Companion.Mod` 文件夹。关闭游戏，双击 **设置星露谷伙伴.cmd**，选择游戏目录并按提示安装。
-3. 向导把整包安装到 `游戏目录\Mods\StardewAI.Companion.Mod`，然后让你选择 Kimi 或 agy，以及使用的模型。已有配置和 `data` 会保留。
+3. 向导把整包安装到 `游戏目录\Mods\StardewAI.Companion.Mod`，然后让你选择 Kimi、agy 或 Codex（GPT），以及使用的模型。已有配置和 `data` 会保留。
 
 也可以自行把整个文件夹复制进游戏的 `Mods`，然后运行该文件夹中的设置入口。不要只复制 DLL：`runtime`、`tools`、`release-manifest.json` 等也属于运行所需文件。
 
@@ -18,6 +18,7 @@
 
 - **Kimi CLI**：设置会把伙伴 MCP 配置写到已安装 Mod 内的 `.kimi-code/mcp.json`。第一次使用，在该 Mod 文件夹打开终端运行 `kimi`，确认该文件夹及伙伴工具的信任提示；可用 `/mcp` 查看工具连接。完成后退出检查会话，再开始游戏内聊天。
 - **agy**：设置时选择 agy 会注册名为 `stardew-companion` 的 MCP 工具。agy 的这项注册是客户端级配置；如果之前有同名配置，先留意它指向的目录。按 agy 自己的流程完成登录，并选择账号支持的模型。
+- **Codex（GPT）**：先在本机安装 Codex CLI 并完成登录。向导中的模型可以留空，沿用本机 Codex 配置；伙伴工具只绑定到当前游戏运行，不需要修改全局 MCP 配置。
 
 工具读取当前存档需要游戏已通过 SMAPI 启动并进入存档。遇到尚未连接游戏的提示，可以先完成登录，再进游戏检查。模型名称应使用客户端实际支持的标识。
 

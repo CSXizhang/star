@@ -59,7 +59,7 @@ function Start-ReleaseCompanion([string]$Root, [switch]$CheckOnly, [string[]]$Fo
     $configPath = Join-Path $Root 'config/chat-backend.json'
     if (-not (Test-Path -LiteralPath $configPath)) { throw 'Run the setup entry first to select your AI backend and model.' }
     $settings = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($settings.backend -notin @('kimi', 'agy')) { throw 'Choose Kimi or agy in setup first.' }
+    if ($settings.backend -notin @('kimi', 'agy', 'codex')) { throw 'Choose Kimi, agy, or Codex in setup first.' }
     if (-not (Get-Command ($settings.backend + '.exe') -ErrorAction SilentlyContinue)) { throw "AI CLI $($settings.backend) is missing. Install and sign in to that CLI, then reopen the game." }
     $hash = [Security.Cryptography.SHA256]::Create()
     try { $key = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Root).ToLowerInvariant()))).Replace('-', '') }

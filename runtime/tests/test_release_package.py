@@ -22,6 +22,8 @@ def package_at(root):
     }
     for name in ("setup-companion.ps1", "install-release.ps1", "release-package.ps1", "register-mcp.ps1", "start-companion.ps1", "detect-game.ps1"):
         files["tools/" + name] = (ROOT / "tools" / name).read_bytes()
+    skill = "agent-skills/stardew-companion/SKILL.md"
+    files[skill] = (ROOT / skill).read_bytes()
     for relative, content in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,6 +48,37 @@ def test_relocated_release_pairs_without_developer_metadata(tmp_path, monkeypatc
     (root / "runtime/src/stardew_ai_runtime/chat_bridge.py").write_text("changed")
     with pytest.raises(compatibility.CompatibilityError, match="MOD_RUNTIME_MISMATCH"):
         compatibility.assert_native_compatible(root)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows release registration")
+def test_codex_registration_from_release_is_local_and_preserves_configuration(tmp_path):
+    import tomllib
+
+    root = tmp_path / "玩家发行包"
+    package_at(root)
+    project = tmp_path / "我的农场"
+    config = project / ".codex/config.toml"
+    config.parent.mkdir(parents=True)
+    original = 'model = "existing-choice"\n[mcp_servers.other]\ncommand = "other.exe"\n'
+    config.write_text(original, encoding="utf-8")
+    command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+               str(root / "tools/register-mcp.ps1"), "-RunDir", str(root), "-Agent", "codex",
+               "-ProjectDir", str(project), "-Install"]
+    for _ in range(2):
+        result = subprocess.run(command, capture_output=True)
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert config.read_text(encoding="utf-8").startswith(original)
+    data = tomllib.loads(config.read_text(encoding="utf-8"))
+    server = data["mcp_servers"]["stardew-companion"]
+    assert server["command"] == str(root / "runtime/python/python.exe")
+    assert server["env"] == {"STARDEW_EXTERNAL_CODEX": "1"}
+    assert server["args"][4] == str(root)
+    assert (project / ".agents/skills/stardew-companion/SKILL.md").is_file()
+    # A hand-owned collision must leave every existing byte untouched.
+    config.write_text('[mcp_servers."stardew-companion"]\ncommand = "mine.exe"\n', encoding="utf-8")
+    before = config.read_bytes()
+    assert subprocess.run(command, capture_output=True).returncode != 0
+    assert config.read_bytes() == before
 
 
 @pytest.mark.parametrize("relative", ["../outside", "/outside", "C:/outside", "data/memory.json", "config/chat-backend.json", ".kimi-code/mcp.json"])

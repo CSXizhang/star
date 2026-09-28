@@ -66,6 +66,8 @@ def build(args) -> Path:
         copy_file(path, package / path.relative_to(ROOT))
     for name in TOOL_FILES:
         copy_file(ROOT / "tools" / name, package / "tools" / name)
+    skill = Path("agent-skills/stardew-companion/SKILL.md")
+    copy_file(ROOT / skill, package / skill)
     for name in ("设置星露谷伙伴.cmd", "启动伙伴服务.cmd", "LICENSE"):
         copy_file(ROOT / name, package / name)
     guide = (ROOT / "docs/release-guide.md").read_text(encoding="utf-8-sig")

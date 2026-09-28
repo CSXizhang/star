@@ -599,6 +599,48 @@ def create_mcp_server(
     resolved_surface = resolve_surface(full, surface)
     inst = instructions if instructions is not None else "每次模型决策仅选择一个语义短作业。submit_plan只接受一个task，可包含同一业务范围内的导航及多步原生操作。不同业务必须下一次模型选择；remember_intent及旧计划仅记录意图。工具返回job-selected只代表选择，效果未执行；运行时完成后返回真实精简终态。信任作业结果，不重复逐格核查。自由模式自动再次调用模型，不等待玩家逐步审批。"
     mcp = FastMCP(server_name, instructions=inst)
+    external_codex = os.environ.get("STARDEW_EXTERNAL_CODEX") == "1" and not os.environ.get("STARDEW_DECISION_TOKEN")
+    external_token = uuid.uuid4().hex
+    external_save_id: str | None = None
+    external_selected = False
+
+    def decision_token() -> str | None:
+        return external_token if external_codex else os.environ.get("STARDEW_DECISION_TOKEN")
+
+    if external_codex:
+        @mcp.tool()
+        async def begin_game_turn() -> dict[str, Any]:
+            """Start one external Codex decision after prior work has reached a terminal result.
+
+            Requires idle, unpaused work and disabled free mode. Does not execute
+            anything; then observe as needed and select ONE job with submit_plan.
+            Never invoke concurrently with in-game chat. Repeated calls before
+            selection are idempotent; active/uncertain work blocks a new turn.
+            """
+            nonlocal external_token, external_save_id, external_selected
+            if external_selected and external_save_id:
+                state = work_for_run().state(external_save_id)
+                if state.paused or any(task.status in {"pending", "running", "waiting", "partial", "unknown"} for task in state.tasks):
+                    raise ToolError("GAME_BUSY: resolve existing work before starting another external turn")
+                # The previous task has settled. Reconnect to verify which save is
+                # currently loaded before granting a fresh decision.
+                external_selected = False
+            sid = await current_save_id()
+            if autonomy_for_run().state(sid).enabled:
+                raise ToolError("GAME_BUSY: disable free mode before using external Codex")
+            try:
+                store = work_for_run()
+                current = store.state(sid).decision
+                retry = (current.get("token") == external_token and not current.get("selected")
+                         and not current.get("finished") and current.get("expires", 0) > time.time())
+                token = external_token if retry else uuid.uuid4().hex
+                store.begin_decision(sid, token, require_idle=True)
+                external_token = token
+                external_save_id = sid
+                external_selected = False
+            except WorkStateError as ex:
+                raise ToolError(str(ex)) from None
+            return {"saveId": sid, "status": "ready", "executionScope": "one_short_job"}
     sched = scheduler or CompanionScheduler(run_dir=run_dir)
     # Populated at the end from the real registered tools; shared with the
     # discovery/call closures so both surfaces expose every base op.
@@ -698,6 +740,8 @@ def create_mcp_server(
         return _classify_step_outcome(result)
 
     async def current_save_id() -> str:
+        if external_codex and external_selected and external_save_id:
+            return external_save_id
         current = await sched.get_status()
         sid = current.get("saveId")
         if not sid or sid == "unknown":
@@ -725,6 +769,8 @@ def create_mcp_server(
         Returns crop/soil counts, backpack space/items, and candidate chests with merge status.
         """
         try:
+            if external_codex and external_selected and external_save_id:
+                return {**work_for_run().overview(external_save_id), "gameSnapshotStale": True}
             return await sched.get_work_overview(detail=detail)
         except SchedulerError as ex:
             raise ToolError(f"Failed to get work overview: {ex}") from None
@@ -741,6 +787,8 @@ def create_mcp_server(
         missing field: anything the Mod did not publish stays absent/unknown.
         """
         try:
+            if external_codex and external_selected and external_save_id:
+                return {**work_for_run().overview(external_save_id), "gameSnapshotStale": True}
             res = await sched.get_status()
             if detail:
                 enriched = dict(res)
@@ -853,7 +901,9 @@ def create_mcp_server(
         Use this once instead of repeatedly listing tasks and re-querying status. It
         reads only the latest cached snapshot; it never issues a new farm query.
         """
-        sid = await current_save_id()
+        # After an external Codex selects work, the bridge worker needs the
+        # Mod's sole command socket. Read its persisted result without reopening it.
+        sid = external_save_id if external_codex and external_save_id else await current_save_id()
         store = work_for_run()
         decisions = store.recover(sid)
         snapshot = sched.latest_snapshot
@@ -1187,6 +1237,7 @@ def create_mcp_server(
         running, partial or unknown is preserved. Call
         discover_capabilities("memory") for the same schema.
         """
+        nonlocal external_selected
         sid = await current_save_id()
         store = work_for_run()
         try:
@@ -1198,8 +1249,11 @@ def create_mcp_server(
                 goal_id=goal_id,
                 goal_text=goal_text,
                 replace=replace,
-                decision_token=os.environ.get("STARDEW_DECISION_TOKEN"),
+                decision_token=decision_token(),
             )
+            if external_codex:
+                external_selected = True
+                await sched.close()
             return {"saveId": sid, "executionScope": "one_short_job", **result}
         except WorkStateError as ex:
             raise ToolError(str(ex)) from None
@@ -2961,6 +3015,7 @@ def create_mcp_server(
     def protect_job(name, fn):
         @functools.wraps(fn)
         async def guarded(*args, **kwargs):
+            nonlocal external_selected
             sid = await current_save_id()
             store = work_for_run()
             if name in {"pause_task", "resume_task"}:
@@ -2983,16 +3038,19 @@ def create_mcp_server(
             try:
                 selected = store.submit_plan(sid, goal_text="Current model-selected short job",
                     tasks=[{"title": name, "steps": [{"operation": name, "params": dict(kwargs)}]}],
-                    decision_token=os.environ.get("STARDEW_DECISION_TOKEN"))
+                    decision_token=decision_token())
             except WorkStateError as ex:
                 raise ToolError(str(ex)) from None
+            if external_codex:
+                external_selected = True
+                await sched.close()
             return {"status": "job-selected", "taskId": selected["tasks"][0]["id"],
                     "effectStatus": "not_executed_yet", "nextBusiness": "new_model_decision_required"}
         return guarded
 
     readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
     for tool in mcp._tool_manager.list_tools():
-        exempt = {"submit_plan", "remember_intent", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "work_plan_overview"}
+        exempt = {"begin_game_turn", "submit_plan", "remember_intent", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "work_plan_overview"}
         if tool.name not in exempt and tool.name not in readonly and not tool.name.startswith(("query_", "get_", "list_", "discover_", "observe_")):
             tool.fn = protect_job(tool.name, tool.fn)
         base_tools[tool.name] = tool.fn
@@ -3001,7 +3059,7 @@ def create_mcp_server(
             "parameters": tool.parameters,
         }
     if resolved_surface == "light":
-        allowed = LIGHT_TOOLS
+        allowed = LIGHT_TOOLS | ({"begin_game_turn", "work_plan_overview"} if external_codex else set())
     elif resolved_surface == "internal":
         allowed = INTERNAL_TOOLS
     elif resolved_surface == "life":

@@ -2893,6 +2893,11 @@ class ChatBridge:
                 generations if isinstance(generations, int) and generations > 0 else 1
             )
 
+        # Codex manages compaction in the resumed thread. Its turn usage is not
+        # a reliable measurement of the latest request's context window, so do
+        # not apply the generic token/request-count rotation to it.
+        if self.provider == "codex":
+            return None
         context_tokens = self._request_input_context(usage)
         if context_tokens is None:
             # Unknown measurement: never invent a context length, use the bounded
@@ -2945,7 +2950,7 @@ class ChatBridge:
         self._last_day_settlement = settlement
         # Rotate only after a real settlement; a first observation, a reloaded old
         # save or a repeated day must not churn the provider session.
-        if settlement and settlement.get("settled"):
+        if settlement and settlement.get("settled") and self.provider != "codex":
             self._rotate_provider_session(save_id, reason="game-day-advanced")
         if self._milestone_store is not None:
             await self._settle_milestone_nodes(

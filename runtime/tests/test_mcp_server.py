@@ -1623,6 +1623,45 @@ def test_mcp_work_plan_runs_step_and_goes_idle(mock_scheduler, tmp_path):
     asyncio.run(run())
 
 
+def test_external_codex_turn_uses_existing_executor_and_blocks_overlap(mock_scheduler, tmp_path, monkeypatch):
+    monkeypatch.setenv("STARDEW_EXTERNAL_CODEX", "1")
+    monkeypatch.delenv("STARDEW_DECISION_TOKEN", raising=False)
+    mock_scheduler.run_dir = None
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        other = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        _, started = await server.call_tool("begin_game_turn", {})
+        assert started["saveId"] == "mock-save-123"
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        first_token = store.state("mock-save-123").decision["token"]
+        await server.call_tool("begin_game_turn", {})  # safe retry
+        assert store.state("mock-save-123").decision["token"] == first_token
+        with pytest.raises(ToolError, match="GAME_BUSY"):
+            await other.call_tool("begin_game_turn", {})
+        _, plan = await server.call_tool("submit_plan", {
+            "goal_text": "照料农场", "tasks": [{"id": "external-water", "title": "浇水",
+            "steps": [{"id": "water", "operation": "water_auto", "params": {"max_tiles": 5}}]}],
+        })
+        with pytest.raises(ToolError, match="GAME_BUSY"):
+            await server.call_tool("begin_game_turn", {})
+        _, executed = await server.call_tool("run_next_step", {})
+        assert executed["outcome"] == "completed"
+        assert executed["taskStatus"] == "completed"
+        mock_scheduler.water_auto.assert_awaited_once_with(max_tiles=5)
+        # Match the existing bridge's terminal handoff, without creating a new executor.
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        store.finish_job("mock-save-123", executed, task_id=plan["tasks"][0]["id"])
+        await server.call_tool("begin_game_turn", {})
+        assert store.state("mock-save-123").decision["token"] != first_token
+        store.revoke_decision("mock-save-123")
+        store.set_paused("mock-save-123", True)
+        with pytest.raises(ToolError, match="GAME_BUSY"):
+            await server.call_tool("begin_game_turn", {})
+
+    asyncio.run(run())
+
+
 def test_mcp_plan_rejects_bad_operation_and_model_user_goal(mock_scheduler, tmp_path):
     mock_scheduler.run_dir = None
 

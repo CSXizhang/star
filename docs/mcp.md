@@ -2,7 +2,25 @@
 
 本项目通过本地 MCP 服务向模型客户端提供游戏观察和动作工具。游戏内聊天另由伙伴服务转发。发行包玩家先看[安装指南](release-guide.md)；本页保留源码开发与高级客户端的手动接入步骤。模型客户端需要自行安装和登录。
 
-## 接入前
+## Codex 直接接入
+
+发行包安装完成后，在 PowerShell 运行实际安装目录里的脚本；`-ProjectDir` 指向你准备在 Codex 打开的已有文件夹：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\你的游戏目录\Mods\StardewAI.Companion.Mod\tools\register-mcp.ps1" -RunDir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" -Agent codex -ProjectDir "C:\我的农场对话" -Install
+```
+
+脚本只写该项目的 `.codex/config.toml` 和 `.agents/skills/stardew-companion/SKILL.md`，保留其他配置；已有同名非脚本配置或不同技能内容时停止并说明冲突。省略 `-ProjectDir` 则使用脚本所在发行包或仓库根目录。发行包使用自带 Python，玩家无需编译或安装开发环境。升级后可重跑注册；若旧技能不同，先保留自己的修改，再移走旧技能让脚本安装新版。
+
+在 Codex 打开并信任这个项目，重新开启会话后输入 `$stardew-companion 看看今天农场有什么要做`。可在该目录用 `codex mcp get stardew-companion` 检查配置。项目配置仅在可信项目生效，技能按需加载，见 [Codex MCP 文档](https://developers.openai.com/codex/mcp)及[技能文档](https://developers.openai.com/codex/skills)。
+
+通过 SMAPI 进入存档，保持自动启动的伙伴服务运行。外部 Codex 先观察状态；玩家要求执行后用 `begin_game_turn` 开启一轮，再选一个短作业，由已有执行器完成。`job-selected` 并非完成，须等待实际终态。下一业务再开启一轮；已有任务未完、结果不明、暂停或自由模式开启时会拒绝新轮次。
+
+外部 Codex 派工前关闭自由模式、等待当前游戏内请求结束；此时不要再用 F8 或 NPC 聊天派工。不要另外启动第二个伙伴聊天服务，以免争用连接或端口。切回游戏内入口前先让外部任务结束。菜单会暂停游戏动作，关闭菜单后才继续。
+
+两个入口使用相同游戏事实和任务记录，但**不共享同一 Codex 会话**。外部沿用当前 Codex 对话；游戏内按后端、存档和入口续接，Codex 上下文压缩由宿主管理。游戏日结算继续进行，不再仅因跨天或通用 token 阈值重开 Codex；伙伴配置、记忆或工具范围变化仍可能新建会话。
+
+## 源码开发接入
 
 源码开发者先按[参与开发](../CONTRIBUTING.md#从源码构建)构建和安装 Mod，通过 SMAPI 启动游戏并进入存档。Mod 会在自己的 `data` 目录下生成 `transport-discovery.json`，供 Runtime 发现本地连接。
 

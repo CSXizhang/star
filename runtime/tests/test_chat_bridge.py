@@ -1100,6 +1100,24 @@ def test_day_advance_settles_once_and_rotates_provider_session(tmp_path: Path) -
     asyncio.run(run())
 
 
+def test_codex_keeps_session_across_day_and_generic_context_limits(tmp_path: Path) -> None:
+    async def run() -> None:
+        bridge = ChatBridge(run_dir=tmp_path, backend="codex")
+        bridge._ensure_session_matches_profile("save-1", None)
+        bridge.record_conversation_id("save-1", "codex-1")
+        bridge.record_conversation_id("save-2", "codex-2")
+        bridge._session_token_budget = 1
+        bridge._session_request_checkpoint = 1
+        assert bridge._note_session_context("save-1", {"input_tokens": 200000}) is None
+        assert bridge._note_session_context("save-1", None) is None
+        await bridge._settle_day_advance("save-1", {"year": 1, "season": "spring", "dayOfMonth": 5})
+        await bridge._settle_day_advance("save-1", {"year": 1, "season": "spring", "dayOfMonth": 6})
+        assert bridge._last_day_settlement["settled"] is True
+        assert bridge._ensure_session_matches_profile("save-1", bridge.get_conversation_id("save-1")) == "codex-1"
+        assert bridge.get_conversation_id("save-2") == "codex-2"
+    asyncio.run(run())
+
+
 def test_receive_loop_settles_only_a_real_day_change(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path)
     stop_event = asyncio.Event()

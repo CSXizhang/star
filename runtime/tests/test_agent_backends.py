@@ -106,6 +106,21 @@ def test_codex_backend_uses_run_local_mcp_and_qualified_session(tmp_path: Path) 
     assert "-m" in cmd and cmd[cmd.index("-m") + 1] == "gpt-local"
 
 
+def test_codex_resume_uses_exact_thread_id(tmp_path: Path) -> None:
+    python = tmp_path / "runtime" / "python" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    proc = MagicMock()
+    proc.stdout = iter([json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "continued"}})])
+    proc.stderr = iter([])
+    proc.returncode = 0
+    with patch("subprocess.Popen", return_value=proc) as popen:
+        result = CodexBackend(tmp_path).run(_task(), "thread-for-this-save", "next turn")
+    assert popen.call_args.args[0][1:4] == ["exec", "resume", "thread-for-this-save"]
+    assert result["conversation_id"] == "thread-for-this-save"
+    assert result["success"]
+
+
 def test_codex_backend_cleans_up_process_after_progress_exception(tmp_path: Path) -> None:
     python = tmp_path / "runtime" / "python" / "python.exe"
     python.parent.mkdir(parents=True)

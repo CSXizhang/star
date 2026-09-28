@@ -10,7 +10,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$RunDir,
     [ValidateSet('agy', 'kimi', 'claude', 'codex', 'dsh', 'all')][string]$Agent = 'all',
-    [switch]$Install
+    [switch]$Install,
+    [string]$ProjectDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +24,7 @@ $OutputEncoding = [System.Text.Encoding]::ASCII
 # Dynamically resolve repo root from script location
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
+if (-not $ProjectDir) { $ProjectDir = $repoRoot }
 
 $resolved = Resolve-Path -LiteralPath $RunDir -ErrorAction SilentlyContinue
 if (-not $resolved) { $resolved = Join-Path $repoRoot $RunDir }
@@ -85,11 +87,44 @@ function Show-Claude {
 }
 
 function Show-Codex {
-    Write-Host "`n=== Codex (~/.codex/config.toml) ==="
-    Write-Host "[mcp_servers.$serverName]"
-    Write-Host ('command = "' + ($mcpCommand -replace '\\', '\\') + '"')
-    $tomlArgs = ($uvArgs | ForEach-Object { '"' + ($_ -replace '\\', '\\') + '"' }) -join ", "
-    Write-Host "args = [ $tomlArgs ]"
+    Write-Host "`n=== Codex (project .codex/config.toml) ==="
+    Write-Host (Get-CodexConfig)
+}
+
+function Get-CodexConfig {
+    # JSON strings/arrays are also valid TOML basic strings/arrays.
+    $commandJson = ConvertTo-Json -InputObject $mcpCommand -Compress
+    $argsJson = ConvertTo-Json -InputObject @($uvArgs) -Compress
+    return "[mcp_servers.$serverName]`ncommand = $commandJson`nargs = $argsJson`nenv = { STARDEW_EXTERNAL_CODEX = `"1`" }`n"
+}
+
+function Install-Codex {
+    $project = (Resolve-Path -LiteralPath $ProjectDir).Path
+    $configDir = Join-Path $project '.codex'
+    $configFile = Join-Path $configDir 'config.toml'
+    $skillSource = Join-Path $repoRoot 'agent-skills/stardew-companion/SKILL.md'
+    $skillDir = Join-Path $project '.agents/skills/stardew-companion'
+    $skillFile = Join-Path $skillDir 'SKILL.md'
+    $begin = '# BEGIN stardew-companion (register-mcp.ps1)'
+    $end = '# END stardew-companion (register-mcp.ps1)'
+    $content = if (Test-Path -LiteralPath $configFile) { [IO.File]::ReadAllText($configFile) } else { '' }
+    $pattern = '(?ms)^' + [regex]::Escape($begin) + '\r?\n.*?^' + [regex]::Escape($end) + '(?:\r?\n|$)'
+    $remaining = [regex]::Replace($content, $pattern, '')
+    if ($remaining.Contains($begin) -or $remaining.Contains($end) -or $remaining -match '(?m)^\s*\[\s*mcp_servers\.(?:stardew-companion|"stardew-companion"|''stardew-companion'')\s*[.\]]') {
+        throw 'Existing stardew-companion configuration is not script-managed; review it before installing. No files changed.'
+    }
+    $skill = [IO.File]::ReadAllText($skillSource)
+    if ((Test-Path -LiteralPath $skillFile) -and [IO.File]::ReadAllText($skillFile) -ne $skill) {
+        throw 'Existing stardew-companion skill differs; preserve or remove it before installing. No files changed.'
+    }
+    $block = "$begin`n$(Get-CodexConfig)$end`n"
+    $updated = if ($content -match $pattern) { [regex]::Replace($content, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($match) $block }) } else { $content + "`n" + $block }
+    New-Item -ItemType Directory -Path $configDir, $skillDir -Force | Out-Null
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($configFile, $updated, $utf8)
+    [IO.File]::WriteAllText($skillFile, $skill, $utf8)
+    Write-Host ">>> Installed project MCP and skill in $project. No global configuration changed."
+    Write-Host '>>> Open/trust this project in Codex, restart its session, then use $stardew-companion.'
 }
 
 function Show-Dsh {
@@ -140,7 +175,7 @@ switch ($Agent) {
     'agy'    { Show-Agy;    if ($Install) { Install-Agy } }
     'kimi'   { Show-Kimi;   if ($Install) { Install-Kimi } }
     'claude' { Show-Claude; if ($Install) { Write-Warning "Claude Desktop 请将上述 JSON 片段合并至 claude_desktop_config.json" } }
-    'codex'  { Show-Codex;  if ($Install) { Write-Warning "Codex 请将上述 TOML 片段合并至 ~/.codex/config.toml" } }
+    'codex'  { Show-Codex;  if ($Install) { Install-Codex } }
     'dsh'    { Show-Dsh;    if ($Install) { Write-Warning "dsh 请按其文档填入 command 与 args" } }
     'all'    { Show-Agy; Show-Kimi; Show-Claude; Show-Codex; Show-Dsh }
 }

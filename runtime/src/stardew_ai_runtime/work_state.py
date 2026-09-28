@@ -705,9 +705,17 @@ class WorkStore:
         state.tasks.extend(plan)
         return plan
 
-    def begin_decision(self, save_id: str, token: str) -> None:
+    def begin_decision(self, save_id: str, token: str, *, require_idle: bool = False) -> None:
         """A fresh provider invocation, not a goal/todo, may select one short job."""
         def mutate(state: SaveWorkState) -> None:
+            if require_idle:
+                if state.paused or any(t.status in {"pending", "running", "waiting", "partial", "unknown"} for t in state.tasks):
+                    raise WorkStateError("GAME_BUSY: resolve or cancel existing work, and resume paused work before starting an external turn")
+                current = state.decision
+                if current.get("expires", 0) > _time.time() and not current.get("finished"):
+                    if current.get("token") == token and not current.get("selected"):
+                        return  # Idempotent retry by this MCP connection.
+                    raise WorkStateError("GAME_BUSY: another decision is still active")
             state.scheduler_epoch += 1
             state.decision = {"token": token, "epoch": state.scheduler_epoch,
                               "expires": _time.time() + 1200, "selected": False}

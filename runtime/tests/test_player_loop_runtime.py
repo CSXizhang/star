@@ -157,7 +157,10 @@ def test_wire_schema_and_four_preferences():
     for style in ("earn", "workhorse", "community", "decor"):
         prompt = LifeChatService.build_system_prompt({"playStyle": style}, {}, {}, mode="plan")
         assert "propose" in prompt and "软偏好" in prompt and "选择方向本身不是工作授权" in prompt
-    assert "不能摆放家具" in LifeChatService.build_system_prompt({"playStyle": "decor"}, {}, {}, mode="plan")
+    decor = LifeChatService.build_system_prompt({"playStyle": "decor"}, {}, {}, mode="plan")
+    assert "摆放和回收家具、地板、围栏与物件" in decor
+    assert "制造已解锁配方" in decor and "搬迁建筑" in decor
+    assert "新建升级建筑尚不支持" in decor
     assert "提交仍由玩家完成" in LifeChatService.build_system_prompt({"playStyle": "community"}, {}, {}, mode="plan")
 
 

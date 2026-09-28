@@ -736,6 +736,13 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private void HandleChatReplyReceived(ChatReplyPayload reply)
     {
         string currentSave = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        if (reply.Status == "player-decision")
+        {
+            if (Context.IsWorldReady && _lifeMenuUiState.TryAddDecisionNotice(currentSave, reply.SaveId,
+                reply.RequestId, GetCurrentGameDate(), CompanionDialogueInbox.PlainText(reply.ReplyText)))
+                Game1.addHUDMessage(new HUDMessage("伙伴有件重要的事想和你商量，和伙伴对话查看消息。"));
+            return;
+        }
         if (reply.Status == "processing" && !_chatUiState.HasActiveCommand &&
             !_chatUiState.HasPendingControl && CompanionCommandMenu.AutonomyMode == "free" &&
             string.Equals(reply.SaveId, currentSave, StringComparison.Ordinal))
@@ -1735,6 +1742,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             CompanionCommandMenu.TaskState.ApplyProjection(_lifeMenuUiState.PlayStyle,
                 state.Work.ActiveGoals?.FirstOrDefault()?.Text ?? state.Work.Goal,
                 state.Work.WaitingConditions ?? new List<string>(), state.Work.PlanWaitReason, state.Work.Paused);
+            CompanionCommandMenu.TaskState.ApplyExecutionHistory(state.Work.RecentExecutions);
             if (state.Work.Activity != null)
                 CompanionCommandMenu.TaskState.ApplyActivity(state.Work.Activity.Phase, state.Work.Activity.Summary, state.Work.Activity.NextStep);
             _lifeMenuUiState.EndProfileSet(state.RequestId);

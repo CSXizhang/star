@@ -385,6 +385,8 @@ public sealed class CompanionDialogueController
             new("progress", "看看任务进度"),
             new("say", "随便聊聊……"),
         };
+        if (_state.UnreadCareHints.Any(h => h.Kind == "player-decision"))
+            choices.Insert(0, new Response("decision-notices", "听听需要我决定的事"));
         if (_inbox.Reply != null) choices.Add(new Response("again", "接着刚才的方案"));
         choices.Add(new Response("other", "说点别的……"));
         choices.Add(new Response("bye", "先去忙了"));
@@ -399,6 +401,7 @@ public sealed class CompanionDialogueController
                 case "say": ShowInput("chat"); break;
                 case "again": ShowSpeech(_inbox.Reply!, true); break;
                 case "other": ShowOtherTopics(); break;
+                case "decision-notices": ShowDecisionNotices(); break;
             }
         });
     }
@@ -465,6 +468,8 @@ public sealed class CompanionDialogueController
     private void ShowResponses()
     {
         var responses = new List<Response>();
+        if (_state.UnreadCareHints.Any(h => h.Kind == "player-decision"))
+            responses.Add(new Response("decision-notices", "听听需要我决定的事"));
         if (_inbox.ProposalReady)
         {
             responses.Add(new Response("agree", "按这个安排。"));
@@ -480,6 +485,7 @@ public sealed class CompanionDialogueController
         {
             switch (key)
             {
+                case "decision-notices": ShowDecisionNotices(); break;
                 case "agree": if (_inbox.ProposalReady) Submit("按刚才这个具体方案安排吧。只采纳这个方案，不扩大花钱或取消无关工作。", "plan", _inbox.ProposalNodeId); break;
                 case "discuss": Submit($"我们刚才聊的是：{_inbox.PlayerText}\n你的回复是：{_inbox.Reply}\n现在就这件事商量一个具体可行的小方案。先不要采纳、派工或消费。", "plan"); break;
                 case "change": Submit("先不采纳刚才的方案，换个打算吧。", "plan"); break;
@@ -490,6 +496,14 @@ public sealed class CompanionDialogueController
                 case "plan": Submit("看看眼前的农场，你觉得接下来怎么安排？", "plan"); break;
             }
         });
+    }
+
+    private void ShowDecisionNotices()
+    {
+        string text = string.Join("\n", _state.UnreadCareHints.Where(h => h.Kind == "player-decision").Select(h => h.Text));
+        _state.MarkDecisionNoticesRead();
+        ShowSpeech(string.IsNullOrWhiteSpace(text) ? "这会儿没有新的待决定事项。" : text, false);
+        _afterPages = ShowGreeting;
     }
 
     private void ShowSpeech(string text, bool responses)

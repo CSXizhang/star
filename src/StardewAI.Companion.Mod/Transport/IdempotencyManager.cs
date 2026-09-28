@@ -117,6 +117,14 @@ public sealed class IdempotencyManager
                 }
             }
             sb.Append('|');
+            // Preserve every extended parameter (item identity, crafting recipe, building identity,
+            // destination and region). Otherwise changing a construction request could replay an
+            // unrelated cached success under the same key.
+            var extras = System.Text.Json.JsonSerializer.SerializeToNode(payload.Parameters)!.AsObject();
+            foreach (string key in new[] { "locationId", "tiles", "chestTile", "itemIds" }) extras.Remove(key);
+            sb.Append(extras.ToJsonString()).Append('|');
+            if (payload.SkillId is "place-items" or "remove-items")
+                sb.Append(System.Text.Json.JsonSerializer.Serialize(payload.Parameters.Tiles)).Append('|');
         }
 
         if (payload.Budgets != null)

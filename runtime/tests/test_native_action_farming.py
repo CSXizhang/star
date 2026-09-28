@@ -118,6 +118,13 @@ def _client(snapshot: Envelope | None = None) -> MagicMock:
 
 def test_native_action_parameter_contract() -> None:
     assert set(NATIVE_ACTION_SKILLS) == {
+        "inspect-location",
+        "inspect-map-image",
+        "inspect-crafting",
+        "place-items",
+        "remove-items",
+        "craft-items",
+        "move-building",
         "refill-watering-can",
         "apply-fertilizer",
         "clear-debris",

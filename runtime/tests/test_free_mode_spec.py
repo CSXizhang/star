@@ -71,7 +71,15 @@ def test_fingerprint_uses_real_world_snapshot_fixture_and_tolerates_missing_shap
     candidate = ctl.next_candidate("save-a", snapshot)
     assert candidate is not None
     fingerprint = ctl.fingerprint("save-a", snapshot, candidate, ctl.state("save-a"))
-    assert "spring:1" in fingerprint and "(O)24" in fingerprint
+    # The persisted signature is bounded; unchanged native facts remain stable.
+    assert len(fingerprint) == 64
+    assert ctl.fingerprint("save-a", snapshot, candidate, ctl.state("save-a")) == fingerprint
+    changed = json.loads(json.dumps(snapshot))
+    changed["inventory"]["slots"][0]["stack"] += 1
+    assert ctl.fingerprint("save-a", changed, candidate, ctl.state("save-a")) != fingerprint
+    changed = json.loads(json.dumps(snapshot))
+    changed["world"]["dayOfMonth"] += 1
+    assert ctl.fingerprint("save-a", changed, candidate, ctl.state("save-a")) != fingerprint
     safe = dict(snapshot, chests="invalid", inventory=None, shop=None, farmWork=None)
     assert isinstance(ctl.fingerprint("save-a", safe, candidate), str)
 

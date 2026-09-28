@@ -1,0 +1,36 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.execute",
+  "messageId": "msg-inspect-location-001",
+  "saveId": "save-hash-example",
+  "gameSessionId": "game-session-001",
+  "senderInstanceId": "runtime-instance-001",
+  "sequenceNumber": 6,
+  "worldRevision": 19,
+  "sentAt": "2026-08-24T00:03:40Z",
+  "expiresAt": "2026-08-24T00:04:10Z",
+  "idempotencyKey": "save-hash-example:task-inspect-location-001:attempt-001",
+  "payload": {
+    "commandId": "command-inspect-location-001",
+    "taskId": "task-inspect-location-001",
+    "skillId": "inspect-location",
+    "skillVersion": "0.1",
+    "expectedWorldRevision": 19,
+    "parameters": {
+      "locationId": "Farm",
+      "region": {
+        "x": 60,
+        "y": 10,
+        "width": 10,
+        "height": 10
+      }
+    },
+    "budgets": {
+      "maxGameMinutes": 60,
+      "maxStamina": 50.0,
+      "maxWater": 0
+    },
+    "cancelPolicy": "safe-point",
+    "policyDecisionId": "policy-decision-plant-001"
+  }
+}

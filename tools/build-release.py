@@ -74,7 +74,7 @@ def build(args) -> Path:
     guide = guide.replace("(companion-guide.md)", "(docs/companion-guide.md)").replace("(mcp.md)", "(docs/mcp.md)").replace("(../CONTRIBUTING.md)", "(CONTRIBUTING.md)")
     (package / "使用说明.md").write_text(guide, encoding="utf-8")
     copy_file(ROOT / "CONTRIBUTING.md", package / "CONTRIBUTING.md")
-    for name in ("release-guide.md", "companion-guide.md", "mcp.md"):
+    for name in ("release-guide.md", "companion-guide.md", "mcp.md", "farm-projects.md"):
         copy_file(ROOT / "docs" / name, package / "docs" / name)
 
     cache = args.cache.resolve()

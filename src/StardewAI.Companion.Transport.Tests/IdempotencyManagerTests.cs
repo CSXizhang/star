@@ -4,6 +4,20 @@ namespace StardewAI.Companion.Mod.Transport.Tests;
 
 public class IdempotencyManagerTests
 {
+    [Fact]
+    public void ConstructionIdentityRecipeDestinationAndOrderArePartOfFingerprint()
+    {
+        var original = CreateSamplePayload() with { SkillId = "place-items" };
+        string fingerprint = IdempotencyManager.ComputeSemanticFingerprint(original);
+        var parameters = original.Parameters;
+        foreach (var changed in new[] {
+            parameters with { ItemId = "(O)328" }, parameters with { RecipeName = "Wood Floor" },
+            parameters with { BuildingName = "building-id" }, parameters with { Tile = new(20, 30) },
+            parameters with { Region = new(0, 0, 10, 10) }, parameters with { ItemCount = 2 },
+            parameters with { Tiles = parameters.Tiles!.AsEnumerable().Reverse().ToList() } })
+            Assert.NotEqual(fingerprint, IdempotencyManager.ComputeSemanticFingerprint(original with { Parameters = changed }));
+    }
+
     private static SkillExecutePayload CreateSamplePayload(
         string commandId = "cmd-1",
         string taskId = "task-1",

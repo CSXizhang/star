@@ -292,8 +292,12 @@ compact current farm counts without requiring the player to re-enter them.
 A plan turn that explicitly adopts/re-adopts or materially revises current due
 preparation may hand one short job to the existing work command path. It never
 promotes casual chat, mere proposals or reopen to execution authority. Paused
-or busy work is preserved, global free mode is not enabled, and future-dated
+or busy work is preserved. Adopting a `layout` preparation enables continuation
+scoped to that project; other preparation does not enable free mode. Future-dated
 preparation is retained for existing scheduling. Plan replies distinguish saved
 arrangements from observed native results. Custom proposals may name existing
 preparation capabilities (`water`, `harvest`, `clear`, `plant`, `animals`,
-`machines`); these are bounded intents, not arbitrary executable operations.
+`machines`, `layout`); these are bounded intents, not arbitrary executable operations.
+
+See [spatial observation and construction](spatial-construction.md) for map images,
+regional observations, item placement, crafting and building relocation.

@@ -44,10 +44,16 @@ OUTCOMES = frozenset({"completed", "partial", "unknown", "cancelled", "failed"})
 ALLOWED_OPERATIONS = frozenset(
     {
         "observe_farming_helpers",
+        "observe_crafting",
+        "observe_farm_space",
         "observe_machines",
         "observe_livestock",
         "refill_watering_can",
         "apply_fertilizer",
+        "craft_items",
+        "move_building",
+        "place_items",
+        "remove_items",
         "clear_debris",
         "pickup_items",
         "chop_tree",
@@ -85,6 +91,8 @@ ALLOWED_OPERATIONS = frozenset(
 READ_ONLY_OPERATIONS = frozenset(
     {
         "observe_farming_helpers",
+        "observe_crafting",
+        "observe_farm_space",
         "observe_machines",
         "observe_livestock",
         "get_work_overview",
@@ -285,6 +293,8 @@ class Goal:
     source: str
     priority: int = 0
     constraints: dict[str, Any] = field(default_factory=dict)
+    # Advisory design/phase/open questions; execution facts remain in the ledger.
+    project: dict[str, Any] = field(default_factory=dict)
     status: str = "active"
     epoch: int = 0
     created_at: str = field(default_factory=_now_iso)
@@ -312,6 +322,7 @@ class ExecutionEntry:
     effects: list[dict[str, Any]] = field(default_factory=list)
     reason_code: str | None = None
     snapshot_revision: int | None = None
+    game_date: str | None = None
     at: str = field(default_factory=_now_iso)
 
 
@@ -321,6 +332,7 @@ class SaveWorkState:
     tasks: list[Task] = field(default_factory=list)
     todos: list[Todo] = field(default_factory=list)
     executions: list[ExecutionEntry] = field(default_factory=list)
+    notices: list[dict[str, Any]] = field(default_factory=list)
     paused: bool = False
     scheduler_epoch: int = 0
     decision: dict[str, Any] = field(default_factory=dict)
@@ -378,6 +390,7 @@ class WorkStore:
                         for e in value.get("executions", [])
                         if isinstance(e, dict)
                     ],
+                    notices=[n for n in value.get("notices", []) if isinstance(n, dict)],
                     paused=bool(value.get("paused", False)),
                     scheduler_epoch=int(value.get("schedulerEpoch", 0)),
                     decision=dict(value.get("decision") or {}),
@@ -427,6 +440,7 @@ class WorkStore:
                 "tasks": [asdict(t) for t in state.tasks],
                 "todos": [asdict(t) for t in state.todos],
                 "executions": [asdict(e) for e in state.executions],
+                "notices": state.notices[-20:],
                 "paused": state.paused,
                 "schedulerEpoch": state.scheduler_epoch,
                 "decision": state.decision,
@@ -459,6 +473,32 @@ class WorkStore:
             raise WorkStateError("save_id is required")
         self._load()
         return self._states.setdefault(save_id, SaveWorkState())
+
+    def request_player_decision(self, save_id: str, goal_id: str, message: str) -> dict[str, Any]:
+        """Explicit model signal, separate from routine completion text."""
+        text = message.strip()
+        if not text or len(text) > 1000:
+            raise WorkStateError("Player decision message must contain 1..1000 characters")
+        def mutate(state: SaveWorkState) -> dict[str, Any]:
+            self._find_goal(state, goal_id)
+            previous = next((n for n in state.notices if n["goalId"] == goal_id and n["message"] == text), None)
+            if previous:
+                return dict(previous)
+            notice = {"id": _new_id("notice"), "goalId": goal_id, "message": text, "delivered": False}
+            state.notices = (state.notices + [notice])[-20:]
+            return dict(notice)
+        return self._mutate(save_id, mutate)
+
+    def pending_player_notice(self, save_id: str) -> dict[str, Any] | None:
+        notice = next((n for n in self.state(save_id).notices if not n.get("delivered")), None)
+        return dict(notice) if notice else None
+
+    def acknowledge_player_notice(self, save_id: str, notice_id: str) -> None:
+        def mutate(state: SaveWorkState) -> None:
+            notice = next((n for n in state.notices if n.get("id") == notice_id), None)
+            if notice:
+                notice["delivered"] = True
+        self._mutate(save_id, mutate)
 
     # ------------------------------------------------------------- goals
     def add_goal(
@@ -498,6 +538,7 @@ class WorkStore:
         priority: int | None = None,
         constraints: dict[str, Any] | None = None,
         status: str | None = None,
+        project: dict[str, Any] | None = None,
     ) -> Goal:
         def mutate(state: SaveWorkState) -> Goal:
             goal = self._find_goal(state, goal_id)
@@ -509,6 +550,10 @@ class WorkStore:
                 goal.priority = int(priority)
             if constraints is not None:
                 goal.constraints = dict(constraints)
+            if project is not None:
+                if len(json.dumps(project, ensure_ascii=False)) > 24000:
+                    raise WorkStateError("project notes must fit within 24000 characters")
+                goal.project = dict(project)
             if status is not None:
                 if status not in GOAL_STATUSES:
                     raise WorkStateError(f"invalid goal status '{status}'")
@@ -559,11 +604,38 @@ class WorkStore:
                 for spec in todos:
                     todo = Todo(id=_new_id("todo"), intent=spec["intent"],
                                 trigger=dict(spec["trigger"]), goal_id=goal.id,
-                                expiry=dict(spec["expiry"]))
+                                expiry=dict(spec["expiry"]) if spec.get("expiry") else None)
                     state.todos.append(todo)
                     ids[spec["key"]] = todo.id
             return goal.id, ids
 
+        return self._mutate(save_id, mutate)
+
+    def complete_goal(self, save_id: str, goal_id: str) -> Goal:
+        """Close the model's project assessment without inventing native effects."""
+        def mutate(state: SaveWorkState) -> Goal:
+            goal = self._find_goal(state, goal_id)
+            if goal.status == "completed":
+                return goal
+            tasks = [t for t in state.tasks if t.goal_id == goal_id]
+            if any(t.status not in {"completed", "cancelled"} for t in tasks):
+                raise WorkStateError("PROJECT_UNRESOLVED: finish or reconcile outstanding work before closing the project")
+            completed = [t.id for t in tasks if t.status == "completed"]
+            completed += [entry["task"]["id"] for entry in state.archive
+                          if entry.get("task", {}).get("goal_id") == goal_id
+                          and entry["task"].get("status") == "completed"]
+            if not completed:
+                raise WorkStateError("PROJECT_NO_EXECUTION: no completed native task evidence; cancel an unneeded goal instead")
+            goal.status = "completed"
+            goal.project = {**goal.project, "phase": "completed", "completionAssessment": "model-reviewed",
+                            "completedTaskIds": completed[-64:]}
+            goal.updated_at = _now_iso()
+            goal.epoch += 1
+            state.scheduler_epoch += 1
+            for todo in state.todos:
+                if todo.goal_id == goal_id and todo.status in {"pending", "due"}:
+                    todo.status = "done"
+            return goal
         return self._mutate(save_id, mutate)
 
     def cancel_goal(self, save_id: str, goal_id: str) -> Goal:
@@ -705,11 +777,11 @@ class WorkStore:
         state.tasks.extend(plan)
         return plan
 
-    def begin_decision(self, save_id: str, token: str, *, require_idle: bool = False) -> None:
+    def begin_decision(self, save_id: str, token: str, *, require_idle: bool = False, goal_scope: str | None = None) -> None:
         """A fresh provider invocation, not a goal/todo, may select one short job."""
         def mutate(state: SaveWorkState) -> None:
             if require_idle:
-                if state.paused or any(t.status in {"pending", "running", "waiting", "partial", "unknown"} for t in state.tasks):
+                if state.paused or any(t.status in {"pending", "running", "waiting", "unknown"} for t in state.tasks):
                     raise WorkStateError("GAME_BUSY: resolve or cancel existing work, and resume paused work before starting an external turn")
                 current = state.decision
                 if current.get("expires", 0) > _time.time() and not current.get("finished"):
@@ -720,7 +792,12 @@ class WorkStore:
             state.decision = {"token": token, "epoch": state.scheduler_epoch,
                               "expires": _time.time() + 1200, "selected": False}
             active_goals = [goal for goal in state.goals if goal.status == "active"]
-            if len(active_goals) == 1:
+            if goal_scope:
+                if not any(g.id == goal_scope for g in active_goals):
+                    raise WorkStateError("Scoped project is not active")
+                state.decision["goalId"] = goal_scope
+                state.decision["goalScope"] = goal_scope
+            elif len(active_goals) == 1:
                 state.decision["goalId"] = active_goals[0].id
         self._mutate(save_id, mutate)
 
@@ -825,7 +902,15 @@ class WorkStore:
         def mutate(state: SaveWorkState) -> None:
             nonlocal resolved_goal_id, resolved_goal_source, created_goal
             self._assert_decision_valid(state, decision_token)
-            if goal_id:
+            scope = state.decision.get("goalScope")
+            if scope and goal_id and goal_id != scope:
+                raise WorkStateError("GOAL_SCOPE_MISMATCH: autonomous project cannot dispatch unrelated work")
+            if scope and not goal_id:
+                scoped_goal = self._find_goal(state, scope)
+                if scoped_goal.status != "active":
+                    raise WorkStateError("Scoped project is not active")
+                goal = scoped_goal
+            elif goal_id:
                 goal = self._find_goal(state, goal_id)
                 if goal.status != "active":
                     raise WorkStateError(f"goal '{goal_id}' is not active")
@@ -855,8 +940,12 @@ class WorkStore:
                 for existing in state.tasks:
                     if existing.goal_id != goal.id:
                         continue
-                    if existing.status not in {"pending", "waiting"}:
-                        # running/partial/unknown/completed work is never discarded.
+                    settled_partial = (existing.status == "partial"
+                                       and not any(s.status in {"running", "unknown"} for s in existing.steps))
+                    if existing.status not in {"pending", "waiting"} and not settled_partial:
+                        # Running/unknown commands remain protected. Replacing a
+                        # settled partial cancels only its unexecuted remainder;
+                        # partial step outcomes/effects stay in the native ledger.
                         continue
                     existing.status = "cancelled"
                     existing.updated_at = _now_iso()
@@ -978,6 +1067,43 @@ class WorkStore:
         """Most recent harness-recorded executions for this save."""
         entries = self.state(save_id).executions
         return [asdict(e) for e in entries[-limit:]]
+
+    def recent_execution_summary(self, save_id: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        """Bounded player-facing projection of the native ledger, oldest first.
+
+        Missing legacy/recovered game dates stay unknown; wall-clock timestamps
+        never become invented game dates. A command is shown once after recovery.
+        """
+        state = self.state(save_id)
+        titles = {entry["task"]["id"]: entry["task"].get("title", "农场工作")
+                  for entry in state.archive if isinstance(entry.get("task"), dict)}
+        titles.update({task.id: task.title for task in state.tasks})
+        tasks = {task.id: task for task in state.tasks}
+        labels = {"completed": "已完成", "partial": "部分完成", "unknown": "结果待核实",
+                  "failed": "未完成", "cancelled": "已取消"}
+        seen: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for entry in reversed(state.executions):
+            if entry.operation in READ_ONLY_OPERATIONS:
+                continue
+            identity = entry.command_id or f"{entry.task_id}:{entry.step_id}"
+            if identity in seen:
+                continue
+            seen.add(identity)
+            label = labels.get(entry.outcome, "结果待核实")
+            task = tasks.get(entry.task_id)
+            if entry.outcome == "completed" and task and task.status in {"pending", "running", "waiting"}:
+                label = "步骤完成，任务继续中"
+            summary = label
+            if entry.effects:
+                summary += f"；记录 {len(entry.effects)} 项实际变化"
+            if entry.reason_code and entry.outcome != "completed":
+                summary += "；" + entry.reason_code[:80]
+            rows.append({"commandId": identity, "taskTitle": str(titles.get(entry.task_id) or entry.operation)[:80],
+                         "gameDate": entry.game_date, "outcome": entry.outcome, "summary": summary[:180]})
+            if len(rows) >= max(1, min(int(limit), 8)):
+                break
+        return list(reversed(rows))
 
     # ----------------------------------------------------------- claiming
     @staticmethod
@@ -1256,6 +1382,7 @@ class WorkStore:
         reason_code: str | None = None,
         snapshot_revision: int | None = None,
         command_id: str | None = None,
+        game_date: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Harness-only completion commit; requires a matching executed command id."""
         if outcome not in OUTCOMES:
@@ -1291,6 +1418,8 @@ class WorkStore:
                     effects=list(effects or []),
                     reason_code=reason_code,
                     snapshot_revision=snapshot_revision,
+                    game_date=(_day_key(game_date.get("year"), game_date.get("season"), game_date.get("day"))
+                               if isinstance(game_date, dict) else None),
                 )
             )
 

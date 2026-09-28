@@ -454,6 +454,13 @@ public sealed class CompanionCommandMenu : IClickableMenu
         if (!string.IsNullOrWhiteSpace(TaskState.WaitReason)) rows.Add(new("等待", TaskState.WaitReason, Color.DarkGoldenrod));
         if (!string.IsNullOrWhiteSpace(TaskState.LastResult)) rows.Add(new("最近结果", TaskState.LastResult, Color.DarkGreen));
         rows.Add(new("下一步", TaskState.NextStep, Color.DarkBlue));
+        foreach (var execution in TaskState.RecentExecutions)
+        {
+            string date = CompanionTaskPanelState.ExecutionDateName(execution.GameDate);
+            string outcome = CompanionTaskPanelState.ExecutionOutcomeName(execution.Outcome);
+            rows.Add(new("工作记录", $"{date} · {execution.TaskTitle} · {outcome}\n{execution.Summary}",
+                execution.Outcome is "failed" or "rejected" ? Color.DarkGoldenrod : Game1.textColor));
+        }
         foreach (var msg in rows)
         {
             string wrapped = Game1.parseText($"[{msg.Speaker}]: {msg.Text ?? string.Empty}", Game1.smallFont, contentWidth);

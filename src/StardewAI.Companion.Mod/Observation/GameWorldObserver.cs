@@ -44,6 +44,52 @@ public sealed class GameWorldObserver : IWorldObserver
         Interlocked.Increment(ref _worldRevision);
     }
 
+    public Dictionary<string, object> InspectLocation(string locationName, Rectangle? region = null)
+    {
+        if (!IsMainThread) throw new InvalidOperationException("Spatial observation requires the game thread.");
+        var location = Game1.getLocationFromName(locationName)
+            ?? throw new InvalidOperationException($"Location '{locationName}' is not loaded.");
+        return FarmSpaceObserver.Capture(location, this, region);
+    }
+
+    public Dictionary<string, object> InspectMapImage(string locationName)
+    {
+        if (!IsMainThread) throw new InvalidOperationException("Map screenshots require the game thread.");
+        if (Game1.currentLocation is null || !string.Equals(Game1.currentLocation.NameOrUniqueName, locationName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Map screenshot requires the requested map to be the player's currently rendered map; no player movement was performed.");
+        var directory = Path.Combine(Path.GetTempPath(), "StardewAI.Companion", "map-images");
+        Directory.CreateDirectory(directory);
+        // The native API appends .png and Path.Combine preserves this rooted name.
+        // Neither the user nor a model can supply a filename or arbitrary output path.
+        string stem = Path.Combine(directory, Guid.NewGuid().ToString("N"));
+        string? result = Game1.game1.takeMapScreenshot(0.5f, stem, null);
+        string path = stem + ".png";
+        if (string.IsNullOrEmpty(result) || !File.Exists(path) || new FileInfo(path).Length == 0)
+            throw new InvalidOperationException("The native map screenshot did not produce an image.");
+        return new Dictionary<string, object> { ["locationId"] = locationName, ["path"] = path,
+            ["mimeType"] = "image/png", ["scale"] = 0.5, ["capturedRevision"] = WorldRevision,
+            ["region"] = "native map screenshot region (custom maps may define ScreenshotRegion)" };
+    }
+
+    public Dictionary<string, object> InspectCrafting(IFarmerActor actor)
+    {
+        if (!IsMainThread || actor.GameFarmer is null) throw new InvalidOperationException("Crafting observation requires the game thread and companion inventory.");
+        var recipes = new List<object>();
+        foreach (string name in Game1.player.craftingRecipes.Keys.OrderBy(n => n, StringComparer.Ordinal))
+        {
+            if (!CraftingRecipe.craftingRecipes.ContainsKey(name)) continue;
+            var recipe = new CraftingRecipe(name, false);
+            // Native getCraftableCount adds Game1.player's inventory. Count only companion stacks.
+            int count = recipe.recipeList.Count == 0 ? 0 : recipe.recipeList.Min(ingredient =>
+                ingredient.Value <= 0 ? 0 : actor.GameFarmer.Items.Where(i => i is not null && CraftingRecipe.ItemMatchesForCrafting(i, ingredient.Key)).Sum(i => i.Stack) / ingredient.Value);
+            recipes.Add(new { name, displayName = recipe.DisplayName, itemId = recipe.GetItemData().QualifiedItemId,
+                countPerCraft = recipe.numberProducedPerCraft, ingredients = recipe.recipeList.Select(p => new { itemId = p.Key, count = p.Value }).ToList(),
+                craftableCount = count });
+        }
+        return new Dictionary<string, object> { ["recipes"] = recipes, ["recipeKnowledge"] = "player-unlocked", ["inventoryOwner"] = "companion",
+            ["note"] = "Counts use companion ingredients only; overlapping modded ingredient categories are revalidated transactionally at execution." };
+    }
+
     public bool IsTilePassable(string locationName, TileCoordinate tile)
     {
         var loc = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
@@ -51,6 +97,15 @@ public sealed class GameWorldObserver : IWorldObserver
             return false;
 
         var v = new Vector2(tile.X, tile.Y);
+
+        var layer = loc.Map?.Layers.FirstOrDefault();
+        if (layer is null || tile.X < 0 || tile.Y < 0 || tile.X >= layer.LayerWidth || tile.Y >= layer.LayerHeight)
+            return false;
+        if (loc.buildings.Any(b => b.occupiesTile(v) && !b.isTilePassable(v))) return false;
+        var tileBox = new Rectangle(tile.X * 64, tile.Y * 64, 64, 64);
+        if (loc.furniture.Any(f => !f.isPassable() && f.GetBoundingBox().Intersects(tileBox))) return false;
+        if (loc.largeTerrainFeatures.Any(f => !f.isPassable() && f.getBoundingBox().Intersects(tileBox))) return false;
+        if (loc.resourceClumps.Any(c => c.getBoundingBox().Intersects(tileBox))) return false;
 
         // Check if there is an obstructing building or solid object
         if (loc.isObjectAtTile(tile.X, tile.Y))

@@ -2749,6 +2749,96 @@ class CompanionScheduler:
             "saveId": client.save_id or snap.get("saveId", "unknown"),
         }
 
+    async def query_crafting(self, location_id: str = "Farm") -> dict[str, Any]:
+        """Known native recipes and craftable quantities from companion materials."""
+        result = await self._execute_native_action("inspect-crafting", {"locationId": location_id}, tiles=[])
+        details = result.get("details") or {}
+        if isinstance(details, dict) and isinstance(details.get("crafting"), dict):
+            return details["crafting"]
+        raise SchedulerError(str(result.get("error") or result.get("message") or "Native crafting observation unavailable"))
+
+    async def craft_items(self, recipe_name: str, item_count: int = 1, location_id: str = "Farm",
+                          timeout_seconds: float = 30.0, task_id: str | None = None,
+                          command_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(recipe_name, str) or not recipe_name.strip():
+            raise PolicyViolationError("recipe_name must identify an observed known recipe")
+        if isinstance(item_count, bool) or not isinstance(item_count, int) or not 1 <= item_count <= 64:
+            raise PolicyViolationError("item_count must be 1..64 recipe executions")
+        return await self._execute_native_action(
+            "craft-items", {"locationId": location_id, "recipeName": recipe_name, "itemCount": item_count},
+            tiles=[], timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
+
+    async def move_building(self, building_name: str, tile: dict[str, int], location_id: str = "Farm",
+                            timeout_seconds: float = 30.0, task_id: str | None = None,
+                            command_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(building_name, str) or not building_name.strip():
+            raise PolicyViolationError("building_name must be the observed building identity")
+        validated = validate_action_tiles([tile], max_tiles=1)
+        return await self._execute_native_action(
+            "move-building", {"locationId": location_id, "buildingName": building_name, "tile": validated[0]},
+            tiles=validated, timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
+
+    async def query_map_image(self, location_id: str = "Farm") -> dict[str, Any]:
+        """Request a native screenshot of the current player map without moving them."""
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
+        result = await self._execute_native_action(
+            "inspect-map-image", {"locationId": location_id.strip()}, tiles=[]
+        )
+        details = result.get("details") or {}
+        if isinstance(details, dict) and isinstance(details.get("mapImage"), dict):
+            return details["mapImage"]
+        raise SchedulerError(str(result.get("error") or result.get("message") or "Native map image unavailable"))
+
+    async def query_farm_space(self, location_id: str = "Farm", region: dict[str, int] | None = None) -> dict[str, Any]:
+        """On-demand full native map; never included in routine snapshots/context."""
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
+        parameters: dict[str, Any] = {"locationId": location_id.strip()}
+        if region is not None:
+            if not isinstance(region, dict) or set(region) != {"x", "y", "width", "height"}:
+                raise PolicyViolationError("region must contain x, y, width and height only")
+            if any(isinstance(v, bool) or not isinstance(v, int) for v in region.values()):
+                raise PolicyViolationError("region coordinates and dimensions must be integers")
+            if region["x"] < 0 or region["y"] < 0 or region["width"] < 1 or region["height"] < 1:
+                raise PolicyViolationError("region origin must be non-negative and dimensions positive")
+            parameters["region"] = dict(region)
+        result = await self._execute_native_action("inspect-location", parameters, tiles=[])
+        details = result.get("details") or {}
+        if isinstance(details, dict) and isinstance(details.get("farmSpace"), dict):
+            return details["farmSpace"]
+        raise SchedulerError(str(result.get("error") or result.get("message") or "Native farmSpace observation unavailable"))
+
+    async def place_items(
+        self, tiles: list[dict[str, Any]], item_id: str, location_id: str = "Farm",
+        timeout_seconds: float = 30.0, task_id: str | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Place up to 64 copies of one carried item through real game rules."""
+        return await self._layout_items("place-items", tiles, item_id, location_id,
+                                       timeout_seconds, task_id, command_id)
+
+    async def remove_items(
+        self, tiles: list[dict[str, Any]], item_id: str, location_id: str = "Farm",
+        timeout_seconds: float = 30.0, task_id: str | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Recover explicit matching placed items; mismatches are never removed."""
+        return await self._layout_items("remove-items", tiles, item_id, location_id,
+                                       timeout_seconds, task_id, command_id)
+
+    async def _layout_items(self, skill_id, tiles, item_id, location_id,
+                            timeout_seconds, task_id, command_id) -> dict[str, Any]:
+        validated = validate_action_tiles(tiles, max_tiles=64)
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise PolicyViolationError("item_id must identify the exact native item")
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
+        return await self._execute_native_action(
+            skill_id, {"locationId": location_id.strip(), "tiles": validated, "itemId": item_id.strip()},
+            tiles=validated, timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id,
+        )
+
     async def query_machines(self, location_id: str = "Farm") -> dict[str, Any]:
         """Projects the machine observation group (idle / processing / ready output)."""
         if not isinstance(location_id, str) or not location_id.strip():

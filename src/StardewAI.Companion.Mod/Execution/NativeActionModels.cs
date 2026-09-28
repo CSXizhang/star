@@ -19,7 +19,11 @@ public enum NativeActionKind
     FeedAnimals,
     ToggleAnimalDoor,
     CollectAnimalProduce,
-    ChopTree
+    ChopTree,
+    PlaceItems,
+    RemoveItems,
+    CraftItems,
+    MoveBuilding
 }
 
 /// <summary>

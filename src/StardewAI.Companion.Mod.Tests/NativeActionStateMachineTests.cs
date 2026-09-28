@@ -8,6 +8,39 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class NativeActionStateMachineTests
 {
+    [Theory]
+    [InlineData(11, 10)]
+    [InlineData(10, 11)]
+    [InlineData(10, 10)]
+    public void BuildingMoveWalksOutsideDestinationBeforeActing(int actorX, int actorY)
+    {
+        var (machine, actor, _, adapter) = CreateHarness(initialTile: new TileCoordinate(actorX, actorY));
+        Assert.True(machine.Start(Request(NativeActionKind.MoveBuilding, new TileCoordinate(10, 10)), out _));
+        machine.StepTicks(300);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Single(adapter.Calls);
+        Assert.True(actor.Tile == new TileCoordinate(9, 10) || actor.Tile == new TileCoordinate(10, 9));
+    }
+
+    [Theory]
+    [InlineData(NativeActionKind.PlaceItems)]
+    [InlineData(NativeActionKind.RemoveItems)]
+    public void ConstructionCancelKeepsVerifiedEffectsAndDoesNotTouchRemainingTiles(NativeActionKind kind)
+    {
+        var (machine, _, _, adapter) = CreateHarness();
+        var request = Request(kind, new TileCoordinate(10, 11), new TileCoordinate(11, 10));
+        Assert.True(machine.Start(request, out _));
+        for (int tick = 0; tick < 100 && machine.CurrentTargetIndex == 0; tick++) machine.StepTicks(1);
+        Assert.Equal(1, adapter.CallCount);
+        machine.RequestCancel("Player changed the design");
+        machine.StepTicks(100);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Single(machine.FinalResult.Effects);
+        Assert.Equal(new TileCoordinate(10, 11), machine.FinalResult.Effects[0].Tile);
+        Assert.Equal(1, adapter.CallCount);
+        Assert.Equal(1, machine.FinalResult.ToTransportPayload().CompletedCount);
+    }
+
     private (
         NativeActionStateMachine machine,
         MechanicsActor actor,

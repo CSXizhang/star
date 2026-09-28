@@ -15,13 +15,14 @@ import inspect
 import logging
 import os
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -48,6 +49,16 @@ from stardew_ai_runtime.scheduler import (
 )
 from stardew_ai_runtime.wiki import WikiLookup
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+
+
+class SpatialRegion(BaseModel):
+    """An absolute native map rectangle for bounded observation."""
+
+    model_config = ConfigDict(extra="forbid")
+    x: int = Field(ge=0, strict=True)
+    y: int = Field(ge=0, strict=True)
+    width: int = Field(ge=1, strict=True)
+    height: int = Field(ge=1, strict=True)
 
 
 class ShortJobStep(BaseModel):
@@ -293,6 +304,12 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
     # Grouped observation + native agricultural/husbandry actions. Every entry runs
     # the same real scheduler method as the corresponding MCP tool.
     "observe_farming_helpers": ("query_farming_helpers", frozenset({"location_id"})),
+    "observe_crafting": ("query_crafting", frozenset({"location_id"})),
+    "craft_items": ("craft_items", frozenset({"recipe_name", "item_count", "location_id"})),
+    "move_building": ("move_building", frozenset({"building_name", "tile", "location_id"})),
+    "observe_farm_space": ("query_farm_space", frozenset({"location_id", "region"})),
+    "place_items": ("place_items", frozenset({"tiles", "item_id", "location_id"})),
+    "remove_items": ("remove_items", frozenset({"tiles", "item_id", "location_id"})),
     "observe_machines": ("query_machines", frozenset({"location_id"})),
     "observe_livestock": ("query_livestock", frozenset()),
     "refill_watering_can": ("refill_watering_can", frozenset({"tiles", "location_id", "max_tiles"})),
@@ -345,6 +362,9 @@ BASE_TOOLS = frozenset(
         "get_status",
         # grouped observation (on-demand: never mixes backpack/chests into a farm tool)
         "observe_farming_helpers",
+        "observe_map_image",
+        "observe_crafting",
+        "observe_farm_space",
         "observe_machines",
         "observe_livestock",
         # common actions exposed directly
@@ -355,6 +375,7 @@ BASE_TOOLS = frozenset(
         "refill_watering_can",
         # write entry points
         "submit_plan",
+        "request_player_decision",
         "remember_intent",
         # player controls
         "autonomy_status",
@@ -389,6 +410,9 @@ LIFE_TOOLS = frozenset(
         "work_plan_overview",
         # grouped observation
         "observe_farming_helpers",
+        "observe_map_image",
+        "observe_crafting",
+        "observe_farm_space",
         "observe_machines",
         "observe_livestock",
         # queries
@@ -421,6 +445,8 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
         "clear_debris",
         "pickup_items",
     ),
+    "farm_space": ("observe_map_image", "observe_farm_space", "place_items", "remove_items", "move_building"),
+    "crafting": ("observe_crafting", "craft_items"),
     "forestry": ("chop_tree",),
     "machines": ("observe_machines", "insert_machine", "collect_machine"),
     "livestock": (
@@ -620,8 +646,10 @@ def create_mcp_server(
             nonlocal external_token, external_save_id, external_selected
             if external_selected and external_save_id:
                 state = work_for_run().state(external_save_id)
-                if state.paused or any(task.status in {"pending", "running", "waiting", "partial", "unknown"} for task in state.tasks):
+                if state.paused or any(task.status in {"pending", "running", "waiting", "unknown"} for task in state.tasks):
                     raise ToolError("GAME_BUSY: resolve existing work before starting another external turn")
+                if state.decision.get("selected") and not state.decision.get("finished"):
+                    raise ToolError("GAME_BUSY: native owner is still settling the previous job")
                 # The previous task has settled. Reconnect to verify which save is
                 # currently loaded before granting a fresh decision.
                 external_selected = False
@@ -920,6 +948,19 @@ def create_mcp_server(
         return overview
 
     @mcp.tool()
+    async def request_player_decision(goal_id: str, message: str) -> dict[str, Any]:
+        """Notify the player explicitly about a needed decision or significant discussion.
+
+        Routine progress belongs in the execution log. Identical notices deduplicate
+        across restarts. This never grants permission or unpauses work.
+        """
+        sid = await current_save_id()
+        try:
+            return work_for_run().request_player_decision(sid, goal_id, message)
+        except WorkStateError as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
     async def manage_goal(
         action: str,
         goal_id: str | None = None,
@@ -927,11 +968,14 @@ def create_mcp_server(
         priority: int | None = None,
         constraints: dict[str, Any] | None = None,
         source: str = "agent",
+        project: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create/revise/pause/resume/cancel/list long-term goals for the current save.
+        """Create/revise/pause/resume/complete/cancel/list long-term goals for the current save.
 
         Model-created goals are recorded with source=agent; the model cannot label a
         goal as a user instruction. Player-authored goals come from the chat path.
+        project is advisory durable design: phase, summary, layout, openQuestions.
+        It never grants authority or proves completion; native execution log does.
         """
         sid = await current_save_id()
         store = work_for_run()
@@ -944,10 +988,12 @@ def create_mcp_server(
                 goal = store.add_goal(
                     sid, text or "", source="agent", priority=priority or 0, constraints=constraints
                 )
+                if project is not None:
+                    goal = store.revise_goal(sid, goal.id, project=project)
                 return {"saveId": sid, "goal": asdict(goal)}
             if action == "revise":
                 goal = store.revise_goal(
-                    sid, goal_id or "", text=text, priority=priority, constraints=constraints
+                    sid, goal_id or "", text=text, priority=priority, constraints=constraints, project=project
                 )
                 return {"saveId": sid, "goal": asdict(goal)}
             if action in {"pause", "resume"}:
@@ -955,6 +1001,9 @@ def create_mcp_server(
                     sid, goal_id or "", status="paused" if action == "pause" else "active"
                 )
                 return {"saveId": sid, "goal": asdict(goal)}
+            if action in {"complete", "finish"}:
+                goal = store.complete_goal(sid, goal_id or "")
+                return {"saveId": sid, "goal": asdict(goal), "assessment": "model-reviewed; native log unchanged"}
             if action == "cancel":
                 goal = store.cancel_goal(sid, goal_id or "")
                 return {"saveId": sid, "goal": asdict(goal)}
@@ -1070,7 +1119,7 @@ def create_mcp_server(
 
         For a custom proposal, preparation optionally lists existing capabilities:
         water, harvest, clear, plant (existing seeds), animals, machines, store,
-        ship (explicitly approved sale items only) or pickup. Summary must retain
+        ship (explicitly approved sale items only), pickup or layout (persistent multi-day design/construction). Summary must retain
         location, scope and protected items. For today's ordinary work, omit
         target_date to use the observed game date; no festival node is required.
         Infer a modest proposal from the live snapshot; budget/count are optional,
@@ -1234,7 +1283,9 @@ def create_mcp_server(
         active ``goal_id`` from context or ``goal_text`` to resolve/create an agent goal.
         Both may be omitted when the decision has one bound active goal. With
         ``replace=True`` the goal's still-pending tasks are superseded; work already
-        running, partial or unknown is preserved. Call
+        running or unknown is preserved. A settled partial may be explicitly
+        superseded with replace=True after inspecting its effects; this cancels
+        its remaining work while retaining the partial native evidence. Call
         discover_capabilities("memory") for the same schema.
         """
         nonlocal external_selected
@@ -1487,6 +1538,8 @@ def create_mcp_server(
         This runs the exact same implementation, validation and result shape as the
         corresponding base tool; it is not a parallel code path.
         """
+        if tool == "observe_map_image":
+            raise ToolError("Call observe_map_image directly to receive native image content")
         if tool not in base_tools:
             raise ToolError(f"unknown capability '{tool}'; call discover_capabilities first")
         schema = base_schemas.get(tool, {})
@@ -2652,6 +2705,93 @@ def create_mcp_server(
             raise ToolError(f"Failed to observe farming helpers: {ex}") from None
 
     @mcp.tool()
+    async def observe_crafting(location_id: str = "Farm") -> dict[str, Any]:
+        """Read unlocked real recipes and available companion crafting materials."""
+        try:
+            return await sched.query_crafting(location_id=location_id)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
+    async def craft_items(recipe_name: str, item_count: int = 1, location_id: str = "Farm") -> dict[str, Any]:
+        """Craft an observed known recipe 1..64 times, consuming companion materials."""
+        try:
+            return await sched.craft_items(recipe_name=recipe_name, item_count=item_count, location_id=location_id)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
+    async def move_building(building_name: str, tile: dict[str, int], location_id: str = "Farm") -> dict[str, Any]:
+        """Move one building by observed occupant GUID to explicit origin tile.
+
+        Native occupied-space and entrance checks apply. Single-player only.
+        """
+        try:
+            return await sched.move_building(building_name=building_name, tile=tile, location_id=location_id)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
+    async def observe_map_image(location_id: str = "Farm") -> Image:
+        """See a native map PNG for design, only when player is already on that map.
+
+        Returns image content to the model, never requires shell/file access.
+        Use observe_farm_space for exact tile identities; screenshots are visual references.
+        """
+        try:
+            result = await sched.query_map_image(location_id=location_id)
+            image_path = Path(str(result.get("path") or "")).resolve()
+            allowed_root = (Path(tempfile.gettempdir()) / "StardewAI.Companion" / "map-images").resolve()
+            if (not image_path.is_relative_to(allowed_root) or image_path.suffix.lower() != ".png"
+                    or not image_path.is_file()):
+                raise ToolError("Native map image path is outside the controlled image directory or missing")
+            if image_path.stat().st_size > 32 * 1024 * 1024:
+                raise ToolError("Native map image exceeds 32 MiB")
+            data = image_path.read_bytes()
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ToolError("Native map image is not PNG")
+            return Image(data=data, format="png")
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
+    async def observe_farm_space(location_id: str = "Farm", region: SpatialRegion | None = None) -> dict[str, Any]:
+        """Read full native map rows, occupants/footprints and warps on demand.
+
+        Omit region for the initial full-map design. Later pass {x,y,width,height}
+        for the construction area only. Rows are relative to returned offset;
+        occupants/warps retain absolute coordinates, mapWidth/mapHeight are full-map
+        dimensions. Inspect the row legend before selecting construction tiles.
+        """
+        try:
+            return await sched.query_farm_space(location_id=location_id,
+                                               region=region.model_dump() if isinstance(region, SpatialRegion) else region)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
+    async def place_items(tiles: list[dict[str, Any]], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
+        """Place up to 64 copies of one real backpack item at explicit tiles.
+
+        Native placement rules, inventory consumption and partial results apply.
+        """
+        try:
+            return await sched.place_items(tiles=tiles, item_id=item_id, location_id=location_id)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
+    async def remove_items(tiles: list[dict[str, Any]], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
+        """Recover matching placed items into backpack; item_id is required identity.
+
+        Use observed identities and explicit tiles. Native mismatches are skipped.
+        """
+        try:
+            return await sched.remove_items(tiles=tiles, item_id=item_id, location_id=location_id)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
     async def observe_machines(location_id: str = "Farm") -> dict[str, Any]:
         """Observe placed machines only: idle / processing (minutes left) / ready output.
 
@@ -3048,11 +3188,23 @@ def create_mcp_server(
                     "effectStatus": "not_executed_yet", "nextBusiness": "new_model_decision_required"}
         return guarded
 
+    def protect_external_observation(fn):
+        @functools.wraps(fn)
+        async def guarded(*args, **kwargs):
+            if external_codex and external_selected and external_save_id:
+                decision = work_for_run().state(external_save_id).decision
+                if decision.get("selected") and not decision.get("finished"):
+                    raise ToolError("JOB_IN_PROGRESS: use work_plan_overview for persisted progress; native observation is available after the job settles")
+            return await fn(*args, **kwargs)
+        return guarded
+
     readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
     for tool in mcp._tool_manager.list_tools():
-        exempt = {"begin_game_turn", "submit_plan", "remember_intent", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "work_plan_overview"}
+        exempt = {"request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "work_plan_overview"}
         if tool.name not in exempt and tool.name not in readonly and not tool.name.startswith(("query_", "get_", "list_", "discover_", "observe_")):
             tool.fn = protect_job(tool.name, tool.fn)
+        if tool.name.startswith(("query_", "observe_")) and tool.name != "query_wiki":
+            tool.fn = protect_external_observation(tool.fn)
         base_tools[tool.name] = tool.fn
         base_schemas[tool.name] = {
             "description": tool.description,

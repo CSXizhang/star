@@ -169,6 +169,7 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
 
 
 _PREPARATION_LABELS = {
+    "layout": "按认可的整体范围设计与分批施工，原生观察布局、放置或回收真实物品；保留保护区与通道，跨日继续",
     "water": "照料当前缺水作物，按实际体力和水量完成一小段浇水",
     "harvest": "收取眼前成熟作物；不自动出售或处理献祭保留品",
     "clear": "清理农场眼前少量杂物，保留资源并遵守体力保护",
@@ -758,15 +759,20 @@ class CompanionMilestoneStore:
                           f'范围={node.get("summary") or "仅当前可确认范围，不扩大到其他工作"}；'
                           f'计划数量={node.get("plannedCount") or "待商量"}；'
                           f'约定={node.get("termsNote") or "无"}',
-                "trigger": {"type": "calendar", **trigger}, "expiry": dict(target),
+                "trigger": {"type": "calendar", **trigger}, "expiry": None if prep["key"] == "layout" else dict(target),
             })
         try:
             goal_id, todo_ids = work_store.sync_milestone_work(
-                save_id, node["id"], text=f'节点准备：{node["title"]}（{node["targetDate"]}）',
+                save_id, node["id"], text=(f'持续项目：{node["title"]}' if any(p["key"] == "layout" for p in capability_items)
+                                          else f'节点准备：{node["title"]}（{node["targetDate"]}）'),
                 constraints=constraints, todos=specs, active=True,
                 existing_goal_id=node.get("goalId"),
             )
             node["goalId"], node["todoIds"] = goal_id, todo_ids
+            if any(p["key"] == "layout" for p in capability_items):
+                goal = next(g for g in work_store.state(save_id).goals if g.id == goal_id)
+                if not goal.project:
+                    work_store.revise_goal(save_id, goal_id, project={"phase": "observe", "summary": node.get("summary") or node["title"], "openQuestions": []})
         except WorkStateError as ex:
             raise MilestoneError(f"work system rejected milestone: {ex}") from None
 

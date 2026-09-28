@@ -457,6 +457,7 @@ class InternalMcpPlanClient:
         self._ready: asyncio.Future | None = None
         self._closed = False
         self._live_session: Any | None = None
+        self._close_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -514,24 +515,27 @@ class InternalMcpPlanClient:
 
     async def close(self) -> None:
         """Release the internal execution socket so a provider turn can own it."""
-        if self._task is None:
-            return
-        try:
-            await self._command(("close", None, None))
-        except Exception:
-            logger.debug("Internal MCP client close command failed", exc_info=True)
-        task, self._task = self._task, None
-        if not task.done():
+        async with self._close_lock:
+            if self._task is None:
+                return
             try:
-                await asyncio.wait_for(task, timeout=5.0)
-            except (TimeoutError, asyncio.CancelledError):
-                task.cancel()
-                with contextlib.suppress(Exception):
-                    await task
+                if not self._task.done():
+                    await asyncio.wait_for(self._command(("close", None, None)), timeout=5.0)
             except Exception:
-                logger.debug("Internal MCP session task ended with error", exc_info=True)
-        self._requests = None
-        self._ready = None
+                logger.debug("Internal MCP client close command failed", exc_info=True)
+            task, self._task = self._task, None
+            if not task.done():
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (TimeoutError, asyncio.CancelledError):
+                    task.cancel()
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await task
+                except Exception:
+                    logger.debug("Internal MCP session task ended with error", exc_info=True)
+            self._requests = None
+            self._ready = None
+
 
     # ------------------------------------------------------------- internals
     async def _command(self, command: tuple[str, Any, Any]) -> Any:
@@ -727,6 +731,24 @@ class PlanWorker:
                 logger.warning("Plan worker evaluation failed", exc_info=True)
 
     async def evaluate(self) -> list[StepExecution]:
+        """Own the native socket only for this execution batch, never while idle."""
+        try:
+            return await self._evaluate_ready_steps()
+        finally:
+            # External Codex/observation turns do not pass through the bridge's
+            # _claim_execution. Release here after native reconciliation settles,
+            # so a finished worker cannot monopolize the sole command socket.
+            await self._release_idle_session()
+
+    async def _release_idle_session(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close) and getattr(self.client, "connected", True):
+            try:
+                await close()
+            except Exception:
+                logger.warning("Plan worker could not release its idle MCP session", exc_info=True)
+
+    async def _evaluate_ready_steps(self) -> list[StepExecution]:
         """Run ready steps until none remain (or a deviation needs the model)."""
         self._dirty = False
         executions: list[StepExecution] = []
@@ -773,6 +795,9 @@ class PlanWorker:
                 feedback = compact_job_feedback({**(execution.result or {}), "effects": all_effects, "reasonCode": execution.reason_code, "commandId": execution.command_id, "message": execution.message}, operation=execution.operation or "", status=execution.outcome)
                 feedback["effectCount"] = len(all_effects)
                 feedback["stepsCompleted"] = sum(step.status == "completed" for step in completed_task.steps) if completed_task else 0
+                # Publish finished only after releasing the native owner: an
+                # external client may immediately observe upon seeing this flag.
+                await self._release_idle_session()
                 self.store.finish_job(save_id, feedback, task_id=execution.task_id)
                 self.pending_reasons.append("SHORT_JOB_TERMINAL")
                 if self.terminal_callback:
@@ -1588,6 +1613,13 @@ class ChatBridge:
         """Evaluate the latest native snapshot through the chat channel only."""
         if not save_id or self._autonomy is None or envelope.message_type != "world.snapshot":
             return
+        if self._work_store is not None and ws is not None:
+            notice = self._work_store.pending_player_notice(save_id)
+            if notice:
+                delivered = await self._send_reply(ws, Envelope.create_chat_reply(
+                    self.instance_id, notice["id"], "player-decision", notice["message"], save_id=save_id))
+                if delivered:
+                    self._work_store.acknowledge_player_notice(save_id, notice["id"])
         now = time.monotonic()
         previous = self._autonomy_last_snapshot_at.get(save_id)
         self._autonomy_last_snapshot_at[save_id] = now
@@ -1615,14 +1647,30 @@ class ChatBridge:
         snapshot = envelope.payload or {}
         if self._work_store is not None:
             job_state = self._work_store.state(save_id)
+            if state.goal_scope and not any(g.id == state.goal_scope and g.status == "active" for g in job_state.goals):
+                return
             decision = job_state.decision
             if decision.get("selected") and not decision.get("finished"):
                 return
             last_job = job_state.last_job
-            if last_job and last_job.get("decisionId") != getattr(self, "_last_job_wake", None):
-                self._last_job_wake = last_job.get("decisionId")
-                self._autonomy.request_job_decision(save_id)
-        candidate = self._autonomy.next_candidate(save_id, snapshot)
+            if last_job.get("decisionId"):
+                self._autonomy.request_job_decision(save_id, str(last_job["decisionId"]))
+        work_signal = ""
+        if self._work_store is not None:
+            world = snapshot.get("world") or {}
+            due = self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date={
+                "year": world.get("year"), "season": world.get("season"), "day": world.get("dayOfMonth")})
+            work_signal = json.dumps({
+                # Advisory project notes increment the store epoch but are not
+                # new work. Wake only for changed objectives/authorization/state,
+                # otherwise a blocked planner could wake itself by editing notes.
+                "goals": [(g.id, g.text, g.priority, g.status,
+                           {k: v for k, v in g.constraints.items() if k != "milestoneSpec"})
+                          for g in job_state.goals if g.status == "active"
+                          and (not state.goal_scope or g.id == state.goal_scope)],
+                "due": sorted(t["id"] for t in due if not state.goal_scope or t.get("goal_id") == state.goal_scope),
+            }, sort_keys=True)
+        candidate = self._autonomy.next_candidate(save_id, snapshot, work_signal=work_signal)
         if candidate is None:
             return
         fingerprint = self._autonomy.fingerprint(save_id, snapshot, candidate, state)
@@ -1639,10 +1687,17 @@ class ChatBridge:
         compact["lastResult"] = self._work_store.state(save_id).last_job if self._work_store else state.last_event_key or "none"
         compact["wakeReason"] = candidate.get("reason", "state-change")
         compact["objective"] = state.goal or "由当前状态决定"
+        if state.goal_scope:
+            compact["projectScope"] = state.goal_scope
+            scoped = next((g for g in job_state.goals if g.id == state.goal_scope), None)
+            if scoped:
+                compact["goals"] = [{"id": scoped.id, "text": scoped.text, "source": scoped.source,
+                                     "constraints": {k: v for k, v in scoped.constraints.items() if k != "milestoneSpec"},
+                                     "project": {k: v for k, v in scoped.project.items() if k in {"phase", "summary", "openQuestions"}}}]
         prompt = (
-            "自由模式自主安排。依据以下紧凑实时上下文选择并执行一项有用短任务："
+            "自由模式自主安排。观察当前状态，自主选择值得推进的目标与一项短任务，也可以安静待命："
             f"{render_decision_context(compact)}。"
-            "固定规则：自主照料农场，原子动作只能经 MCP；遵守预算与箱子范围；不保存睡觉；"
+            "人格与记忆是参考，不替代实际授权与任务事实。需要玩家决定或重要商量时调用request_player_decision(goal_id,message)，普通完成文字不会打扰玩家。若有projectScope只能推进该项目，不能借机执行其他旧目标。项目设计与阶段用manage_goal的project保存，阻塞条件用todo保存。常规结果进入日志，不逐步播报。固定规则：原子动作只能经 MCP；遵守预算与箱子范围；不保存睡觉；"
             "原生事实优先，知识不足才 query_wiki；无合适工作就说明待命，不为待命查 wiki。"
             "长期目标或待办用remember_intent，它们不是执行授权；本次用submit_plan选择一个语义短作业，允许内部导航和同一业务范围的多步操作。完成后信任工具精简终态，不重复查询。下一业务由下一次模型决策选择，不预排存箱或出售。"
             f"已保存目标：{state.goal or '由当前状态决定'}。"
@@ -1695,7 +1750,8 @@ class ChatBridge:
             return None
         return {
             "goals": [
-                {"text": g["text"], "source": g["source"]} for g in overview.get("goals", [])[:3]
+                {key: g.get(key) for key in ("id", "text", "source", "constraints", "project")}
+                for g in overview.get("goals", [])[:3]
             ],
             "duePreparation": [
                 {"id": t["id"], "intent": t["intent"], "goalId": t.get("goal_id")}
@@ -1810,6 +1866,7 @@ class ChatBridge:
             "lastSettledDay": overview.get("lastSettledDay"),
             "activeGoals": goals,
             "recentTodos": todos,
+            "recentExecutions": self._work_store.recent_execution_summary(save_id) if self._work_store else [],
             # Contract §1.3 declares [str]; rows from WorkStore.wait_conditions()
             # carry objects, so surface only the display description.
             "waitingConditions": [
@@ -2450,14 +2507,27 @@ class ChatBridge:
         if self._milestone_store is None or self._work_store is None:
             return
         new_todo_ids: set[str] = set()
+        layout_project = False
+        layout_goal_id = None
         for node in self._milestone_store.list_nodes(save_id):
             todos = node.get("todoIds") or {}
             if node.get("status") == "adopted" and todos != before.get(node["id"], {}):
                 new_todo_ids.update(todos.values())
+                layout_project = layout_project or "layout" in todos
+                if "layout" in todos:
+                    layout_goal_id = node.get("goalId")
         if not new_todo_ids:
             return
         state = self._work_store.state(save_id)
         autonomy = self._autonomy.state(save_id) if self._autonomy is not None else None
+        if layout_project and autonomy is not None and not autonomy.enabled:
+            was_paused = autonomy.paused or state.paused
+            self._autonomy.set_enabled(save_id, True)
+            if was_paused:
+                self._autonomy.set_paused(save_id, True)
+            autonomy = self._autonomy.state(save_id)
+        if layout_goal_id and self._autonomy is not None:
+            self._autonomy.set_goal_scope(save_id, layout_goal_id)
         if (state.paused or (autonomy is not None and autonomy.paused)
                 or self._active_task is not None or self._busy_lock.locked()
                 or save_id in self._command_chains
@@ -2470,7 +2540,8 @@ class ChatBridge:
             return "安排已保存，眼前还没到这项准备的时间。"
         if autonomy is not None and autonomy.enabled:
             self._autonomy.request_job_decision(save_id)
-            return "已把眼前可做的准备交给日常工作安排；完成后会按实际结果告诉你。"
+            return ("已接手这个持续项目。我会观察全场、保存设计并分批推进，跨天继续；常规进度留在日志，遇到需要你决定的事再告诉你。"
+                    if layout_project else "已把眼前可做的准备交给日常工作安排；常规进度会记入日志。")
         prompt = (
             "玩家刚在商量计划中明确认可了以下准备安排，现交给你执行一个当前可做的短作业。"
             "这是本次具体安排的执行授权，不开启全局自由模式；不要再问预算/数量或重复确认。"
@@ -3851,9 +3922,12 @@ class ChatBridge:
             world: dict[str, Any] = {}
             if isinstance(self._latest_snapshot_payload, dict):
                 world = self._latest_snapshot_payload.get("world") or {}
-            await self._maybe_fire_care(
-                save_id, "work-done", event_ref, world, fact=f"完成了「{task_title}」"
-            )
+            binding = getattr(self, "_job_reply_binding", None)
+            autonomous = bool(pending_af or (binding and str(binding[0]).startswith("autonomy-")))
+            if not autonomous:
+                await self._maybe_fire_care(
+                    save_id, "work-done", event_ref, world, fact=f"完成了「{task_title}」"
+                )
         if pending_af and self._autonomy is not None:
             af_save_id, af_fingerprint = pending_af
             job_fail_reason = execution.reason_code or execution.message or execution.outcome or reason
@@ -4018,7 +4092,9 @@ class ChatBridge:
         token = uuid.uuid4().hex
         save_id = active_task.save_id
         if save_id and self._work_store is not None:
-            self._work_store.begin_decision(save_id, token)
+            scope = (self._autonomy.state(save_id).goal_scope
+                     if self._autonomy and active_task.request_id.startswith("autonomy-") else None)
+            self._work_store.begin_decision(save_id, token, goal_scope=scope)
         previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
         os.environ["STARDEW_DECISION_TOKEN"] = token
         try:
@@ -4326,14 +4402,20 @@ class ChatBridge:
         finally:
             active_task.process = None
 
-    async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> None:
+    async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> bool:
+        if reply.message_type == "chat.reply" and str(reply.payload.get("requestId", "")).startswith("autonomy-"):
+            if reply.payload.get("status") not in {"failed", "job-failed", "rejected", "unknown", "partial"}:
+                logger.info("Quiet autonomous reply: %s", json.dumps(dict(reply.payload), ensure_ascii=False))
+                return True
         if ws is None:
-            return
+            return False
         try:
             json_text = json.dumps(reply.to_mapping(), ensure_ascii=False)
             await ws.send_text(json_text)
+            return True
         except Exception as ex:
             logger.warning("Failed to send chat reply to WebSocket: %s", ex)
+            return False
 
 
 def main(argv: list[str] | None = None) -> None:

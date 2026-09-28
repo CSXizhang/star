@@ -317,15 +317,13 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         }
 
         _currentTarget = _pendingTargets[_currentTargetIndex];
-        bool selfTarget = _currentTarget.Tile == _actor.Tile;
-
-        if (selfTarget || _actor.Tile.IsAdjacentTo(_currentTarget.Tile))
+        if (IsReadyToInteract())
         {
             CurrentState = ExecutionState.Facing;
             return;
         }
 
-        var pathResult = _navigator.FindPathToInteract(_actor, _currentRequest!.LocationId, _currentTarget.Tile);
+        var pathResult = FindInteractionPath();
         if (!pathResult.Success || pathResult.Steps.Count == 0)
         {
             _skipped.Add(new NativeActionEffect(Describe(_currentTarget), "skipped", "unreachable", Tile: _currentTarget.Tile));
@@ -346,7 +344,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         if (_currentPathIndex >= _currentPath.Count)
         {
             _actor.Halt();
-            CurrentState = _actor.Tile.IsAdjacentTo(_currentTarget.Tile) || _currentTarget.Tile == _actor.Tile
+            CurrentState = IsReadyToInteract()
                 ? ExecutionState.Facing
                 : ExecutionState.Preparing;
             return;
@@ -369,7 +367,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
                 return;
             }
 
-            var replan = _navigator.FindPathToInteract(_actor, _currentRequest!.LocationId, _currentTarget.Tile);
+            var replan = FindInteractionPath();
             if (!replan.Success || replan.Steps.Count == 0)
             {
                 _skipped.Add(new NativeActionEffect(Describe(_currentTarget), "skipped", "unreachable", Tile: _currentTarget.Tile));
@@ -410,6 +408,30 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
 
         CurrentState = ExecutionState.Acting;
+    }
+
+    private bool IsReadyToInteract()
+    {
+        if (_currentRequest!.Kind == NativeActionKind.MoveBuilding)
+            return _actor.Tile == new TileCoordinate(_currentTarget.Tile.X - 1, _currentTarget.Tile.Y)
+                || _actor.Tile == new TileCoordinate(_currentTarget.Tile.X, _currentTarget.Tile.Y - 1);
+        return _actor.Tile == _currentTarget.Tile || _actor.Tile.IsAdjacentTo(_currentTarget.Tile);
+    }
+
+    private PathResult FindInteractionPath()
+    {
+        if (_currentRequest!.Kind != NativeActionKind.MoveBuilding)
+            return _navigator.FindPathToInteract(_actor, _currentRequest.LocationId, _currentTarget.Tile);
+        // The destination is the new building's top-left origin. North and west are
+        // guaranteed outside every positive-sized footprint; east/south may be inside.
+        // Use explicit endpoints because FindPathToInteract accepts an already-adjacent actor.
+        var north = new TileCoordinate(_currentTarget.Tile.X, _currentTarget.Tile.Y - 1);
+        var west = new TileCoordinate(_currentTarget.Tile.X - 1, _currentTarget.Tile.Y);
+        return new[] {
+            _navigator.FindPath(_currentRequest.LocationId, _actor.Tile, north, FacingDirection.Down),
+            _navigator.FindPath(_currentRequest.LocationId, _actor.Tile, west, FacingDirection.Right)
+        }.Where(p => p.Success).OrderBy(p => p.Steps.Count).FirstOrDefault()
+            ?? PathResult.Failed("No reachable standing tile outside the building destination footprint.");
     }
 
     private void HandleActing(GameTime? time, long tickCount)

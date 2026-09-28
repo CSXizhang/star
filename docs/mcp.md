@@ -30,7 +30,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -
 
 ## 游戏内聊天
 
-复制 `config/chat-backend.example.json` 为 `config/chat-backend.json`，设置 `backend` 和 `model`。当前聊天后端支持 `kimi` 和 `agy`；模型标识应与已配置的客户端一致。
+复制 `config/chat-backend.example.json` 为 `config/chat-backend.json`，设置 `backend` 和 `model`。当前聊天后端支持 `kimi`、`agy` 和 `codex`。使用本机已登录的 Codex CLI 时，设置 `"backend": "codex"`；省略 `model` 会沿用本机 Codex 配置的模型。每次调用只临时绑定当前游戏的 MCP，不修改全局配置。
 
 ```powershell
 uv run --project runtime python -m stardew_ai_runtime.chat_bridge --run-dir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" --backend kimi

@@ -15,7 +15,7 @@ Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash.
 | 对话与控制 | NPC 头像对话，F8 查看同一任务的安排、进度、结果与下一步，支持暂停、继续和取消 |
 | 四个方向 | 装修、献祭、赚钱、日常干活；结合当前农场商量安排，确认后接手可做的准备 |
 | 伙伴生活 | 初次见面由你起名、选择相处方式，闲聊、偏好与约定记忆、共同经历和伙伴消息 |
-| 模型接入 | Kimi、agy 聊天后端，以及供其他客户端使用的 MCP 工具 |
+| 模型接入 | Kimi、agy、Codex（GPT）聊天后端，以及供其他客户端使用的 MCP 工具 |
 
 在游戏里按 **F8**，可以直接说：
 
@@ -27,11 +27,11 @@ Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash.
 
 ## 开始使用
 
-Windows 64 位发行包已包含编译好的 Mod 和独立 Python 环境，无需安装 Python、uv 或 .NET SDK。需要你已有 **Stardew Valley 1.6.15、SMAPI 4.2.1**，以及可用的 Kimi CLI 或 agy 模型账号。
+Windows 64 位发行包已包含编译好的 Mod 和独立 Python 环境，无需安装 Python、uv 或 .NET SDK。需要你已有 **Stardew Valley 1.6.15、SMAPI 4.2.1**，以及可用的 Kimi CLI、agy 或已登录的 Codex CLI。
 
 1. 到 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.2.1-windows-x64.zip`，解压到一个普通文件夹。请选择这个安装包，而非 GitHub 自动生成的 Source code。
 2. 关闭游戏，双击解压目录中的 **设置星露谷伙伴.cmd**。选择游戏目录，按向导将伙伴安装到 `Mods`，再选择聊天后端和模型。
-3. 按所选模型客户端自己的流程完成安装与登录。Kimi 首次连接还需在已安装的伙伴目录确认项目信任；设置时选择 agy 会注册它的伙伴 MCP 工具。
+3. 按所选模型客户端自己的流程完成安装与登录。Kimi 首次连接还需在已安装的伙伴目录确认项目信任；设置时选择 agy 会注册它的伙伴 MCP 工具；选择 Codex（GPT）可将模型留空，沿用本机 Codex 配置。
 4. 通过 **SMAPI 启动游戏并进入存档**。伙伴服务会随存档载入自动启动。走近伙伴按交互键，第一次见面时给她起个名字；按 **F8** 可以交代工作。
 
 安装、模型信任、升级与连接问题见[发行包安装指南](docs/release-guide.md)。已有源码开发环境的构建和安装步骤见[参与开发](CONTRIBUTING.md#从源码构建)。

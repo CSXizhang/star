@@ -36,7 +36,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from stardew_ai_runtime.agent_backends import AgyBackend, KimiBackend
+from stardew_ai_runtime.agent_backends import AgyBackend, CodexBackend, KimiBackend
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
 from stardew_ai_runtime.companion_care import CompanionCareService
@@ -899,7 +899,7 @@ class ChatBridge:
         self.run_dir = Path(run_dir) if run_dir else None
         configured = load_chat_backend_config()
         self.backend_name = backend or configured["backend"]
-        self.model = backend_model or model or (configured["model"] if self.backend_name == configured["backend"] else ("kimi-code/k3" if self.backend_name == "kimi" else "gemini-3.8-flash"))
+        self.model = backend_model or model or (configured["model"] if self.backend_name == configured["backend"] else ("kimi-code/k3" if self.backend_name == "kimi" else "" if self.backend_name == "codex" else "gemini-3.8-flash"))
         self.effort = effort or configured.get("effort", "default")
         self.instance_id = instance_id or f"chat-bridge-{uuid.uuid4().hex[:8]}"
         self.agy_cmd = agy_cmd or "agy.exe"
@@ -1016,6 +1016,13 @@ class ChatBridge:
                     cwd=project_root(), auto=False,
                     progress=getattr(self, "_backend_progress_callback", None),
                     agent=self.agent, agent_file=self.agent_file,
+                )
+            elif self.backend_name == "codex":
+                if self.run_dir is None:
+                    raise ValueError("Codex backend requires a game run directory")
+                self._backend = CodexBackend(
+                    run_dir=self.run_dir, model=self.model or "",
+                    progress=getattr(self, "_backend_progress_callback", None),
                 )
             else:
                 raise ValueError(f"Unsupported chat backend: {self.backend_name}")
@@ -1300,9 +1307,11 @@ class ChatBridge:
     def get_conversation_id(self, save_id: str | None) -> str | None:
         if not save_id:
             return None
-        # Provider-qualified keys prevent an old agy conversation from ever
-        # being passed to Kimi (and retain compatibility with old agy files).
-        return self._sessions.get(f"{self.backend_name}:{save_id}") if self.backend_name == "kimi" else self._sessions.get(save_id) or self._sessions.get(f"agy:{save_id}")
+        # Provider-qualified keys prevent sessions from crossing CLI backends.
+        # The unqualified key is retained solely for legacy agy files.
+        if self.backend_name != "agy":
+            return self._sessions.get(f"{self.backend_name}:{save_id}")
+        return self._sessions.get(save_id) or self._sessions.get(f"agy:{save_id}")
 
     def record_conversation_id(self, save_id: str | None, conversation_id: str) -> None:
         if not save_id or not conversation_id:
@@ -2216,7 +2225,7 @@ class ChatBridge:
         env["STARDEW_LIFE_PROPOSAL_ID"] = proposal["id"] if proposal else ""
         try:
             backend = self._get_backend()
-            if isinstance(backend, KimiBackend):
+            if isinstance(backend, (KimiBackend, CodexBackend)):
                 backend.progress = getattr(self, "_backend_progress_callback", None)
             return backend.run(active_task, conversation_id, prompt)
         finally:
@@ -4009,7 +4018,7 @@ class ChatBridge:
         os.environ["STARDEW_DECISION_TOKEN"] = token
         try:
             backend = self._get_backend()
-            if isinstance(backend, KimiBackend):
+            if isinstance(backend, (KimiBackend, CodexBackend)):
                 backend.progress = getattr(self, "_backend_progress_callback", None)
             return backend.run(active_task, conversation_id, prompt)
         finally:
@@ -4334,7 +4343,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to run directory containing transport-discovery.json (or set STARDEW_RUN_DIR)",
     )
     parser.add_argument(
-        "--backend", type=str, choices=["agy", "kimi"], default=None,
+        "--backend", type=str, choices=["agy", "kimi", "codex"], default=None,
         help="Chat provider (overrides config/chat-backend.json)",
     )
     parser.add_argument(

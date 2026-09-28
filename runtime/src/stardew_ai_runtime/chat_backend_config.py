@@ -24,8 +24,9 @@ def load_chat_backend_config(path: Path | None = None) -> dict[str, str]:
     target = path or config_path()
     try:
         raw: Any = json.loads(target.read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and raw.get("backend") in {"agy", "kimi"}:
-            config = {"backend": str(raw["backend"]), "model": str(raw.get("model") or (DEFAULT_MODEL if raw["backend"] == "kimi" else "gemini-3.8-flash"))}
+        if isinstance(raw, dict) and raw.get("backend") in {"agy", "kimi", "codex"}:
+            defaults = {"kimi": DEFAULT_MODEL, "agy": "gemini-3.8-flash", "codex": ""}
+            config = {"backend": str(raw["backend"]), "model": str(raw.get("model") or defaults[raw["backend"]])}
             if raw.get("effort") in {"default", "low", "medium", "high"}:
                 config["effort"] = str(raw["effort"])
             if raw.get("agent"):

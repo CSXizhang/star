@@ -98,6 +98,25 @@ public sealed class CompanionDialogueController
     private Action? _next;
     private bool _returnAfterPages;
     private Action? _afterPages;
+    private LocalizedContentManager.LanguageCode? _previousDialogueLanguage;
+
+    private void UseReadableDialogueFont()
+    {
+        // Stardew's English SpriteText has no Chinese glyphs. Its native speech
+        // and question boxes use the current language's font, so keep Chinese
+        // active only while this companion conversation owns the menu.
+        if (_previousDialogueLanguage != null ||
+            LocalizedContentManager.CurrentLanguageCode == LocalizedContentManager.LanguageCode.zh) return;
+        _previousDialogueLanguage = LocalizedContentManager.CurrentLanguageCode;
+        LocalizedContentManager.CurrentLanguageCode = LocalizedContentManager.LanguageCode.zh;
+    }
+
+    private void RestoreDialogueLanguage()
+    {
+        if (_previousDialogueLanguage is not { } previous) return;
+        _previousDialogueLanguage = null;
+        LocalizedContentManager.CurrentLanguageCode = previous;
+    }
 
     public CompanionDialogueController(LifeMenuUiState state, Func<string, string, string?, bool> submit,
         Action refresh, Action settings, Action memory, Func<Farmer?> farmer,
@@ -118,6 +137,7 @@ public sealed class CompanionDialogueController
 
     public void Reset()
     {
+        RestoreDialogueLanguage();
         _inbox.Reset();
         _ownedMenu = _pages = null;
         _next = null;
@@ -133,6 +153,9 @@ public sealed class CompanionDialogueController
 
     public void Update()
     {
+        if (_previousDialogueLanguage != null && _next == null && _pages == null &&
+            (_ownedMenu == null || !ReferenceEquals(Game1.activeClickableMenu, _ownedMenu)))
+            RestoreDialogueLanguage();
         if ((_meetingProfileRequest != null || _meetingMemoryRequest != null) &&
             DateTime.UtcNow - _meetingSentAt > TimeSpan.FromSeconds(30))
         {
@@ -339,6 +362,7 @@ public sealed class CompanionDialogueController
     {
         void ShowChoices()
         {
+            UseReadableDialogueFont();
             // Stardew deliberately uses its separate response layout for choices.
             Game1.currentLocation.createQuestionDialogue($"{CompanionNpcDialogueBox.LiteralText(DisplayName)}：", responses,
                 (_, key) => _next = () => answer(key));
@@ -470,6 +494,7 @@ public sealed class CompanionDialogueController
 
     private void ShowSpeech(string text, bool responses)
     {
+        UseReadableDialogueFont();
         _pages = _ownedMenu = new CompanionNpcDialogueBox(MakeDialogue(text));
         _returnAfterPages = responses;
         Game1.activeClickableMenu = _pages;
@@ -509,6 +534,7 @@ public sealed class CompanionDialogueController
 
     private void ShowInput(string mode)
     {
+        UseReadableDialogueFont();
         _ownedMenu = new CompanionSpeechInputMenu(_state.CompanionName,
             text => Submit(text, mode), () => _next = ShowResponses);
         Game1.activeClickableMenu = _ownedMenu;

@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from stardew_ai_runtime.agent_backends import KimiBackend
+from stardew_ai_runtime.agent_backends import CodexBackend, KimiBackend
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config
 
 
@@ -74,6 +74,56 @@ def test_chat_backend_config_defaults_to_kimi_and_accepts_explicit_file(tmp_path
     config = tmp_path / "chat-backend.json"
     config.write_text(json.dumps({"backend": "agy", "model": "gemini-test"}), encoding="utf-8")
     assert load_chat_backend_config(config) == {"backend": "agy", "model": "gemini-test"}
+
+
+def test_codex_backend_uses_run_local_mcp_and_qualified_session(tmp_path: Path) -> None:
+    python = tmp_path / "runtime" / "python" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    config = tmp_path / "chat-backend.json"
+    config.write_text('{"backend":"codex"}', encoding="utf-8")
+    assert load_chat_backend_config(config) == {"backend": "codex", "model": ""}
+
+    proc = MagicMock()
+    proc.stdout = iter([
+        json.dumps({"type": "thread.started", "thread_id": "codex-session-1"}) + "\n",
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "已看过农场。"}}) + "\n",
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 7}}) + "\n",
+    ])
+    proc.stderr = iter([])
+    proc.returncode = 0
+    with patch.dict("os.environ", {"STARDEW_MCP_SURFACE": "life", "STARDEW_LIFE_MODE": "plan"}), \
+         patch("subprocess.Popen", return_value=proc) as popen:
+        result = CodexBackend(tmp_path, model="gpt-local").run(_task(), None, "只读观察")
+    cmd = popen.call_args.args[0]
+    assert result["success"] is True
+    assert result["conversation_id"] == "codex-session-1"
+    assert result["response"] == "已看过农场。"
+    mcp_args = next(value for value in cmd if value.startswith("mcp_servers.stardew-companion.args="))
+    assert json.loads(mcp_args.split("=", 1)[1])[4] == str(tmp_path)
+    assert "mcp_servers.stardew-companion.env.STARDEW_MCP_SURFACE=\"life\"" in cmd
+    assert "mcp_servers.stardew-companion.env.STARDEW_LIFE_MODE=\"plan\"" in cmd
+    assert "-m" in cmd and cmd[cmd.index("-m") + 1] == "gpt-local"
+
+
+def test_codex_backend_cleans_up_process_after_progress_exception(tmp_path: Path) -> None:
+    python = tmp_path / "runtime" / "python" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    proc = MagicMock()
+    proc.poll.return_value = None
+    task = _task()
+
+    def fail_progress(_event):
+        raise RuntimeError("callback failed")
+
+    with patch("subprocess.Popen", return_value=proc), \
+         patch.object(CodexBackend, "terminate") as terminate:
+        result = CodexBackend(tmp_path, progress=fail_progress).run(task, None, "只读观察")
+
+    assert result["success"] is False
+    terminate.assert_called_once_with(proc)
+    assert task.process is None
 
 
 def _ok_proc() -> MagicMock:

@@ -2251,3 +2251,79 @@ def test_manage_milestones_on_life_surface_is_not_job_wrapped(
         assert listed["nodes"][0]["status"] == "adopted"
 
     asyncio.run(run())
+
+
+def test_compact_external_overviews_keep_recovery_facts_and_offer_full_detail(mock_scheduler, tmp_path, monkeypatch):
+    monkeypatch.setenv("STARDEW_EXTERNAL_CODEX", "1")
+    monkeypatch.delenv("STARDEW_DECISION_TOKEN", raising=False)
+    mock_scheduler.run_dir = None
+    mock_scheduler.close = AsyncMock()
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        await server.call_tool("begin_game_turn", {})
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        sid = "mock-save-123"
+        goal = store.add_goal(sid, "Complete the east farm paths", source="user",
+                              constraints={"protectedAreas": [{"x": 5, "y": 5, "width": 8, "height": 9}], "spendingLimit": 0})
+        tiles = [{"x": x, "y": y} for y in range(12, 16) for x in range(16, 32)]
+        layout = {"location": "Farm", "regions": [{"name": "East paths", "itemId": "(O)328", "tiles": tiles}]}
+        store.revise_goal(sid, goal.id, project={"phase": "paths", "summary": "Keep the orchard and entrances clear", "layout": layout})
+        tasks = [{"id": "east-path", "title": "Lay east paths", "steps": [
+            {"id": "first", "operation": "place_items", "params": {"item_id": "(O)328", "location_id": "Farm", "tiles": tiles[:32]}},
+            {"id": "second", "operation": "place_items", "params": {"item_id": "(O)328", "location_id": "Farm", "tiles": tiles[32:]}},
+        ]}]
+        _, selected = await server.call_tool("submit_plan", {"goal_id": goal.id, "tasks": tasks})
+        assert "steps" not in selected["tasks"][0]
+        assert selected["tasks"][0]["stepCount"] == 2
+        assert selected["tasks"][0]["status"] == "pending"
+        for step_id, count, outcome in (("first", 32, "completed"), ("second", 2, "partial")):
+            claim = store.claim_next_step(sid, "worker")
+            assert claim["stepId"] == step_id
+            command = "native-" + step_id
+            store.assign_command_id(sid, "east-path", step_id, command)
+            source_tiles = tiles[:32] if step_id == "first" else tiles[32:]
+            store.commit_step_result(sid, task_id="east-path", step_id=step_id, command_id=command,
+                                     outcome=outcome, reason_code="TILE_OCCUPIED" if outcome == "partial" else None,
+                                     effects=[{"tile": tile, "itemId": "(O)328", "state": "placed"} for tile in source_tiles[:count]])
+        store.finish_job(sid, {"status": "partial", "reasonCode": "TILE_OCCUPIED", "effectCount": 34,
+                               "effects": [{"tile": tile, "state": "placed"} for tile in tiles[:8]]}, task_id="east-path")
+        native_reads = mock_scheduler.get_status.await_count
+        for name in ("get_status", "get_work_overview", "work_plan_overview"):
+            _, compact = await server.call_tool(name, {})
+            _, full = await server.call_tool(name, {"detail": True})
+            assert compact["goals"][0]["constraints"] == full["goals"][0]["constraints"]
+            assert "layout" not in compact["goals"][0]["project"]
+            assert full["goals"][0]["project"]["layout"] == layout
+            assert compact["tasks"][0]["status"] == "partial"
+            assert compact["lastJob"]["reasonCode"] == "TILE_OCCUPIED"
+            assert compact["anomalies"][0]["reasonCode"] == "TILE_OCCUPIED"
+            assert "detail=True" in compact["detailHint"]
+            assert full["tasks"][0]["steps"][1]["params"]["tiles"] == tiles[32:]
+            assert len(full["tasks"][0]["steps"][1]["effects"]) == 2
+            before = len(json.dumps(full, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            after = len(json.dumps(compact, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            assert after < before * 0.6
+            print(f"{name}: full={before} compact={after} UTF-8 JSON bytes")
+        assert mock_scheduler.get_status.await_count == native_reads
+        assert store.state(sid).goals[0].project["layout"] == layout
+    asyncio.run(run())
+
+
+def test_internal_work_overview_keeps_full_contract_and_compact_unknown_has_reason(mock_scheduler, tmp_path):
+    from stardew_ai_runtime.mcp_server import compact_work_overview
+    mock_scheduler.run_dir = None
+    async def run():
+        store = _grant_decision(tmp_path, mock_scheduler)
+        plan = store.submit_plan("mock-save-123", goal_text="test", decision_token="decision-1", tasks=[{
+            "title": "Place", "steps": [{"operation": "place_items", "params": {"item_id": "(O)328", "tiles": [{"x": 1, "y": 2}]}}]}])
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="internal")
+        _, invoked = await server.call_tool("call_capability", {"tool": "work_plan_overview"})
+        assert invoked["result"]["tasks"][0]["steps"] == plan["tasks"][0]["steps"]
+        unknown = {"tasks": [{"id": "t", "status": "unknown", "steps": [{"id": "s", "status": "unknown", "reason_code": "NATIVE_TERMINAL_UNCONFIRMED", "command_id": "stable"}]}],
+                   "anomalies": [{"reasonCode": "NATIVE_TERMINAL_UNCONFIRMED", "commandId": "stable"}], "paused": True}
+        compact = compact_work_overview(unknown)
+        assert compact["paused"] is True
+        assert compact["tasks"][0]["stepStates"][0]["reason_code"] == "NATIVE_TERMINAL_UNCONFIRMED"
+        assert compact["anomalies"] == unknown["anomalies"]
+    asyncio.run(run())

@@ -32,7 +32,7 @@ Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash.
 
 Windows 64 位发行包已包含编译好的 Mod 和独立 Python 环境，无需安装 Python、uv 或 .NET SDK。需要你已有 **Stardew Valley 1.6.15、SMAPI 4.2.1**，以及可用的 Kimi CLI、agy 或已登录的 Codex CLI。
 
-1. 到 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.3.0-windows-x64.zip`，解压到一个普通文件夹。请选择这个安装包，而非 GitHub 自动生成的 Source code。
+1. 到 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.3.1-windows-x64.zip`，解压到一个普通文件夹。请选择这个安装包，而非 GitHub 自动生成的 Source code。
 2. 关闭游戏，双击解压目录中的 **设置星露谷伙伴.cmd**。选择游戏目录，按向导将伙伴安装到 `Mods`，再选择聊天后端和模型。
 3. 按所选模型客户端自己的流程完成安装与登录。Kimi 首次连接还需在已安装的伙伴目录确认项目信任；设置时选择 agy 会注册它的伙伴 MCP 工具；选择 Codex（GPT）可将模型留空，沿用本机 Codex 配置。
 4. 通过 **SMAPI 启动游戏并进入存档**。伙伴服务会随存档载入自动启动。走近伙伴按交互键，第一次见面时给她起个名字；按 **F8** 可以交代工作。

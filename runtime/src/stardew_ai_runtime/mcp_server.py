@@ -51,6 +51,60 @@ from stardew_ai_runtime.wiki import WikiLookup
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 
+def _compact_plan_task(task: dict[str, Any]) -> dict[str, Any]:
+    steps = task.get("steps") or []
+    result = {key: task[key] for key in ("id", "goal_id", "title", "status", "completion_condition", "dependencies") if key in task}
+    result["stepCount"] = len(steps)
+    result["completedStepCount"] = sum(step.get("status") == "completed" for step in steps)
+    result["effectCount"] = sum(len(step.get("effects") or []) for step in steps)
+    result["stepStates"] = [{key: step[key] for key in ("id", "operation", "status", "outcome", "reason_code", "command_id") if step.get(key) is not None} for step in steps]
+    result["detailsAvailable"] = True
+    return result
+
+
+def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
+    """Model response projection only; durable work and internal consumers stay full.
+
+    Never summarizes away authorization constraints or failure reasons. Native
+    effect coordinates/target arrays are available via the same tool's detail flag.
+    """
+    result = dict(overview)
+    result["goals"] = []
+    for goal in overview.get("goals") or []:
+        row = {key: goal[key] for key in ("id", "text", "source", "priority", "status") if key in goal}
+        # milestoneSpec duplicates the goal/todos; other constraints remain exact.
+        row["constraints"] = {key: value for key, value in (goal.get("constraints") or {}).items() if key != "milestoneSpec"}
+        project = goal.get("project") or {}
+        row["project"] = {key: project[key] for key in ("phase", "summary", "openQuestions") if key in project}
+        if isinstance(row["project"].get("summary"), str):
+            row["project"]["summary"] = row["project"]["summary"][:320]
+        if isinstance(row["project"].get("openQuestions"), list):
+            row["project"]["openQuestions"] = row["project"]["openQuestions"][:3]
+        row["detailsAvailable"] = bool(project or (goal.get("constraints") or {}).get("milestoneSpec"))
+        result["goals"].append(row)
+    result["tasks"] = [_compact_plan_task(task) for task in overview.get("tasks") or []]
+    next_step = overview.get("nextStep")
+    if isinstance(next_step, dict):
+        result["nextStep"] = {key: value for key, value in next_step.items() if key != "params"}
+        params = next_step.get("params") or {}
+        result["nextStep"]["params"] = {key: value for key, value in params.items() if not isinstance(value, (dict, list))}
+        if isinstance(params.get("tiles"), list):
+            result["nextStep"]["targetCount"] = len(params["tiles"])
+        result["nextStep"]["detailsAvailable"] = bool(params)
+    result["recentExecutions"] = []
+    for execution in overview.get("recentExecutions") or []:
+        row = {key: execution[key] for key in ("command_id", "task_id", "step_id", "operation", "outcome", "reason_code", "game_date", "snapshot_revision") if execution.get(key) is not None}
+        row["effectCount"] = len(execution.get("effects") or [])
+        result["recentExecutions"].append(row)
+    if overview.get("lastJob") and isinstance(overview["lastJob"], dict):
+        result["lastJob"] = {key: value for key, value in overview["lastJob"].items() if key != "effects"}
+        if "effectCount" not in result["lastJob"]:
+            result["lastJob"]["effectSampleCount"] = len(overview["lastJob"].get("effects") or [])
+    result["detailsAvailable"] = True
+    result["detailHint"] = "Use detail=True for full project/layout, step targets and native effects. For partial/unknown outcomes inspect those facts and remaining targets before replanning; never replay the original target list blindly."
+    return result
+
+
 class SpatialRegion(BaseModel):
     """An absolute native map rectangle for bounded observation."""
 
@@ -798,7 +852,8 @@ def create_mcp_server(
         """
         try:
             if external_codex and external_selected and external_save_id:
-                return {**work_for_run().overview(external_save_id), "gameSnapshotStale": True}
+                overview = work_for_run().overview(external_save_id)
+                return {**(overview if detail or resolved_surface == "internal" else compact_work_overview(overview)), "gameSnapshotStale": True}
             return await sched.get_work_overview(detail=detail)
         except SchedulerError as ex:
             raise ToolError(f"Failed to get work overview: {ex}") from None
@@ -813,10 +868,13 @@ def create_mcp_server(
         reads (weather icon, companion wallet, backpack inventory, chests, planting,
         shop) instead of dropping them in the condensed view. Never invents a
         missing field: anything the Mod did not publish stays absent/unknown.
+        After external submission, returns persisted work without reconnecting;
+        detail=True includes full project/layout, step targets and native effects.
         """
         try:
             if external_codex and external_selected and external_save_id:
-                return {**work_for_run().overview(external_save_id), "gameSnapshotStale": True}
+                overview = work_for_run().overview(external_save_id)
+                return {**(overview if detail or resolved_surface == "internal" else compact_work_overview(overview)), "gameSnapshotStale": True}
             res = await sched.get_status()
             if detail:
                 enriched = dict(res)
@@ -923,11 +981,14 @@ def create_mcp_server(
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
-    async def work_plan_overview() -> dict[str, Any]:
+    async def work_plan_overview(detail: bool = False) -> dict[str, Any]:
         """Relevant-only work memory: active goals, current short tasks, next step, waiting todos, anomalies.
 
         Use this once instead of repeatedly listing tasks and re-querying status. It
         reads only the latest cached snapshot; it never issues a new farm query.
+        Default omits full layout, step parameters and effect coordinates. Use
+        detail=True for those exact facts, especially before recovering partial or
+        unknown work; omission never means a target was completed or should retry.
         """
         # After an external Codex selects work, the bridge worker needs the
         # Mod's sole command socket. Read its persisted result without reopening it.
@@ -945,7 +1006,7 @@ def create_mcp_server(
         overview = store.overview(sid, snapshot=payload if payload else None, game_date=game_date)
         overview["dueTodos"] = store.evaluate_todos(sid, snapshot=snapshot, game_date=game_date)
         overview["recoveryDecisions"] = decisions
-        return overview
+        return overview if detail or resolved_surface == "internal" else compact_work_overview(overview)
 
     @mcp.tool()
     async def request_player_decision(goal_id: str, message: str) -> dict[str, Any]:
@@ -1262,11 +1323,14 @@ def create_mcp_server(
         goal_id: str | None = None,
         goal_text: str | None = None,
         replace: bool = False,
+        detail: bool = False,
     ) -> dict[str, Any]:
         """Select ONE semantic short job for the CURRENT provider decision.
 
         One task may combine navigation and bounded steps of one business kind.
         A second job in this decision is rejected. Future plans are memory only.
+        Default acknowledges task ids/states without echoing full submitted targets;
+        detail=True returns the full persisted task. It never means execution succeeded.
 
         Prefer this over the legacy ``manage_plan`` tool. Exact shape::
 
@@ -1305,6 +1369,10 @@ def create_mcp_server(
             if external_codex:
                 external_selected = True
                 await sched.close()
+            if not detail and resolved_surface != "internal":
+                result = {**result, "tasks": [_compact_plan_task(task) for task in result.get("tasks", [])],
+                          "detailsAvailable": True,
+                          "detailHint": "Read work_plan_overview(detail=True) for stored targets and effects; do not resubmit to retrieve details."}
             return {"saveId": sid, "executionScope": "one_short_job", **result}
         except WorkStateError as ex:
             raise ToolError(str(ex)) from None

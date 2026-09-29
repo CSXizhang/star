@@ -49,10 +49,16 @@ def test_provider_shapes_succeed_once_through_bridge_and_fastmcp(tmp_path, monke
     assert results[0]["goalCreated"] is False
     selected = results[0]["tasks"][0]
     assert selected["title"] == task.get("label", task.get("title"))
-    assert selected["steps"][0]["operation"] == "water_auto"
-    if task.get("params", {}).get("maxTiles"):
-        assert selected["steps"][0]["params"] == {"max_tiles": 10}
-    assert store.state("save").decision["selected"] is True
+    assert selected["stepStates"][0]["operation"] == "water_auto"
+    assert "steps" not in selected
+    state = store.state("save")
+    persisted = next(item for item in state.tasks if item.id == selected["id"])
+    assert persisted.steps[0].id == selected["stepStates"][0]["id"]
+    assert persisted.steps[0].operation == "water_auto"
+    source_params = task["steps"][0].get("params", {}) if "steps" in task else task.get("params", {})
+    expected_params = {"max_tiles" if key == "maxTiles" else key: value for key, value in source_params.items()}
+    assert persisted.steps[0].params == expected_params
+    assert state.decision["selected"] is True
 
 
 def test_schema_and_discovery_expose_one_nested_task(tmp_path):

@@ -9,7 +9,7 @@
 param(
     [string]$GameDir = "",
     [string]$TargetModDir = "",
-    [ValidateSet('agy', 'kimi', 'claude', 'all', 'none')][string]$Agent = 'kimi',
+    [ValidateSet('agy', 'kimi', 'codex', 'dsh', 'mcode', 'claude', 'all', 'none')][string]$Agent = 'kimi',
     [string]$Model = "",
     [switch]$AutoInstall,
     [switch]$DryRun,
@@ -25,7 +25,7 @@ $OutputEncoding = (New-Object System.Text.UTF8Encoding($false))
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
 if (Test-Path -LiteralPath (Join-Path $repoRoot 'release-manifest.json')) {
-    if ($Agent -notin @('kimi', 'agy', 'none')) { throw 'Release chat supports kimi or agy; use register-mcp.ps1 for other MCP clients.' }
+    if ($Agent -notin @('kimi', 'agy', 'codex', 'dsh', 'mcode', 'none')) { throw 'Release chat supports kimi, agy, codex, dsh or mcode; use register-mcp.ps1 for other MCP clients.' }
     $releaseArgs = @{}
     foreach ($key in @('GameDir', 'TargetModDir', 'Agent', 'Model', 'AutoInstall', 'DryRun', 'CheckOnly')) {
         if ($PSBoundParameters.ContainsKey($key)) { $releaseArgs[$key] = $PSBoundParameters[$key] }
@@ -328,6 +328,13 @@ function Register-Mcp([string]$agentName, [string]$modDir, [bool]$isDryRun = $fa
                 Message = "已成功写入项目级配置: $mcpFile"
             }
         }
+        { $_ -in @('codex', 'dsh', 'mcode') } {
+            return [PSCustomObject]@{
+                Agent = $agentName
+                Success = $true
+                Message = "游戏内会话会临时绑定伙伴工具；请先完成 $agentName 的本机登录。"
+            }
+        }
         'claude' {
             $claudeDir = Join-Path $env:APPDATA "Claude"
             $cfgFile = Join-Path $claudeDir "claude_desktop_config.json"
@@ -370,7 +377,7 @@ function Register-Mcp([string]$agentName, [string]$modDir, [bool]$isDryRun = $fa
 }
 
 function Set-ChatBackendConfig([string]$backendName, [bool]$isDryRun = $false) {
-    if ($backendName -notin @('agy', 'kimi')) {
+    if ($backendName -notin @('agy', 'kimi', 'codex', 'dsh', 'mcode')) {
         return
     }
     $configDir = Join-Path $repoRoot "config"
@@ -382,8 +389,10 @@ function Set-ChatBackendConfig([string]$backendName, [bool]$isDryRun = $false) {
     if (-not (Test-Path -LiteralPath $configDir)) {
         New-Item -ItemType Directory -Path $configDir -Force | Out-Null
     }
-    $model = if ($backendName -eq 'kimi') { 'kimi-code/k3' } else { 'gemini-3.8-flash' }
-    $jsonText = @{ backend = $backendName; model = $model } | ConvertTo-Json
+    $model = if ($backendName -eq 'kimi') { 'kimi-code/k3' } elseif ($backendName -eq 'dsh') { 'deepseek-flash' } elseif ($backendName -in @('codex', 'mcode')) { '' } else { 'gemini-3.8-flash' }
+    $backendSettings = @{ backend = $backendName; model = $model }
+    if ($backendName -in @('codex', 'dsh', 'mcode')) { $backendSettings.effort = 'low' }
+    $jsonText = $backendSettings | ConvertTo-Json
     [System.IO.File]::WriteAllText($configFile, $jsonText, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "聊天后端已配置为 $backendName / $model"
 }
@@ -502,18 +511,36 @@ $grpAgent.Size = New-Object System.Drawing.Size(605, 110)
 $form.Controls.Add($grpAgent)
 
 $rbAgy = New-Object System.Windows.Forms.RadioButton
-$rbAgy.Text = "agy CLI（推荐，当前环境自动注册）"
+$rbAgy.Text = "agy CLI"
 $rbAgy.Location = New-Object System.Drawing.Point(20, 25)
 $rbAgy.AutoSize = $true
 $rbAgy.Checked = $false
 $grpAgent.Controls.Add($rbAgy)
 
 $rbKimi = New-Object System.Windows.Forms.RadioButton
-$rbKimi.Text = "Kimi Code（项目级 .kimi-code/mcp.json）"
+$rbKimi.Text = "Kimi Code（项目配置）"
 $rbKimi.Location = New-Object System.Drawing.Point(20, 50)
 $rbKimi.AutoSize = $true
 $rbKimi.Checked = $true
 $grpAgent.Controls.Add($rbKimi)
+
+$rbCodex = New-Object System.Windows.Forms.RadioButton
+$rbCodex.Text = "Codex（GPT，沿用本机模型）"
+$rbCodex.Location = New-Object System.Drawing.Point(310, 25)
+$rbCodex.AutoSize = $true
+$grpAgent.Controls.Add($rbCodex)
+
+$rbDsh = New-Object System.Windows.Forms.RadioButton
+$rbDsh.Text = "dsh（DeepSeek Flash，low）"
+$rbDsh.Location = New-Object System.Drawing.Point(310, 50)
+$rbDsh.AutoSize = $true
+$grpAgent.Controls.Add($rbDsh)
+
+$rbMcode = New-Object System.Windows.Forms.RadioButton
+$rbMcode.Text = "MiniMax Code（mcode CLI，low）"
+$rbMcode.Location = New-Object System.Drawing.Point(310, 75)
+$rbMcode.AutoSize = $true
+$grpAgent.Controls.Add($rbMcode)
 
 $rbClaude = New-Object System.Windows.Forms.RadioButton
 $rbClaude.Text = "Claude Desktop / Cursor / 其他客户端"
@@ -636,7 +663,7 @@ $btnApply.Add_Click({
     }
 
     # 3. 注册选定的客户端
-    $chosenAgent = if ($rbAgy.Checked) { 'agy' } elseif ($rbKimi.Checked) { 'kimi' } else { 'claude' }
+    $chosenAgent = if ($rbAgy.Checked) { 'agy' } elseif ($rbKimi.Checked) { 'kimi' } elseif ($rbCodex.Checked) { 'codex' } elseif ($rbDsh.Checked) { 'dsh' } elseif ($rbMcode.Checked) { 'mcode' } else { 'claude' }
     try {
         $txtLog.AppendText(">>> 正在配置 AI 客户端 ($chosenAgent)...`r`n")
         $mcpRes = Register-Mcp -agentName $chosenAgent -modDir $targetMod
@@ -651,7 +678,7 @@ $btnApply.Add_Click({
     $txtLog.AppendText("`r`n🎉 全部设置已完成！`r`n")
     $txtLog.AppendText("使用说明：`r`n")
     $txtLog.AppendText("1. 正常运行 StardewModdingAPI.exe 进入存档（无需控制台命令，伙伴后台常驻）；`r`n")
-    $txtLog.AppendText("2. 在 AI 客户端中直接发送指令（例如：'帮我种4棵防风草并浇水，缺种子去买'）；`r`n")
+    $txtLog.AppendText("2. 走近伙伴选择直接对话，或按 F8 查看计划（例如：'帮我种4棵防风草并浇水，缺种子去买'）；`r`n")
     $txtLog.AppendText("（MCP 服务在客户端调用时自动在后台启动，无需手动开启终端）`r`n")
 
     Update-UiStatus

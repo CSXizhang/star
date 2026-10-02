@@ -78,7 +78,7 @@ def main() -> None:
         trigger={"type": "calendar", "year": 1, "season": "spring", "day": 3},
     )
     bridge._autonomy.set_preferences(
-        SAVE, goal="优先赚钱：收获出货", budget_limit=500, box_preference="shipping"
+        SAVE, goal="优先赚钱：收获出货", box_preference="shipping"
     )
     work_projection = bridge._life_work_projection(SAVE)
 

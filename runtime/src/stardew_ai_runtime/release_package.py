@@ -6,9 +6,12 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 
+from .agent_instructions import INSTRUCTION_FILES
+
 MOD_DLL = "StardewAI.Companion.Mod.dll"
 REQUIRED = {MOD_DLL, "manifest.json", "runtime/python/python.exe",
             "runtime/src/stardew_ai_runtime/chat_bridge.py", "tools/start-companion.ps1"}
+REQUIRED.update(path.as_posix() for path in INSTRUCTION_FILES)
 
 
 def managed_path(root: Path, relative: str) -> Path:

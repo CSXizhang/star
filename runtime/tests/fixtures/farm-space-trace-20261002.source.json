@@ -1,0 +1,11 @@
+{
+  "fixture": "farm-space-trace-20261002.json",
+  "fixtureSha256": "2a44e724c5db0c10f5a5b0397001e651e4bae7314fbf5ffae41a6d43cb58a43e",
+  "sourceSessionId": "stardew-82626f2fe45d4762a5b257958b4b3dc6",
+  "sourceEventType": "tool/result",
+  "sourceEventSeq": 59,
+  "sourceEventTimeUtc": "2026-10-02T10:38:15.665000+00:00",
+  "originalCompactJsonCharacters": 126545,
+  "originalOccupants": 1614,
+  "content": "Only the native farm-space tool response; no player chat, credentials or provider configuration."
+}

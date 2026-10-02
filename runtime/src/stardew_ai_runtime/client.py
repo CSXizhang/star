@@ -155,6 +155,7 @@ class TransportClient:
         max_water: int = 20,
         cancel_policy: str = "safe-point",
         world_revision: int | None = None,
+        include_empty_tiles: bool | None = None,
     ) -> str:
         """Dispatches a skill.execute command targeting a water-zone."""
         if not self.save_id or not self.game_session_id:
@@ -182,6 +183,7 @@ class TransportClient:
             max_stamina=max_stamina,
             max_water=max_water,
             cancel_policy=cancel_policy,
+            include_empty_tiles=include_empty_tiles,
         )
 
         await self.send_envelope(execute_envelope)

@@ -564,15 +564,12 @@ def test_scheduler_water_auto_no_work(mock_transport_client):
     asyncio.run(run())
 
 
-def test_scheduler_water_auto_with_work_within_budget(mock_transport_client, native_compatible_run_dir):
+@pytest.mark.parametrize("tile_count", [3, 40])
+def test_scheduler_water_auto_with_work_within_budget(mock_transport_client, native_compatible_run_dir, tile_count):
     async def run():
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
-            "tilledUnwateredTiles": [
-                {"x": 64, "y": 15},
-                {"x": 65, "y": 15},
-                {"x": 66, "y": 15},
-            ],
-            "tilledUnwateredCount": 3,
+            "tilledUnwateredTiles": [{"x": 64 + i % 8, "y": 15 + i // 8} for i in range(tile_count)],
+            "tilledUnwateredCount": tile_count,
             "isTruncated": False,
             "matureCropCount": 1,
         }
@@ -592,7 +589,7 @@ def test_scheduler_water_auto_with_work_within_budget(mock_transport_client, nat
                 "commandId": "cmd-auto-1",
                 "taskId": "task-auto-1",
                 "terminalState": "succeeded",
-                "completedCount": 3,
+                "completedCount": tile_count,
                 "skippedCount": 0,
                 "failedCount": 0,
                 "effects": [{"tile": {"x": 64, "y": 15}, "state": "watered"}],
@@ -601,14 +598,16 @@ def test_scheduler_water_auto_with_work_within_budget(mock_transport_client, nat
         mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-auto-1")
         mock_transport_client.wait_for_result = AsyncMock(return_value=result_env)
 
-        res = await scheduler.water_auto(max_tiles=25)
+        res = await scheduler.water_auto(max_tiles=max(25, tile_count))
 
         assert res["status"] == "executed"
         assert res["terminalState"] == "succeeded"
-        assert res["targetCount"] == 3
+        assert res["targetCount"] == tile_count
         assert res["remainingUnwateredCount"] == 0
-        assert res["completedCount"] == 3
+        assert res["completedCount"] == tile_count
         mock_transport_client.execute_water_zone.assert_awaited_once()
+        assert mock_transport_client.execute_water_zone.await_args.kwargs["max_water"] == tile_count
+        assert mock_transport_client.execute_water_zone.await_args.kwargs["max_stamina"] == max(50.0, tile_count * 2.0)
 
     asyncio.run(run())
 
@@ -1499,6 +1498,9 @@ def test_validate_action_tiles():
         {"x": 64, "y": 15},
         {"x": 65, "y": 15},
     ]
+    assert validate_action_tiles(input_tiles, preserve_order=True) == [
+        input_tiles[0], input_tiles[1], input_tiles[3],
+    ]
 
     # Exceeds 64 unique tiles
     too_many = [{"x": i, "y": 0} for i in range(65)]
@@ -1800,21 +1802,29 @@ def test_scheduler_query_shop_projection(mock_transport_client):
 def test_scheduler_query_shop_missing_section(mock_transport_client):
     async def run():
         scheduler = CompanionScheduler(client=mock_transport_client)
-        with pytest.raises(SchedulerError, match="too old"):
+        scheduler._execute_native_action = AsyncMock(return_value={"details": {}})
+        with pytest.raises(SchedulerError, match="did not return shop"):
             await scheduler.query_shop()
+        scheduler._execute_native_action.assert_awaited_once()
 
     asyncio.run(run())
 
 
-def test_scheduler_query_shop_unsupported_shop_id(mock_transport_client):
+def test_scheduler_query_shop_unsupported_shop_id_is_observed_natively(mock_transport_client):
     async def run():
         mock_transport_client.latest_snapshot.payload["shop"] = {
             "shopId": "SeedShop",
             "status": "ok",
         }
         scheduler = CompanionScheduler(client=mock_transport_client)
-        with pytest.raises(SchedulerError, match="Published shop ID\\(s\\): \\['SeedShop'\\]"):
-            await scheduler.query_shop(shop_id="JojaMart")
+        scheduler._execute_native_action = AsyncMock(return_value={"details": {"shop": {
+            "shopId": "JojaMart", "status": "unknown", "items": [],
+            "errorMessage": "Unknown native shop ID",
+        }}})
+        result = await scheduler.query_shop(shop_id="JojaMart")
+        assert result["status"] == "unknown" and result["shopId"] == "JojaMart"
+        scheduler._execute_native_action.assert_awaited_once_with(
+            "inspect-shop", {"locationId": "JojaMart", "shopId": "JojaMart"}, tiles=[])
 
     asyncio.run(run())
 

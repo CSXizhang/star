@@ -28,6 +28,17 @@ def _snapshot() -> dict:
     return _real_snapshot()
 
 
+def test_coop_empty_farm_work_is_unobserved_but_farm_true_zero_is_preserved():
+    counts = {key: 0 for key in ("tilledUnwateredCount", "cropUnwateredCount", "matureCropCount", "deadCropCount")}
+    for location in ("Coopc24c873f-3070-4dfa-9268-7e9b5ca8df58", "Farm", None):
+        snapshot = {"payload": {"companion": {"locationId": location},
+                                "world": {"currentLocation": "Farm"}, "farmWork": counts}}
+        result = build_decision_context(snapshot, origin="test")["farmWork"]
+        assert result["locationId"] == "Farm"
+        assert result["observationStatus"] == ("observed" if location == "Farm" else "not-observed")
+        assert all(result[key] == (0 if location == "Farm" else UNKNOWN) for key in counts)
+
+
 def test_context_matches_real_captured_snapshot_schema() -> None:
     snapshot = _real_snapshot()
     context = build_decision_context(
@@ -64,8 +75,8 @@ def test_context_matches_real_captured_snapshot_schema() -> None:
     # Funds come from the companion wallet in the real payload.
     assert context["funds"] == 1250
     assert context["inventory"]["freeSlots"] == 5
-    assert context["inventory"]["items"] == [{"name": "Parsnip Seeds", "count": 7}]
-    assert context["inventory"]["tools"] == [{"name": "Hoe"}, {"name": "Watering Can"}]
+    assert context["inventory"]["items"] == [{"itemId": "(O)472", "name": "Parsnip Seeds", "count": 7, "quality": 0}]
+    assert context["inventory"]["tools"] == [{"itemId": "(T)Hoe", "name": "Hoe"}, {"itemId": "(T)WateringCan", "name": "Watering Can"}]
     assert context["inventory"]["toolResources"]["waterCan"] == {"level": 33, "max": 40}
     assert context["goals"] == [{"text": "把农场种满胡萝卜", "source": "user"}]
     assert context["currentTask"]["nextStep"]["operation"] == "water_auto"
@@ -112,8 +123,34 @@ def test_missing_stack_is_unknown_not_one() -> None:
         }
     )
     assert context["inventory"]["items"] == [
-        {"name": "Parsnip Seeds", "count": UNKNOWN},
-        {"name": "Parsnip", "count": 3},
+        {"itemId": "(O)472", "name": "Parsnip Seeds", "count": UNKNOWN, "quality": UNKNOWN},
+        {"itemId": "(O)24", "name": "Parsnip", "count": 3, "quality": UNKNOWN},
+    ]
+
+
+def test_same_name_ingredients_keep_distinct_native_ids_and_available_counts() -> None:
+    snapshot = {"inventory": {"slots": [
+        {"itemId": "(O)176", "name": "Egg", "stack": 1},
+        {"itemId": "(O)180", "name": "Egg", "stack": 15},
+        {"name": "unknown ingredient"},
+    ]}}
+    items = build_decision_context(snapshot)["inventory"]["items"]
+    assert {item["itemId"]: item["count"] for item in items if "itemId" in item} == {
+        "(O)176": 1, "(O)180": 15,
+    }
+    assert items[2] == {"name": "unknown ingredient", "count": UNKNOWN, "quality": UNKNOWN}
+
+
+def test_same_native_item_keeps_distinct_stack_qualities_and_missing_is_unknown() -> None:
+    slots = [
+        {"itemId": "(O)176", "name": "Egg", "stack": 16, "quality": 0},
+        {"itemId": "(O)176", "name": "Egg", "stack": 2, "quality": 2},
+        {"itemId": "(O)176", "name": "Egg", "stack": 1},
+    ]
+    context = build_decision_context({"inventory": {"slots": slots, "freeSlots": 0}})
+    assert context["inventory"]["freeSlots"] == 0
+    assert [(item["count"], item["quality"]) for item in context["inventory"]["items"]] == [
+        (16, 0), (2, 2), (1, UNKNOWN),
     ]
 
 

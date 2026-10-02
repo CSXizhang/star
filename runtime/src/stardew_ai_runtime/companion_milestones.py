@@ -169,12 +169,13 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
 
 
 _PREPARATION_LABELS = {
+    "production": "持续负责玩家交付的种植与畜牧，按实际资金安排种子、工具、饲料、畜舍建造和购动物等必要前置，分批生产、照料和收取产物；跨日继续",
     "layout": "按认可的整体范围设计与分批施工，原生观察布局、放置或回收真实物品；保留保护区与通道，跨日继续",
     "water": "照料当前缺水作物，按实际体力和水量完成一小段浇水",
     "harvest": "收取眼前成熟作物；不自动出售或处理献祭保留品",
     "clear": "清理农场眼前少量杂物，保留资源并遵守体力保护",
-    "plant": "用现有可用种子小规模补种并浇水；不因此自动买种子",
-    "animals": "照料现有动物的日常喂食和抚摸，不购买动物",
+    "plant": "按本次明确种植范围安排播种与浇水，必要种子按实际资金准备",
+    "animals": "照料当前动物的日常喂食和抚摸；持续养殖目标用production",
     "machines": "收取现有机器成品，不自动出售或追加采购",
     "store": "把玩家指定保留的物品整理进获准使用的箱子，不出售",
     "ship": "仅出货玩家已明确认可可出售的物品，保留献祭和其他约定保留品",
@@ -568,6 +569,12 @@ class CompanionMilestoneStore:
         }
 
         def mutate(record: dict[str, Any]) -> dict[str, Any]:
+            for existing in record["nodes"].values():
+                if (existing.get("status") == "suggested" and not existing.get("templateId")
+                        and existing.get("title") == node["title"] and existing.get("summary") == node["summary"]
+                        and existing.get("targetDate") == node["targetDate"]
+                        and [prep.get("key") for prep in existing.get("prepItems", [])] == preparation):
+                    return existing
             record["nodes"][node["id"]] = node
             self._bump(record, node["targetDate"], "propose", node["title"])
             return node
@@ -759,17 +766,17 @@ class CompanionMilestoneStore:
                           f'范围={node.get("summary") or "仅当前可确认范围，不扩大到其他工作"}；'
                           f'计划数量={node.get("plannedCount") or "待商量"}；'
                           f'约定={node.get("termsNote") or "无"}',
-                "trigger": {"type": "calendar", **trigger}, "expiry": None if prep["key"] == "layout" else dict(target),
+                "trigger": {"type": "calendar", **trigger}, "expiry": None if not node.get("templateId") or prep["key"] in {"layout", "production"} else dict(target),
             })
         try:
             goal_id, todo_ids = work_store.sync_milestone_work(
-                save_id, node["id"], text=(f'持续项目：{node["title"]}' if any(p["key"] == "layout" for p in capability_items)
+                save_id, node["id"], text=(f'持续项目：{node["title"]}' if any(p["key"] in {"layout", "production"} for p in capability_items)
                                           else f'节点准备：{node["title"]}（{node["targetDate"]}）'),
                 constraints=constraints, todos=specs, active=True,
                 existing_goal_id=node.get("goalId"),
             )
             node["goalId"], node["todoIds"] = goal_id, todo_ids
-            if any(p["key"] == "layout" for p in capability_items):
+            if any(p["key"] in {"layout", "production"} for p in capability_items):
                 goal = next(g for g in work_store.state(save_id).goals if g.id == goal_id)
                 if not goal.project:
                     work_store.revise_goal(save_id, goal_id, project={"phase": "observe", "summary": node.get("summary") or node["title"], "openQuestions": []})

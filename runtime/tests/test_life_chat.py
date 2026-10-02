@@ -70,14 +70,14 @@ def test_life_system_prompt_contains_profile_memory_and_work() -> None:
     assert "每天浇水" in prompt
     assert "完成了「浇水」" in prompt
     assert "优先赚钱" in prompt
-    assert "不能派工、取消或暂停工作" in prompt
-    assert "绝不能说任务已执行、已取消、已安排" in prompt
-    assert "帮我做件事" in prompt
-    assert "查看记忆" in prompt
-    assert "当前工作状态仅供聊天时核对事实" in prompt
+    assert "统一伙伴对话" in prompt
+    assert "明确派活直接安排" in prompt
+    assert "无需换入口或再次认可" in prompt
+    assert "manage_companion" in prompt
+    assert "当前工作" in prompt
     assert "没有显示的状态就是未知" in prompt
     plan_prompt = LifeChatService.build_system_prompt(profile, memory, work, mode="plan")
-    assert "不要代为派发" in plan_prompt
+    assert "统一伙伴对话" in plan_prompt
 
 
 def test_plan_prompt_injects_milestone_snapshot_and_rules() -> None:
@@ -91,15 +91,15 @@ def test_plan_prompt_injects_milestone_snapshot_and_rules() -> None:
     prompt = LifeChatService.build_system_prompt(
         profile, None, {"mode": "free"}, mode="plan", milestones=milestones
     )
-    assert "节点快照" in prompt
+    assert "安排工具" in prompt
     assert "spring-egg-festival-strawberry:y1" in prompt
     assert "manage_milestones" in prompt
-    assert "未确认前不得声称" in prompt
-    assert "不会冻结资金" in prompt
-    assert "query_wiki" in prompt
-    # Casual chat must redirect plan edits to the plan mode instead.
+    assert "记录安排不等于动作已经完成" in prompt
+    assert "采购按真实资金与目标自行处理" in prompt
+    assert "每日购买上限" not in prompt
+    # Both compatibility wire modes offer the same direct-conversation tools.
     chat_prompt = LifeChatService.build_system_prompt(profile, None, None, mode="chat")
-    assert "商量计划" in chat_prompt
+    assert "无需换入口或再次认可" in chat_prompt
     assert "节点快照" not in chat_prompt
 
 
@@ -133,8 +133,8 @@ def test_mcp_life_surface_is_readonly() -> None:
         ):
             assert forbidden not in tools, forbidden
         for expected in (
-            "get_work_overview", "get_status", "observe_machines",
-            "query_farm_work", "query_wiki", "manage_milestones",
+            "get_work_overview", "get_status", "work_plan_overview",
+            "manage_companion", "query_wiki", "manage_milestones",
         ):
             assert expected in tools, expected
 
@@ -199,7 +199,8 @@ def test_life_chat_turn_replies_completed_without_token_fields(tmp_path) -> None
         prompt = turn.call_args[0][2]
         assert "玩家说：在吗" in prompt
         replies = _sent_payloads(ws)
-        assert [r["payload"]["status"] for r in replies] == ["processing", "completed"]
+        assert [r["payload"]["status"] for r in replies if r["messageType"] == "life.chat.reply"] == ["processing", "completed"]
+        assert any(r["messageType"] == "autonomy.state" and "usageTodayText" in r["payload"] for r in replies)
         final = replies[-1]["payload"]
         assert final["requestId"] == "life-req-1"
         assert final["replyText"] == "今天过得怎么样？"
@@ -339,7 +340,7 @@ def test_life_profile_get_set_roundtrip(tmp_path) -> None:
         await bridge._handle_life_message(ws, "life.profile.get", {
             "payload": {"requestId": "g1", "saveId": "Save1"},
         }, "Save1")
-        state = _sent_payloads(ws)[-1]
+        state = next(r for r in _sent_payloads(ws) if r["messageType"] == "life.profile.state")
         assert state["messageType"] == "life.profile.state"
         assert state["payload"]["status"] == "confirmed"
         assert state["payload"]["profile"] is None
@@ -941,7 +942,7 @@ def test_preparation_keeps_pause_and_unrelated_active_work(tmp_path):
         bridge._milestone_store.adopt("S", node["id"], work_store=bridge._work_store)
         bridge.handle_chat_submit = AsyncMock()
         bridge._work_store.set_paused("S", True)
-        assert "当前暂停" in await bridge._start_accepted_preparation(None, "S", {})
+        assert "工作已暂停" in await bridge._start_accepted_preparation(None, "S", {})
         bridge.handle_chat_submit.assert_not_awaited()
         bridge._work_store.set_paused("S", False)
         bridge._active_task = ActiveChatTask(request_id="unrelated", save_id="S")
@@ -951,18 +952,20 @@ def test_preparation_keeps_pause_and_unrelated_active_work(tmp_path):
     asyncio.run(run())
 
 
-def test_life_provider_borrows_single_mcp_socket_and_returns_it_on_failure(tmp_path):
+def test_life_provider_never_borrows_native_socket_even_on_failure(tmp_path):
     async def run():
         for mode, fails in [("chat", False), ("plan", False), ("plan", True)]:
             bridge = _bridge(tmp_path / f"{mode}-{fails}")
             worker = MagicMock()
+            worker.last_result = None
+            worker.pending_reasons = []
             worker.client.close = AsyncMock()
             bridge._plan_worker = worker
             bridge._work_store.recover = MagicMock()
             def provider(*args, worker=worker, bridge=bridge, fails=fails):
-                worker.client.close.assert_awaited_once()
-                assert bridge._execution_lock.locked()
-                worker.set_provider_active.assert_called_once_with(True)
+                worker.client.close.assert_not_awaited()
+                assert not bridge._execution_lock.locked()
+                worker.set_provider_active.assert_not_called()
                 if fails:
                     raise RuntimeError("provider failed after taking socket")
                 return {"success": True, "response": "我看到了现在的农场。"}
@@ -974,8 +977,8 @@ def test_life_provider_borrows_single_mcp_socket_and_returns_it_on_failure(tmp_p
                     "request_id": "socket-life", "save_id": "S", "mode": mode, "text": "看看农场",
                 })
             assert not bridge._execution_lock.locked()
-            assert [call.args for call in worker.set_provider_active.call_args_list] == [(True,), (False,)]
-            worker.notify.assert_called_once()
+            worker.set_provider_active.assert_not_called()
+            worker.notify.assert_not_called()
             bridge._work_store.recover.assert_not_called()
             terminal = _sent_payloads(ws)[-1]["payload"]
             assert terminal["status"] == ("failed" if fails else "completed")
@@ -1005,12 +1008,12 @@ def test_continuation_context_keeps_fresh_facts_without_repeating_persona(tmp_pa
     assert "温柔体贴" not in second and "不卖木材" not in second
     assert '"money":"unknown"' in second and '"paused":true' in second
     assert '"milestones":[]' in second and "完整替换" in second
-    assert "node_id" in second and "暂停不得解除" in second
+    assert "node_id" in second and "manage_companion" in second
     assert len(second) < len(first) / 2
     # A mode transition needs full boundaries; a new session restores personality.
     kwargs["mode"] = "chat"
     switched = svc.build_turn_prompt("S", "cid", profile, memory, {}, **kwargs)
-    assert "温柔体贴" in switched and "只读生活对话" in switched
+    assert "温柔体贴" in switched and "统一伙伴对话" in switched
     assert "温柔体贴" in svc.build_turn_prompt("S", "another-cid", profile, memory, {}, **kwargs)
     assert "companion" in live and "inventory" in live  # formatter doesn't mutate source facts
 
@@ -1030,7 +1033,7 @@ def test_bridge_only_marks_successful_life_prompt_as_delivered(tmp_path):
         assert "你是农场伙伴" in prompts[0]
         assert "你是农场伙伴" in prompts[1]
         assert "你是农场伙伴" not in prompts[2]
-        assert "本轮是只读闲聊" in prompts[2]
+        assert "明确派活就propose并adopt" in prompts[2]
     asyncio.run(run())
 
 

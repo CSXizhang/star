@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -29,6 +30,62 @@ def test_same_decision_cannot_select_second_business_or_bundle(tmp_path):
         store.submit_plan("save", goal_text="mixed", tasks=tasks(steps=[{"operation":"water_auto"},{"operation":"ship_items"}]), decision_token="second")
 
 
+def seed_batch_steps():
+    return [
+        {"operation": "plant_seeds", "params": {"seed_item_id": "(O)472", "tiles": [{"x": x, "y": 10} for x in range(9, 12)], "location_id": "Farm"}},
+        {"operation": "water_zone", "params": {"center_x": 10, "center_y": 10, "radius": 1}},
+    ]
+
+
+@pytest.mark.parametrize("plant_status, expected_calls", [("completed", ["plant_seeds", "water_zone"]), ("partial", ["plant_seeds"])])
+def test_same_seed_batch_runs_then_returns_to_model_or_stops_on_partial(tmp_path, plant_status, expected_calls):
+    store = WorkStore(tmp_path / "work.json")
+    choose(store, plan=tasks(steps=seed_batch_steps()))
+    calls = []
+
+    class Client:
+        async def current_save_id(self):
+            return "save"
+
+        async def call_tool(self, name, args):
+            operation = args["operation"]
+            calls.append(operation)
+            return {"status": plant_status if operation == "plant_seeds" else "completed",
+                    "effects": [{"state": "planted" if operation == "plant_seeds" else "watered"}]}
+
+    asyncio.run(PlanWorker(store, Client()).evaluate())
+    assert calls == expected_calls
+    assert store.state("save").decision["finished"] is True
+    with pytest.raises(WorkStateError, match="NEW_MODEL"):
+        store.submit_plan("save", goal_text="more", tasks=tasks(), decision_token="decision-1")
+
+
+@pytest.mark.parametrize("mutation", ["different_area", "water_first", "different_map", "too_large"])
+def test_seed_batch_rejects_unrelated_or_unbounded_work(tmp_path, mutation):
+    steps = seed_batch_steps()
+    if mutation == "different_area":
+        steps[1]["params"]["center_x"] = 30
+    elif mutation == "water_first":
+        steps.reverse()
+    elif mutation == "different_map":
+        steps[0]["params"]["location_id"] = "Greenhouse"
+    else:
+        steps[0]["params"]["tiles"] = [{"x": x, "y": y} for x in range(7, 14) for y in range(7, 14)]
+        steps[1]["params"]["radius"] = 3
+    store = WorkStore(tmp_path / "work.json")
+    with pytest.raises(WorkStateError, match="PLANTING_BATCH_REQUIRED|64 native targets"):
+        choose(store, plan=tasks(steps=steps))
+    assert store.state("save").tasks == []
+
+
+def test_multiple_watering_areas_count_their_native_targets(tmp_path):
+    steps = [{"operation": "water_zone", "params": {"center_x": 10 * index, "center_y": 10, "radius": 3}} for index in range(1, 3)]
+    store = WorkStore(tmp_path / "work.json")
+    with pytest.raises(WorkStateError, match="64 native targets"):
+        choose(store, plan=tasks(steps=steps))
+    assert store.state("save").tasks == []
+
+
 def test_legacy_plan_is_intent_and_revocation_stops_next_step(tmp_path):
     store=WorkStore(tmp_path/"work.json")
     goal=store.add_goal("save", "old plan", source="agent")
@@ -56,6 +113,39 @@ def test_multi_navigation_and_native_steps_run_without_model_then_stop(tmp_path)
     asyncio.run(worker.evaluate())
     assert len(calls)==4
     assert not store.has_ready_step("save")
+
+
+@pytest.mark.parametrize("native,expected,effect_count", [
+    ({"terminalState": "succeeded", "effects": [{"tile": {"x": 1, "y": 2}}]}, "completed", 1),
+    (None, "unknown", 0),
+])
+def test_worker_reconciles_expired_running_lease_before_new_work(tmp_path, native, expected, effect_count):
+    store = WorkStore(tmp_path / "work.json")
+    choose(store)
+    claim = store.claim_next_step("save", "old-worker", now=time.monotonic() - 10, lease_seconds=1)
+    store.assign_command_id("save", claim["taskId"], claim["stepId"], "native-command-1")
+    calls = []
+
+    class Client:
+        async def current_save_id(self): return "save"
+        async def reconcile(self, command_id):
+            calls.append(("reconcile", command_id))
+            return native
+        async def call_tool(self, name, args):
+            calls.append(("dispatch", name))
+            raise AssertionError("An expired command must never be re-dispatched")
+
+    worker = PlanWorker(store, Client())
+    terminal = []
+    worker.terminal_callback = lambda save_id, execution, reason: terminal.append((execution.outcome, reason))
+    asyncio.run(worker.evaluate())
+    state = store.state("save")
+    task = next(task for task in state.tasks if task.id == claim["taskId"])
+    assert task.steps[0].status == expected
+    assert len(task.steps[0].effects) == effect_count
+    assert calls == [("reconcile", "native-command-1")]
+    assert terminal and terminal[0][0] == expected
+    assert store.state("save").last_job["status"] == expected
 
 
 def test_direct_and_plan_share_decision_budget(tmp_path):

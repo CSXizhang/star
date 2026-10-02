@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from stardew_ai_runtime.decision_policy import project_context
+
 UNKNOWN = "unknown"
 
 
@@ -106,6 +108,8 @@ def build_decision_context(
         }
         _attach_companion_memory(res, companion, memory)
         if isinstance(work, dict):
+            if "plantingEvidence" in work:
+                res["plantingEvidence"] = work["plantingEvidence"]
             if "paused" in work:
                 res["paused"] = bool(work.get("paused"))
                 res["currentTask"]["paused"] = bool(work.get("paused"))
@@ -156,6 +160,11 @@ def build_decision_context(
         }
     player_location = _value(world, "currentLocation")
 
+    farm_work = payload.get("farmWork") or world.get("farmWork") or {}
+    farm_scope = farm_work.get("locationId")
+    farm_observed = farm_work.get("observationStatus") not in {"not-observed", "unavailable", "unknown"} and (
+        farm_scope == "Farm" or (farm_scope is None and companion_snapshot.get("locationId") == "Farm"))
+
     # Funds: the companion wallet published in the native snapshot. The older
     # shop-section reading is only a fallback for pre-upgrade payloads.
     money = companion_snapshot.get("availableMoney")
@@ -177,10 +186,14 @@ def build_decision_context(
         if not isinstance(raw_count, int):
             raw_count = slot.get("count")
         count: Any = raw_count if isinstance(raw_count, int) else UNKNOWN
+        identity = ({"itemId": slot["itemId"]}
+                    if isinstance(slot.get("itemId"), str) and slot["itemId"] else {})
         if slot.get("isTool"):
-            tools.append({"name": name})
+            tools.append({**identity, "name": name})
         else:
-            items.append({"name": name, "count": count})
+            quality = slot.get("quality")
+            quality = quality if isinstance(quality, int) and not isinstance(quality, bool) else UNKNOWN
+            items.append({**identity, "name": name, "count": count, "quality": quality})
 
     inventory_block: dict[str, Any] = {
         "items": items[:24],
@@ -205,7 +218,7 @@ def build_decision_context(
         {**({"id": g["id"]} if g.get("id") else {}),
          "text": g.get("text"), "source": g.get("source"),
          **({"constraints": {key: value for key, value in g["constraints"].items() if key != "milestoneSpec"}} if g.get("constraints") else {}),
-         **({"project": {key: g["project"].get(key) for key in ("phase", "summary", "openQuestions") if key in g["project"]}} if g.get("project") else {})}
+         **({"project": project_context(g["project"])} if g.get("project") else {})}
         for g in overview_goals
         if isinstance(g, dict) and g.get("text")
     ][:3]
@@ -239,6 +252,7 @@ def build_decision_context(
         "nextStep": work.get("nextStep"),
         "waitingFor": waiting,
         "anomalies": anomalies[:3],
+        "blockedBranches": work.get("blockedBranches", [])[-5:],
     }
     if "paused" in work:
         current_task["paused"] = bool(work.get("paused"))
@@ -266,8 +280,10 @@ def build_decision_context(
             "note": "玩家金币和伙伴可花钱包分别观察，不能相加或推定同一钱包；未知不是零",
         },
         "farmWork": {
-            key: (payload.get("farmWork") or world.get("farmWork") or {}).get(key, UNKNOWN)
-            for key in ("tilledUnwateredCount", "cropUnwateredCount", "matureCropCount")
+            "locationId": "Farm",
+            "observationStatus": "observed" if farm_observed else "not-observed",
+            **{key: farm_work.get(key, UNKNOWN) if farm_observed else UNKNOWN
+               for key in ("tilledUnwateredCount", "cropUnwateredCount", "matureCropCount", "deadCropCount")},
         },
         "duePreparation": work.get("duePreparation", []),
         "inventory": inventory_block,
@@ -276,6 +292,8 @@ def build_decision_context(
     }
     if "paused" in work:
         context["paused"] = bool(work.get("paused"))
+    if "plantingEvidence" in work:
+        context["plantingEvidence"] = work["plantingEvidence"]
     if "decision" in work:
         context["decision"] = dict(work.get("decision") or {})
     if money_status is not None:

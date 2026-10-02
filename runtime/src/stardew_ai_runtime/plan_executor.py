@@ -31,7 +31,7 @@ from typing import Any
 
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 
-from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+from stardew_ai_runtime.work_state import READ_ONLY_OPERATIONS, WorkStateError, WorkStore
 
 logger = logging.getLogger("stardew_ai_runtime.plan_executor")
 
@@ -146,7 +146,7 @@ class StepExecution:
         return payload
 
 
-def classify_step_outcome(result: Any) -> tuple[str, str | None]:
+def classify_step_outcome(result: Any, operation: str | None = None) -> tuple[str, str | None]:
     """Map a real operation result to the unified outcome enum."""
     if not isinstance(result, dict) or not result:
         return "unknown", "INVALID_TOOL_RESULT"
@@ -175,6 +175,34 @@ def classify_step_outcome(result: Any) -> tuple[str, str | None]:
         return "completed", "NO_WORK"
     if terminal == "succeeded" or status == "completed":
         return "completed", reason
+    if operation in READ_ONLY_OPERATIONS:
+        if result.get("error") or status in {"error", "missing", "unknown", "unavailable"} or terminal:
+            return "unknown", reason or "OBSERVATION_UNAVAILABLE"
+        if status == "ok":
+            return "completed", None
+        # Snapshot and wiki readers return data without an action terminal/status.
+        # Require their documented payload, rather than accepting arbitrary dicts.
+        payloads = {
+            "get_status": ("companion", dict),
+            "query_farm_work": ("farmWork", dict),
+            "query_inventory": ("inventory", dict),
+            "query_chests": ("chests", list),
+            "query_planting_options": ("regions", list),
+            "get_work_overview": ("tasks", list),
+            "query_wiki": ("results", list),
+            "observe_building_services": ("animalService", dict),
+            "observe_production": ("groundItems", list),
+            "observe_farming_helpers": ("groundItems", list),
+            "observe_crafting": ("recipes", list),
+            "observe_farm_space": ("rows", list),
+            "observe_machines": ("machines", list),
+            "observe_livestock": ("buildings", list),
+        }
+        field_name, field_type = payloads.get(operation, ("", dict))
+        if not status and isinstance(result.get(field_name), field_type):
+            return "completed", None
+        if not status and operation == "query_planting_options" and isinstance(result.get("candidateTiles"), (dict, list)):
+            return "completed", None
     return "unknown", reason or "UNRECOGNIZED_TOOL_RESULT"
 
 
@@ -387,7 +415,7 @@ class PlanExecutor:
         if wait_condition is not None:
             return self._park_for_wait(save_id, step, command_id, wait_condition, result)
 
-        outcome, reason = classify_step_outcome(result)
+        outcome, reason = classify_step_outcome(result, step.operation)
         effects = result.get("effects") if isinstance(result, dict) else None
         revision = result.get("snapshotRevision") if isinstance(result, dict) else None
         if revision is None and isinstance(result, dict) and isinstance(result.get("worldRevision"), int):
@@ -516,6 +544,7 @@ class PlanExecutor:
                 outcome="unknown" if transient else "partial",
                 reason_code=reason,
                 command_id=command_id,
+                game_date=self._fresh_state()[1],
             )
         except WorkStateError as commit_ex:
             logger.warning("Could not commit failed dispatch for %s: %s", step.step_id, commit_ex)

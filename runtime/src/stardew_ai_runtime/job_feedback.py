@@ -2,15 +2,26 @@
 import json
 from typing import Any
 
+from stardew_ai_runtime.work_state import WorkStore
+
 
 def compact_job_feedback(result: Any, *, operation: str = "", status: str | None = None) -> dict[str, Any]:
     raw = result if isinstance(result, dict) else {}
     feedback = {"operation": operation, "status": status or raw.get("status", raw.get("outcome", "unknown")),
                 "nextBusiness": "new_model_decision_required"}
+    effects = raw.get("effects") or []
+    actual_summary = WorkStore.effect_summary(effects) if effects else None
     for key in ("commandId", "reasonCode", "message", "error", "terminalState", "effects", "inventoryDelta", "resourceDelta", "tile", "locationId", "completedCount", "failedCount"):
         value = raw.get(key)
         if value is not None:
             feedback[key] = value[:8] if isinstance(value, list) else value[:320] if isinstance(value, str) else value
+    if len(effects) > 8:
+        feedback["effectCount"] = len(effects)
+        feedback["effectsTruncated"] = True
     if len(json.dumps(feedback, ensure_ascii=False)) > 2400:
-        feedback = {"operation": operation, "status": feedback["status"], "nextBusiness": "new_model_decision_required", "reasonCode": raw.get("reasonCode"), "effectCount": len(raw.get("effects") or []), "detailsTruncated": True}
+        feedback = {"operation": operation, "status": feedback["status"], "nextBusiness": "new_model_decision_required", "reasonCode": raw.get("reasonCode"), "effectCount": len(effects), "detailsTruncated": True}
+    if actual_summary:
+        feedback["actualSummary"] = actual_summary
+    if raw.get("reasonCode"):
+        feedback["reason"] = WorkStore.reason_summary(raw["reasonCode"], raw.get("message"))
     return feedback

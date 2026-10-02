@@ -29,6 +29,7 @@ _WIRE_TO_FIELD: dict[str, str] = {
     "playStyle": "play_style",
     "personality": "personality",
     "careFrequency": "care_frequency",
+    "bedtime": "bedtime",
     "companionName": "companion_name",
     "profileRevision": "profile_revision",
 }
@@ -129,6 +130,7 @@ class CompanionProfileStore:
             "play_style": "earn",
             "personality": "gentle",
             "care_frequency": "moderate",
+            "bedtime": 2400,
             "companion_name": DEFAULT_COMPANION_NAME,
             "profile_revision": 0,
         }
@@ -155,6 +157,7 @@ class CompanionProfileStore:
             "playStyle": record.get("play_style", "earn"),
             "personality": record.get("personality", "gentle"),
             "careFrequency": record.get("care_frequency", "moderate"),
+            "bedtime": record.get("bedtime", 2400),
             "companionName": record.get("companion_name", DEFAULT_COMPANION_NAME),
         }
         return {"profile": profile, "profileRevision": revision}
@@ -179,6 +182,8 @@ class CompanionProfileStore:
         status_holder: list[str] = ["confirmed"]
 
         def apply(record: dict[str, Any]) -> None:
+            persisted = record
+            record = dict(record)
             current_rev = int(record.get("profile_revision", 0))
             if current_rev != expected_revision:
                 status_holder[0] = "rejected"
@@ -186,6 +191,18 @@ class CompanionProfileStore:
                 result["profileRevision"] = current_rev
                 return
 
+            if "bedtime" in patch:
+                val = patch["bedtime"]
+                if isinstance(val, bool) or not isinstance(val, int):
+                    status_holder[0] = "rejected"
+                    result.update(reason="INVALID_BEDTIME", profileRevision=current_rev)
+                    return
+                val = val + 2400 if 0 <= val <= 100 else val
+                if not 1800 <= val <= 2500 or val % 100 >= 60 or val % 10:
+                    status_holder[0] = "rejected"
+                    result.update(reason="INVALID_BEDTIME", profileRevision=current_rev)
+                    return
+                record["bedtime"] = val
             # Apply allowed patch fields
             if "onboarded" in patch:
                 record["onboarded"] = bool(patch["onboarded"])
@@ -225,6 +242,8 @@ class CompanionProfileStore:
                 record["companion_name"] = name
 
             record["profile_revision"] = current_rev + 1
+            persisted.clear()
+            persisted.update(record)
             new_rev = record["profile_revision"]
             result["profileRevision"] = new_rev
             result["profile"] = {
@@ -233,6 +252,7 @@ class CompanionProfileStore:
                 "playStyle": record.get("play_style", "earn"),
                 "personality": record.get("personality", "gentle"),
                 "careFrequency": record.get("care_frequency", "moderate"),
+            "bedtime": record.get("bedtime", 2400),
                 "companionName": record.get("companion_name", DEFAULT_COMPANION_NAME),
             }
 

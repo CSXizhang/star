@@ -42,8 +42,8 @@ class SaveAutonomyState:
     paused: bool = False
     goal: str = ""
     goal_scope: str | None = None
-    budget_limit: int | None = None
     box_preference: str = "none"
+    idle_preference: str = "autonomous"
     preferences_revision: int = 0
     decision_epoch: int = 0
     last_decision_fingerprint: str | None = None
@@ -66,7 +66,7 @@ class SaveAutonomyState:
 
     def __post_init__(self) -> None:
         # ``enabled`` was the pre-free-mode public field.  Read old files as
-        # free mode, but never grant spending permission during migration.
+        # free mode. Legacy purchase allowances are no longer loaded.
         if self.mode not in {"command", "free"}:
             self.mode = "free" if self.enabled else "command"
         if self.enabled and self.mode == "command":
@@ -197,10 +197,12 @@ class AutonomyController:
         self._load()
         return self._states.setdefault(save_id, SaveAutonomyState())
 
-    def set_enabled(self, save_id: str, enabled: bool) -> SaveAutonomyState:
-        return self.set_mode(save_id, "free" if enabled else "command")
+    def set_enabled(self, save_id: str, enabled: bool, *, goal_scope: str | None = None,
+                    paused: bool | None = None) -> SaveAutonomyState:
+        return self.set_mode(save_id, "free" if enabled else "command", goal_scope=goal_scope, paused=paused)
 
-    def set_mode(self, save_id: str, mode: str) -> SaveAutonomyState:
+    def set_mode(self, save_id: str, mode: str, *, goal_scope: str | None = None,
+                 paused: bool | None = None) -> SaveAutonomyState:
         if mode not in {"command", "free"}:
             raise ValueError("mode must be command or free")
         def mutate(state: SaveAutonomyState) -> None:
@@ -209,20 +211,25 @@ class AutonomyController:
                 state.last_action_fingerprint = None
                 state.last_decision_fingerprint = None
                 state.decision_epoch += 1
-                state.paused = False
             state.failure_count = 0
             state.breaker_tripped = False
             state.breaker_cooldown_until = None
             state.breaker_reason = None
-            state.goal_scope = None
+            if goal_scope is not None:
+                state.goal_scope = goal_scope
             state.mode = mode
             state.enabled = value
-            if not value:
-                state.paused = False
+            if paused is not None:
+                state.paused = paused
         return self._mutate(save_id, mutate)
 
     def set_paused(self, save_id: str, paused: bool) -> SaveAutonomyState:
         def mutate(state: SaveAutonomyState) -> None:
+            if state.paused and not paused:
+                # Explicit resume must reconsider the preserved world, including
+                # a decision interrupted after its fingerprint was consumed.
+                state.decision_epoch += 1
+                state.last_decision_fingerprint = None
             state.paused = bool(paused)
             state.failure_count = 0
             state.breaker_tripped = False
@@ -238,41 +245,48 @@ class AutonomyController:
         if action == "resume":
             return self.set_paused(save_id, False)
         if action == "cancel":
-            return self.set_mode(save_id, "command")
+            def cancel_arrangement(state: SaveAutonomyState) -> None:
+                state.goal = ""
+                state.goal_scope = None
+                state.pending = []
+                state.decision_epoch += 1
+                state.last_decision_fingerprint = None
+            return self._mutate(save_id, cancel_arrangement)
         if action == "set_preferences":
             return self.set_preferences(
                 save_id,
                 goal=params.get("goal"),
-                budget_limit=params.get("budget_limit"),
                 box_preference=params.get("box_preference"),
+                idle_preference=params.get("idle_preference"),
             )
         raise ValueError("unsupported autonomy control action")
 
-    def set_goal_scope(self, save_id: str, goal_id: str) -> None:
+    def set_goal_scope(self, save_id: str, goal_id: str | None) -> None:
         def mutate(state: SaveAutonomyState) -> None:
             state.goal_scope = goal_id
             state.decision_epoch += 1
         self._mutate(save_id, mutate)
 
     def set_preferences(
-        self, save_id: str, *, goal: str | None = None, budget_limit: int | None = None,
-        box_preference: str | None = None
+        self, save_id: str, *, goal: str | None = None,
+        box_preference: str | None = None, idle_preference: str | None = None
     ) -> SaveAutonomyState:
-        if budget_limit is not None and budget_limit < 0:
-            raise ValueError("budget_limit must be non-negative")
         def mutate(state: SaveAutonomyState) -> None:
             changed = False
             if goal is not None and state.goal != goal.strip():
                 state.goal = goal.strip()
-                changed = True
-            if budget_limit is not None and state.budget_limit != budget_limit:
-                state.budget_limit = budget_limit
                 changed = True
             if box_preference is not None:
                 normalized = box_preference.strip()
                 if normalized != state.box_preference:
                     changed = True
                 state.box_preference = normalized or "none"
+            if idle_preference is not None:
+                if idle_preference not in {"autonomous", "clear", "forage", "wood", "wait"}:
+                    raise ValueError("unsupported idle preference")
+                if idle_preference != state.idle_preference:
+                    changed = True
+                state.idle_preference = idle_preference
             if changed:
                 state.preferences_revision += 1
                 state.decision_epoch += 1
@@ -326,7 +340,7 @@ class AutonomyController:
     def next_candidate(self, save_id: str, snapshot: dict[str, Any], *, now: float | None = None, work_signal: str = "") -> dict[str, Any] | None:
         """Return one explainable task from fresh native data, or None when idle."""
         state = self.state(save_id)
-        if not state.enabled or state.paused or self.is_cooling_down(save_id, now=now):
+        if (not state.enabled and not state.goal_scope) or state.paused or self.is_cooling_down(save_id, now=now):
             return None
         world = snapshot.get("world") if isinstance(snapshot.get("world"), dict) else {}
         day = world.get("dayOfMonth")
@@ -338,11 +352,11 @@ class AutonomyController:
             if self.is_cooling_down(save_id, now=now):
                 return None
         farm = snapshot.get("farmWork") if isinstance(snapshot.get("farmWork"), dict) else {}
-        if farm.get("matureCropCount", 0) > 0:
-            return {"kind": "harvest", "reason": "成熟作物待收", "max_tiles": 16}
+        if state.enabled and not state.goal_scope and farm.get("matureCropCount", 0) > 0:
+            return {"kind": "harvest", "reason": "成熟作物待收", "max_tiles": 16, "workSignal": work_signal}
         crops = farm.get("cropUnwateredTiles")
-        if isinstance(crops, list) and crops:
-            return {"kind": "water", "reason": "作物需要浇水", "tiles": crops[:64]}
+        if state.enabled and not state.goal_scope and isinstance(crops, list) and crops:
+            return {"kind": "water", "reason": "作物需要浇水", "tiles": crops[:64], "workSignal": work_signal}
         # One agent decision at enable/new-day/goal change is useful for
         # planting or other saved goals; it is not a recurring idle planner.
         decision_key = self.fingerprint(save_id, snapshot, {"kind": "decision", "reason": "daily-decision", "goal": state.goal, "workSignal": work_signal}, state)
@@ -375,7 +389,7 @@ class AutonomyController:
             f"{candidate.get('kind')}:{candidate.get('reason')}:{mature_summary}:{pending_summary}:"
             f"{candidate.get('goal', '')}:{candidate.get('workSignal', '')}:{json.dumps(tiles, sort_keys=True, ensure_ascii=False)}:"
             f"{json.dumps(items, sort_keys=True)}:{json.dumps(chest_summary)}:{shop.get('isOpen', shop.get('open'))}:"
-            f"{state.budget_limit if state else None}:{state.preferences_revision if state else None}:"
+            f"{state.preferences_revision if state else None}:"
             f"{world.get('weatherIcon')}:{world.get('isRaining')}:"
             f"{(snapshot.get('companion') or {}).get('availableMoney')}"
         )
@@ -387,7 +401,7 @@ class AutonomyController:
         accepted = False
         def mutate(state: SaveAutonomyState) -> None:
             nonlocal accepted
-            if not state.enabled:
+            if not state.enabled and not state.goal_scope:
                 return
             decision_key = f"{state.decision_epoch}:{fingerprint}"
             if state.last_decision_fingerprint == decision_key:
@@ -459,7 +473,7 @@ class AutonomyController:
                 state.daily_tokens.setdefault(day_key, current)
                 return
             for key in ("input_tokens", "cache_read_tokens", "output_tokens", "total_tokens"):
-                value = usage.get(key)
+                value = usage.get(key, usage.get("cache_read_input_tokens") if key == "cache_read_tokens" else None)
                 if value is None or not isinstance(value, int) or value < 0:
                     continue
                 current[key] = (current.get(key) or 0) + value
@@ -467,7 +481,11 @@ class AutonomyController:
         return self._mutate(save_id, mutate)
 
     def reserve_spend(self, save_id: str, command_id: str, quoted_cost: int, limit: int | None = None) -> int:
-        """Reserve a native quote once; duplicate command ids are idempotent."""
+        """Track an in-flight purchase once, without imposing a daily allowance.
+
+        ``limit`` is the quote check for this single native command. Outstanding
+        commands survive restart/day rollover until their actual result is known.
+        """
         if quoted_cost < 0:
             raise ValueError("quoted_cost must be non-negative")
         result = 0
@@ -478,11 +496,8 @@ class AutonomyController:
                 return
             if command_id in state.settled_spend_commands:
                 return
-            state_limit = state.budget_limit if state.budget_limit is not None else 0
-            remaining = max(0, state_limit - state.daily_spend - sum(state.spend_reservations.values()))
-            allowed = min(limit if limit is not None else state_limit, remaining)
-            if quoted_cost > allowed:
-                raise ValueError("daily autonomy budget exceeded")
+            if limit is not None and quoted_cost > limit:
+                raise ValueError("purchase quote exceeds this command's limit")
             state.spend_reservations[command_id] = quoted_cost
             result = quoted_cost
         self._mutate(save_id, mutate)

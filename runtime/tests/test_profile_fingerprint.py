@@ -168,3 +168,24 @@ def test_uncorrected_agreement_keeps_work_session(tmp_path: Path) -> None:
     assert status == "confirmed"
     assert bridge._ensure_session_matches_profile("save-1", "conv-work-3") is None
     assert bridge.get_conversation_id("save-1") is None
+
+
+def test_completion_events_preserve_work_session_after_store_reload(tmp_path: Path) -> None:
+    bridge = ChatBridge(run_dir=tmp_path)
+    bridge._ensure_session_matches_profile("save-1", None)
+    bridge.record_conversation_id("save-1", "conv-work-events")
+    status, _ = bridge._memory_store.add(
+        "save-1", kind="event", text="完成了浇水", source="system",
+        game_date="1:spring:1", expected_revision=0, command_id="water-1",
+    )
+    assert status == "confirmed"
+    assert bridge._memory_revision("save-1") == 1
+    reloaded = ChatBridge(run_dir=tmp_path)
+    assert reloaded._ensure_session_matches_profile("save-1", "conv-work-events") == "conv-work-events"
+    assert "完成了浇水" in reloaded._format_agent_prompt("继续", "save-1")
+    status, _ = reloaded._memory_store.add(
+        "save-1", kind="preference", text="空闲先砍树", source="player",
+        game_date="1:spring:1", expected_revision=1,
+    )
+    assert status == "confirmed"
+    assert reloaded._ensure_session_matches_profile("save-1", "conv-work-events") is None

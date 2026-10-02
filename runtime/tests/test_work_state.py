@@ -14,6 +14,20 @@ def _store(tmp_path: Path) -> WorkStore:
     return WorkStore(tmp_path / "data" / "work-state.json")
 
 
+def test_effect_summary_combines_confirmed_production_changes() -> None:
+    effects = [
+        {"state": "collected", "stack": 2},
+        {"state": "deposited", "stack": 2},
+        {"state": "inserted", "stack": 1},
+        {"state": "skipped", "stack": 99},
+    ]
+    assert WorkStore.effect_summary(effects) == "已入箱 2 件，已投入原料 1 件，已收取 2 件"
+    assert WorkStore.effect_summary([{"state": "skipped"}]) == "未确认实际变化"
+    assert WorkStore.effect_summary([
+        {"state": "planted"}, {"state": "watered"}, {"state": "skipped"},
+    ]) == "已种下 1 格，已浇水 1 格"
+
+
 def _goal(store: WorkStore, save: str = "Save1") -> str:
     return store.add_goal(save, "照料农场", source="user").id
 
@@ -118,6 +132,7 @@ def test_recover_unconfirmed_step_keeps_unknown_and_asks_once(tmp_path: Path) ->
     assert len(store.recover("Save1",now=3))==1
     assert store.recover("Save1",now=4)==[]
     assert store.list_tasks("Save1")[0]["steps"][0]["status"]=="unknown"
+    assert store.list_tasks("Save1")[0]["steps"][0]["reason_code"]=="UNCONFIRMED_AFTER_RESTART"
 
 
 def test_recover_applies_logged_outcome(tmp_path: Path) -> None:

@@ -3,51 +3,711 @@
   "$id": "https://stardew-ai.local/protocol/v0.1/schema.json",
   "title": "Stardew AI Companion Protocol v0.1",
   "oneOf": [
-    { "$ref": "#/$defs/runtimeHello" },
-    { "$ref": "#/$defs/modWelcome" },
-    { "$ref": "#/$defs/worldSnapshot" },
-    { "$ref": "#/$defs/skillExecute" },
-    { "$ref": "#/$defs/skillCancel" },
-    { "$ref": "#/$defs/skillPause" },
-    { "$ref": "#/$defs/skillResume" },
-    { "$ref": "#/$defs/skillResult" },
-    { "$ref": "#/$defs/autonomyControl" },
-    { "$ref": "#/$defs/autonomyState" },
-    { "$ref": "#/$defs/lifeChatSubmit" },
-    { "$ref": "#/$defs/lifeChatReply" },
-    { "$ref": "#/$defs/lifeProfileState" },
-    { "$ref": "#/$defs/protocolError" }
+    {
+      "$ref": "#/$defs/runtimeHello"
+    },
+    {
+      "$ref": "#/$defs/modWelcome"
+    },
+    {
+      "$ref": "#/$defs/worldSnapshot"
+    },
+    {
+      "$ref": "#/$defs/skillExecute"
+    },
+    {
+      "$ref": "#/$defs/skillCancel"
+    },
+    {
+      "$ref": "#/$defs/skillPause"
+    },
+    {
+      "$ref": "#/$defs/skillResume"
+    },
+    {
+      "$ref": "#/$defs/skillResult"
+    },
+    {
+      "$ref": "#/$defs/autonomyControl"
+    },
+    {
+      "$ref": "#/$defs/autonomyState"
+    },
+    {
+      "$ref": "#/$defs/chatReply"
+    },
+    {
+      "$ref": "#/$defs/lifeChatSubmit"
+    },
+    {
+      "$ref": "#/$defs/lifeChatReply"
+    },
+    {
+      "$ref": "#/$defs/lifeProfileState"
+    },
+    {
+      "$ref": "#/$defs/protocolError"
+    }
   ],
   "$defs": {
+    "farmWorkSnapshot": {
+      "type": "object",
+      "required": [
+        "tilledUnwateredTiles",
+        "tilledUnwateredCount",
+        "isTruncated",
+        "matureCropCount",
+        "matureCrops",
+        "matureCropsTruncated"
+      ],
+      "properties": {
+        "tilledUnwateredTiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tileCoord"
+          }
+        },
+        "tilledUnwateredCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "isTruncated": {
+          "type": "boolean"
+        },
+        "matureCropCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "matureCrops": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": [
+              "x",
+              "y",
+              "cropId"
+            ],
+            "properties": {
+              "x": {
+                "type": "integer"
+              },
+              "y": {
+                "type": "integer"
+              },
+              "cropId": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "matureCropsTruncated": {
+          "type": "boolean"
+        },
+        "cropUnwateredTiles": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/tileCoord"
+          }
+        },
+        "cropUnwateredCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cropUnwateredTruncated": {
+          "type": "boolean"
+        },
+        "deadCropCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "locationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observationStatus": {
+          "enum": [
+            "observed",
+            "not-observed",
+            "unavailable",
+            "unknown"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "animalBuildingSnapshot": {
+      "type": "object",
+      "properties": {
+        "buildingType": {
+          "type": "string"
+        },
+        "indoorsName": {
+          "type": "string"
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tile": {
+          "$ref": "#/$defs/tileCoord"
+        },
+        "doorTile": {
+          "$ref": "#/$defs/tileCoord"
+        },
+        "animalDoorOpen": {
+          "type": "boolean"
+        },
+        "doorStateKnown": {
+          "type": "boolean"
+        },
+        "animalCount": {
+          "type": "integer"
+        },
+        "animalLimit": {
+          "type": "integer"
+        },
+        "hayCount": {
+          "type": "integer"
+        },
+        "hayCapacity": {
+          "type": "integer"
+        },
+        "siloHayCount": {
+          "type": "integer"
+        },
+        "residentCount": {
+          "type": "integer"
+        },
+        "animals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/animalSnapshot"
+          }
+        },
+        "buildingId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "residentAnimalIds": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "buildingType",
+        "indoorsName",
+        "tile",
+        "doorTile",
+        "animals"
+      ],
+      "additionalProperties": false
+    },
+    "groundItemSnapshot": {
+      "type": "object",
+      "properties": {
+        "tile": {
+          "$ref": "#/$defs/tileCoord"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "stack": {
+          "type": "integer"
+        },
+        "isDropped": {
+          "type": "boolean"
+        },
+        "isWeed": {
+          "type": "boolean"
+        },
+        "canBeGrabbed": {
+          "type": "boolean"
+        },
+        "isStone": {
+          "type": "boolean"
+        },
+        "isTwig": {
+          "type": "boolean"
+        },
+        "clearTool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quality": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "tile",
+        "kind",
+        "itemId",
+        "name",
+        "stack",
+        "isDropped",
+        "isWeed",
+        "canBeGrabbed"
+      ],
+      "additionalProperties": false
+    },
+    "choppableTreeSnapshot": {
+      "type": "object",
+      "properties": {
+        "tile": {
+          "$ref": "#/$defs/tileCoord"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "growthStage": {
+          "type": "integer"
+        },
+        "tapped": {
+          "type": "boolean"
+        },
+        "width": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tile",
+        "kind",
+        "growthStage",
+        "tapped"
+      ],
+      "additionalProperties": false
+    },
+    "shopItemSnapshot": {
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "price": {
+          "type": "integer"
+        },
+        "stock": {
+          "type": "integer"
+        },
+        "isInfiniteStock": {
+          "type": "boolean"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "limitedStockMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actionsOnPurchase": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "category": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tradeItem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tradeItemCount": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "itemId",
+        "name",
+        "price",
+        "stock",
+        "isInfiniteStock"
+      ],
+      "additionalProperties": false
+    },
+    "shopSnapshot": {
+      "type": "object",
+      "properties": {
+        "shopId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "moneyStatus": {
+          "type": "string"
+        },
+        "isOpen": {
+          "type": "boolean"
+        },
+        "ownerPresent": {
+          "type": "boolean"
+        },
+        "closedMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owners": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "currency": {
+          "type": "integer"
+        },
+        "availableMoney": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "itemsCount": {
+          "type": "integer"
+        },
+        "items": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/shopItemSnapshot"
+          }
+        },
+        "errorMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interactionTile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/tileCoord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "shopId",
+        "status",
+        "isOpen",
+        "ownerPresent"
+      ],
+      "additionalProperties": false
+    },
+    "chatReply": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "properties": {
+            "messageType": {
+              "const": "chat.reply"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "requestId": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "replyText": {
+                  "type": "string"
+                },
+                "conversationId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "usageSource": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "toolName": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "saveId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "commandId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "provider": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tokensUsed": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "promptTokens": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "outputTokens": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "cachedTokens": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "cacheReadTokens": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "cacheWriteTokens": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "modelCalls": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "commandComplete": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "resumeWorkRequested": {
+                  "type": "boolean"
+                },
+                "readOnly": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "requestId",
+                "status",
+                "replyText"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
     "tileCoord": {
       "type": "object",
-      "required": ["x", "y"],
+      "required": [
+        "x",
+        "y"
+      ],
       "properties": {
-        "x": { "type": "integer" },
-        "y": { "type": "integer" }
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        }
       },
       "additionalProperties": false
     },
     "animalSnapshot": {
       "type": "object",
-      "required": ["name", "animalType", "produceReady"],
+      "required": [
+        "name",
+        "animalType",
+        "produceReady"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "animalType": { "type": "string" },
-        "displayType": { "type": "string" },
-        "age": { "type": "integer", "minimum": 0 },
-        "happiness": { "type": "integer" },
-        "fullness": { "type": "integer" },
-        "friendship": { "type": "integer" },
-        "produceReady": { "type": "boolean" },
-        "currentProduceId": { "type": ["string", "null"] },
-        "harvestType": { "type": ["string", "null"] },
-        "requiredTool": { "type": ["string", "null"] },
-        "buildingType": { "type": ["string", "null"] },
-        "location": { "type": ["string", "null"] },
-        "tile": { "anyOf": [{ "$ref": "#/$defs/tileCoord" }, { "type": "null" }] },
-        "wasPetToday": { "type": "boolean" },
-        "wasAutoPetToday": { "type": "boolean" }
+        "name": {
+          "type": "string"
+        },
+        "animalType": {
+          "type": "string"
+        },
+        "displayType": {
+          "type": "string"
+        },
+        "age": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "happiness": {
+          "type": "integer"
+        },
+        "fullness": {
+          "type": "integer"
+        },
+        "friendship": {
+          "type": "integer"
+        },
+        "produceReady": {
+          "type": "boolean"
+        },
+        "currentProduceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "harvestType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requiredTool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "buildingType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/tileCoord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wasPetToday": {
+          "type": "boolean"
+        },
+        "wasAutoPetToday": {
+          "type": "boolean"
+        },
+        "sleepingBlocksPetting": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "animalId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "homeBuildingId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       },
       "additionalProperties": false
     },
@@ -64,41 +724,111 @@
         "payload"
       ],
       "properties": {
-        "protocolVersion": { "const": "0.1" },
-        "messageType": { "type": "string", "minLength": 1 },
-        "messageId": { "type": "string", "minLength": 1 },
-        "correlationId": { "type": ["string", "null"] },
-        "saveId": { "type": ["string", "null"] },
-        "gameSessionId": { "type": ["string", "null"] },
-        "senderInstanceId": { "type": "string", "minLength": 1 },
-        "sequenceNumber": { "type": "integer", "minimum": 0 },
-        "worldRevision": { "type": "integer", "minimum": 0 },
-        "sentAt": { "type": "string", "format": "date-time" },
-        "expiresAt": { "type": ["string", "null"], "format": "date-time" },
-        "idempotencyKey": { "type": ["string", "null"] },
-        "payload": { "type": "object" }
+        "protocolVersion": {
+          "const": "0.1"
+        },
+        "messageType": {
+          "type": "string",
+          "minLength": 1
+        },
+        "messageId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "correlationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "saveId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gameSessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "senderInstanceId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sequenceNumber": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "worldRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sentAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expiresAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "idempotencyKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "type": "object"
+        }
       }
     },
     "runtimeHello": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
+        {
+          "$ref": "#/$defs/base"
+        },
         {
           "properties": {
-            "messageType": { "const": "runtime.hello" },
-            "worldRevision": { "const": 0 },
+            "messageType": {
+              "const": "runtime.hello"
+            },
+            "worldRevision": {
+              "const": 0
+            },
             "payload": {
               "type": "object",
-              "required": ["supportedProtocolVersions", "runtimeVersion", "features"],
+              "required": [
+                "supportedProtocolVersions",
+                "runtimeVersion",
+                "features"
+              ],
               "properties": {
                 "supportedProtocolVersions": {
                   "type": "array",
-                  "contains": { "const": "0.1" }
+                  "contains": {
+                    "const": "0.1"
+                  }
                 },
-                "runtimeVersion": { "type": "string", "minLength": 1 },
-                "sessionToken": { "type": ["string", "null"] },
+                "runtimeVersion": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "sessionToken": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "features": {
                   "type": "object",
-                  "additionalProperties": { "type": "boolean" }
+                  "additionalProperties": {
+                    "type": "boolean"
+                  }
                 }
               },
               "additionalProperties": false
@@ -110,23 +840,60 @@
     },
     "modWelcome": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
         {
-          "required": ["saveId", "gameSessionId"],
+          "$ref": "#/$defs/base"
+        },
+        {
+          "required": [
+            "saveId",
+            "gameSessionId"
+          ],
           "properties": {
-            "messageType": { "const": "mod.welcome" },
-            "saveId": { "type": "string", "minLength": 1 },
-            "gameSessionId": { "type": "string", "minLength": 1 },
+            "messageType": {
+              "const": "mod.welcome"
+            },
+            "saveId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gameSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
             "payload": {
               "type": "object",
-              "required": ["selectedProtocolVersion", "modVersion", "gameVersion", "smapiVersion", "skills"],
+              "required": [
+                "selectedProtocolVersion",
+                "modVersion",
+                "gameVersion",
+                "smapiVersion",
+                "skills"
+              ],
               "properties": {
-                "selectedProtocolVersion": { "const": "0.1" },
-                "modVersion": { "type": "string", "minLength": 1 },
-                "gameVersion": { "type": "string", "minLength": 1 },
-                "smapiVersion": { "type": "string", "minLength": 1 },
-                "lifecycleState": { "type": "string" },
-                "skills": { "type": "array", "items": { "type": "string" } }
+                "selectedProtocolVersion": {
+                  "const": "0.1"
+                },
+                "modVersion": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "gameVersion": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "smapiVersion": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "lifecycleState": {
+                  "type": "string"
+                },
+                "skills": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
               },
               "additionalProperties": false
             }
@@ -137,93 +904,259 @@
     },
     "worldSnapshot": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
         {
-          "required": ["saveId", "gameSessionId"],
+          "$ref": "#/$defs/base"
+        },
+        {
+          "required": [
+            "saveId",
+            "gameSessionId"
+          ],
           "properties": {
-            "messageType": { "const": "world.snapshot" },
-            "saveId": { "type": "string", "minLength": 1 },
-            "gameSessionId": { "type": "string", "minLength": 1 },
+            "messageType": {
+              "const": "world.snapshot"
+            },
+            "saveId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gameSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
             "payload": {
               "type": "object",
-              "required": ["capturedRevision", "companion", "world"],
+              "required": [
+                "capturedRevision",
+                "companion",
+                "world"
+              ],
               "properties": {
-                "capturedRevision": { "type": "integer", "minimum": 0 },
-                "companion": { "type": "object" },
+                "capturedRevision": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "companion": {
+                  "type": "object",
+                  "properties": {
+                    "locationId": {
+                      "type": "string"
+                    },
+                    "activity": {
+                      "type": "string"
+                    },
+                    "tileX": {
+                      "type": "integer"
+                    },
+                    "tileY": {
+                      "type": "integer"
+                    },
+                    "facingDirection": {
+                      "type": "integer"
+                    },
+                    "maxStamina": {
+                      "type": "integer"
+                    },
+                    "waterCanLevel": {
+                      "type": "integer"
+                    },
+                    "maxWaterCanLevel": {
+                      "type": "integer"
+                    },
+                    "stamina": {
+                      "type": "number"
+                    },
+                    "hasWateringCan": {
+                      "type": "boolean"
+                    },
+                    "availableMoney": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "moneyStatus": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "restState": {
+                      "type": "string",
+                      "enum": [
+                        "awake",
+                        "winding-down",
+                        "returning-home",
+                        "waiting-for-bed",
+                        "sleeping"
+                      ]
+                    },
+                    "bedtime": {
+                      "type": "integer",
+                      "minimum": 1800,
+                      "maximum": 2500
+                    },
+                    "sleepStartedAt": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "locationId",
+                    "tileX",
+                    "tileY",
+                    "activity"
+                  ],
+                  "additionalProperties": false
+                },
                 "world": {
                   "type": "object",
                   "properties": {
-                    "playerMoney": { "type": "integer", "minimum": 0 },
-                    "playerStamina": { "type": "number" },
-                    "playerMaxStamina": { "type": "integer", "minimum": 0 },
+                    "playerMoney": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "playerStamina": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "playerMaxStamina": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "playerItems": {
                       "type": "array",
                       "maxItems": 40,
                       "items": {
                         "type": "object",
-                        "required": ["name", "quantity"],
+                        "required": [
+                          "name",
+                          "quantity"
+                        ],
                         "properties": {
-                          "name": { "type": "string", "minLength": 1 },
-                          "quantity": { "type": "integer", "minimum": 1 }
+                          "name": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "quantity": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
                         },
                         "additionalProperties": false
                       }
+                    },
+                    "currentLocation": {
+                      "type": "string"
+                    },
+                    "season": {
+                      "type": "string"
+                    },
+                    "timeOfDay": {
+                      "type": "integer"
+                    },
+                    "dayOfMonth": {
+                      "type": "integer"
+                    },
+                    "year": {
+                      "type": "integer"
+                    },
+                    "isRaining": {
+                      "type": "boolean"
+                    },
+                    "farmWork": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/farmWorkSnapshot"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "weatherIcon": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
-                  }
-                },
-                "farmWork": {
-                  "type": "object",
-                  "required": [
-                    "tilledUnwateredTiles",
-                    "tilledUnwateredCount",
-                    "isTruncated",
-                    "matureCropCount",
-                    "matureCrops",
-                    "matureCropsTruncated"
-                  ],
-                  "properties": {
-                    "tilledUnwateredTiles": {
-                      "type": "array",
-                      "items": { "$ref": "#/$defs/tileCoord" }
-                    },
-                    "tilledUnwateredCount": { "type": "integer", "minimum": 0 },
-                    "isTruncated": { "type": "boolean" },
-                    "matureCropCount": { "type": "integer", "minimum": 0 },
-                    "matureCrops": {
-                      "type": "array",
-                      "maxItems": 64,
-                      "items": {
-                        "type": "object",
-                        "required": ["x", "y", "cropId"],
-                        "properties": {
-                          "x": { "type": "integer" },
-                          "y": { "type": "integer" },
-                          "cropId": { "type": "string", "minLength": 1 }
-                        },
-                        "additionalProperties": false
-                      }
-                    },
-                    "matureCropsTruncated": { "type": "boolean" }
                   },
                   "additionalProperties": false
                 },
+                "farmWork": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/farmWorkSnapshot"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "inventory": {
                   "type": "object",
-                  "required": ["capacity", "freeSlots", "slots"],
+                  "required": [
+                    "capacity",
+                    "freeSlots",
+                    "slots"
+                  ],
                   "properties": {
-                    "capacity": { "type": "integer", "minimum": 0 },
-                    "freeSlots": { "type": "integer", "minimum": 0 },
+                    "capacity": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "freeSlots": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
                     "slots": {
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "required": ["index", "itemId", "name", "stack", "quality"],
+                        "required": [
+                          "index",
+                          "itemId",
+                          "name",
+                          "stack",
+                          "quality"
+                        ],
                         "properties": {
-                          "index": { "type": "integer", "minimum": 0 },
-                          "itemId": { "type": "string", "minLength": 1 },
-                          "name": { "type": "string" },
-                          "stack": { "type": "integer", "minimum": 1 },
-                          "quality": { "type": "integer", "minimum": 0 }
+                          "index": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "itemId": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "stack": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "quality": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "displayName": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "isTool": {
+                            "type": "boolean"
+                          }
                         },
                         "additionalProperties": false
                       }
@@ -233,30 +1166,86 @@
                 },
                 "chests": {
                   "type": "object",
-                  "required": ["truncated", "items"],
+                  "required": [
+                    "truncated",
+                    "items"
+                  ],
                   "properties": {
-                    "truncated": { "type": "boolean" },
+                    "truncated": {
+                      "type": "boolean"
+                    },
                     "items": {
                       "type": "array",
                       "maxItems": 16,
                       "items": {
                         "type": "object",
-                        "required": ["tile", "capacity", "freeSlots", "contents"],
+                        "required": [
+                          "tile",
+                          "capacity",
+                          "freeSlots",
+                          "contents"
+                        ],
                         "properties": {
-                          "tile": { "$ref": "#/$defs/tileCoord" },
-                          "capacity": { "type": "integer", "minimum": 0 },
-                          "freeSlots": { "type": "integer", "minimum": 0 },
+                          "tile": {
+                            "$ref": "#/$defs/tileCoord"
+                          },
+                          "capacity": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "freeSlots": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
                           "contents": {
                             "type": "array",
                             "items": {
                               "type": "object",
-                              "required": ["slot", "itemId", "name", "stack", "quality"],
+                              "required": [
+                                "slot",
+                                "itemId",
+                                "name",
+                                "stack",
+                                "quality"
+                              ],
                               "properties": {
-                                "slot": { "type": "integer", "minimum": 0 },
-                                "itemId": { "type": "string", "minLength": 1 },
-                                "name": { "type": "string" },
-                                "stack": { "type": "integer", "minimum": 1 },
-                                "quality": { "type": "integer", "minimum": 0 }
+                                "slot": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "itemId": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "name": {
+                                  "type": "string"
+                                },
+                                "stack": {
+                                  "type": "integer",
+                                  "minimum": 1
+                                },
+                                "quality": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "displayName": {
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                },
+                                "isSeed": {
+                                  "type": "boolean"
+                                },
+                                "seasons": {
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ],
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                }
                               },
                               "additionalProperties": false
                             }
@@ -270,48 +1259,132 @@
                 },
                 "planting": {
                   "type": "object",
-                  "required": ["season", "dayOfMonth", "companionHasHoe", "seeds", "candidateTiles", "searchBounds"],
+                  "required": [
+                    "season",
+                    "dayOfMonth",
+                    "companionHasHoe",
+                    "seeds",
+                    "candidateTiles",
+                    "searchBounds"
+                  ],
                   "properties": {
-                    "season": { "type": "string" },
-                    "dayOfMonth": { "type": "integer", "minimum": 1 },
-                    "companionHasHoe": { "type": "boolean" },
+                    "season": {
+                      "type": "string"
+                    },
+                    "dayOfMonth": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "companionHasHoe": {
+                      "type": "boolean"
+                    },
                     "seeds": {
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "required": ["itemId", "name", "stack", "canPlantCurrentSeason", "seasons"],
+                        "required": [
+                          "itemId",
+                          "name",
+                          "stack",
+                          "canPlantCurrentSeason",
+                          "seasons"
+                        ],
                         "properties": {
-                          "itemId": { "type": "string" },
-                          "name": { "type": "string" },
-                          "stack": { "type": "integer", "minimum": 1 },
-                          "canPlantCurrentSeason": { "type": "boolean" },
-                          "seasons": { "type": "array", "items": { "type": "string" } },
-                          "growthDays": { "type": ["integer", "null"] },
-                          "regrows": { "type": ["boolean", "null"] },
-                          "isRaised": { "type": ["boolean", "null"] }
+                          "itemId": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "stack": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "canPlantCurrentSeason": {
+                            "type": "boolean"
+                          },
+                          "seasons": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "growthDays": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "regrows": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          },
+                          "isRaised": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          }
                         },
                         "additionalProperties": false
                       }
                     },
                     "candidateTiles": {
                       "type": "object",
-                      "required": ["tilledEmptyCount", "tilledEmptyTiles", "tilledEmptyTruncated", "tillableCount", "tillableTiles", "tillableTruncated"],
+                      "required": [
+                        "tilledEmptyCount",
+                        "tilledEmptyTiles",
+                        "tilledEmptyTruncated",
+                        "tillableCount",
+                        "tillableTiles",
+                        "tillableTruncated"
+                      ],
                       "properties": {
-                        "tilledEmptyCount": { "type": "integer", "minimum": 0 },
-                        "tilledEmptyTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
-                        "tilledEmptyTruncated": { "type": "boolean" },
-                        "tillableCount": { "type": "integer", "minimum": 0 },
-                        "tillableTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
-                        "tillableTruncated": { "type": "boolean" }
+                        "tilledEmptyCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "tilledEmptyTiles": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/$defs/tileCoord"
+                          }
+                        },
+                        "tilledEmptyTruncated": {
+                          "type": "boolean"
+                        },
+                        "tillableCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "tillableTiles": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/$defs/tileCoord"
+                          }
+                        },
+                        "tillableTruncated": {
+                          "type": "boolean"
+                        }
                       },
                       "additionalProperties": false
                     },
                     "searchBounds": {
                       "type": "object",
-                      "required": ["center", "radius"],
+                      "required": [
+                        "center",
+                        "radius"
+                      ],
                       "properties": {
-                        "center": { "$ref": "#/$defs/tileCoord" },
-                        "radius": { "type": "integer", "minimum": 0 }
+                        "center": {
+                          "$ref": "#/$defs/tileCoord"
+                        },
+                        "radius": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
                       },
                       "additionalProperties": false
                     }
@@ -320,26 +1393,71 @@
                 },
                 "machines": {
                   "type": "object",
-                  "required": ["truncated", "items"],
+                  "required": [
+                    "truncated",
+                    "items"
+                  ],
                   "properties": {
-                    "truncated": { "type": "boolean" },
+                    "truncated": {
+                      "type": "boolean"
+                    },
                     "items": {
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "required": ["tile", "itemId", "name", "isReady", "minutesUntilReady"],
+                        "required": [
+                          "tile",
+                          "itemId",
+                          "name",
+                          "isReady",
+                          "minutesUntilReady"
+                        ],
                         "properties": {
-                          "tile": { "$ref": "#/$defs/tileCoord" },
-                          "itemId": { "type": "string" },
-                          "name": { "type": "string" },
-                          "isReady": { "type": "boolean" },
-                          "minutesUntilReady": { "type": "integer", "minimum": 0 },
-                          "outputItemId": { "type": ["string", "null"] },
-                          "outputName": { "type": ["string", "null"] },
-                          "outputStack": { "type": "integer", "minimum": 0 },
-                          "outputQuality": { "type": "integer", "minimum": 0 },
-                          "lastInputItemId": { "type": ["string", "null"] },
-                          "hasInput": { "type": "boolean" }
+                          "tile": {
+                            "$ref": "#/$defs/tileCoord"
+                          },
+                          "itemId": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "isReady": {
+                            "type": "boolean"
+                          },
+                          "minutesUntilReady": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "outputItemId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "outputName": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "outputStack": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "outputQuality": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "lastInputItemId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "hasInput": {
+                            "type": "boolean"
+                          }
                         },
                         "additionalProperties": false
                       }
@@ -349,27 +1467,147 @@
                 },
                 "livestock": {
                   "type": "object",
-                  "required": ["buildingsTruncated", "animalsTruncated", "buildings", "roamingAnimals"],
+                  "required": [
+                    "buildingsTruncated",
+                    "animalsTruncated",
+                    "buildings",
+                    "roamingAnimals"
+                  ],
                   "properties": {
-                    "buildingsTruncated": { "type": "boolean" },
-                    "animalsTruncated": { "type": "boolean" },
-                    "buildings": { "type": "array", "items": { "type": "object" } },
-                    "roamingAnimals": { "type": "array", "items": { "$ref": "#/$defs/animalSnapshot" } }
+                    "buildingsTruncated": {
+                      "type": "boolean"
+                    },
+                    "animalsTruncated": {
+                      "type": "boolean"
+                    },
+                    "buildings": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/animalBuildingSnapshot"
+                      }
+                    },
+                    "roamingAnimals": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/animalSnapshot"
+                      }
+                    },
+                    "roamingScopeLocationId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
                   },
                   "additionalProperties": false
                 },
                 "farming": {
                   "type": "object",
-                  "required": ["location", "refillWaterTiles", "groundItems", "groundItemsTruncated", "fertilizedTiles", "companionTools"],
+                  "required": [
+                    "location",
+                    "refillWaterTiles",
+                    "groundItems",
+                    "groundItemsTruncated",
+                    "fertilizedTiles",
+                    "companionTools"
+                  ],
                   "properties": {
-                    "location": { "type": "string" },
-                    "refillWaterTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
-                    "groundItems": { "type": "array", "items": { "type": "object" } },
-                    "groundItemsTruncated": { "type": "boolean" },
-                    "fertilizedTiles": { "type": "array", "items": { "$ref": "#/$defs/tileCoord" } },
-                    "companionTools": { "type": "array", "items": { "type": "string" } }
+                    "location": {
+                      "type": "string"
+                    },
+                    "refillWaterTiles": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/tileCoord"
+                      }
+                    },
+                    "groundItems": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/groundItemSnapshot"
+                      }
+                    },
+                    "groundItemsTruncated": {
+                      "type": "boolean"
+                    },
+                    "fertilizedTiles": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/tileCoord"
+                      }
+                    },
+                    "companionTools": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "choppableTrees": {
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "$ref": "#/$defs/choppableTreeSnapshot"
+                      }
+                    },
+                    "choppableTreesTruncated": {
+                      "type": "boolean"
+                    },
+                    "refillWaterScope": {
+                      "type": "string"
+                    },
+                    "refillWaterRadius": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "refillWaterCenter": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/tileCoord"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "refillWaterTilesTruncated": {
+                      "type": "boolean"
+                    },
+                    "refillWaterMapComplete": {
+                      "type": "boolean"
+                    }
                   },
                   "additionalProperties": false
+                },
+                "productionSignals": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "locationId": {
+                        "type": "string"
+                      },
+                      "tile": {
+                        "$ref": "#/$defs/tileCoord"
+                      },
+                      "isReady": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "locationId",
+                      "tile",
+                      "isReady"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "productionSignalsTruncated": {
+                  "type": "boolean"
+                },
+                "shop": {
+                  "$ref": "#/$defs/shopSnapshot"
                 }
               },
               "additionalProperties": false
@@ -381,15 +1619,36 @@
     },
     "skillExecute": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
         {
-          "required": ["saveId", "gameSessionId", "idempotencyKey", "expiresAt"],
+          "$ref": "#/$defs/base"
+        },
+        {
+          "required": [
+            "saveId",
+            "gameSessionId",
+            "idempotencyKey",
+            "expiresAt"
+          ],
           "properties": {
-            "messageType": { "const": "skill.execute" },
-            "saveId": { "type": "string", "minLength": 1 },
-            "gameSessionId": { "type": "string", "minLength": 1 },
-            "idempotencyKey": { "type": "string", "minLength": 1 },
-            "expiresAt": { "type": "string", "format": "date-time" },
+            "messageType": {
+              "const": "skill.execute"
+            },
+            "saveId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gameSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "idempotencyKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expiresAt": {
+              "type": "string",
+              "format": "date-time"
+            },
             "payload": {
               "type": "object",
               "required": [
@@ -404,22 +1663,60 @@
                 "policyDecisionId"
               ],
               "properties": {
-                "commandId": { "type": "string", "minLength": 1 },
-                "taskId": { "type": "string", "minLength": 1 },
-                "skillId": { "type": "string", "minLength": 1 },
-                "skillVersion": { "type": "string", "minLength": 1 },
-                "expectedWorldRevision": { "type": "integer", "minimum": 0 },
+                "commandId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "taskId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "skillId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "skillVersion": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "expectedWorldRevision": {
+                  "type": "integer",
+                  "minimum": 0
+                },
                 "parameters": {
                   "type": "object",
-                  "required": ["locationId"],
+                  "required": [
+                    "locationId"
+                  ],
                   "properties": {
-                    "locationId": { "type": "string", "minLength": 1 },
+                    "locationId": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "shopId": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "budget_limit": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "includeEmptyTiles": {
+                      "type": "boolean"
+                    },
                     "tile": {
                       "type": "object",
-                      "required": ["x", "y"],
+                      "required": [
+                        "x",
+                        "y"
+                      ],
                       "properties": {
-                        "x": { "type": "integer" },
-                        "y": { "type": "integer" }
+                        "x": {
+                          "type": "integer"
+                        },
+                        "y": {
+                          "type": "integer"
+                        }
                       },
                       "additionalProperties": false
                     },
@@ -428,51 +1725,133 @@
                       "minItems": 1,
                       "items": {
                         "type": "object",
-                        "required": ["x", "y"],
+                        "required": [
+                          "x",
+                          "y"
+                        ],
                         "properties": {
-                          "x": { "type": "integer" },
-                          "y": { "type": "integer" }
+                          "x": {
+                            "type": "integer"
+                          },
+                          "y": {
+                            "type": "integer"
+                          }
                         },
                         "additionalProperties": false
                       }
                     },
-                    "chestTile": { "$ref": "#/$defs/tileCoord" },
+                    "chestTile": {
+                      "$ref": "#/$defs/tileCoord"
+                    },
                     "itemIds": {
                       "type": "array",
                       "maxItems": 36,
-                      "items": { "type": "string", "minLength": 1 }
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
                     },
-                    "seedItemId": { "type": "string", "minLength": 1 },
-                    "fertilizerItemId": { "type": "string", "minLength": 1 },
-                    "itemId": { "type": "string", "minLength": 1 },
-                    "itemCount": { "type": "integer", "minimum": 1, "maximum": 64 },
-                    "recipeName": { "type": "string", "minLength": 1 },
+                    "seedItemId": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "fertilizerItemId": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "itemId": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "itemCount": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 64
+                    },
+                    "recipeName": {
+                      "type": "string",
+                      "minLength": 1
+                    },
                     "region": {
-                      "type": "object", "required": ["x", "y", "width", "height"],
+                      "type": "object",
+                      "required": [
+                        "x",
+                        "y",
+                        "width",
+                        "height"
+                      ],
                       "properties": {
-                        "x": { "type": "integer", "minimum": 0 },
-                        "y": { "type": "integer", "minimum": 0 },
-                        "width": { "type": "integer", "minimum": 1 },
-                        "height": { "type": "integer", "minimum": 1 }
+                        "x": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "y": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "width": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "height": {
+                          "type": "integer",
+                          "minimum": 1
+                        }
                       },
                       "additionalProperties": false
                     },
-                    "animalName": { "type": "string", "minLength": 1 },
-                    "buildingName": { "type": "string", "minLength": 1 }
+                    "animalName": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "animalId": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "animalType": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "buildingType": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "buildingName": {
+                      "type": "string",
+                      "minLength": 1
+                    }
                   },
                   "additionalProperties": false
                 },
                 "budgets": {
                   "type": "object",
                   "properties": {
-                    "maxGameMinutes": { "type": "integer", "minimum": 1 },
-                    "maxStamina": { "type": "number", "minimum": 0 },
-                    "maxWater": { "type": "integer", "minimum": 0 }
+                    "maxGameMinutes": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "maxStamina": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "maxWater": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
                   },
                   "additionalProperties": false
                 },
-                "cancelPolicy": { "type": "string", "enum": ["safe-point", "finish-atomic"] },
-                "policyDecisionId": { "type": "string", "minLength": 1 }
+                "cancelPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "safe-point",
+                    "finish-atomic"
+                  ]
+                },
+                "policyDecisionId": {
+                  "type": "string",
+                  "minLength": 1
+                }
               },
               "additionalProperties": false
             }
@@ -483,22 +1862,58 @@
     },
     "skillCancel": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
         {
-          "required": ["saveId", "gameSessionId", "correlationId"],
+          "$ref": "#/$defs/base"
+        },
+        {
+          "required": [
+            "saveId",
+            "gameSessionId",
+            "correlationId"
+          ],
           "properties": {
-            "messageType": { "const": "skill.cancel" },
-            "saveId": { "type": "string", "minLength": 1 },
-            "gameSessionId": { "type": "string", "minLength": 1 },
-            "correlationId": { "type": "string", "minLength": 1 },
+            "messageType": {
+              "const": "skill.cancel"
+            },
+            "saveId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gameSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "correlationId": {
+              "type": "string",
+              "minLength": 1
+            },
             "payload": {
               "type": "object",
-              "required": ["commandId", "reason", "requestedByPlayer", "cancelPolicy"],
+              "required": [
+                "commandId",
+                "reason",
+                "requestedByPlayer",
+                "cancelPolicy"
+              ],
               "properties": {
-                "commandId": { "type": "string", "minLength": 1 },
-                "reason": { "type": "string", "minLength": 1 },
-                "requestedByPlayer": { "type": "boolean" },
-                "cancelPolicy": { "type": "string", "enum": ["safe-point", "finish-atomic"] }
+                "commandId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "requestedByPlayer": {
+                  "type": "boolean"
+                },
+                "cancelPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "safe-point",
+                    "finish-atomic"
+                  ]
+                }
               },
               "additionalProperties": false
             }
@@ -509,20 +1924,46 @@
     },
     "skillPause": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
         {
-          "required": ["saveId", "gameSessionId", "correlationId"],
+          "$ref": "#/$defs/base"
+        },
+        {
+          "required": [
+            "saveId",
+            "gameSessionId",
+            "correlationId"
+          ],
           "properties": {
-            "messageType": { "const": "skill.pause" },
-            "saveId": { "type": "string", "minLength": 1 },
-            "gameSessionId": { "type": "string", "minLength": 1 },
-            "correlationId": { "type": "string", "minLength": 1 },
+            "messageType": {
+              "const": "skill.pause"
+            },
+            "saveId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gameSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "correlationId": {
+              "type": "string",
+              "minLength": 1
+            },
             "payload": {
               "type": "object",
-              "required": ["commandId", "reason"],
+              "required": [
+                "commandId",
+                "reason"
+              ],
               "properties": {
-                "commandId": { "type": "string", "minLength": 1 },
-                "reason": { "type": "string", "minLength": 1 }
+                "commandId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                }
               },
               "additionalProperties": false
             }
@@ -533,19 +1974,41 @@
     },
     "skillResume": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
         {
-          "required": ["saveId", "gameSessionId", "correlationId"],
+          "$ref": "#/$defs/base"
+        },
+        {
+          "required": [
+            "saveId",
+            "gameSessionId",
+            "correlationId"
+          ],
           "properties": {
-            "messageType": { "const": "skill.resume" },
-            "saveId": { "type": "string", "minLength": 1 },
-            "gameSessionId": { "type": "string", "minLength": 1 },
-            "correlationId": { "type": "string", "minLength": 1 },
+            "messageType": {
+              "const": "skill.resume"
+            },
+            "saveId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gameSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "correlationId": {
+              "type": "string",
+              "minLength": 1
+            },
             "payload": {
               "type": "object",
-              "required": ["commandId"],
+              "required": [
+                "commandId"
+              ],
               "properties": {
-                "commandId": { "type": "string", "minLength": 1 }
+                "commandId": {
+                  "type": "string",
+                  "minLength": 1
+                }
               },
               "additionalProperties": false
             }
@@ -556,14 +2019,31 @@
     },
     "skillResult": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
         {
-          "required": ["saveId", "gameSessionId", "correlationId"],
+          "$ref": "#/$defs/base"
+        },
+        {
+          "required": [
+            "saveId",
+            "gameSessionId",
+            "correlationId"
+          ],
           "properties": {
-            "messageType": { "const": "skill.result" },
-            "saveId": { "type": "string", "minLength": 1 },
-            "gameSessionId": { "type": "string", "minLength": 1 },
-            "correlationId": { "type": "string", "minLength": 1 },
+            "messageType": {
+              "const": "skill.result"
+            },
+            "saveId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gameSessionId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "correlationId": {
+              "type": "string",
+              "minLength": 1
+            },
             "payload": {
               "type": "object",
               "required": [
@@ -577,70 +2057,184 @@
                 "effects"
               ],
               "properties": {
-                "commandId": { "type": "string", "minLength": 1 },
-                "taskId": { "type": "string", "minLength": 1 },
+                "commandId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "taskId": {
+                  "type": "string",
+                  "minLength": 1
+                },
                 "terminalState": {
                   "type": "string",
-                  "enum": ["succeeded", "partially-succeeded", "failed", "cancelled", "rejected"]
+                  "enum": [
+                    "succeeded",
+                    "partially-succeeded",
+                    "failed",
+                    "cancelled",
+                    "rejected"
+                  ]
                 },
-                "completedCount": { "type": "integer", "minimum": 0 },
-                "skippedCount": { "type": "integer", "minimum": 0 },
-                "failedCount": { "type": "integer", "minimum": 0 },
-                "finalWorldRevision": { "type": "integer", "minimum": 0 },
+                "completedCount": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "skippedCount": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failedCount": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "finalWorldRevision": {
+                  "type": "integer",
+                  "minimum": 0
+                },
                 "effects": {
                   "type": "array",
                   "items": {
                     "type": "object",
                     "properties": {
-                      "tile": { "$ref": "#/$defs/tileCoord" },
-                      "chestTile": { "$ref": "#/$defs/tileCoord" },
-                      "state": { "type": "string", "minLength": 1 },
-                      "reason": { "type": "string", "minLength": 1 },
-                      "cropId": { "type": "string", "minLength": 1 },
-                      "itemId": { "type": "string", "minLength": 1 },
-                      "itemName": { "type": "string" },
-                      "stack": { "type": "integer", "minimum": 0 },
-                      "quality": { "type": "integer", "minimum": 0 },
-                      "mergedStack": { "type": "integer", "minimum": 0 }
+                      "tile": {
+                        "$ref": "#/$defs/tileCoord"
+                      },
+                      "chestTile": {
+                        "$ref": "#/$defs/tileCoord"
+                      },
+                      "state": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "reason": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "cropId": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "itemId": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "itemName": {
+                        "type": "string"
+                      },
+                      "stack": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "quality": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "mergedStack": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
                     }
                   }
                 },
                 "details": {
-                  "type": ["object", "null"],
+                  "type": [
+                    "object",
+                    "null"
+                  ],
                   "properties": {
-                    "inventoryFull": { "type": "boolean" },
-                    "chestFull": { "type": "boolean" },
-                    "outOfSeeds": { "type": "boolean" },
-                    "remainingSeedStack": { "type": "integer" },
-                    "seedItemId": { "type": "string" },
-                    "hoedTiles": { "type": "array" },
-                    "plantedTiles": { "type": "array" },
-                    "skippedTiles": { "type": "array" }
+                    "inventoryFull": {
+                      "type": "boolean"
+                    },
+                    "chestFull": {
+                      "type": "boolean"
+                    },
+                    "outOfSeeds": {
+                      "type": "boolean"
+                    },
+                    "remainingSeedStack": {
+                      "type": "integer"
+                    },
+                    "seedItemId": {
+                      "type": "string"
+                    },
+                    "hoedTiles": {
+                      "type": "array"
+                    },
+                    "plantedTiles": {
+                      "type": "array"
+                    },
+                    "skippedTiles": {
+                      "type": "array"
+                    }
                   },
                   "additionalProperties": false
                 },
                 "resources": {
-                  "type": ["object", "null"],
+                  "type": [
+                    "object",
+                    "null"
+                  ],
                   "properties": {
-                    "staminaUsed": { "type": "number", "minimum": 0 },
-                    "waterUsed": { "type": "integer", "minimum": 0 },
-                    "gameMinutesElapsed": { "type": "integer", "minimum": 0 }
+                    "staminaUsed": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "waterUsed": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "gameMinutesElapsed": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
                   },
                   "additionalProperties": false
                 },
                 "error": {
-                  "type": ["object", "null"],
-                  "required": ["code", "message"],
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "required": [
+                    "code",
+                    "message"
+                  ],
                   "properties": {
-                    "code": { "type": "string", "minLength": 1 },
-                    "message": { "type": "string", "minLength": 1 },
-                    "details": { "type": ["string", "null"] },
-                    "retryable": { "type": "boolean" }
+                    "code": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "details": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
                   },
                   "additionalProperties": false
                 },
-                "retryRecommended": { "type": "boolean" },
-                "playerActionRequired": { "type": "boolean" }
+                "retryRecommended": {
+                  "type": "boolean"
+                },
+                "playerActionRequired": {
+                  "type": "boolean"
+                },
+                "skillId": {
+                  "type": "string"
+                },
+                "targetAdjusted": {
+                  "type": "boolean"
+                },
+                "requestedTile": {
+                  "$ref": "#/$defs/tileCoord"
+                }
               },
               "additionalProperties": false
             }
@@ -651,97 +2245,563 @@
     },
     "autonomyControl": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
-        { "properties": {
-          "messageType": { "const": "autonomy.control" },
-          "payload": { "type": "object", "required": ["requestId", "saveId", "action"],
-            "properties": { "requestId": { "type": "string", "minLength": 1 }, "saveId": { "type": "string", "minLength": 1 },
-              "action": { "enum": ["set_mode", "pause", "resume", "cancel", "set_preferences"] },
-              "parameters": { "type": "object" } }, "additionalProperties": false }
-        } }
-      ], "unevaluatedProperties": false
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "properties": {
+            "messageType": {
+              "const": "autonomy.control"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "requestId",
+                "saveId",
+                "action"
+              ],
+              "properties": {
+                "requestId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "saveId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "action": {
+                  "enum": [
+                    "set_mode",
+                    "pause",
+                    "resume",
+                    "cancel",
+                    "set_preferences"
+                  ]
+                },
+                "parameters": {
+                  "type": "object"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
     },
     "autonomyState": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
-        { "properties": {
-          "messageType": { "const": "autonomy.state" },
-          "payload": { "type": "object", "required": ["requestId", "saveId", "mode", "paused", "preferences", "preferencesRevision", "decisionEpoch", "gameDate", "dailySpend", "status"],
-            "properties": { "requestId": { "type": "string" }, "saveId": { "type": "string" }, "mode": { "enum": ["command", "free"] },
-              "paused": { "type": "boolean" }, "preferences": { "type": "object" }, "preferencesRevision": { "type": "integer", "minimum": 0 },
-              "decisionEpoch": { "type": "integer", "minimum": 0 }, "gameDate": { "type": ["string", "null"] }, "dailySpend": { "type": "integer", "minimum": 0 },
-              "status": { "enum": ["confirmed", "rejected"] }, "reason": { "type": ["string", "null"] } }, "additionalProperties": false }
-        } }
-      ], "unevaluatedProperties": false
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "properties": {
+            "messageType": {
+              "const": "autonomy.state"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "requestId",
+                "saveId",
+                "mode",
+                "paused",
+                "preferences",
+                "preferencesRevision",
+                "decisionEpoch",
+                "gameDate",
+                "dailySpend",
+                "status"
+              ],
+              "properties": {
+                "requestId": {
+                  "type": "string"
+                },
+                "saveId": {
+                  "type": "string"
+                },
+                "mode": {
+                  "enum": [
+                    "command",
+                    "free"
+                  ]
+                },
+                "paused": {
+                  "type": "boolean"
+                },
+                "preferences": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "preferencesRevision": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "decisionEpoch": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "gameDate": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "dailySpend": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "status": {
+                  "enum": [
+                    "confirmed",
+                    "rejected"
+                  ]
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "usageTodayText": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lastPlanAction": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "planWaitReason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "hasExecutableWork": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "waitingConditions": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "taskId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "taskTitle": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "stepId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "operation": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "waitDescription": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "reasonCode": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "waitCondition": {
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "displayText": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "controlAction": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "pause",
+                    "resume",
+                    "cancel",
+                    "set_mode",
+                    "set_preferences",
+                    "enable",
+                    "disable",
+                    null
+                  ]
+                },
+                "usageSaveTodayText": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "usageSaveTotalText": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
     },
     "playerActivity": {
-      "type": "object", "required": ["phase", "summary", "nextStep"],
+      "type": "object",
+      "required": [
+        "phase",
+        "summary",
+        "nextStep"
+      ],
       "properties": {
-        "phase": { "enum": ["planning", "proposed", "working", "waiting", "paused", "completed", "failed", "idle"] },
-        "summary": { "type": "string" }, "nextStep": { "type": "string" }
-      }, "additionalProperties": false
+        "phase": {
+          "enum": [
+            "planning",
+            "proposed",
+            "working",
+            "waiting",
+            "paused",
+            "completed",
+            "failed",
+            "idle"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "nextStep": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "lifeChatSubmit": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
-        { "properties": {
-          "messageType": { "const": "life.chat.submit" },
-          "payload": { "type": "object", "required": ["requestId", "saveId", "mode", "text"],
-            "properties": {
-              "requestId": { "type": "string", "minLength": 1 }, "saveId": { "type": "string", "minLength": 1 },
-              "mode": { "enum": ["chat", "plan"] }, "text": { "type": "string", "minLength": 1, "maxLength": 500 },
-              "source": { "type": "string" }, "acceptedNodeId": { "type": "string", "minLength": 1 }
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "properties": {
+            "messageType": {
+              "const": "life.chat.submit"
             },
-            "if": { "required": ["acceptedNodeId"] }, "then": { "properties": { "mode": { "const": "plan" } } },
-            "additionalProperties": false }
-        } }
-      ], "unevaluatedProperties": false
+            "payload": {
+              "type": "object",
+              "required": [
+                "requestId",
+                "saveId",
+                "mode",
+                "text"
+              ],
+              "properties": {
+                "requestId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "saveId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "mode": {
+                  "enum": [
+                    "chat",
+                    "plan"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500
+                },
+                "source": {
+                  "type": "string"
+                },
+                "acceptedNodeId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "replyToNoticeId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "resolveNotice": {
+                  "type": "boolean"
+                },
+                "noticeAction": {
+                  "enum": ["dismiss", "restore"]
+                },
+                "noticeIds": {
+                  "type": "array", "minItems": 1, "maxItems": 200,
+                  "items": {"type": "string", "minLength": 1}
+                }
+              },
+              "if": {
+                "required": [
+                  "acceptedNodeId"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "mode": {
+                    "const": "plan"
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "dependentRequired": {
+                "noticeAction": ["noticeIds"],
+                "noticeIds": ["noticeAction"],
+                "resolveNotice": [
+                  "replyToNoticeId"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
     },
     "lifeChatReply": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
-        { "properties": {
-          "messageType": { "const": "life.chat.reply" },
-          "payload": { "type": "object", "required": ["requestId", "saveId", "status", "profileRevision", "memoryRevision"],
-            "properties": {
-              "requestId": { "type": "string" }, "saveId": { "type": "string" },
-              "status": { "enum": ["queued", "processing", "completed", "failed", "rejected"] },
-              "profileRevision": { "type": "integer" }, "memoryRevision": { "type": "integer" },
-              "replyText": { "type": ["string", "null"] }, "error": { "type": ["string", "null"] },
-              "queuePosition": { "type": "integer" }, "proposalReady": { "type": "boolean" },
-              "proposalNodeId": { "type": "string" }, "activity": { "$ref": "#/$defs/playerActivity" }
-            }, "additionalProperties": false }
-        } }
-      ], "unevaluatedProperties": false
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "properties": {
+            "messageType": {
+              "const": "life.chat.reply"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "requestId",
+                "saveId",
+                "status",
+                "profileRevision",
+                "memoryRevision"
+              ],
+              "properties": {
+                "requestId": {
+                  "type": "string"
+                },
+                "saveId": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "queued",
+                    "processing",
+                    "completed",
+                    "failed",
+                    "rejected"
+                  ]
+                },
+                "profileRevision": {
+                  "type": "integer"
+                },
+                "memoryRevision": {
+                  "type": "integer"
+                },
+                "replyText": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "queuePosition": {
+                  "type": "integer"
+                },
+                "proposalReady": {
+                  "type": "boolean"
+                },
+                "proposalNodeId": {
+                  "type": "string"
+                },
+                "activity": {
+                  "$ref": "#/$defs/playerActivity"
+                },
+                "answeredNoticeId": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
     },
     "lifeProfileState": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
-        { "properties": {
-          "messageType": { "const": "life.profile.state" },
-          "payload": { "type": "object", "required": ["requestId", "saveId", "status", "profile", "profileRevision"],
-            "properties": {
-              "requestId": { "type": "string" }, "saveId": { "type": "string" },
-              "status": { "type": "string" }, "profile": { "type": ["object", "null"] },
-              "profileRevision": { "type": "integer" }, "reason": { "type": ["string", "null"] },
-              "work": { "type": "object", "properties": { "activity": { "$ref": "#/$defs/playerActivity" } } }
-            }, "additionalProperties": false }
-        } }
-      ], "unevaluatedProperties": false
+        {
+          "$ref": "#/$defs/base"
+        },
+        {
+          "properties": {
+            "messageType": {
+              "const": "life.profile.state"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "requestId",
+                "saveId",
+                "status",
+                "profile",
+                "profileRevision"
+              ],
+              "properties": {
+                "requestId": {
+                  "type": "string"
+                },
+                "saveId": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "profile": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "profileRevision": {
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "work": {
+                  "type": "object",
+                  "properties": {
+                    "activity": {
+                      "$ref": "#/$defs/playerActivity"
+                    },
+                    "playerDecisions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "message",
+                          "status"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "message": {
+                            "type": "string"
+                          },
+                          "goalId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "enum": [
+                              "pending",
+                              "answered",
+                              "dismissed"
+                            ]
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    }
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
     },
     "protocolError": {
       "allOf": [
-        { "$ref": "#/$defs/base" },
+        {
+          "$ref": "#/$defs/base"
+        },
         {
           "properties": {
-            "messageType": { "const": "protocol.error" },
+            "messageType": {
+              "const": "protocol.error"
+            },
             "payload": {
               "type": "object",
-              "required": ["code", "message"],
+              "required": [
+                "code",
+                "message"
+              ],
               "properties": {
-                "code": { "type": "string", "minLength": 1 },
-                "message": { "type": "string", "minLength": 1 },
-                "details": { "type": ["string", "null"] }
+                "code": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "message": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "details": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
               },
               "additionalProperties": false
             }

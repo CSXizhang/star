@@ -12,7 +12,7 @@ from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 
-def test_player_chat_submit_unpauses_work_state(tmp_path, monkeypatch):
+def test_player_continue_applies_resume_control_without_model(tmp_path, monkeypatch):
     bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False, backend="kimi")
     bridge._send_reply = AsyncMock()
     store = bridge._work_store
@@ -25,6 +25,8 @@ def test_player_chat_submit_unpauses_work_state(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "_execute_turn", fake_execute)
     asyncio.run(bridge.handle_chat_submit(None, "player-req-1", "继续干活", "Save1"))
     assert store.state("Save1").paused is False
+    reply = bridge._send_reply.await_args.args[1]
+    assert reply.payload["status"] == "completed"
 
     # Autonomy submit should not unpause
     store.set_paused("Save1", True)

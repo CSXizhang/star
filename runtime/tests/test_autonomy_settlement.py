@@ -121,7 +121,7 @@ async def _autonomy_turn(bridge: ChatBridge, ws, index: int) -> str:
 
 
 def test_stale_last_job_success_does_not_mask_new_failure(tmp_path, monkeypatch):
-    """旧成功 last_job 不能替当前决策结算；当前作业的失败必须计入 failure_count。"""
+    """旧成功不能结算当前决策；当前原生失败计入分支，不触发提供者保护。"""
     client = _ScriptedClient()
     bridge = _autonomy_bridge(tmp_path, monkeypatch, client)
     ws = AsyncMock()
@@ -139,13 +139,19 @@ def test_stale_last_job_success_does_not_mask_new_failure(tmp_path, monkeypatch)
         )
         await bridge._plan_worker.evaluate()
         state = bridge._autonomy.state("Save1")
-        assert state.failure_count == 1, "new failure must be counted, not masked by the stale success"
+        assert state.failure_count == 0
+        assert not bridge._autonomy_pending_task_fingerprints
+        work = bridge._work_store.state("Save1")
+        assert work.last_job["taskId"] == "auto-task-2"
+        assert work.last_job["decisionId"] == work.decision["token"]
+        assert sum(row["failures"] for row in work.branch_failures) == 1
+        assert work.executions[-1].reason_code == "OUT_OF_ENERGY"
 
     asyncio.run(run())
 
 
 def test_stale_last_job_failure_does_not_pollute_new_success(tmp_path, monkeypatch):
-    """旧失败 last_job 不能污染当前决策；当前作业成功后 failure_count 必须清零。"""
+    """旧原生失败不能污染当前决策；新成功必须以当前任务的终态结算。"""
     client = _ScriptedClient()
     bridge = _autonomy_bridge(tmp_path, monkeypatch, client)
     ws = AsyncMock()
@@ -154,7 +160,8 @@ def test_stale_last_job_failure_does_not_pollute_new_success(tmp_path, monkeypat
         client.fail_dispatch = True
         await _autonomy_turn(bridge, ws, 1)
         await bridge._plan_worker.evaluate()
-        assert bridge._autonomy.state("Save1").failure_count == 1
+        assert bridge._autonomy.state("Save1").failure_count == 0
+        assert sum(row["failures"] for row in bridge._work_store.state("Save1").branch_failures) == 1
 
         client.fail_dispatch = False
         await _autonomy_turn(bridge, ws, 2)
@@ -164,6 +171,9 @@ def test_stale_last_job_failure_does_not_pollute_new_success(tmp_path, monkeypat
         await bridge._plan_worker.evaluate()
         state = bridge._autonomy.state("Save1")
         assert state.failure_count == 0, "fresh success must reset the count instead of inheriting the stale failure"
+        assert not bridge._autonomy_pending_task_fingerprints
+        assert bridge._work_store.state("Save1").last_job["taskId"] == "auto-task-2"
+        assert bridge._work_store.state("Save1").last_job["status"] == "completed"
 
     asyncio.run(run())
 
@@ -179,7 +189,11 @@ def test_three_consecutive_failures_trip_breaker(tmp_path, monkeypatch):
         await bridge._plan_worker.evaluate()
         assert bridge._autonomy.state("Save1").failure_count == 0
 
-        client.fail_dispatch = True
+        class FailingBackend:
+            def run(self, active_task, cid, prompt):
+                return {"success": False, "response": "模型连接失败", "error": "PROVIDER_UNAVAILABLE"}
+
+        bridge._backend = FailingBackend()
         for index in (2, 3, 4):
             await _autonomy_turn(bridge, ws, index)
             await bridge._plan_worker.evaluate()
@@ -202,8 +216,10 @@ def test_duplicate_terminal_settles_once(tmp_path, monkeypatch):
         client.fail_dispatch = True
         await _autonomy_turn(bridge, ws, 1)
         await bridge._plan_worker.evaluate()
-        assert bridge._autonomy.state("Save1").failure_count == 1
+        assert bridge._autonomy.state("Save1").failure_count == 0
         assert not bridge._autonomy_pending_task_fingerprints, "terminal must consume the pending fingerprint"
+        before = json.dumps(bridge._work_store.state("Save1").branch_failures, sort_keys=True)
+        assert sum(row["failures"] for row in bridge._work_store.state("Save1").branch_failures) == 1
 
         execution = StepExecution(
             status="executed",
@@ -214,7 +230,9 @@ def test_duplicate_terminal_settles_once(tmp_path, monkeypatch):
         )
         await bridge._on_job_terminal("Save1", execution, "SHORT_JOB_TERMINAL")
         await bridge._on_job_terminal("Save1", execution, "SHORT_JOB_TERMINAL")
-        assert bridge._autonomy.state("Save1").failure_count == 1, "duplicate terminal must not double-count"
+        assert bridge._autonomy.state("Save1").failure_count == 0
+        assert json.dumps(bridge._work_store.state("Save1").branch_failures, sort_keys=True) == before
+        assert not bridge._autonomy_pending_task_fingerprints
 
     asyncio.run(run())
 

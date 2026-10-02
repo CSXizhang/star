@@ -14,6 +14,88 @@ from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.protocol import Envelope, LifeChatSubmitPayload, ProtocolError
 
 
+def test_archived_native_result_and_new_job_have_separate_specific_names(tmp_path):
+    from stardew_ai_runtime.chat_bridge import CommandChain
+    from stardew_ai_runtime.work_state import ExecutionEntry, Step, Task
+    bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+    bridge._work_store._mutate("S", lambda state: (
+        state.archive.append({"task": {"id": "build-old", "title": "订建鸡舍", "goal_id": "g1"}}),
+        setattr(state, "last_job", {"taskId": "build-old", "status": "completed",
+                                  "effects": [{"state": "building-construction-ordered"}]}),
+    ))
+    result = bridge._player_activity("S")
+    assert result["summary"] == "订建鸡舍：建造已下单，等待施工。"
+    bridge._work_store._mutate("S", lambda state: (
+        state.tasks.append(Task(id="water-new", goal_id="g1", title="浇菜地", status="running")),
+        state.decision.update(taskId="water-new", selected=True, finished=False),
+    ))
+    result = bridge._player_activity("S")
+    assert result["summary"] == "正在处理：浇菜地"
+    assert "鸡舍" not in result["summary"]
+    bridge._work_store._mutate("S", lambda state: (
+        setattr(state.tasks[-1], "status", "completed"),
+        state.tasks[-1].steps.append(Step(id="water-step", operation="water_auto", effects=[{"state": "watered"}] * 20)),
+        state.decision.update(finished=True),
+        setattr(state, "last_job", {"taskId": "water-new", "status": "completed", "effects": [{"state": "watered"}] * 8}),
+    ))
+    bridge._command_chains["S"] = CommandChain(instruction="继续种植", save_id="S", started_at=0, waiting_task_id="water-new")
+    result = bridge._player_activity("S")
+    assert result["phase"] == "completed"
+    assert result["summary"] == "浇菜地：已浇水 20 格。"
+    assert bridge._work_store.effect_summary([{"state": "hoed"}] * 40) == "已开垦 40 格"
+    assert bridge._work_store.effect_summary([{"state": "harvested"}] * 25) == "已收获 25 格"
+    assert bridge._work_store.effect_summary([{"state": "deposited", "stack": n} for n in (36, 2, 1)]) == "已入箱 39 件"
+    assert bridge._work_store.effect_summary([{"state": "refilled"}]) == "水壶已补满"
+    assert bridge._work_store.effect_summary([{"state": "ate-food", "stack": 1}] * 4) == "已吃 4 份食物恢复体力"
+    bridge._work_store._mutate("S", lambda state: state.executions.append(ExecutionEntry(
+        command_id="hoe-partial", task_id="water-new", step_id="hoe", operation="hoe_tiles",
+        outcome="partial", effects=[{"state": "hoed"}] * 2, reason_code="STEP_PARTIAL",
+    )))
+    summary = bridge._work_store.recent_execution_summary("S")[-1]["summary"]
+    assert "已开垦 2 格" in summary
+    assert "还有未完成的地块" in summary
+    assert "STEP_PARTIAL" not in summary
+    bridge._work_store.add_todo("S", intent="核对鸡舍施工进度", trigger={"type": "calendar", "year": 1, "season": "spring", "day": 20})
+    bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 18}}
+    assert "春20日" in bridge._player_activity("S")["nextStep"]
+    bridge._latest_snapshot_payload["world"]["dayOfMonth"] = 21
+    assert bridge._player_activity("S")["nextStep"] == "接下来核对鸡舍进度，再继续养鸡安排。"
+    bridge._work_store.add_todo("S", intent="豪华鸡舍施工结束后核对容量，再继续养鸡", trigger={"type": "calendar", "year": 1, "season": "spring", "day": 23})
+    assert bridge._player_activity("S")["nextStep"] == "春23日核对鸡舍进度，再继续养鸡安排。"
+
+
+def test_quiet_autonomy_updates_named_work_panel_without_chat_chatter(tmp_path):
+    from stardew_ai_runtime.work_state import Step, Task
+
+    async def run():
+        bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        bridge._work_store._mutate("S", lambda state: (
+            state.tasks.append(Task(id="water", goal_id="g", title="浇好新种的菜地", status="running")),
+            state.decision.update(taskId="water", selected=True, finished=False),
+        ))
+        ws = type("Socket", (), {"send_text": AsyncMock()})()
+        running = Envelope.create_chat_reply(bridge.instance_id, "autonomy-test", "job-running", "routine", save_id="S")
+        assert await bridge._send_reply(ws, running)
+        await bridge._send_reply(ws, running)
+        assert ws.send_text.await_count == 1
+        payload = json.loads(ws.send_text.call_args.args[0])
+        assert payload["messageType"] == "life.profile.state"
+        assert payload["payload"]["work"]["activity"]["summary"] == "正在处理：浇好新种的菜地"
+        bridge._work_store._mutate("S", lambda state: (
+            setattr(state.tasks[0], "status", "completed"),
+            state.tasks[0].steps.append(Step(id="done", operation="water_zone", effects=[{"state": "watered"}] * 18)),
+            state.decision.update(finished=True),
+            setattr(state, "last_job", {"taskId": "water", "status": "completed"}),
+        ))
+        await bridge._send_reply(ws, Envelope.create_chat_reply(
+            bridge.instance_id, "autonomy-test", "job-completed", "routine", save_id="S"))
+        payload = json.loads(ws.send_text.call_args.args[0])
+        assert ws.send_text.await_count == 2
+        assert payload["payload"]["work"]["activity"]["summary"] == "浇好新种的菜地：已浇水 18 格。"
+        assert payload["payload"]["work"]["activity"]["phase"] == "completed"
+    asyncio.run(run())
+
+
 def test_propose_accept_real_work_terminal_reopen_panel(tmp_path, monkeypatch):
     monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda _: None)
 
@@ -160,7 +242,7 @@ def test_wire_schema_and_four_preferences():
     decor = LifeChatService.build_system_prompt({"playStyle": "decor"}, {}, {}, mode="plan")
     assert "摆放和回收家具、地板、围栏与物件" in decor
     assert "制造已解锁配方" in decor and "搬迁建筑" in decor
-    assert "新建升级建筑尚不支持" in decor
+    assert "服务柜台办理并等待真实工期" in decor
     assert "提交仍由玩家完成" in LifeChatService.build_system_prompt({"playStyle": "community"}, {}, {}, mode="plan")
 
 

@@ -573,7 +573,27 @@ def test_mcp_server_tool_registration(mock_scheduler):
         assert "toggle_animal_door" in tool_names
         assert "chop_tree" in tool_names
         assert {"observe_farm_space", "place_items", "remove_items"} <= set(tool_names)
-        assert len(tools) == 60
+        assert {"observe_production", "eat_food"} <= set(tool_names)
+        assert {"cut_grass", "observe_building_services", "build_building", "upgrade_building", "purchase_animal"} <= set(tool_names)
+        assert {"query_route", "read_guidance"} <= set(tool_names)
+        assert len(tool_names) == len(set(tool_names))
+        assert set(tool_names) == set("""
+            read_reload_history
+            apply_fertilizer autonomy_status build_building call_capability cancel_task
+            chop_tree clear_debris collect_animal_produce collect_machine craft_items
+            cut_grass deposit_to_chest discover_capabilities dispatch_plan_operation
+            eat_food feed_animals get_status get_work_overview harvest_and_store harvest_auto
+            hoe_tiles insert_machine manage_goal manage_milestones manage_companion manage_plan manage_todo
+            move_building navigate_to observe_building_services observe_crafting
+            observe_farm_space observe_farming_helpers observe_livestock observe_machines
+            observe_map_image observe_production organize_chest pause_task pet_animal
+            pickup_items place_items plant_crop_workflow plant_seeds purchase_animal
+            purchase_items query_chests query_farm_work query_inventory query_planting_options
+            query_route query_shop query_wiki read_guidance reconcile_plan_command
+            refill_watering_can remember_intent remove_items request_player_decision
+            resume_task run_next_step set_autonomy ship_items submit_plan toggle_animal_door
+            upgrade_building water_auto water_zone withdraw_from_chest work_plan_overview
+        """.split())
         assert "autonomy_status" in tool_names
         assert "set_autonomy" in tool_names
         assert "query_wiki" in tool_names
@@ -864,7 +884,7 @@ def test_mcp_server_call_deposit_to_chest(mock_scheduler, tmp_path):
         mock_scheduler.deposit_to_chest.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "deposit_to_chest"
-        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "detail": False}
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "detail": False, "location_id": "Farm"}
 
     asyncio.run(run())
 
@@ -881,7 +901,7 @@ def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler, tmp_p
         mock_scheduler.deposit_to_chest.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "deposit_to_chest"
-        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": None, "detail": False}
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": None, "detail": False, "location_id": "Farm"}
 
     asyncio.run(run())
 
@@ -932,10 +952,37 @@ def test_mcp_server_call_query_planting_options(mock_scheduler):
         assert data["season"] == "spring"
         assert data["companionHasHoe"] is True
         assert data["candidateTiles"]["tilledEmptyCount"] == 6
-        mock_scheduler.query_planting_options.assert_awaited_once_with(detail=False)
+        mock_scheduler.query_planting_options.assert_awaited_once_with(detail=False, location_id="Farm", region=None)
 
         await server.call_tool("query_planting_options", {"detail": True})
-        mock_scheduler.query_planting_options.assert_awaited_with(detail=True)
+        mock_scheduler.query_planting_options.assert_awaited_with(detail=True, location_id="Farm", region=None)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("tool,scheduler_method", [
+    ("query_planting_options", "query_planting_options"),
+    ("observe_farm_space", "query_farm_space"),
+])
+@pytest.mark.parametrize("through_gateway", [False, True])
+def test_saved_farm_region_survives_typed_and_gateway_calls(mock_scheduler, tool, scheduler_method, through_gateway):
+    """The real gateway supplies a dict, while direct MCP calls create SpatialRegion."""
+    async def run():
+        region = {"x": 41, "y": 22, "width": 12, "height": 8}
+        method = AsyncMock(return_value={"region": region, "capacity": 95})
+        setattr(mock_scheduler, scheduler_method, method)
+        server = create_mcp_server(scheduler=mock_scheduler)
+        params = {"location_id": "Farm", "region": region}
+        if through_gateway:
+            _, data = await server.call_tool("call_capability", {"tool": tool, "params": params})
+            data = data["result"]
+        else:
+            _, data = await server.call_tool(tool, params)
+        assert data["region"] == region
+        expected = {"location_id": "Farm", "region": region}
+        if tool == "query_planting_options":
+            expected["detail"] = False
+        method.assert_awaited_once_with(**expected)
 
     asyncio.run(run())
 
@@ -2031,6 +2078,46 @@ def test_internal_dispatch_plan_operation_forwards_stable_command_id(mock_schedu
     asyncio.run(run())
 
 
+def test_short_job_rejects_misspelled_navigation_parameters_before_saving(mock_scheduler, tmp_path, monkeypatch):
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("mock-save-123", "navigation-decision")
+    monkeypatch.setenv("STARDEW_DECISION_TOKEN", "navigation-decision")
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+
+    async def run():
+        with pytest.raises(ToolError, match="INVALID_JOB_PARAMETERS"):
+            await server.call_tool("submit_plan", {"goal_text": "打开鸡舍门", "tasks": [
+                {"title": "走到鸡舍门前", "steps": [{"operation": "navigate_to",
+                                                       "params": {"location_id": "Farm", "tile_x": 42, "tile_y": 36}}]},
+            ]})
+        assert not store.state("mock-save-123").tasks
+        assert not store.state("mock-save-123").decision.get("selected")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["build_building", "upgrade_building", "purchase_animal"])
+def test_service_target_map_is_checked_before_navigation_or_selection(mock_scheduler, tmp_path, monkeypatch, operation):
+    store = _grant_decision(tmp_path, mock_scheduler, token="service-decision")
+    monkeypatch.setenv("STARDEW_DECISION_TOKEN", "service-decision")
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+
+    async def run():
+        steps = [{"operation": "navigate_to", "params": {"location_id": "AnimalShop", "tile": {"x": 12, "y": 16}}},
+                 {"operation": operation, "params": {"location_id": "AnimalShop", "budget_limit": 800}}]
+        with pytest.raises(ToolError, match="target building"):
+            await server.call_tool("submit_plan", {"goal_text": "养鸡", "tasks": [{"title": "购鸡", "steps": steps}]})
+        assert not store.state("mock-save-123").tasks
+        assert not store.state("mock-save-123").decision.get("selected")
+        steps[1]["params"]["location_id"] = "Farm"
+        _, data = await server.call_tool("submit_plan", {"goal_text": "养鸡", "tasks": [{"title": "购鸡", "steps": steps}]})
+        assert data["executionScope"] == "one_short_job"
+        assert len(store.state("mock-save-123").tasks) == 1
+        assert store.state("mock-save-123").decision["selected"] is True
+
+    asyncio.run(run())
+
+
 def test_get_status_detail_keeps_real_native_sections(mock_scheduler):
     """detail=True must not drop the real inventory/weather/wallet sections."""
     mock_scheduler.run_dir = None
@@ -2111,7 +2198,7 @@ def test_manage_milestones_aliases_missing_and_conflicting_ids(mock_scheduler, t
                 todo_ids = saved["todoIds"]
         with pytest.raises(ToolError, match="unknown"):
             await server.call_tool("manage_milestones", {"action": "adopt", "id": "not-a-node"})
-        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "outside-player-conversation")
         with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
             await server.call_tool("manage_milestones", {"action": "adopt", "id": "spring-egg-festival-strawberry:y1"})
     asyncio.run(run())
@@ -2153,7 +2240,7 @@ def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
     }
     autonomy = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     autonomy.set_preferences(
-        "mock-save-123", goal="优先赚钱", budget_limit=500, box_preference="shipping"
+        "mock-save-123", goal="优先赚钱", box_preference="shipping"
     )
 
     async def run():
@@ -2187,7 +2274,7 @@ def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
 
         # The one-time reservation never becomes a per-day purchase budget.
         state = autonomy.state("mock-save-123")
-        assert state.budget_limit == 500
+        assert "budget_limit" not in state.__dict__
         assert state.daily_spend == 0
         # No decision/plan machinery was involved.
         assert store.state("mock-save-123").decision == {}
@@ -2233,6 +2320,13 @@ def test_manage_milestones_on_life_surface_is_not_job_wrapped(
     mock_scheduler.latest_snapshot = {
         "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
     }
+
+    import json
+    import time
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "life-snapshot.json").write_text(json.dumps({
+        "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot,
+    }), encoding="utf-8")
 
     async def run():
         monkeypatch.setenv("STARDEW_MCP_SURFACE", "life")

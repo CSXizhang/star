@@ -1,0 +1,10 @@
+{
+  "your-backend": {
+    "your-model": {
+      "uncachedInput": null,
+      "cachedInput": null,
+      "output": null,
+      "cacheWrite": null
+    }
+  }
+}

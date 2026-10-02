@@ -18,6 +18,8 @@ public sealed class TestNativeActionAdapter : INativeActionAdapter
     public bool SimulateFailure { get; set; }
     public string FailureMessage { get; set; } = "native failure";
     public bool SimulatePlayerActionRequired { get; set; }
+    public string? AnimationTool { get; set; }
+    public string? GetAnimationTool(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target) => AnimationTool;
 
     /// <summary>Return Continue() for the first N calls, simulating a multi-tick action.</summary>
     public int ContinueCallsBeforeSuccess { get; set; }

@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Reflection;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
@@ -10,6 +12,131 @@ namespace StardewAI.Companion.Mod.Transport.Tests;
 
 public class WebSocketTransportServerTests
 {
+    [Fact]
+    public async Task ChatSnapshotBackpressureReportsSafeTimeoutOnceOnGameThread()
+    {
+        var logs = new ConcurrentQueue<string>();
+        var problems = new List<string>();
+        int callbackThread = 0;
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler,
+            logger: (message, _) => logs.Enqueue(message));
+        server.OnChatChannelProblem += (_, _, reason) =>
+        {
+            callbackThread = Environment.CurrentManagedThreadId;
+            problems.Add(reason);
+        };
+        using var blockedSocket = new ControlledChatSocket(block: true);
+        SetChatSocket(server, blockedSocket, 1);
+        var snapshot = handler.CaptureCurrentSnapshot(1);
+        snapshot = snapshot with { Companion = snapshot.Companion with {
+            Activity = "private-payload-do-not-log" } };
+
+        // A transport whose write never completes exposes cancellation deterministically.
+        await server.SendSnapshotAsync(snapshot, 1).WaitAsync(TimeSpan.FromSeconds(12));
+        int updateThread = Environment.CurrentManagedThreadId;
+        server.Update();
+        Assert.Equal(updateThread, callbackThread);
+        Assert.Contains("快照发送超时（5秒）", Assert.Single(problems));
+        Assert.Contains(logs, l => l.Contains("Chat send timeout: world.snapshot, generation 1"));
+        Assert.DoesNotContain(logs, l => l.Contains("private-payload-do-not-log"));
+        Assert.DoesNotContain(problems, p => p.Contains("test-token"));
+        await server.SendSnapshotAsync(handler.CaptureCurrentSnapshot(2), 2);
+        server.Update();
+        Assert.Single(problems);
+    }
+
+    [Fact]
+    public async Task BlockedOldChatGenerationCannotReportFailureOrSendIntoReplacement()
+    {
+        var logs = new ConcurrentQueue<string>();
+        var problems = new List<string>();
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler,
+            logger: (message, _) => logs.Enqueue(message));
+        server.OnChatChannelProblem += (_, _, reason) => problems.Add(reason);
+        using var blockedSocket = new ControlledChatSocket(block: true);
+        SetChatSocket(server, blockedSocket, 1);
+        var small = handler.CaptureCurrentSnapshot(1);
+        Task blocked = server.SendSnapshotAsync(small, 1);
+        await blockedSocket.SendStarted.Task;
+        // Cache a small current snapshot; its old-generation send waits behind the blocked send.
+        Task oldQueued = server.SendSnapshotAsync(small, 2);
+        using var replacement = new ControlledChatSocket();
+        SetChatSocket(server, replacement, 2);
+
+        await Task.WhenAll(blocked, oldQueued).WaitAsync(TimeSpan.FromSeconds(12));
+        server.Update();
+        Assert.Empty(problems);
+        Assert.True(server.IsChatConnected);
+        Assert.Empty(replacement.SentMessages);
+        Assert.True(await server.SendChatSubmitAsync(new ChatSubmitPayload("new-request", "still connected", "text", "save")));
+        Assert.Contains("chat.submit", Assert.Single(replacement.SentMessages));
+    }
+
+    [Fact]
+    public async Task WebSocketFailureReturnsFalseAndDoesNotRepeatOrExposeExceptionPayload()
+    {
+        var logs = new ConcurrentQueue<string>();
+        var problems = new List<string>();
+        using var server = new WebSocketTransportServer(0, "test-token", new TestTransportHandler(),
+            logger: (message, _) => logs.Enqueue(message));
+        using var failing = new ControlledChatSocket(fail: true);
+        SetChatSocket(server, failing, 1);
+        server.OnChatChannelProblem += (_, _, reason) => problems.Add(reason);
+        var message = new ChatSubmitPayload("request", "private-message", "text", "save");
+        Assert.False(await server.SendChatSubmitAsync(message));
+        Assert.False(await server.SendChatSubmitAsync(message));
+        Assert.Empty(problems);
+        server.Update();
+        Assert.Contains("发送失败", Assert.Single(problems));
+        Assert.Single(logs.Where(l => l.Contains("Chat send WebSocket failure")));
+        Assert.DoesNotContain(logs, l => l.Contains("secret-from-exception") || l.Contains("private-message"));
+        SetChatSocket(server, failing, 2);
+        Assert.False(await server.SendChatSubmitAsync(message));
+        using var recovered = new ControlledChatSocket();
+        SetChatSocket(server, recovered, 3);
+        server.Update(); // a failure queued before replacement must be discarded too
+        Assert.Single(problems);
+        Assert.True(server.IsChatConnected);
+    }
+
+    private static void SetChatSocket(WebSocketTransportServer server, WebSocket socket, long generation)
+    {
+        typeof(WebSocketTransportServer).GetField("_chatSocket", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(server, socket);
+        typeof(WebSocketTransportServer).GetField("_chatSocketGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(server, generation);
+    }
+
+    private sealed class ControlledChatSocket : WebSocket
+    {
+        private readonly bool _block;
+        private readonly bool _fail;
+        private WebSocketState _state = WebSocketState.Open;
+        public TaskCompletionSource<bool> SendStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<string> SentMessages { get; } = new();
+        public ControlledChatSocket(bool block = false, bool fail = false) { _block = block; _fail = fail; }
+        public override WebSocketCloseStatus? CloseStatus => null;
+        public override string? CloseStatusDescription => null;
+        public override WebSocketState State => _state;
+        public override string? SubProtocol => null;
+        public override void Abort() { }
+        public override void Dispose() { }
+        public override Task CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
+        public override Task CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
+        public override Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public override async Task SendAsync(ArraySegment<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken)
+        {
+            SendStarted.TrySetResult(true);
+            if (_fail) throw new WebSocketException("secret-from-exception");
+            if (_block)
+            {
+                try { await Task.Delay(Timeout.Infinite, cancellationToken); }
+                catch (OperationCanceledException) { _state = WebSocketState.Aborted; throw; }
+            }
+            SentMessages.Add(Encoding.UTF8.GetString(buffer));
+        }
+    }
+
     [Fact]
     public async Task SpatialResultAbove64KbIsDeliveredAndOversizeResultBecomesTerminalError()
     {

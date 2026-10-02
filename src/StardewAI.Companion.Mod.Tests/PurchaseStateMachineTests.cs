@@ -12,6 +12,24 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public sealed class PurchaseStateMachineTests
 {
+    [Fact]
+    public void PausedCancelSettlesWithoutPurchaseOrSpending()
+    {
+        var (machine, actor, _, adapter) = CreateTestContext(new TileCoordinate(10, 12));
+        Assert.True(machine.Start(new PurchaseRequest("pause-buy", "task", "SeedShop", "SeedShop",
+            Items: new[] { new PurchaseItemRequest("(O)472", 1) }, BudgetLimit: 100), out _));
+        machine.RequestPause();
+        machine.Update(null, 1);
+        Assert.True(machine.IsPaused);
+        machine.RequestCancel("cancel paused purchase");
+        machine.Update(null, 2);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Empty(machine.FinalResult.PurchasedItems);
+        Assert.Equal(0, machine.FinalResult.TotalCost);
+        Assert.Equal(1000, adapter.AvailableMoney);
+        Assert.Equal(0, actor.GetItemCount("(O)472"));
+    }
+
     private static (PurchaseStateMachine machine, MechanicsActor actor, SimulatedWorldObserver observer, TestPurchaseAdapter adapter)
         CreateTestContext(TileCoordinate actorTile, string location = "SeedShop")
     {

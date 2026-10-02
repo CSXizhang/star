@@ -58,6 +58,13 @@ public sealed class CompanionActorState
     /// Stored active task ID on disk (if any). Must NEVER be auto-resumed on reload!
     /// </summary>
     public string? PersistedTaskId { get; set; }
+    public int? ResourceDay { get; set; }
+    public int OvernightBedtime { get; set; } = 2200;
+    public int? SleepDay { get; set; }
+    public int? SleepStartedAt { get; set; }
+    public int PreferredBedtime { get; set; } = 2400;
+    public bool Exhausted { get; set; }
+
 
     /// <summary>
     /// Creates a fresh instance with initial default values.

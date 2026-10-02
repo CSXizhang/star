@@ -10,5 +10,6 @@ public sealed record FarmDirtWorkItem(
     bool IsWatered,
     bool HasCrop,
     string? CropId,
-    bool IsHarvestable
+    bool IsHarvestable,
+    bool IsDead = false
 );

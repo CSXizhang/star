@@ -33,7 +33,8 @@ public sealed record WaterZoneRequest(
     int MaxGameMinutes,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
-    long ExpectedWorldRevision = 1
+    long ExpectedWorldRevision = 1,
+    bool IncludeEmptyTiles = true
 );
 
 public sealed record SkippedTileInfo(TileCoordinate Tile, string Reason);

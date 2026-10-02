@@ -56,7 +56,10 @@ public sealed record CompanionSnapshot(
     // companion wallet is a real per-save fact. Nullable so an older serialized
     // snapshot stays "unknown" instead of being read as a fabricated zero.
     [property: JsonPropertyName("availableMoney"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? AvailableMoney = null,
-    [property: JsonPropertyName("moneyStatus"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? MoneyStatus = null
+    [property: JsonPropertyName("moneyStatus"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? MoneyStatus = null,
+    [property: JsonPropertyName("restState"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? RestState = null,
+    [property: JsonPropertyName("bedtime"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Bedtime = null,
+    [property: JsonPropertyName("sleepStartedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? SleepStartedAt = null
 );
 
 public sealed record MatureCropTile(
@@ -74,13 +77,16 @@ public sealed record FarmWorkSnapshot(
     [property: JsonPropertyName("matureCropsTruncated")] bool MatureCropsTruncated = false,
     [property: JsonPropertyName("cropUnwateredTiles")] List<TileCoord>? CropUnwateredTiles = null,
     [property: JsonPropertyName("cropUnwateredCount")] int? CropUnwateredCount = null,
-    [property: JsonPropertyName("cropUnwateredTruncated")] bool CropUnwateredTruncated = false
+    [property: JsonPropertyName("cropUnwateredTruncated")] bool CropUnwateredTruncated = false,
+    [property: JsonPropertyName("deadCropCount")] int DeadCropCount = 0,
+    [property: JsonPropertyName("locationId")] string? LocationId = null,
+    [property: JsonPropertyName("observationStatus")] string ObservationStatus = "unknown"
 )
 {
     [JsonPropertyName("truncated")]
     public bool Truncated => IsTruncated;
 
-    public static FarmWorkSnapshot CreateEmpty() => new(
+    public static FarmWorkSnapshot CreateEmpty(string? locationId = null, string observationStatus = "unknown") => new(
         TilledUnwateredTiles: new List<TileCoord>(),
         TilledUnwateredCount: 0,
         IsTruncated: false,
@@ -89,7 +95,9 @@ public sealed record FarmWorkSnapshot(
         MatureCropsTruncated: false,
         CropUnwateredTiles: new List<TileCoord>(),
         CropUnwateredCount: 0,
-        CropUnwateredTruncated: false
+        CropUnwateredTruncated: false,
+        LocationId: locationId,
+        ObservationStatus: observationStatus
     );
 }
 
@@ -239,13 +247,21 @@ public sealed record WorldSnapshotPayload(
     [property: JsonPropertyName("shop"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ShopSnapshot? Shop = null,
     [property: JsonPropertyName("machines"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] MachinesSnapshot? Machines = null,
     [property: JsonPropertyName("livestock"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LivestockSnapshot? Livestock = null,
-    [property: JsonPropertyName("farming"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] FarmingSnapshot? Farming = null
+    [property: JsonPropertyName("farming"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] FarmingSnapshot? Farming = null,
+    [property: JsonPropertyName("productionSignals"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<ProductionSignal>? ProductionSignals = null,
+    [property: JsonPropertyName("productionSignalsTruncated"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ProductionSignalsTruncated = false
 );
 
 // ---------------------------------------------------------------------------
 // On-demand grouped observation sections (farming helpers / machines / livestock).
 // Nullable on WorldSnapshotPayload so an older reader/writer stays compatible.
 // ---------------------------------------------------------------------------
+
+public sealed record ProductionSignal(
+    [property: JsonPropertyName("locationId")] string LocationId,
+    [property: JsonPropertyName("tile")] TileCoord Tile,
+    [property: JsonPropertyName("isReady")] bool IsReady
+);
 
 public sealed record MachineSnapshot(
     [property: JsonPropertyName("tile")] TileCoord Tile,
@@ -282,7 +298,10 @@ public sealed record AnimalSnapshot(
     [property: JsonPropertyName("location"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Location = null,
     [property: JsonPropertyName("tile"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] TileCoord? Tile = null,
     [property: JsonPropertyName("wasPetToday")] bool WasPetToday = false,
-    [property: JsonPropertyName("wasAutoPetToday")] bool WasAutoPetToday = false
+    [property: JsonPropertyName("wasAutoPetToday")] bool WasAutoPetToday = false,
+    [property: JsonPropertyName("animalId")] string? AnimalId = null,
+    [property: JsonPropertyName("homeBuildingId")] string? HomeBuildingId = null,
+    [property: JsonPropertyName("sleepingBlocksPetting"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? SleepingBlocksPetting = null
 );
 
 public sealed record AnimalBuildingSnapshot(
@@ -298,14 +317,18 @@ public sealed record AnimalBuildingSnapshot(
     [property: JsonPropertyName("hayCount")] int HayCount,
     [property: JsonPropertyName("hayCapacity")] int HayCapacity,
     [property: JsonPropertyName("siloHayCount")] int SiloHayCount,
-    [property: JsonPropertyName("animals")] List<AnimalSnapshot> Animals
+    [property: JsonPropertyName("animals")] List<AnimalSnapshot> Animals,
+    [property: JsonPropertyName("buildingId")] string? BuildingId = null,
+    [property: JsonPropertyName("residentCount")] int ResidentCount = 0,
+    [property: JsonPropertyName("residentAnimalIds")] IReadOnlyList<string>? ResidentAnimalIds = null
 );
 
 public sealed record LivestockSnapshot(
     [property: JsonPropertyName("buildingsTruncated")] bool BuildingsTruncated,
     [property: JsonPropertyName("animalsTruncated")] bool AnimalsTruncated,
     [property: JsonPropertyName("buildings")] List<AnimalBuildingSnapshot> Buildings,
-    [property: JsonPropertyName("roamingAnimals")] List<AnimalSnapshot> RoamingAnimals
+    [property: JsonPropertyName("roamingAnimals")] List<AnimalSnapshot> RoamingAnimals,
+    [property: JsonPropertyName("roamingScopeLocationId")] string? RoamingScopeLocationId = null
 );
 
 public sealed record GroundItemSnapshot(
@@ -319,7 +342,8 @@ public sealed record GroundItemSnapshot(
     [property: JsonPropertyName("canBeGrabbed")] bool CanBeGrabbed,
     [property: JsonPropertyName("clearTool"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ClearTool = null,
     [property: JsonPropertyName("isStone")] bool IsStone = false,
-    [property: JsonPropertyName("isTwig")] bool IsTwig = false
+    [property: JsonPropertyName("isTwig")] bool IsTwig = false,
+    [property: JsonPropertyName("quality"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Quality = null
 );
 
 public sealed record ChoppableTreeSnapshot(
@@ -341,7 +365,12 @@ public sealed record FarmingSnapshot(
     // the Mod never grants tools, and the model needs to know what it can act with.
     [property: JsonPropertyName("companionTools")] List<string> CompanionTools,
     [property: JsonPropertyName("choppableTrees")] List<ChoppableTreeSnapshot>? ChoppableTrees = null,
-    [property: JsonPropertyName("choppableTreesTruncated")] bool ChoppableTreesTruncated = false
+    [property: JsonPropertyName("choppableTreesTruncated")] bool ChoppableTreesTruncated = false,
+    [property: JsonPropertyName("refillWaterScope")] string RefillWaterScope = "near-companion",
+    [property: JsonPropertyName("refillWaterRadius")] int RefillWaterRadius = 12,
+    [property: JsonPropertyName("refillWaterCenter")] TileCoord? RefillWaterCenter = null,
+    [property: JsonPropertyName("refillWaterTilesTruncated")] bool RefillWaterTilesTruncated = false,
+    [property: JsonPropertyName("refillWaterMapComplete")] bool RefillWaterMapComplete = false
 );
 
 
@@ -364,7 +393,7 @@ public sealed record WaterZoneParameters(
 )
 {
     [JsonPropertyName("includeEmptyTiles")]
-    public bool IncludeEmptyTiles { get; init; }
+    public bool IncludeEmptyTiles { get; init; } = true;
     [JsonPropertyName("tile")]
     public TileCoord? Tile { get; init; }
 
@@ -400,6 +429,12 @@ public sealed record WaterZoneParameters(
 
     [JsonPropertyName("animalName")]
     public string? AnimalName { get; init; }
+    [JsonPropertyName("animalId")]
+    public string? AnimalId { get; init; }
+    [JsonPropertyName("animalType")]
+    public string? AnimalType { get; init; }
+    [JsonPropertyName("buildingType")]
+    public string? BuildingType { get; init; }
 
     [JsonPropertyName("buildingName")]
     public string? BuildingName { get; init; }
@@ -515,7 +550,9 @@ public sealed record ChatReplyPayload(
     // A logical player instruction spans provider turns and native jobs.
     // Null retains the legacy per-request terminal semantics.
     [property: JsonPropertyName("commandId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CommandId = null,
-    [property: JsonPropertyName("commandComplete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? CommandComplete = null
+    [property: JsonPropertyName("commandComplete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? CommandComplete = null,
+    [property: JsonPropertyName("resumeWorkRequested"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? ResumeWorkRequested = null,
+    [property: JsonPropertyName("readOnly"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? ReadOnly = null
 );
 
 public sealed record ChatCancelPayload(
@@ -547,7 +584,11 @@ public sealed record AutonomyStatePayload(
     [property: JsonPropertyName("lastPlanAction")] JsonObject? LastPlanAction = null,
     [property: JsonPropertyName("planWaitReason")] string? PlanWaitReason = null,
     [property: JsonPropertyName("waitingConditions")] List<WaitingConditionPayload>? WaitingConditions = null,
-    [property: JsonPropertyName("hasExecutableWork")] bool? HasExecutableWork = null
+    [property: JsonPropertyName("hasExecutableWork")] bool? HasExecutableWork = null,
+    [property: JsonPropertyName("usageTodayText")] string? UsageTodayText = null,
+    [property: JsonPropertyName("controlAction"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ControlAction = null,
+    [property: JsonPropertyName("usageSaveTodayText")] string? UsageSaveTodayText = null,
+    [property: JsonPropertyName("usageSaveTotalText")] string? UsageSaveTotalText = null
 );
 
 // Same object schema as WorkStore.wait_conditions; never a list of display strings.
@@ -578,7 +619,11 @@ public sealed record LifeChatSubmitPayload(
     [property: JsonPropertyName("mode")] string Mode,      // "chat" | "plan"
     [property: JsonPropertyName("text")] string Text,
     [property: JsonPropertyName("source")] string Source = "life-menu",
-    [property: JsonPropertyName("acceptedNodeId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AcceptedNodeId = null
+    [property: JsonPropertyName("acceptedNodeId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AcceptedNodeId = null,
+    [property: JsonPropertyName("replyToNoticeId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReplyToNoticeId = null,
+    [property: JsonPropertyName("resolveNotice"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ResolveNotice = false,
+    [property: JsonPropertyName("noticeAction"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? NoticeAction = null,
+    [property: JsonPropertyName("noticeIds"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? NoticeIds = null
 );
 
 /// <summary>
@@ -596,7 +641,8 @@ public sealed record LifeChatReplyPayload(
     [property: JsonPropertyName("error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null,
     [property: JsonPropertyName("proposalReady"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ProposalReady = false,
     [property: JsonPropertyName("proposalNodeId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ProposalNodeId = null,
-    [property: JsonPropertyName("activity"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionActivityDto? Activity = null
+    [property: JsonPropertyName("activity"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionActivityDto? Activity = null,
+    [property: JsonPropertyName("answeredNoticeId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AnsweredNoticeId = null
 );
 
 public sealed record CompanionActivityDto(
@@ -624,7 +670,8 @@ public sealed record CompanionProfileDto(
     [property: JsonPropertyName("playStyle")] string PlayStyle,
     [property: JsonPropertyName("personality")] string Personality,
     [property: JsonPropertyName("careFrequency")] string CareFrequency,
-    [property: JsonPropertyName("companionName")] string CompanionName
+    [property: JsonPropertyName("companionName")] string CompanionName,
+    [property: JsonPropertyName("bedtime")] int Bedtime = 2400
 );
 
 /// <summary>
@@ -635,7 +682,6 @@ public sealed record CompanionWorkStateDto(
     [property: JsonPropertyName("mode")] string Mode,
     [property: JsonPropertyName("paused")] bool Paused,
     [property: JsonPropertyName("goal"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Goal = null,
-    [property: JsonPropertyName("dailySpendLimit"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DailySpendLimit = null,
     [property: JsonPropertyName("boxPreference"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? BoxPreference = null,
     [property: JsonPropertyName("dailySpend"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DailySpend = null,
     [property: JsonPropertyName("hasExecutableWork")] bool HasExecutableWork = false,
@@ -646,14 +692,25 @@ public sealed record CompanionWorkStateDto(
     [property: JsonPropertyName("recentTodos"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<RecentTodoDto>? RecentTodos = null,
     [property: JsonPropertyName("waitingConditions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<string>? WaitingConditions = null,
     [property: JsonPropertyName("activity"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CompanionActivityDto? Activity = null,
-    [property: JsonPropertyName("recentExecutions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<RecentExecutionDto>? RecentExecutions = null
+    [property: JsonPropertyName("recentExecutions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<RecentExecutionDto>? RecentExecutions = null,
+    [property: JsonPropertyName("playerDecisions"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<PlayerDecisionDto>? PlayerDecisions = null,
+    [property: JsonPropertyName("currentGoalId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CurrentGoalId = null,
+    [property: JsonPropertyName("pauseReason"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PauseReason = null,
+    [property: JsonPropertyName("updatedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? UpdatedAt = null
 );
 
 /// <summary>Active goal entry within <see cref="CompanionWorkStateDto"/>.</summary>
+public sealed record PlayerDecisionDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("goalId")] string? GoalId = null);
+
 public sealed record ActiveGoalDto(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("text")] string Text,
-    [property: JsonPropertyName("status")] string Status
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("summary"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Summary = null
 );
 
 /// <summary>Recent todo entry within <see cref="CompanionWorkStateDto"/>.</summary>
@@ -695,7 +752,8 @@ public sealed record LifeProfilePatchDto(
     [property: JsonPropertyName("playStyle"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PlayStyle = null,
     [property: JsonPropertyName("personality"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Personality = null,
     [property: JsonPropertyName("careFrequency"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CareFrequency = null,
-    [property: JsonPropertyName("companionName"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CompanionName = null
+    [property: JsonPropertyName("companionName"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CompanionName = null,
+    [property: JsonPropertyName("bedtime"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Bedtime = null
 );
 
 /// <summary>
@@ -816,4 +874,8 @@ public sealed record RecentExecutionDto(
     [property: JsonPropertyName("taskTitle")] string TaskTitle,
     [property: JsonPropertyName("gameDate")] string? GameDate,
     [property: JsonPropertyName("outcome")] string Outcome,
-    [property: JsonPropertyName("summary")] string Summary);
+    [property: JsonPropertyName("summary")] string Summary,
+    [property: JsonPropertyName("reasonCode"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReasonCode = null,
+    [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Reason = null,
+    [property: JsonPropertyName("gameTime"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? GameTime = null,
+    [property: JsonPropertyName("recordedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? RecordedAt = null);

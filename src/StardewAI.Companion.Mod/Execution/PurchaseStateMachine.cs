@@ -173,7 +173,13 @@ public sealed class PurchaseStateMachine : ISkillExecutionMachine
     {
         lock (_stateLock)
         {
-            if (!IsExecuting || IsPaused) return;
+            if (!IsExecuting) return;
+            if (IsPaused && _cancelRequested)
+            {
+                FinishExecution(ExecutionState.Cancelled, _cancelReason ?? "Purchase cancelled by user.", "CANCELLED");
+                return;
+            }
+            if (IsPaused) return;
 
             _elapsedTicks++;
 

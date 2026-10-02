@@ -8,6 +8,42 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class NativeActionStateMachineTests
 {
+    [Fact]
+    public void PausedCancelSettlesAndPreservesConfirmedEffectsWithoutAnotherAction()
+    {
+        var (machine, _, _, adapter) = CreateHarness();
+        Assert.True(machine.Start(Request(NativeActionKind.PlaceItems,
+            new TileCoordinate(10, 11), new TileCoordinate(11, 10)), out _));
+        for (int tick = 0; tick < 100 && machine.CurrentTargetIndex == 0; tick++) machine.StepTicks(1);
+        Assert.Equal(1, adapter.CallCount);
+        machine.RequestPause();
+        machine.StepTicks(100);
+        Assert.True(machine.IsPaused);
+        machine.RequestCancel("cancel paused work");
+        machine.StepTicks(1);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Single(machine.FinalResult.Effects);
+        Assert.Equal(1, adapter.CallCount);
+    }
+
+    [Fact]
+    public void VisibleSwingAppliesOneEffectAndCancelPreservesOnlyThatSwing()
+    {
+        var (machine, actor, _, adapter) = CreateHarness(initialTile: new TileCoordinate(10, 10));
+        adapter.AnimationTool = "Axe";
+        adapter.ContinueCallsBeforeSuccess = 3;
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        for (int tick = 0; tick < 30 && adapter.CallCount == 0; tick++) machine.StepTicks(1);
+        Assert.Equal(1, adapter.CallCount);
+        machine.RequestCancel("stop after this swing");
+        machine.StepTicks(100);
+        Assert.Equal(1, adapter.CallCount);
+        Assert.Equal(269f, actor.Stamina);
+        Assert.Equal(1f, machine.FinalResult!.StaminaUsed);
+        Assert.Empty(machine.FinalResult.Effects);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult.FinalState);
+    }
+
     [Theory]
     [InlineData(11, 10)]
     [InlineData(10, 11)]

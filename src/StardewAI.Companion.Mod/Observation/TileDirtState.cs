@@ -8,6 +8,7 @@ public sealed record TileDirtState
     public bool IsTilled { get; init; }
     public bool IsWatered { get; init; }
     public bool HasCrop { get; init; }
+    public bool IsDead { get; init; }
     public string? CropId { get; init; }
     public bool IsHarvestable { get; init; }
 

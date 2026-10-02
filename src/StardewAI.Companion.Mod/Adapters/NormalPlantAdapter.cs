@@ -10,7 +10,7 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// <summary>
 /// Production adapter for single-tile seed planting using normal game HoeDirt.plant mechanics.
 /// Enforces:
-/// 1. Main-thread and current-map execution.
+/// 1. Main-thread execution on the companion's loaded map.
 /// 2. Adjacency check.
 /// 3. Seed availability precheck in companion inventory.
 /// 4. Tile must be tilled soil without existing crop or obstacle (CRITICAL: preserve existing crops).
@@ -49,11 +49,15 @@ public sealed class NormalPlantAdapter : IPlantAdapter
             return PlantTileResult.Failed("Plant operation rejected: must execute on the game main thread.");
         }
 
-        // 2. Current map invariant
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        // 2. The companion's map is independent of the human player's active map.
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return PlantTileResult.Failed(
-                $"Plant target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Plant target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return PlantTileResult.Failed($"Plant target map '{locationName}' is not loaded or does not exist.");
         }
 
         // 3. Adjacency check
@@ -84,7 +88,7 @@ public sealed class NormalPlantAdapter : IPlantAdapter
                 $"Tile {targetTile} is not tilled soil.", skipReason: "not-tilled");
         }
 
-        var location = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+        var location = Game1.getLocationFromName(locationName);
         if (location is null)
         {
             return PlantTileResult.Failed($"Game location '{locationName}' not found.");

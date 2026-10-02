@@ -9,6 +9,27 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class WaterZoneStateMachineTests
 {
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 2)]
+    public void CropOnlySelectionDoesNotSpendWaterOnEmptySoil(bool includeEmpty, int expectedWatered)
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var crop = new TileCoordinate(10, 12);
+        var empty = new TileCoordinate(11, 12);
+        observer.SetDirt(crop, TileDirtState.DryDirt(hasCrop: true));
+        observer.SetDirt(empty, TileDirtState.DryDirt());
+        Assert.True(machine.Start(new WaterZoneRequest("crop-filter", "crop-filter-task", "Farm",
+            new[] { crop, empty }, 20, 20, 60, IncludeEmptyTiles: includeEmpty), out _));
+        machine.StepTicks(200);
+        var result = machine.FinalResult!;
+        Assert.Equal(expectedWatered, result.WateredTiles.Count);
+        Assert.Equal(40 - expectedWatered, actor.WaterLeft);
+        Assert.Equal(270f - 2f * expectedWatered, actor.Stamina);
+        Assert.True(observer.GetDirtState("Farm", crop).IsWatered);
+        Assert.Equal(includeEmpty, observer.GetDirtState("Farm", empty).IsWatered);
+    }
+
     private (WaterZoneStateMachine machine, MechanicsActor actor, SimulatedWorldObserver observer, TestWateringCanAdapter adapter) CreateHarness(
         float initialStamina = 270f,
         int initialWater = 40,
@@ -25,6 +46,19 @@ public class WaterZoneStateMachineTests
 
         var machine = new WaterZoneStateMachine(actor, observer, navigator, adapter, avatar);
         return (machine, actor, observer, adapter);
+    }
+
+    [Fact]
+    public void DeadCropsAreSkippedWithoutWaterOrStaminaConsumption()
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var tile = new TileCoordinate(10, 12);
+        observer.SetDirt(tile, TileDirtState.DryDirt(hasCrop: true) with { IsDead = true });
+        Assert.True(machine.Start(new WaterZoneRequest("dead", "dead-task", "Farm", new[] { tile }, 20, 20, 60), out var result));
+        Assert.NotNull(result);
+        Assert.Equal(270f, actor.Stamina);
+        Assert.Equal(40, actor.WaterLeft);
+        Assert.False(observer.GetDirtState("Farm", tile).IsWatered);
     }
 
     [Fact]

@@ -1,4 +1,8 @@
 using System.Text.Json;
+using StardewAI.Companion.Mod.Domain;
+using StardewAI.Companion.Mod.Execution;
+using StardewAI.Companion.Mod.Navigation;
+using StardewAI.Companion.Mod.Observation;
 using StardewAI.Companion.Mod.Transport;
 using Xunit;
 
@@ -12,6 +16,82 @@ namespace StardewAI.Companion.Mod.Tests;
 /// </summary>
 public class SnapshotSchemaTests
 {
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(100, true)]
+    public void ActualRefillSnapshotCarriesNearbyScopeCenterRadiusAndTruncation(int count, bool truncated)
+    {
+        var actor = new MechanicsActor("refill-scope");
+        actor.UpdatePose("Farm", new(20, 20), FacingDirection.Down);
+        var observer = new SimulatedWorldObserver();
+        observer.SetRefillTiles(Enumerable.Range(0, count)
+            .Select(i => new TileCoordinate(15 + i % 10, 15 + i / 10)));
+        var coordinator = new CompanionMechanicsCoordinator(actor, observer,
+            new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
+        var farming = json.RootElement.GetProperty("farming");
+        Assert.Equal("Farm", farming.GetProperty("location").GetString());
+        Assert.Equal("near-companion", farming.GetProperty("refillWaterScope").GetString());
+        Assert.Equal(12, farming.GetProperty("refillWaterRadius").GetInt32());
+        Assert.Equal(20, farming.GetProperty("refillWaterCenter").GetProperty("x").GetInt32());
+        Assert.Equal(20, farming.GetProperty("refillWaterCenter").GetProperty("y").GetInt32());
+        Assert.Equal(truncated, farming.GetProperty("refillWaterTilesTruncated").GetBoolean());
+        Assert.False(farming.GetProperty("refillWaterMapComplete").GetBoolean());
+        Assert.Equal(count == 0 ? 0 : 16, farming.GetProperty("refillWaterTiles").GetArrayLength());
+    }
+
+    [Theory]
+    [InlineData("Farm", false, "observed")]
+    [InlineData("Coop-unique-one", false, "not-observed")]
+    [InlineData("Farm", true, "unavailable")]
+    public void ActualFarmWorkSnapshotIdentifiesUnobservedMapsAndFailures(string location, bool failScan, string status)
+    {
+        var actor = new MechanicsActor("farm-scope");
+        actor.UpdatePose(location, new(1, 1), FacingDirection.Down);
+        var observer = new SimulatedWorldObserver { CurrentLocationName = location };
+        if (failScan) observer.FarmWorkScanFailure = new InvalidOperationException("Unavailable farm scan");
+        var coordinator = new CompanionMechanicsCoordinator(actor, observer,
+            new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
+        foreach (var farm in new[] { json.RootElement.GetProperty("farmWork"), json.RootElement.GetProperty("world").GetProperty("farmWork") })
+        {
+            Assert.Equal(location, farm.GetProperty("locationId").GetString());
+            Assert.Equal(status, farm.GetProperty("observationStatus").GetString());
+        }
+    }
+
+    [Fact]
+    public void FarmScopeAndDailyUsageWireStayBackwardCompatibleWithoutInventingUsage()
+    {
+        var unknown = FarmWorkSnapshot.CreateEmpty();
+        Assert.Null(unknown.LocationId);
+        Assert.Equal("unknown", unknown.ObservationStatus);
+        const string legacy = "{\"requestId\":\"r\",\"saveId\":\"s\",\"mode\":\"free\",\"paused\":false,\"dailySpend\":0,\"status\":\"ok\"}";
+        var state = JsonSerializer.Deserialize<AutonomyStatePayload>(legacy, Options)!;
+        Assert.Null(state.UsageTodayText);
+        state = state with { UsageTodayText = "2026-10-02 · 今日token 1,000 · API估算 unavailable" };
+        var encoded = JsonSerializer.Serialize(state, Options);
+        Assert.Equal(state.UsageTodayText, JsonSerializer.Deserialize<AutonomyStatePayload>(encoded, Options)!.UsageTodayText);
+    }
+    [Fact]
+    public void Ground_item_native_quality_survives_snapshot_wire_and_missing_is_unknown()
+    {
+        var actor = new MechanicsActor("quality-test");
+        actor.UpdatePose("Farm", new TileCoordinate(1, 1), FacingDirection.Down);
+        var observer = new SimulatedWorldObserver();
+        observer.SetGroundItems(new[]
+        {
+            new GroundItemScanInfo(new(1, 1), "object", "(O)176", "Egg", 1, false, false, true, null, Quality: 2),
+            new GroundItemScanInfo(new(2, 1), "dropped", "(O)176", "Egg", 1, true, false, true, null),
+        });
+        var coordinator = new CompanionMechanicsCoordinator(actor, observer,
+            new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
+        var items = json.RootElement.GetProperty("farming").GetProperty("groundItems");
+        Assert.Equal(2, items[0].GetProperty("quality").GetInt32());
+        Assert.False(items[1].TryGetProperty("quality", out _));
+    }
+
     private static readonly JsonSerializerOptions Options = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,

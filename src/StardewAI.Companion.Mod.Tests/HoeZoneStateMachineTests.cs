@@ -10,6 +10,23 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class HoeZoneStateMachineTests
 {
+    [Fact]
+    public void PausedCancelSettlesWithoutHoeEffects()
+    {
+        var (machine, _, observer, _) = CreateHarness();
+        var tile = new TileCoordinate(10, 12);
+        Assert.True(machine.Start(new HoeZoneRequest("paused-hoe", "task", "Farm", new[] { tile }), out _));
+        machine.StepTicks(2);
+        machine.RequestPause();
+        machine.StepTicks(1);
+        Assert.True(machine.IsPaused);
+        machine.RequestCancel("cancel paused hoe");
+        machine.StepTicks(1);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Empty(machine.FinalResult.HoedTiles);
+        Assert.False(observer.GetDirtState("Farm", tile).IsTilled);
+    }
+
     private (HoeZoneStateMachine machine, MechanicsActor actor, SimulatedWorldObserver observer, TestHoeAdapter adapter) CreateHarness(
         float initialStamina = 270f,
         TileCoordinate? initialTile = null,
@@ -239,7 +256,7 @@ public class HoeZoneStateMachineTests
             CommandId: "cmd-loc",
             TaskId: "task-loc",
             LocationId: "Farm",
-            TargetTiles: new[] { new TileCoordinate(10, 12) },
+            TargetTiles: new[] { new TileCoordinate(10, 11) },
             MaxStamina: 50f
         );
 
@@ -247,6 +264,10 @@ public class HoeZoneStateMachineTests
         if (expectedAccepted)
         {
             Assert.Null(early);
+            machine.StepTicks(200);
+            Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+            Assert.Single(machine.FinalResult.HoedTiles);
+            Assert.True(observer.GetDirtState("Farm", request.TargetTiles[0]).IsTilled);
         }
         else
         {

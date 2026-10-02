@@ -211,6 +211,14 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 {
                     _skippedTiles.Add(new SkippedTileInfo(tile, "NotTilled"));
                 }
+                else if (dirt.IsDead)
+                {
+                    _skippedTiles.Add(new SkippedTileInfo(tile, "DeadCrop"));
+                }
+                else if (!request.IncludeEmptyTiles && !dirt.HasCrop)
+                {
+                    _skippedTiles.Add(new SkippedTileInfo(tile, "NoCrop"));
+                }
                 else if (dirt.IsWatered)
                 {
                     _skippedTiles.Add(new SkippedTileInfo(tile, "AlreadyWatered"));
@@ -294,7 +302,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             // 3. Game-level pause, open menus, saving, world not ready
             try
             {
-                if (Game1.paused || Game1.activeClickableMenu != null || !Context.IsWorldReady)
+                if (Game1.paused || StardewAI.Companion.Mod.Menus.CompanionMenuClock.HasBlockingMenu || !Context.IsWorldReady)
                 {
                     _actor.Halt();
                     return;
@@ -550,6 +558,12 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
 
         // Pre-tool re-observation: check if tile was watered concurrently
         var dirt = _observer.GetDirtState(_currentRequest!.LocationId, _currentTargetTile);
+        if (!_currentRequest.IncludeEmptyTiles && (!dirt.HasCrop || dirt.IsDead))
+        {
+            _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, dirt.IsDead ? "DeadCrop" : "NoCrop"));
+            AdvanceToNextTarget();
+            return;
+        }
         if (dirt.IsWatered)
         {
             _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "ConcurrentlyWatered"));

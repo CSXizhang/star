@@ -55,6 +55,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
 
     private readonly HashSet<string> _cancelledTaskIds = new();
 
+    public CompanionRestController Rest { get; }
     public IFarmerActor Actor => _actor;
     public CompanionAvatar? Avatar => _avatar;
     public WaterZoneStateMachine StateMachine => _stateMachine;
@@ -192,6 +193,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
         _navigationMachine = new NavigationStateMachine(_actor, _observer, _navigator, _mapGraph, _avatar, log);
         _navigationMachine.OnCompleted += HandleNavigationCompleted;
         _navigationMachine.OnNotification += msg => OnNotification?.Invoke(msg);
+        Rest = new CompanionRestController(_actor, new NavigationStateMachine(_actor, _observer, _navigator, _mapGraph, _avatar, log));
     }
 
     private readonly Action<string, StardewModdingAPI.LogLevel>? _log;
@@ -209,6 +211,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
     /// </summary>
     public void Update(GameTime? time, long tickCount)
     {
+        Rest.Update(time, tickCount, ActiveMachine);
         _stateMachine.Update(time, tickCount);
         _harvestMachine?.Update(time, tickCount);
         _chestMachine?.Update(time, tickCount);
@@ -587,6 +590,11 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
 
     private bool TryCheckIdle(out string? rejectReason)
     {
+        if (Rest.IsResting)
+        {
+            rejectReason = "BEDTIME: companion is resting; resume unfinished work tomorrow.";
+            return false;
+        }
         if (_actor.ActiveTaskId is not null || _stateMachine.IsExecuting ||
             _harvestMachine?.IsExecuting == true || _chestMachine?.IsExecuting == true ||
             _hoeMachine?.IsExecuting == true || _plantMachine?.IsExecuting == true ||
@@ -640,21 +648,34 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 "place-items" => NativeActionKind.PlaceItems,
                 "remove-items" => NativeActionKind.RemoveItems,
                 "craft-items" => NativeActionKind.CraftItems,
+                "cut-grass" => NativeActionKind.CutGrass,
+                "eat-food" => NativeActionKind.EatFood,
+                "build-building" => NativeActionKind.BuildBuilding,
+                "upgrade-building" => NativeActionKind.UpgradeBuilding,
+                "purchase-animal" => NativeActionKind.PurchaseAnimal,
                 "move-building" => NativeActionKind.MoveBuilding,
                 _ => null
             };
 
-            if (skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting")
+            if (skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting" or "inspect-machines" or "inspect-production" or "inspect-building-services" or "inspect-planting" or "inspect-route" or "inspect-livestock" or "inspect-shop")
             {
                 try
                 {
-                    var space = skillId == "inspect-location"
+                    object space = skillId == "inspect-location"
                         ? _observer.InspectLocation(payload.Parameters.LocationId, payload.Parameters.Region is { } region ? new Rectangle(region.X, region.Y, region.Width, region.Height) : null)
+                        : skillId == "inspect-livestock" ? InspectLivestock(payload.Parameters.LocationId)
+                        : skillId == "inspect-shop" ? InspectShop(payload.Parameters.ShopId ?? throw new ArgumentException("Shop ID is required."))
+                        : skillId == "inspect-route" ? _navigationMachine.PreviewRoute(payload.Parameters.LocationId,
+                            payload.Parameters.Tile is { } routeTile ? new TileCoordinate(routeTile.X, routeTile.Y) : throw new ArgumentException("Route destination tile is required."))
+                        : skillId == "inspect-planting" ? _observer.InspectPlanting(payload.Parameters.LocationId, _actor, payload.Parameters.Region is { } plot ? new Rectangle(plot.X, plot.Y, plot.Width, plot.Height) : null)
+                        : skillId == "inspect-building-services" ? NormalNativeActionAdapter.InspectBuildingServices(payload.Parameters.LocationId)
+                        : skillId == "inspect-machines" ? _observer.InspectMachines(payload.Parameters.LocationId)
+                        : skillId == "inspect-production" ? _observer.InspectProduction(payload.Parameters.LocationId, _actor)
                         : skillId == "inspect-crafting" ? _observer.InspectCrafting(_actor)
                         : _observer.InspectMapImage(payload.Parameters.LocationId);
                     var result = new SkillResultPayload(payload.CommandId, payload.TaskId, "succeeded", 0, 0, 0,
                         _observer.WorldRevision, new(), new SkillResultResources(0, 0, 0), SkillId: skillId,
-                        Details: new Dictionary<string, object> { [skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-crafting" ? "crafting" : "mapImage"] = space });
+                        Details: new Dictionary<string, object> { [skillId == "inspect-shop" ? "shop" : skillId == "inspect-livestock" ? "livestock" : skillId == "inspect-route" ? "route" : skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-planting" ? "planting" : skillId == "inspect-crafting" ? "crafting" : skillId == "inspect-building-services" ? "buildingServices" : skillId == "inspect-machines" ? "machines" : skillId == "inspect-production" ? "production" : "mapImage"] = space });
                     _lastSkillResultPayload = result;
                     if (_transportServer is not null)
                         _ = _transportServer.SendSkillResultAsync(result, envelope.MessageId, envelope.IdempotencyKey);
@@ -739,6 +760,20 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     rejectResult = BuildRejection(payload, "INVALID_PARAMETERS", "Construction requires itemId and 1-64 explicit tiles.", retryable: false);
                     return false;
                 }
+                if (nativeKind is NativeActionKind.BuildBuilding or NativeActionKind.UpgradeBuilding or NativeActionKind.PurchaseAnimal &&
+                    (payload.Parameters.EffectiveBudgetLimit is not > 0
+                     || nativeKind == NativeActionKind.BuildBuilding && (payload.Parameters.Tile is null || string.IsNullOrWhiteSpace(payload.Parameters.BuildingType))
+                     || nativeKind == NativeActionKind.UpgradeBuilding && (string.IsNullOrWhiteSpace(payload.Parameters.BuildingName)||string.IsNullOrWhiteSpace(payload.Parameters.BuildingType))
+                     || nativeKind == NativeActionKind.PurchaseAnimal && (string.IsNullOrWhiteSpace(payload.Parameters.BuildingName)||string.IsNullOrWhiteSpace(payload.Parameters.AnimalType)||string.IsNullOrWhiteSpace(payload.Parameters.AnimalName) && string.IsNullOrWhiteSpace(payload.Parameters.AnimalId))))
+                {
+                    rejectResult=BuildRejection(payload,"INVALID_PARAMETERS","Building services require a positive budget limit and explicit service targets.",retryable:false);
+                    return false;
+                }
+                if (nativeKind == NativeActionKind.EatFood && (string.IsNullOrWhiteSpace(payload.Parameters.ItemId) || (payload.Parameters.ItemCount ?? 1) != 1))
+                {
+                    rejectResult = BuildRejection(payload, "INVALID_PARAMETERS", "Eating requires itemId and exactly one food item.", retryable: false);
+                    return false;
+                }
                 if (nativeKind == NativeActionKind.CraftItems &&
                     (string.IsNullOrWhiteSpace(payload.Parameters.RecipeName) || (payload.Parameters.ItemCount ?? 1) is < 1 or > 64))
                 {
@@ -756,7 +791,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     or NativeActionKind.PickupItems or NativeActionKind.CollectMachine
                     or NativeActionKind.PetAnimal or NativeActionKind.CollectAnimalProduce
                     or NativeActionKind.ToggleAnimalDoor or NativeActionKind.ChopTree
-                    or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems;
+                    or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems or NativeActionKind.CutGrass;
 
                 if (needsTiles && (payload.Parameters.Tiles is null || payload.Parameters.Tiles.Count == 0))
                 {
@@ -781,7 +816,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 }
 
                 if (nativeKind is NativeActionKind.PetAnimal or NativeActionKind.CollectAnimalProduce &&
-                    string.IsNullOrWhiteSpace(payload.Parameters.AnimalName))
+                    string.IsNullOrWhiteSpace(payload.Parameters.AnimalName) && string.IsNullOrWhiteSpace(payload.Parameters.AnimalId))
                 {
                     rejectResult = BuildRejection(payload, "INVALID_PARAMETERS",
                         $"parameters.animalName is required for {payload.SkillId}.", retryable: false);
@@ -817,7 +852,8 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     MaxGameMinutes: payload.Budgets.MaxGameMinutes,
                     CancelPolicy: payload.CancelPolicy,
                     IdempotencyKey: envelope.IdempotencyKey,
-                    ExpectedWorldRevision: payload.ExpectedWorldRevision
+                    ExpectedWorldRevision: payload.ExpectedWorldRevision,
+                    IncludeEmptyTiles: payload.Parameters.IncludeEmptyTiles
                 );
 
                 accepted = TryStartWaterZone(request, envelope, out var earlyResult, out rejectReason);
@@ -958,14 +994,16 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     var destination = payload.Parameters.Tile!;
                     targets.Add(new NativeActionTarget(new TileCoordinate(destination.X, destination.Y), payload.Parameters.BuildingName));
                 }
-                else if (nativeKind == NativeActionKind.CraftItems)
+                else if (nativeKind is NativeActionKind.BuildBuilding or NativeActionKind.UpgradeBuilding or NativeActionKind.PurchaseAnimal)
+                { targets.Add(new NativeActionTarget(_actor.Tile,payload.Parameters.BuildingName)); }
+                else if (nativeKind is NativeActionKind.CraftItems or NativeActionKind.EatFood)
                 {
                     for (int i = 0; i < (payload.Parameters.ItemCount ?? 1); i++) targets.Add(new NativeActionTarget(_actor.Tile));
                 }
                 else if (payload.Parameters.Tiles is { Count: > 0 })
                 {
                     foreach (var tile in payload.Parameters.Tiles)
-                        targets.Add(new NativeActionTarget(new TileCoordinate(tile.X, tile.Y), payload.Parameters.AnimalName));
+                        targets.Add(new NativeActionTarget(new TileCoordinate(tile.X, tile.Y), payload.Parameters.AnimalId is { Length: > 0 } id ? "id:"+id : payload.Parameters.AnimalName));
                 }
                 else if (payload.Parameters.Tile is { } single)
                 {
@@ -997,7 +1035,13 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     MaxGameMinutes: payload.Budgets?.MaxGameMinutes > 0 ? payload.Budgets.MaxGameMinutes : 60,
                     CancelPolicy: payload.CancelPolicy ?? "safe-point",
                     IdempotencyKey: envelope.IdempotencyKey,
-                    ExpectedWorldRevision: payload.ExpectedWorldRevision
+                    ExpectedWorldRevision: payload.ExpectedWorldRevision,
+                    BuildingType: payload.Parameters.BuildingType,
+                    BuildingId: payload.Parameters.BuildingName,
+                    AnimalType: payload.Parameters.AnimalType,
+                    AnimalName: payload.Parameters.AnimalName,
+                    BudgetLimit: payload.Parameters.EffectiveBudgetLimit,
+                    DestinationTile: payload.Parameters.Tile is { } dest ? new TileCoordinate(dest.X,dest.Y) : null
                 );
 
                 accepted = TryStartNativeAction(request, envelope, out var earlyResult, out rejectReason);
@@ -1392,24 +1436,29 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 HasWateringCan: true,
                 Activity: activeMachine is not null ? DescribeActivity(activeMachine) : "idle",
                 AvailableMoney: companionMoney,
-                MoneyStatus: companionMoneyStatus
+                MoneyStatus: companionMoneyStatus,
+                RestState: Rest.State,
+                Bedtime: Rest.Bedtime,
+                SleepStartedAt: Rest.SleepStartedAt
             );
 
             // Scan farm work from observer for current location
             FarmWorkSnapshot farmWork;
             string locationName = _actor.LocationName ?? _observer.CurrentLocationName ?? "Farm";
-            try
+            if (!string.Equals(locationName, "Farm", StringComparison.OrdinalIgnoreCase))
+                farmWork = FarmWorkSnapshot.CreateEmpty(locationName, "not-observed");
+            else try
             {
                 var workItems = _observer.ScanFarmWork(locationName);
                 if (workItems.Count > 0)
                 {
                     var unwatered = workItems
-                        .Where(w => !w.IsWatered)
+                        .Where(w => !w.IsWatered && !w.IsDead)
                         .Select(w => new TileCoord(w.Tile.X, w.Tile.Y))
                         .ToList();
 
                     var cropUnwatered = workItems
-                        .Where(w => !w.IsWatered && w.HasCrop)
+                        .Where(w => !w.IsWatered && w.HasCrop && !w.IsDead)
                         .Select(w => new TileCoord(w.Tile.X, w.Tile.Y))
                         .ToList();
 
@@ -1419,7 +1468,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     var reportedTiles = isTruncated ? unwatered.Take(maxReportedTiles).ToList() : unwatered;
 
                     var matureCrops = workItems
-                        .Where(w => w.IsHarvestable)
+                        .Where(w => w.IsHarvestable && !w.IsDead)
                         .Select(w => new MatureCropTile(w.Tile.X, w.Tile.Y, w.CropId ?? ""))
                         .ToList();
                     int matureCount = matureCrops.Count;
@@ -1442,17 +1491,20 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                         MatureCropsTruncated: matureTruncated,
                         CropUnwateredTiles: reportedCropUnwatered,
                         CropUnwateredCount: cropUnwatered.Count,
-                        CropUnwateredTruncated: cropTruncated
+                        CropUnwateredTruncated: cropTruncated,
+                        DeadCropCount: workItems.Count(w => w.IsDead),
+                        LocationId: locationName,
+                        ObservationStatus: "observed"
                     );
                 }
                 else
                 {
-                    farmWork = FarmWorkSnapshot.CreateEmpty();
+                    farmWork = FarmWorkSnapshot.CreateEmpty(locationName, "observed");
                 }
             }
             catch
             {
-                farmWork = FarmWorkSnapshot.CreateEmpty();
+                farmWork = FarmWorkSnapshot.CreateEmpty(locationName, "unavailable");
             }
 
             var world = new WorldStateSnapshot(
@@ -1567,41 +1619,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             // Shop scan section (default Pierre's General Store "SeedShop")
             ShopSnapshot? shop = null;            try
             {
-                var shopScan = _observer.ScanShop("SeedShop", _actor);
-                var shopItems = shopScan.Items
-                    .Select(i => new ShopItemSnapshot(
-                        ItemId: i.ItemId,
-                        Name: i.Name,
-                        Price: i.Price,
-                        Stock: i.Stock,
-                        IsInfiniteStock: i.IsInfiniteStock,
-                        TradeItem: i.TradeItem,
-                        TradeItemCount: i.TradeItemCount,
-                        LimitedStockMode: i.LimitedStockMode,
-                        ActionsOnPurchase: i.ActionsOnPurchase?.ToList(),
-                        Category: i.Category,
-                        IsSeed: i.IsSeed
-                    ))
-                    .ToList();
-
-                shop = new ShopSnapshot(
-                    ShopId: shopScan.ShopId,
-                    Status: shopScan.Status,
-                    IsOpen: shopScan.IsOpen,
-                    OwnerPresent: shopScan.OwnerPresent,
-                    ClosedMessage: shopScan.ClosedMessage,
-                    Owners: shopScan.Owners.ToList(),
-                    Currency: shopScan.Currency,
-                    AvailableMoney: shopScan.AvailableMoney,
-                    MoneyStatus: shopScan.MoneyStatus,
-                    ItemsCount: shopScan.Items.Count,
-                    Items: shopItems,
-                    ErrorMessage: shopScan.ErrorMessage,
-                    LocationId: shopScan.LocationId,
-                    InteractionTile: shopScan.InteractionTile.HasValue
-                        ? new TileCoord(shopScan.InteractionTile.Value.X, shopScan.InteractionTile.Value.Y)
-                        : null
-                );
+                shop = InspectShop("SeedShop");
             }
             catch
             {
@@ -1641,29 +1659,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             LivestockSnapshot? livestock = null;
             try
             {
-                var scan = _observer.ScanLivestock(locationName, MaxReportedAnimalBuildings, MaxReportedAnimals);
-                livestock = new LivestockSnapshot(
-                    BuildingsTruncated: scan.BuildingsTruncated,
-                    AnimalsTruncated: scan.AnimalsTruncated,
-                    Buildings: scan.Buildings
-                        .Select(b => new AnimalBuildingSnapshot(
-                            BuildingType: b.BuildingType,
-                            IndoorsName: b.IndoorsName,
-                            Location: b.LocationName,
-                            Tile: new TileCoord(b.Tile.X, b.Tile.Y),
-                            DoorTile: new TileCoord(b.DoorTile.X, b.DoorTile.Y),
-                            AnimalDoorOpen: b.AnimalDoorOpen,
-                            DoorStateKnown: b.DoorStateKnown,
-                            AnimalCount: b.AnimalCount,
-                            AnimalLimit: b.AnimalLimit,
-                            HayCount: b.HayCount,
-                            HayCapacity: b.HayCapacity,
-                            SiloHayCount: b.SiloHayCount,
-                            Animals: b.Animals.Select(ToAnimalSnapshot).ToList()
-                        ))
-                        .ToList(),
-                    RoamingAnimals: scan.RoamingAnimals.Select(ToAnimalSnapshot).ToList()
-                );
+                livestock = BuildLivestockSnapshot(locationName);
             }
             catch
             {
@@ -1693,7 +1689,8 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                         CanBeGrabbed: g.CanBeGrabbed,
                         ClearTool: g.ClearTool,
                         IsStone: g.IsStone,
-                        IsTwig: g.IsTwig
+                        IsTwig: g.IsTwig,
+                        Quality: g.Quality
                     ))
                     .ToList();
 
@@ -1729,7 +1726,9 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     FertilizedTiles: fertilized,
                     CompanionTools: companionTools,
                     ChoppableTrees: reportedChoppable,
-                    ChoppableTreesTruncated: choppableTruncated
+                    ChoppableTreesTruncated: choppableTruncated,
+                    RefillWaterCenter: new TileCoord(_actor.Tile.X, _actor.Tile.Y),
+                    RefillWaterTilesTruncated: refillTruncated
                 );
             }
             catch
@@ -1748,9 +1747,76 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 Shop: shop,
                 Machines: machines,
                 Livestock: livestock,
-                Farming: farming
+                Farming: farming,
+                ProductionSignals: _observer.GetProductionSignals().ToList(),
+                ProductionSignalsTruncated: _observer.ProductionSignalsTruncated
             );
         }
+    }
+
+    private LivestockSnapshot BuildLivestockSnapshot(string locationName)
+    {
+        var scan = _observer.ScanLivestock(locationName, MaxReportedAnimalBuildings, MaxReportedAnimals);
+        return new LivestockSnapshot(
+                    BuildingsTruncated: scan.BuildingsTruncated,
+                    AnimalsTruncated: scan.AnimalsTruncated,
+                    Buildings: scan.Buildings
+                        .Select(b => new AnimalBuildingSnapshot(
+                            BuildingType: b.BuildingType,
+                            IndoorsName: b.IndoorsName,
+                            Location: b.LocationName,
+                            Tile: new TileCoord(b.Tile.X, b.Tile.Y),
+                            DoorTile: new TileCoord(b.DoorTile.X, b.DoorTile.Y),
+                            AnimalDoorOpen: b.AnimalDoorOpen,
+                            DoorStateKnown: b.DoorStateKnown,
+                            AnimalCount: b.AnimalCount,
+                            AnimalLimit: b.AnimalLimit,
+                            HayCount: b.HayCount,
+                            HayCapacity: b.HayCapacity,
+                            SiloHayCount: b.SiloHayCount,
+                            Animals: b.Animals.Select(ToAnimalSnapshot).ToList(),
+                            BuildingId: b.BuildingId, ResidentCount: b.ResidentCount, ResidentAnimalIds: b.ResidentAnimalIds
+                        ))
+                        .ToList(),
+                    RoamingAnimals: scan.RoamingAnimals.Select(ToAnimalSnapshot).ToList(), RoamingScopeLocationId: locationName
+                );
+    }
+
+    private ShopSnapshot InspectShop(string shopId)
+    {
+        var scan = _observer.ScanShop(shopId, _actor);
+        return new ShopSnapshot(
+            ShopId: scan.ShopId, Status: scan.Status, IsOpen: scan.IsOpen,
+            OwnerPresent: scan.OwnerPresent, ClosedMessage: scan.ClosedMessage,
+            Owners: scan.Owners.ToList(), Currency: scan.Currency,
+            AvailableMoney: scan.AvailableMoney, MoneyStatus: scan.MoneyStatus,
+            ItemsCount: scan.Items.Count,
+            Items: scan.Items.Select(i => new ShopItemSnapshot(
+                ItemId: i.ItemId, Name: i.Name, Price: i.Price, Stock: i.Stock,
+                IsInfiniteStock: i.IsInfiniteStock, TradeItem: i.TradeItem,
+                TradeItemCount: i.TradeItemCount, LimitedStockMode: i.LimitedStockMode,
+                ActionsOnPurchase: i.ActionsOnPurchase?.ToList(), Category: i.Category,
+                IsSeed: i.IsSeed)).ToList(),
+            ErrorMessage: scan.ErrorMessage, LocationId: scan.LocationId,
+            InteractionTile: scan.InteractionTile.HasValue
+                ? new TileCoord(scan.InteractionTile.Value.X, scan.InteractionTile.Value.Y) : null);
+    }
+
+    private Dictionary<string, object> InspectLivestock(string locationName)
+    {
+        if (!_observer.LocationExists(locationName)) throw new ArgumentException($"Location '{locationName}' is not loaded.");
+        var scan = BuildLivestockSnapshot(locationName);
+        var observed = scan.Buildings.SelectMany(b => b.Animals).Concat(scan.RoamingAnimals)
+            .Select(a => a.AnimalId).ToHashSet();
+        var missing = scan.Buildings.SelectMany(b => b.ResidentAnimalIds ?? Array.Empty<string>())
+            .Where(id => !observed.Contains(id)).Distinct().ToArray();
+        return new()
+        {
+            ["locationId"] = locationName, ["roamingScopeLocationId"] = locationName,
+            ["buildings"] = scan.Buildings, ["roamingAnimals"] = scan.RoamingAnimals,
+            ["buildingsTruncated"] = scan.BuildingsTruncated, ["animalsTruncated"] = scan.AnimalsTruncated,
+            ["unobservedResidentIds"] = missing, ["capturedRevision"] = _observer.WorldRevision
+        };
     }
 
     private static AnimalSnapshot ToAnimalSnapshot(AnimalScanInfo animal) => new(
@@ -1769,7 +1835,8 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
         Location: animal.LocationName,
         Tile: new TileCoord(animal.Tile.X, animal.Tile.Y),
         WasPetToday: animal.WasPetToday,
-        WasAutoPetToday: animal.WasAutoPetToday
+        WasAutoPetToday: animal.WasAutoPetToday, AnimalId: animal.AnimalId, HomeBuildingId: animal.HomeBuildingId,
+        SleepingBlocksPetting: animal.SleepingBlocksPetting
     );
 
     private static string DescribeActivity(ISkillExecutionMachine machine)    {
@@ -1806,6 +1873,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
 
     public string GetActivityStatus()
     {
+        if (Rest.IsResting) return Rest.State;
         var machine = ActiveMachine;
         if (machine is null) return "idle";
         string activity = DescribeActivity(machine);

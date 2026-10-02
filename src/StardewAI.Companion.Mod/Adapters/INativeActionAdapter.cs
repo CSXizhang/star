@@ -42,6 +42,7 @@ public sealed class NativeActionStepResult
     public int WaterGained { get; }
     public string? ItemId { get; }
     public int ItemCount { get; }
+    public int TotalCost { get; }
     public bool PlayerActionRequired { get; }
 
     private NativeActionStepResult(
@@ -56,7 +57,7 @@ public sealed class NativeActionStepResult
         string? itemId,
         int itemCount,
         bool playerActionRequired,
-        bool inProgress = false)
+        bool inProgress = false, int totalCost = 0)
     {
         Success = success;
         PreconditionFailed = preconditionFailed;
@@ -70,6 +71,7 @@ public sealed class NativeActionStepResult
         ItemCount = itemCount;
         PlayerActionRequired = playerActionRequired;
         InProgress = inProgress;
+        TotalCost = totalCost;
     }
 
     public static NativeActionStepResult Succeeded(
@@ -79,8 +81,8 @@ public sealed class NativeActionStepResult
         int waterGained = 0,
         string? itemId = null,
         int itemCount = 0,
-        bool playerActionRequired = false) =>
-        new(true, false, null, null, state, staminaCost, waterUsed, waterGained, itemId, itemCount, playerActionRequired);
+        bool playerActionRequired = false, int totalCost = 0) =>
+        new(true, false, null, null, state, staminaCost, waterUsed, waterGained, itemId, itemCount, playerActionRequired, totalCost: totalCost);
 
     public static NativeActionStepResult Precondition(
         string reason,
@@ -92,8 +94,8 @@ public sealed class NativeActionStepResult
         string reason,
         bool playerActionRequired = false,
         float staminaCost = 0f,
-        int waterUsed = 0) =>
-        new(false, false, reason, null, "failed", staminaCost, waterUsed, 0, null, 0, playerActionRequired);
+        int waterUsed = 0, int totalCost = 0) =>
+        new(false, false, reason, null, "failed", staminaCost, waterUsed, 0, null, 0, playerActionRequired, totalCost: totalCost);
 
     public static NativeActionStepResult Continue(
         string state,
@@ -105,11 +107,15 @@ public sealed class NativeActionStepResult
 /// <summary>
 /// Adapter contract for explicit native agricultural/husbandry actions. Every
 /// implementation must execute through real game APIs on the main thread, must
-/// never mutate <c>Game1.player</c> references or the human player's resources,
+/// never mutate <c>Game1.player</c> references or the human player's inventory/stamina;
+/// explicitly budgeted purchases may charge the native team wallet,
 /// and must return an actionable error instead of faking success.
 /// </summary>
 public interface INativeActionAdapter
 {
+    /// <summary>The real tool used for this target, or null for a non-tool action.</summary>
+    string? GetAnimationTool(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target) => null;
+
     NativeActionStepResult Execute(
         IFarmerActor actor,
         NativeActionRequest request,

@@ -85,7 +85,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
         lock (_lock)
         {
             if (_gameFarmer != null)
-                return _gameFarmer.Items.OfType<Tool>().Select(t => t.GetType().Name).Distinct().ToList();
+                return _gameFarmer.Items.OfType<Tool>().Select(t => t is MeleeWeapon weapon && weapon.isScythe() ? "Scythe" : t.GetType().Name).Distinct().ToList();
 
             var names = _inventory
                 .Where(i => i.IsTool && !string.IsNullOrEmpty(i.ItemId))
@@ -353,6 +353,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             {
                 _isUsingTool = false;
                 _animPhase = ToolAnimationPhase.None;
+                if (_gameFarmer is not null) Farmer.canMoveNow(_gameFarmer);
             }
 
             if (_gameFarmer != null)
@@ -365,7 +366,9 @@ public sealed class FarmerMechanicsActor : IFarmerActor
         }
     }
 
-    public void BeginUsingTool()
+    public void BeginUsingTool() => BeginUsingTool("Watering Can");
+
+    public void BeginUsingTool(string toolName)
     {
         lock (_lock)
         {
@@ -373,15 +376,20 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             {
                 throw new InvalidOperationException("Cannot begin tool usage: GameFarmer is not initialized.");
             }
-            if (_wateringCan == null)
+            Tool? tool = toolName switch
             {
-                throw new InvalidOperationException("Cannot begin tool usage: WateringCan is not initialized.");
-            }
+                "Hoe" => _hoe,
+                "Scythe" => _gameFarmer.Items.OfType<MeleeWeapon>().FirstOrDefault(t => t.isScythe()),
+                "Axe" => _gameFarmer.Items.OfType<Axe>().FirstOrDefault(),
+                "Pickaxe" => _gameFarmer.Items.OfType<Pickaxe>().FirstOrDefault(),
+                _ => _wateringCan
+            };
+            if (tool == null) throw new InvalidOperationException($"Cannot animate missing companion tool: {toolName}.");
             if (_gameFarmer.currentLocation == null)
             {
                 throw new InvalidOperationException("Cannot begin tool usage: GameFarmer current location is null.");
             }
-            if (_wateringCan.WaterLeft <= 0)
+            if (tool is WateringCan can && can.WaterLeft <= 0)
             {
                 throw new InvalidOperationException("Cannot begin tool usage: WateringCan has no water remaining.");
             }
@@ -401,17 +409,17 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             _gameFarmer.UsingTool = true;
             _gameFarmer.canReleaseTool = false;
 
-            // Ensure current tool index resolves to the equipped WateringCan
-            int canSlot = _gameFarmer.Items.IndexOf(_wateringCan);
-            if (canSlot >= 0)
+            // Equip the companion's real tool; never change the human player's slot.
+            int toolSlot = _gameFarmer.Items.IndexOf(tool);
+            if (toolSlot >= 0)
             {
-                _gameFarmer.CurrentToolIndex = canSlot;
+                _gameFarmer.CurrentToolIndex = toolSlot;
             }
 
             // Execute native tool begin/end call chain to initialize FarmerSprite.animateOnce
             // Note: WateringCan.endUsing calls FarmerSprite.animateOnce with null callback (no Game1.toolAnimationDone)
-            _wateringCan.beginUsing(_gameFarmer.currentLocation, (int)_pixelPosition.X, (int)_pixelPosition.Y, _gameFarmer);
-            _wateringCan.endUsing(_gameFarmer.currentLocation, _gameFarmer);
+            tool.beginUsing(_gameFarmer.currentLocation, (int)_pixelPosition.X, (int)_pixelPosition.Y, _gameFarmer);
+            tool.endUsing(_gameFarmer.currentLocation, _gameFarmer);
 
             // Detached-farmer adaptation: the native watering frames carry static behaviors
             // (Farmer.showToolSwipeEffect / Farmer.useTool / Farmer.canMoveNow) which
@@ -430,7 +438,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
                     toolFrames[i] = frame;
                 }
             }
-            Log($"Tool animation started: {toolFrames?.Count ?? 0} native frames, frame behaviors detached (physical effect handled by adapter).");
+            Log($"Tool animation started: {toolName}, {toolFrames?.Count ?? 0} native frames, frame behaviors detached (physical effect handled by adapter).");
 
             // The native loop interval is 0 for this animation (advance every tick, ~66ms/loop).
             // Restore human-like pacing so the pour is visibly distinguishable on real frames.
@@ -502,6 +510,10 @@ public sealed class FarmerMechanicsActor : IFarmerActor
 
             if (_gameFarmer != null)
             {
+                // Native animation frame callbacks are detached above. Perform
+                // the native completion callback ourselves for this actor: merely
+                // StopAnimation leaves PauseForSingleAnimation set, blocking pet.
+                Farmer.canMoveNow(_gameFarmer);
                 _gameFarmer.FarmerSprite?.StopAnimation();
                 _gameFarmer.UsingTool = false;
                 _gameFarmer.canReleaseTool = true;

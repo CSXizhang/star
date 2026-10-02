@@ -9,7 +9,7 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// <summary>
 /// Production chest adapter executing deposit and in-chest organize through normal game mechanics.
 /// Enforces:
-/// 1. Main-thread and current-map execution only.
+/// 1. Main-thread execution on the companion's loaded map.
 /// 2. Only normal chests (no fridge, no special chest types) are valid targets.
 /// 3. Deposit uses the game's own chest transfer primitive (Chest.addItem, the same
 ///    stacking/partial-transfer logic the chest UI uses); the companion-side bookkeeping
@@ -48,10 +48,14 @@ public sealed class NormalChestAdapter : IChestAdapter
             return ChestDepositResult.Failed("Chest operation rejected: must execute on the game main thread.");
         }
 
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return ChestDepositResult.Failed(
-                $"Chest target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Chest target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return ChestDepositResult.Failed($"Chest target map '{locationName}' is not loaded or does not exist.");
         }
 
         if (!actor.Tile.IsAdjacentTo(chestTile))
@@ -162,10 +166,14 @@ public sealed class NormalChestAdapter : IChestAdapter
             return ChestOrganizeResult.Failed("Chest operation rejected: must execute on the game main thread.");
         }
 
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return ChestOrganizeResult.Failed(
-                $"Chest target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Chest target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return ChestOrganizeResult.Failed($"Chest target map '{locationName}' is not loaded or does not exist.");
         }
 
         if (!actor.Tile.IsAdjacentTo(chestTile))
@@ -291,10 +299,14 @@ public sealed class NormalChestAdapter : IChestAdapter
             return ChestWithdrawResult.Failed("Chest operation rejected: must execute on the game main thread.");
         }
 
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return ChestWithdrawResult.Failed(
-                $"Chest target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Chest target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return ChestWithdrawResult.Failed($"Chest target map '{locationName}' is not loaded or does not exist.");
         }
 
         if (!actor.Tile.IsAdjacentTo(chestTile))
@@ -415,7 +427,7 @@ public sealed class NormalChestAdapter : IChestAdapter
 
     private Chest? ResolveNormalChest(string locationName, TileCoordinate chestTile)
     {
-        var location = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+        var location = Game1.getLocationFromName(locationName);
         if (location is null)
             return null;
 

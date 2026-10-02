@@ -9,6 +9,25 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class PlantZoneStateMachineTests
 {
+    [Fact]
+    public void PausedCancelSettlesWithoutPlantingOrConsumingSeed()
+    {
+        var (machine, actor, observer, _) = CreateHarness(seedItemId: "472", initialSeedCount: 5);
+        var tile = new TileCoordinate(10, 12);
+        observer.SetDirt(tile, TileDirtState.DryDirt());
+        Assert.True(machine.Start(new PlantZoneRequest("paused-plant", "task", "Farm", "472", new[] { tile }), out _));
+        machine.StepTicks(2);
+        machine.RequestPause();
+        machine.StepTicks(1);
+        Assert.True(machine.IsPaused);
+        machine.RequestCancel("cancel paused planting");
+        machine.StepTicks(1);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Empty(machine.FinalResult.PlantedTiles);
+        Assert.Equal(5, actor.GetItemCount("472"));
+        Assert.False(observer.GetDirtState("Farm", tile).HasCrop);
+    }
+
     private (PlantZoneStateMachine machine, MechanicsActor actor, SimulatedWorldObserver observer, TestPlantAdapter adapter) CreateHarness(
         string seedItemId = "472", // Parsnip Seeds
         int initialSeedCount = 10,

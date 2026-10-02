@@ -10,17 +10,18 @@ Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash.
 
 | 功能 | 内容 |
 | --- | --- |
-| 农场打理 | 翻地、播种、浇水、施肥、收获、清杂物、伐木与采集 |
+| 农场打理 | 分批翻地、播种、浇水、施肥和收获，补水、食物恢复、清杂物、伐木与采集 |
 | 物品与采购 | 查看背包和箱子、存取与整理物品、出货、到店购买 |
 | 农场改造 | 按需观察全场布局和地图图片，安排道路、围栏与物件的分区施工，保存设计和阶段进度 |
-| 动物与机器 | 喂养、抚摸、挤奶、剪毛、开关动物门，机器投料与收取成品 |
+| 建造与养殖 | 到店建造和升级住房、购买动物，喂养、抚摸、补草、拾蛋、挤奶与剪毛 |
+| 持续生产 | 机器投料、成熟后收取并存箱，按真实条件接续工作，跨天照料已交付的农场项目 |
 | 自由模式 | 按你选择的农活方向照料农场，遵守每日购买上限 |
-| 对话与控制 | NPC 头像对话，F8 查看同一任务的安排、进度、结果与下一步，支持暂停、继续和取消 |
+| 对话与控制 | 身边交互打开 NPC 头像对话；F8 独立窗口滚动查看记录、管理待决定事项与设置，支持暂停、继续和取消 |
 | 四个方向 | 装修、献祭、赚钱、日常干活；结合当前农场商量安排，确认后接手可做的准备 |
 | 伙伴生活 | 初次见面由你起名、选择相处方式，闲聊、偏好与约定记忆、共同经历和伙伴消息 |
-| 模型接入 | Kimi、agy、Codex（GPT）聊天后端，以及供其他客户端使用的 MCP 工具 |
+| 模型接入 | Kimi、agy、Codex（GPT）、dsh（DeepSeek）、MiniMax Code（mcode）聊天后端，以及供其他客户端使用的 MCP 工具 |
 
-在游戏里按 **F8**，可以直接说：
+走近伙伴交谈，或在 **F8** 窗口点击“找伙伴说话”，可以直接说：
 
 > “把没浇水的菜浇完。”
 >
@@ -30,12 +31,12 @@ Powered by Astra, Kimi K3, Gemini 3.8-flash, DeepSeek V4.1-flash.
 
 ## 开始使用
 
-Windows 64 位发行包已包含编译好的 Mod 和独立 Python 环境，无需安装 Python、uv 或 .NET SDK。需要你已有 **Stardew Valley 1.6.15、SMAPI 4.2.1**，以及可用的 Kimi CLI、agy 或已登录的 Codex CLI。
+Windows 64 位发行包已包含编译好的 Mod 和独立 Python 环境，无需安装 Python、uv 或 .NET SDK。需要你已有 **Stardew Valley 1.6.15、SMAPI 4.2.1**，以及已安装登录的 Kimi CLI、agy、Codex CLI、dsh 或 MiniMax Code CLI。
 
-1. 到 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.3.1-windows-x64.zip`，解压到一个普通文件夹。请选择这个安装包，而非 GitHub 自动生成的 Source code。
+1. 到 [GitHub Releases](https://github.com/CSXizhang/star/releases/latest) 下载 `StardewAI.Companion.Mod-0.3.6-windows-x64.zip`，解压到一个普通文件夹。请选择这个安装包，而非 GitHub 自动生成的 Source code。
 2. 关闭游戏，双击解压目录中的 **设置星露谷伙伴.cmd**。选择游戏目录，按向导将伙伴安装到 `Mods`，再选择聊天后端和模型。
-3. 按所选模型客户端自己的流程完成安装与登录。Kimi 首次连接还需在已安装的伙伴目录确认项目信任；设置时选择 agy 会注册它的伙伴 MCP 工具；选择 Codex（GPT）可将模型留空，沿用本机 Codex 配置。
-4. 通过 **SMAPI 启动游戏并进入存档**。伙伴服务会随存档载入自动启动。走近伙伴按交互键，第一次见面时给她起个名字；按 **F8** 可以交代工作。
+3. 按所选模型客户端自己的流程完成安装与登录。Kimi 首次连接还需在已安装的伙伴目录确认项目信任；设置时选择 agy 会注册它的伙伴 MCP 工具；选择 Codex（GPT）或 MiniMax Code（mcode）可将模型留空，沿用本机配置。
+4. 通过 **SMAPI 启动游戏并进入存档**。伙伴服务会随存档载入自动启动。走近伙伴按交互键，第一次见面时给她起个名字；按 **F8** 查看记录、工作和设置。
 
 安装、模型信任、升级与连接问题见[发行包安装指南](docs/release-guide.md)。已有源码开发环境的构建和安装步骤见[参与开发](CONTRIBUTING.md#从源码构建)。
 
@@ -52,7 +53,7 @@ Windows 64 位发行包已包含编译好的 Mod 和独立 Python 环境，无�
 
 - [发行包安装](docs/release-guide.md)：下载、设置、模型登录与升级。
 - [玩家指南](docs/companion-guide.md)：生活菜单、自由模式、记忆、规划与工作控制。
-- [自主生活与农场改造](docs/farm-projects.md)：持续项目、整体布局与分区施工。
+- [自主生活与农场改造](docs/farm-projects.md)：持续经营、养殖加工、整体布局与分区施工。
 - [模型与 MCP 接入](docs/mcp.md)：模型配置、配对、连接和故障排查。
 - [参与开发](CONTRIBUTING.md)：代码结构、构建检查和贡献方式。
 - [通信协议](protocol/README.md)：消息与工具接入约定。

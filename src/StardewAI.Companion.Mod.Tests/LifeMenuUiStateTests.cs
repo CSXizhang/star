@@ -92,13 +92,13 @@ public class LifeMenuUiStateTests
         state.ApplyProfileState(
             onboarded: false, skipped: false, companionName: "阿星", playStyle: "earn",
             personality: "gentle", careFrequency: "moderate", profileRevision: 4,
-            workMode: "command", workPaused: false, dailySpendLimit: null, memoryRevision: 7,
+            workMode: "command", workPaused: false, memoryRevision: 7,
             requestId: "get-1");
         Assert.Equal("set-1", state.PendingProfileSetRequestId);
         state.ApplyProfileState(
             onboarded: true, skipped: false, companionName: "小星", playStyle: "workhorse",
             personality: "calm", careFrequency: "quiet", profileRevision: 5,
-            workMode: "free", workPaused: false, dailySpendLimit: 300, memoryRevision: 7,
+            workMode: "free", workPaused: false, memoryRevision: 7,
             requestId: "set-1");
         Assert.True(state.IsOnboarded);
         Assert.False(state.IsSkipped);
@@ -109,7 +109,6 @@ public class LifeMenuUiStateTests
         Assert.Equal(5, state.ProfileRevision);
         Assert.Equal("free", state.WorkMode);
         Assert.False(state.WorkPaused);
-        Assert.Equal(300, state.DailySpendLimit);
         Assert.Equal(7, state.MemoryRevision);
         Assert.Null(state.PendingProfileSetRequestId);
     }
@@ -209,7 +208,7 @@ public class LifeMenuUiStateTests
     public void Reset_ClearsChatAndHints_ButKeepsProfile()
     {
         var state = NewState();
-        state.ApplyProfileState(true, false, "小星", "earn", "gentle", "moderate", 5, "free", false, 100, 7);
+        state.ApplyProfileState(true, false, "小星", "earn", "gentle", "moderate", 5, "free", false, 7);
         state.BeginChat("req-1", "chat");
         state.AddUnreadCareHint(new PendingCareHint("key-1", "1:spring:1", "morning", "早安"));
         state.Reset();

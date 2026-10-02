@@ -9,14 +9,69 @@ namespace StardewAI.Companion.Mod.Menus;
 /// </summary>
 public sealed class LifeMenuUiState
 {
+    private readonly List<CompanionConversationEntry> _conversation = new();
+    public IReadOnlyList<CompanionConversationEntry> Conversation => _conversation;
+    public int UnreadReplyCount => _conversation.Count(e => e.Unread);
+    public int ConversationRevision { get; private set; }
+    public event Action? ConversationChanged;
+
+    public void RestoreConversation(IEnumerable<CompanionConversationEntry> entries)
+    {
+        _conversation.Clear();
+        _conversation.AddRange(CompanionConversationStore.Retain(entries.Where(e => !string.IsNullOrWhiteSpace(e.Text)).GroupBy(e => e.Id).Select(g => g.Last())));
+        ConversationRevision++;
+    }
+
+    public bool RecordConversation(string id, string speaker, string text, string gameDate, bool isPlayer, bool unread = false,
+        string? decisionId = null, string? replyToDecisionId = null)
+    {
+        if (string.IsNullOrWhiteSpace(text) || _conversation.Any(e => e.Id == id)) return false;
+        _conversation.Add(new(id, speaker, text, gameDate, isPlayer, unread, decisionId,
+            decisionId == null ? null : "pending", replyToDecisionId));
+        while (_conversation.Count(e => e.DecisionStatus != "pending") > CompanionConversationStore.MaxEntries)
+            _conversation.RemoveAt(_conversation.FindIndex(e => e.DecisionStatus != "pending"));
+        ConversationRevision++;
+        ConversationChanged?.Invoke();
+        return true;
+    }
+
+    public void MarkConversationRead(string? entryId = null)
+    {
+        if (UnreadReplyCount == 0) return;
+        for (int i = 0; i < _conversation.Count; i++)
+            if (entryId == null || _conversation[i].Id == entryId) _conversation[i] = _conversation[i] with { Unread = false };
+        ConversationChanged?.Invoke();
+    }
     private readonly HashSet<string> _decisionNoticeKeys = new(StringComparer.Ordinal);
+    public IReadOnlyList<CompanionConversationEntry> PendingDecisions => _conversation
+        .Where(e => e.DecisionId != null && e.DecisionStatus == "pending").ToArray();
+
+    public void ConfirmDecisionReply(string noticeId)
+    {
+        int index = _conversation.FindIndex(e => e.DecisionId == noticeId && e.DecisionStatus == "pending");
+        if (index < 0) return;
+        _conversation[index] = _conversation[index] with { DecisionStatus = "answered", Unread = false };
+        ConversationRevision++;
+        ConversationChanged?.Invoke();
+    }
+
+    public void SetDecisionStatus(string noticeId, string status)
+    {
+        int index = _conversation.FindIndex(e => e.DecisionId == noticeId);
+        if (index < 0 || _conversation[index].DecisionStatus == status) return;
+        _conversation[index] = _conversation[index] with { DecisionStatus = status, Unread = false };
+        _unreadCareHints.RemoveAll(h => h.EventKey == "decision:" + noticeId);
+        ConversationRevision++;
+        ConversationChanged?.Invoke();
+    }
 
     /// <summary>Independent, save-scoped important messages; never changes a chat command's state.</summary>
     public bool TryAddDecisionNotice(string currentSaveId, string? noticeSaveId, string noticeId, string gameDate, string text)
     {
         if (string.IsNullOrWhiteSpace(currentSaveId) || !string.Equals(currentSaveId, noticeSaveId, StringComparison.Ordinal)
             || string.IsNullOrWhiteSpace(noticeId) || string.IsNullOrWhiteSpace(text)) return false;
-        if (!_decisionNoticeKeys.Add(currentSaveId + ":" + noticeId)) return false;
+        if (_conversation.Any(e => e.DecisionId == noticeId) || !_decisionNoticeKeys.Add(currentSaveId + ":" + noticeId)) return false;
+        RecordConversation("decision:" + noticeId, CompanionName, text, gameDate, false, true, decisionId: noticeId);
         AddUnreadCareHint(new PendingCareHint("decision:" + noticeId, gameDate, "player-decision", text));
         return true;
     }
@@ -64,6 +119,7 @@ public sealed class LifeMenuUiState
     /// <summary>
     /// Play-style: <c>"earn"</c>, <c>"workhorse"</c>, <c>"community"</c>, or <c>"decor"</c>.
     /// </summary>
+    public int Bedtime { get; set; } = 2400;
     public string PlayStyle { get; private set; } = "earn";
 
     /// <summary>
@@ -96,7 +152,6 @@ public sealed class LifeMenuUiState
     public bool WorkPaused { get; private set; }
 
     /// <summary>Daily spend limit from the bridge (null = unknown).</summary>
-    public int? DailySpendLimit { get; private set; }
 
     /// <summary>Confirmed, read-only work plan shown in the plan panel.</summary>
     public string? WorkGoal { get; private set; }
@@ -115,13 +170,17 @@ public sealed class LifeMenuUiState
         IEnumerable<string> activeGoals,
         IEnumerable<string> recentTodos,
         IEnumerable<string> waitingConditions,
-        string? planWaitReason)
+        string? planWaitReason,
+        string? mode = null,
+        bool? paused = null)
     {
         WorkGoal = goal;
         ActiveGoalSummaries = activeGoals.Take(5).ToArray();
         RecentTodoSummaries = recentTodos.Take(5).ToArray();
         WaitingConditions = waitingConditions.Take(5).ToArray();
         PlanWaitReason = planWaitReason;
+        if (mode is "free" or "command") WorkMode = mode;
+        if (paused.HasValue) WorkPaused = paused.Value;
     }
 
     // -----------------------------------------------------------------------
@@ -275,7 +334,6 @@ public sealed class LifeMenuUiState
         int profileRevision,
         string workMode,
         bool workPaused,
-        int? dailySpendLimit,
         int memoryRevision,
         string? requestId = null)
     {
@@ -288,7 +346,6 @@ public sealed class LifeMenuUiState
         ProfileRevision = profileRevision;
         WorkMode = workMode;
         WorkPaused = workPaused;
-        DailySpendLimit = dailySpendLimit;
         MemoryRevision = memoryRevision;
 
         // An unrelated profile.get refresh must not claim this edit was saved.
@@ -381,6 +438,8 @@ public sealed class LifeMenuUiState
     /// <summary>Resets transient state (e.g. on return-to-title).</summary>
     public void Reset()
     {
+        _conversation.Clear();
+        ConversationRevision++;
         _decisionNoticeKeys.Clear();
         PendingChatRequestId = null;
         PendingChatMode = null;

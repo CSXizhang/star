@@ -59,7 +59,7 @@ public class ChatCommandUiStateTests
         Assert.True(state.BeginControl("pause-1", "pause"));
         Assert.True(state.ApplyControlAck("pause-1", true, true));
         Assert.True(state.IsPaused);
-        Assert.False(state.CanSubmit);
+        Assert.True(state.CanSubmit); // paused conversations cannot execute work
         Assert.True(state.BeginControl("resume-1", "resume"));
         Assert.True(state.FailControl("resume-1"));
         Assert.True(state.IsPaused);

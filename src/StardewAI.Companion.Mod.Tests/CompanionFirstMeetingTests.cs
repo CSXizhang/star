@@ -29,7 +29,7 @@ public class CompanionFirstMeetingTests
     {
         var state = new LifeMenuUiState();
         state.MarkProfileStateReceived();
-        state.ApplyProfileState(onboarded, skipped, "小满", "community", "calm", "quiet", 4, "command", true, 100, 3);
+        state.ApplyProfileState(onboarded, skipped, "小满", "community", "calm", "quiet", 4, "command", true, 3);
         Assert.Equal(needsMeeting, CompanionFirstMeeting.NeedsMeeting(state));
         Assert.False(CompanionFirstMeeting.NeedsName(state));
         var patch = CompanionFirstMeeting.Patch(null, "help");

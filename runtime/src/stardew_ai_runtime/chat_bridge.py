@@ -1682,7 +1682,6 @@ class ChatBridge:
                 try:
                     raw_text = await ws.receive_text(timeout=2.0)
                 except TimeoutError:
-                    tracked_tasks = {t for t in tracked_tasks if not t.done()}
                     await self._stop_autonomy_if_disabled(ws, active_save_id)
                     if latest_snapshot is not None:
                         await self._maybe_schedule_autonomy(latest_snapshot, active_save_id, tracked_tasks, ws)
@@ -1723,9 +1722,11 @@ class ChatBridge:
                             await self._settle_day_advance(active_save_id, world)
                     # Care can also generate a model reply. Keep the wire reader
                     # draining snapshots and controls while that reply is pending.
-                    tracked_tasks.add(asyncio.create_task(self._snapshot_care_hooks(
+                    task = asyncio.create_task(self._snapshot_care_hooks(
                         active_save_id, world, day_key, previous_day_key,
-                    )))
+                    ))
+                    tracked_tasks.add(task)
+                    task.add_done_callback(tracked_tasks.discard)
                     # A fresh native snapshot is also the trigger for the plan
                     # worker to advance ready steps (and to re-evaluate waiting
                     # todos) without any model turn.
@@ -1753,9 +1754,11 @@ class ChatBridge:
                 if msg_type == "life.chat.submit":
                     # The single-model lock and FIFO queue remain in the handler;
                     # awaiting its whole model turn here stalls the WebSocket.
-                    tracked_tasks.add(asyncio.create_task(
+                    task = asyncio.create_task(
                         self._handle_life_message(ws, msg_type, data, active_save_id)
-                    ))
+                    )
+                    tracked_tasks.add(task)
+                    task.add_done_callback(tracked_tasks.discard)
                     continue
 
                 if msg_type in {
@@ -1782,6 +1785,7 @@ class ChatBridge:
                 if req_id and text.strip():
                     task = asyncio.create_task(run_submit(req_id, text, save_id))
                     tracked_tasks.add(task)
+                    task.add_done_callback(tracked_tasks.discard)
         finally:
             self.abort_active_task("Chat channel stopped")
             self._break_command_chain()
@@ -1932,6 +1936,7 @@ class ChatBridge:
         self._autonomy_requests[request_id] = fingerprint
         task = asyncio.create_task(self.handle_chat_submit(ws, request_id, prompt, save_id))
         tracked_tasks.add(task)
+        task.add_done_callback(tracked_tasks.discard)
 
     def _apply_work_control(self, save_id: str, action: str, params: dict[str, Any]) -> None:
         """Keep durable work scheduling in step with F8 pause/resume/cancel controls."""

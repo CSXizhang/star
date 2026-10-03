@@ -2199,26 +2199,26 @@ def test_manage_milestones_aliases_missing_and_conflicting_ids(mock_scheduler, t
         with pytest.raises(ToolError, match="unknown"):
             await server.call_tool("manage_milestones", {"action": "adopt", "id": "not-a-node"})
         monkeypatch.setenv("STARDEW_LIFE_MODE", "outside-player-conversation")
-        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+        with pytest.raises(ToolError, match="LIFE_CONVERSATION_REQUIRED"):
             await server.call_tool("manage_milestones", {"action": "adopt", "id": "spring-egg-festival-strawberry:y1"})
     asyncio.run(run())
 
 
-def test_manage_milestones_write_actions_require_plan_mode(mock_scheduler, monkeypatch):
+def test_manage_milestones_write_actions_require_life_conversation(mock_scheduler, monkeypatch):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         monkeypatch.delenv("STARDEW_LIFE_MODE", raising=False)
-        # list is always allowed, even in casual chat.
+        # list is allowed even outside a life conversation.
         _, result = await server.call_tool("manage_milestones", {"action": "list"})
         assert result["saveId"] == "mock-save-123"
         assert result["nodes"] == []
-        # adopt without plan mode is rejected with guidance to the plan mode.
-        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+        # Writes require a life conversation; neither chat nor plan grants approval.
+        with pytest.raises(ToolError, match="LIFE_CONVERSATION_REQUIRED"):
             await server.call_tool(
                 "manage_milestones",
                 {"action": "adopt", "node_id": "spring-egg-festival-strawberry:y1"},
             )
-        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+        with pytest.raises(ToolError, match="LIFE_CONVERSATION_REQUIRED"):
             await server.call_tool(
                 "manage_milestones",
                 {"action": "propose", "title": "自定义", "target_date": "1:spring:13"},
@@ -2229,8 +2229,44 @@ def test_manage_milestones_write_actions_require_plan_mode(mock_scheduler, monke
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("mode", ["chat", "plan"])
+def test_manage_milestones_conversation_can_propose_then_adopt_same_turn(
+    mock_scheduler, tmp_path, monkeypatch, mode
+):
+    async def run():
+        mock_scheduler.run_dir = None
+        mock_scheduler.latest_snapshot = {
+            "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+        }
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        monkeypatch.setenv("STARDEW_LIFE_MODE", mode)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        description = tools["manage_milestones"].description
+        assert "chat or plan" in description
+        assert "Neither mode grants" in description
+        assert 'A clear instruction or "you decide" authorizes propose and adopt in the SAME turn' in description
+        assert "a question or preference alone does not" in description
+        _, proposed = await server.call_tool("manage_milestones", {
+            "action": "propose", "title": "照料今天的作物", "preparation": ["water"],
+        })
+        assert proposed["node"]["status"] == "suggested"
+        work = WorkStore(tmp_path / "data" / "work-state.json")
+        assert work.list_goals("mock-save-123") == []
+        # The model must establish agreement before this call; this offline test
+        # verifies the tool contract, not natural-language consent recognition.
+        _, adopted = await server.call_tool("manage_milestones", {
+            "action": "adopt", "node_id": proposed["node"]["id"],
+        })
+        assert adopted["node"]["status"] == "adopted"
+        assert adopted["goalId"] and adopted["todoIds"]
+        assert adopted["execution"] == "not_started_by_this_tool"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["chat", "plan"])
 def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
-    mock_scheduler, tmp_path, monkeypatch
+    mock_scheduler, tmp_path, monkeypatch, mode
 ):
     from stardew_ai_runtime.autonomy import AutonomyController
 
@@ -2245,7 +2281,7 @@ def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
 
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
-        monkeypatch.setenv("STARDEW_LIFE_MODE", "plan")
+        monkeypatch.setenv("STARDEW_LIFE_MODE", mode)
         _, result = await server.call_tool("manage_milestones", {
             "action": "adopt",
             "node_id": "spring-egg-festival-strawberry:y1",

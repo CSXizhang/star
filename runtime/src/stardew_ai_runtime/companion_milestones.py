@@ -2,7 +2,8 @@
 
 The companion proposes data-driven milestone nodes (Egg Festival strawberry
 run, Spring Crops bundle retention) based on the real game date and the
-player's play style; the player adopts/revises/defers them in plan mode, and
+player's play style; the player adopts/revises/defers them in life conversations
+(chat or plan), with explicit agreement to adopt or change accepted work, and
 adopted capability prep items enter the existing WorkStore goal/todo system.
 Completion is decided only by verifiable state on day settlement.
 

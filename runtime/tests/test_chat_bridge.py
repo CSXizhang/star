@@ -1175,6 +1175,49 @@ def test_codex_keeps_session_across_day_and_generic_context_limits(tmp_path: Pat
     asyncio.run(run())
 
 
+def test_receive_loop_releases_completed_tasks_without_receive_timeout(tmp_path, monkeypatch):
+    async def scenario():
+        bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        stop_event = asyncio.Event()
+        tracked = None
+
+        async def capture_tracking(_envelope, _save_id, tracked_tasks, _ws):
+            nonlocal tracked
+            if tracked is not None:
+                assert tracked is tracked_tasks
+            tracked = tracked_tasks
+
+        monkeypatch.setattr(bridge, "_maybe_schedule_autonomy", capture_tracking)
+        for name in ("_snapshot_care_hooks", "_handle_life_message", "handle_chat_submit",
+                     "_push_work_state", "_stop_autonomy_if_disabled"):
+            monkeypatch.setattr(bridge, name, AsyncMock())
+        messages = [json.dumps({
+            "protocolVersion": "0.1", "messageType": kind, "messageId": str(i),
+            "senderInstanceId": "mod", "sequenceNumber": i, "worldRevision": 1,
+            "sentAt": "2026-10-03T00:00:00Z", "saveId": "save-1", "gameSessionId": "g1",
+            "payload": {"requestId": str(i), "text": "hello", "saveId": "save-1", "world": {}},
+        }) for i, kind in enumerate(["world.snapshot", "life.chat.submit", "chat.submit"] * 12)]
+
+        class FakeSocket:
+            async def receive_text(self, timeout):
+                # Let the previous task and its done callbacks run between messages.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                if tracked is not None:
+                    assert not tracked
+                if messages:
+                    return messages.pop(0)
+                stop_event.set()
+                return '{}'  # End the loop without ever raising a receive timeout.
+
+        await bridge._receive_loop(FakeSocket(), "save-1", stop_event)
+        assert tracked is not None and not tracked
+        for name in ("_snapshot_care_hooks", "_handle_life_message", "handle_chat_submit"):
+            assert getattr(bridge, name).await_count == 12
+
+    asyncio.run(scenario())
+
+
 def test_receive_loop_settles_only_a_real_day_change(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path)
     stop_event = asyncio.Event()

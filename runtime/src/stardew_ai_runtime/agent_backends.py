@@ -525,7 +525,7 @@ class DshBackend:
         self._events: queue.Queue = queue.Queue()
         self._surface: str | None = None
         self._rpc_id = 0
-        self._diagnostic_code = "DSH_RUNTIME_FAILED"
+        self._diagnostic_state = {"code": "DSH_RUNTIME_FAILED"}
 
     def _command(self) -> list[str]:
         import shutil
@@ -637,6 +637,9 @@ class DshBackend:
             return
         self.close()
         self._events = queue.Queue()
+        # Each process owns its diagnostics. A late daemon reader only updates
+        # its captured state, even if this backend has already restarted.
+        diagnostic_state = self._diagnostic_state = {"code": "DSH_RUNTIME_FAILED"}
         self._process = subprocess.Popen(
             [*self._command(), "--profile", "sdk-minimal", "--patch", str(patch)],
             cwd=str(self.run_dir), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -665,13 +668,13 @@ class DshBackend:
                 # Keep only fixed categories. Never retain a credential-bearing
                 # line, complete provider response or account path.
                 if "MISSING_CREDENTIAL" in line or "no API key" in line:
-                    self._diagnostic_code = "DSH_MISSING_CREDENTIAL"
+                    diagnostic_state["code"] = "DSH_MISSING_CREDENTIAL"
                 elif "401" in line or "authentication" in line.lower():
-                    self._diagnostic_code = "DSH_AUTH_FAILED"
+                    diagnostic_state["code"] = "DSH_AUTH_FAILED"
                 elif "Cannot find package" in line or "plugin" in line.lower() and "not found" in line.lower():
-                    self._diagnostic_code = "DSH_PROFILE_UNAVAILABLE"
+                    diagnostic_state["code"] = "DSH_PROFILE_UNAVAILABLE"
                 elif "DSH_RESUME_PROTOCOL_UNSUPPORTED" in line:
-                    self._diagnostic_code = "DSH_RESUME_PROTOCOL_UNSUPPORTED"
+                    diagnostic_state["code"] = "DSH_RESUME_PROTOCOL_UNSUPPORTED"
 
         threading.Thread(target=read, daemon=True).start()
         threading.Thread(target=drain_errors, daemon=True).start()
@@ -808,7 +811,7 @@ class DshBackend:
                      "DSH_SESSION_OWNED", "DSH_SESSION_EXISTS", "DSH_SESSION_CORRUPT", "DSH_REQUEST_REJECTED"}
             code = ("CANCELLED" if isinstance(ex, InterruptedError) else "TIMEOUT" if isinstance(ex, TimeoutError)
                     else "DSH_CLI_MISSING" if isinstance(ex, FileNotFoundError) else str(ex) if str(ex) in known
-                    else self._diagnostic_code)
+                    else self._diagnostic_state["code"])
             messages = {
                 "CANCELLED": "已停下。", "TIMEOUT": "DeepSeek 响应超时，请稍后再试。",
                 "DSH_CLI_MISSING": "没找到 dsh，请先安装 DeepSeek Harness。",

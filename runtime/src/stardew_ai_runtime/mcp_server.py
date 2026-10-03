@@ -1289,10 +1289,10 @@ def create_mcp_server(
 
         Facts come from the official English Wiki with sourceUrl on every node.
         Actions: list (always allowed), propose/adopt/revise/defer/reopen (write
-        actions, allowed during the unified player conversation (chat or plan). propose records an UNAPPROVED suggestion for the
-        player's accept button; adopt and changing accepted work require explicit
-        agreement this turn. Only say the
-        plan is saved after this tool confirms it).
+        actions, allowed during the unified player conversation (chat or plan)).
+        propose records an UNAPPROVED suggestion; adopt and changing accepted
+        work require explicit player agreement this turn. Neither mode grants
+        approval by itself. Only say the plan is saved after this tool confirms it.
 
         Use node_id for adopt/revise/defer/reopen, copied from the current node's
         id. Example: {"action":"adopt","node_id":"spring-egg-festival-strawberry:y1",
@@ -1353,9 +1353,11 @@ def create_mcp_server(
             )
         if os.environ.get("STARDEW_LIFE_MODE") not in {"chat", "plan"}:
             raise ToolError(
-                "PLAN_MODE_REQUIRED: 修改节点需要玩家处于「商量计划」模式；"
-                "闲聊模式只能 list 查看，请引导玩家切换到商量计划后再采纳/修改。"
+                "LIFE_CONVERSATION_REQUIRED: 修改节点需要当前伙伴对话（chat 或 plan）；"
+                "采纳或修改已接受的安排需玩家明确授权，模式本身不代表授权。"
             )
+        # The conversation model judges player agreement; this gate only checks
+        # the conversation context, alongside the current-turn/stop checks above.
         identifiers = {value.strip() for value in (node_id, id, nodeId) if value and value.strip()}
         if len(identifiers) > 1:
             raise ToolError("CONFLICTING_NODE_ID: node_id/id/nodeId disagree; pass only node_id from the current node snapshot.")

@@ -1,5 +1,6 @@
 """Deterministic official SDK event-order and reusable-session boundaries."""
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -69,6 +70,59 @@ def test_transport_failure_is_diagnostic_without_leaking_provider_details(tmp_pa
     result, _ = run_frames(tmp_path, monkeypatch, frames)
     assert result["error"] == "DSH_TRANSPORT_FAILED"
     assert "private-secret" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("late_stderr", [False, True], ids=["previous-diagnostic", "late-old-reader"])
+def test_restart_keeps_stderr_diagnostics_process_local(tmp_path, monkeypatch, late_stderr):
+    monkeypatch.setenv("STARDEW_MCP_SURFACE", "life")
+    backend = DshBackend(tmp_path, timeout_seconds=3)
+    monkeypatch.setattr(backend, "_prepare", lambda _: (tmp_path, {}))
+    monkeypatch.setattr(backend, "_command", lambda: ["dsh"])
+    monkeypatch.setattr(backend, "_send", lambda *_: 42)
+    monkeypatch.setattr(backend, "terminate", Mock())
+    auth_drained = threading.Event()
+    release_old_reader = threading.Event()
+    late_auth_drained = threading.Event()
+    initialized = {"id": 42, "result": {"serverInfo": {
+        "name": "deepseek-harness-sdk-runtime", "stardewSessionResume": 1,
+    }}}
+
+    def old_stderr():
+        yield "authentication failed: 401\n"
+        auth_drained.set()  # The reader has already classified the first line.
+        if late_stderr:
+            assert release_old_reader.wait(2)
+            yield "authentication failed: 401 after restart\n"
+            late_auth_drained.set()
+
+    def stdout(first):
+        yield json.dumps(initialized) + "\n"
+        if first:
+            assert auth_drained.wait(2)
+        elif late_stderr:
+            release_old_reader.set()  # New process and its diagnostic state exist.
+            assert late_auth_drained.wait(2)
+        # EOF triggers an ordinary, unclassified runtime failure in both runs.
+
+    processes = [
+        SimpleNamespace(stdout=stdout(True), stderr=old_stderr(), poll=lambda: None),
+        SimpleNamespace(stdout=stdout(False), stderr=iter(()), poll=lambda: None),
+    ]
+    popen = Mock(side_effect=processes)
+    monkeypatch.setattr("subprocess.Popen", popen)
+    task = SimpleNamespace(cancelled=False, process=None)
+    try:
+        first = backend.run(task, "root", "hello")
+        assert not first["success"] and first["error"] == "DSH_AUTH_FAILED"
+        assert backend._process is None
+        second = backend.run(task, "root", "again")
+        assert not second["success"] and second["error"] == "DSH_RUNTIME_FAILED"
+        assert popen.call_count == 2
+        if late_stderr:
+            assert late_auth_drained.is_set()
+    finally:
+        release_old_reader.set()
+        backend.close()
 
 
 def test_reused_runtime_refreshes_turn_authority_and_drops_old_keys(tmp_path, monkeypatch):

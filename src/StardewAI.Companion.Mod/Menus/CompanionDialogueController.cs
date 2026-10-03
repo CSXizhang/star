@@ -259,6 +259,14 @@ public sealed class CompanionDialogueController
         if (_ownedMenu != null) _ownedMenu.exitFunction = () => (returnTo ?? ReturnToF8Choices)();
     }
 
+    public static bool CanCloseF8Root(bool f8Active, bool eventActive, object? activeMenu, object? ownedMenu, object? ownedQuestion) =>
+        f8Active && !eventActive && activeMenu != null &&
+        ReferenceEquals(activeMenu, ownedMenu) && ReferenceEquals(activeMenu, ownedQuestion);
+
+    public bool HandleRootEscape() => CanCloseF8Root(_f8Active,
+        Game1.eventUp || Game1.currentLocation?.currentEvent != null,
+        Game1.activeClickableMenu, _ownedMenu, CompanionMenuClock.OwnedQuestion) && HandleF8();
+
     /// <summary>F8 only affects the current conversation's own menu.</summary>
     public bool HandleF8()
     {

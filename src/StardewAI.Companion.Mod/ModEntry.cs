@@ -760,6 +760,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
+        if (e.Button == SButton.Escape && Context.IsWorldReady && _companionDialogue?.HandleRootEscape() == true)
+        {
+            Helper.Input.Suppress(e.Button);
+            return;
+        }
+
         // Life menu: detect player interacting with companion
         if (e.Button.IsActionButton() && Context.IsWorldReady && _actor != null && Game1.activeClickableMenu == null)
         {

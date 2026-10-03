@@ -22,9 +22,35 @@ public sealed class CompanionRootEscapeTests
     [InlineData(false, false)]
     [InlineData(false, true)]
     [InlineData(true, true)]
-    public void EscapeDoesNotInterceptLegacyConversationOrEvents(bool f8Active, bool eventActive)
+    public void EscapeDoesNotInterceptNonF8QuestionsOrEvents(bool f8Active, bool eventActive)
     {
         var question = new object();
         Assert.False(CompanionDialogueController.CanCloseF8Root(f8Active, eventActive, question, question, question));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void EscapeClosesOwnedSpeechOrInputFromF8OrDirectInteraction(bool f8Active)
+    {
+        var speechOrInput = new object();
+        var previousQuestion = new object();
+        Assert.True(CompanionDialogueController.CanCloseDialogue(f8Active, false,
+            speechOrInput, speechOrInput, previousQuestion, speechOrInput: true));
+    }
+
+    [Fact]
+    public void EscapeLeavesUnrelatedMenusAndEventSpeechToTheGame()
+    {
+        var owned = new object();
+        var unrelated = new object();
+        Assert.False(CompanionDialogueController.CanCloseDialogue(true, false,
+            unrelated, owned, owned, speechOrInput: true));
+        Assert.False(CompanionDialogueController.CanCloseDialogue(true, true,
+            owned, owned, owned, speechOrInput: true));
+        Assert.False(CompanionDialogueController.CanCloseDialogue(true, false,
+            null, owned, owned, speechOrInput: true));
+        Assert.False(CompanionDialogueController.CanCloseDialogue(true, false,
+            owned, owned, unrelated, speechOrInput: false));
     }
 }

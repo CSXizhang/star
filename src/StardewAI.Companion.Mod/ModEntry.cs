@@ -760,7 +760,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
-        if (e.Button == SButton.Escape && Context.IsWorldReady && _companionDialogue?.HandleRootEscape() == true)
+        if (e.Button == SButton.Escape && Context.IsWorldReady && _companionDialogue?.HandleEscape() == true)
         {
             Helper.Input.Suppress(e.Button);
             return;

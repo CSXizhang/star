@@ -263,9 +263,35 @@ public sealed class CompanionDialogueController
         f8Active && !eventActive && activeMenu != null &&
         ReferenceEquals(activeMenu, ownedMenu) && ReferenceEquals(activeMenu, ownedQuestion);
 
-    public bool HandleRootEscape() => CanCloseF8Root(_f8Active,
-        Game1.eventUp || Game1.currentLocation?.currentEvent != null,
-        Game1.activeClickableMenu, _ownedMenu, CompanionMenuClock.OwnedQuestion) && HandleF8();
+    public static bool CanCloseDialogue(bool f8Active, bool eventActive, object? activeMenu, object? ownedMenu,
+        object? ownedQuestion, bool speechOrInput) =>
+        CanCloseF8Root(f8Active, eventActive, activeMenu, ownedMenu, ownedQuestion) ||
+        (!eventActive && speechOrInput && activeMenu != null && ReferenceEquals(activeMenu, ownedMenu));
+
+    public bool HandleEscape()
+    {
+        var menu = Game1.activeClickableMenu;
+        if (!CanCloseDialogue(_f8Active, Game1.eventUp || Game1.currentLocation?.currentEvent != null,
+            menu, _ownedMenu, CompanionMenuClock.OwnedQuestion,
+            menu is CompanionNpcDialogueBox or CompanionSpeechInputMenu)) return false;
+
+        // Escape dismisses the conversation, rather than advancing speech or
+        // invoking the input's return callback and reopening the next menu.
+        _f8Active = false;
+        _next = null;
+        _pages = null;
+        _afterPages = null;
+        _returnAfterPages = false;
+        _ownedMenu = null;
+        menu!.exitFunction = null;
+        if (menu is CompanionNpcDialogueBox) menu.receiveKeyPress(Keys.Escape);
+        else menu.exitThisMenu(playSound: false);
+        CompanionMenuClock.OwnedQuestion = null;
+        Game1.dialogueUp = false;
+        if (Game1.player != null && !Game1.player.UsingTool) Game1.player.CanMove = true;
+        RestoreDialogueLanguage();
+        return true;
+    }
 
     /// <summary>F8 only affects the current conversation's own menu.</summary>
     public bool HandleF8()

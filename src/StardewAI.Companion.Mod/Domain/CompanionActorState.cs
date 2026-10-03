@@ -62,6 +62,7 @@ public sealed class CompanionActorState
     public int OvernightBedtime { get; set; } = 2200;
     public int? SleepDay { get; set; }
     public int? SleepStartedAt { get; set; }
+    public bool SleepIsDaytime { get; set; }
     public int PreferredBedtime { get; set; } = 2400;
     public bool Exhausted { get; set; }
 

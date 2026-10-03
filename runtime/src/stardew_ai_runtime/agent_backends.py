@@ -957,7 +957,9 @@ class McodeBackend:
         # cache inside the input total, as the usage display expects.
         # An exec can contain multiple model requests. These totals are useful
         # for accounting but cannot measure the latest request's context size.
-        usage: dict[str, Any] = {"generations_count": 1, "input_includes_cache": True,
+        # The CLI exposes exec totals, not a request count. A multi-request exec
+        # must not be displayed as one model call merely because it has one result.
+        usage: dict[str, Any] = {"input_includes_cache": True,
                                  "input_context_measured": False, "source": "mcode_exec_result"}
         if input_tokens is not None and cache_read is not None:
             usage["input_tokens"] = input_tokens + cache_read

@@ -1,6 +1,7 @@
 using System.Text.RegularExpressions;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Input;
 using StardewValley;
 using StardewValley.Menus;
 using StardewAI.Companion.Mod.Transport;
@@ -65,7 +66,7 @@ public sealed class CompanionDialogueInbox
     }
 }
 
-/// <summary>Native DialogueBox/Response flow, independent of F8's command UI.</summary>
+/// <summary>Native NPC speech and response choices for companion interaction and F8.</summary>
 public sealed class CompanionDialogueController
 {
     private readonly LifeMenuUiState _state;
@@ -80,6 +81,11 @@ public sealed class CompanionDialogueController
     private readonly Action _progress;
     private readonly Action? _conversation;
     private readonly Func<string?> _connectionProblem;
+    private readonly Action? _records;
+    private readonly Action? _hubSettings;
+    private readonly Action? _replyInput;
+    private readonly CompanionF8Flow _f8Flow = new();
+    private bool _f8Active;
     private string? _directionRequest;
     private DateTime _directionSentAt;
     private string? _directionFeedback;
@@ -123,7 +129,8 @@ public sealed class CompanionDialogueController
     public CompanionDialogueController(LifeMenuUiState state, Func<string, string, string?, bool> submit,
         Action refresh, Action settings, Action memory, Func<Farmer?> farmer,
         Func<LifeProfilePatchDto, string?> saveProfile, Func<string, string?> savePreference, Func<bool> canHelp,
-        Action progress, Func<string?>? connectionProblem = null, Action? conversation = null)
+        Action progress, Func<string?>? connectionProblem = null, Action? conversation = null,
+        Action? records = null, Action? hubSettings = null, Action? replyInput = null)
     {
         _state = state;
         _submit = submit;
@@ -137,6 +144,9 @@ public sealed class CompanionDialogueController
         _progress = progress;
         _conversation = conversation;
         _connectionProblem = connectionProblem ?? (() => null);
+        _records = records;
+        _hubSettings = hubSettings;
+        _replyInput = replyInput;
     }
 
     public void Reset()
@@ -154,6 +164,7 @@ public sealed class CompanionDialogueController
         CompanionMenuClock.OwnedQuestion = null;
         _directionRequest = _directionFeedback = null;
         _directionConfirmed = false;
+        _f8Active = false;
     }
 
     public void Update()
@@ -162,6 +173,7 @@ public sealed class CompanionDialogueController
         // Recover only our closed conversation's movement lock, never another event.
         if (CompanionMenuClock.OwnedQuestion != null && Game1.activeClickableMenu == null)
         {
+            if (_next == null && _pages == null) _f8Active = false;
             CompanionMenuClock.OwnedQuestion = null;
             if (!Game1.eventUp)
             {
@@ -223,8 +235,104 @@ public sealed class CompanionDialogueController
         if (_directionRequest == null) _directionFeedback = "设置还没保存成功，等连接恢复再试一次吧。";
     }
 
-    public void ReturnToConversation() => _next = _conversation ?? Open;
+    public void ReturnToConversation() => _next = _f8Active ? ShowF8Choices : _conversation ?? Open;
     public void ReturnToDashboard(Action openDashboard) => _next = openDashboard;
+
+    public void OpenF8()
+    {
+        if (Game1.activeClickableMenu != null || Game1.eventUp) return;
+        _f8Active = true;
+        _f8Flow.Begin(_state);
+        _refresh();
+        ShowF8Unread();
+    }
+
+    public void ReturnToF8Choices()
+    {
+        _f8Active = true;
+        _next = ShowF8Choices;
+    }
+
+    public void OwnF8Child(Action? returnTo = null)
+    {
+        _ownedMenu = Game1.activeClickableMenu;
+        if (_ownedMenu != null) _ownedMenu.exitFunction = () => (returnTo ?? ReturnToF8Choices)();
+    }
+
+    /// <summary>F8 only affects the current conversation's own menu.</summary>
+    public bool HandleF8()
+    {
+        if (!_f8Active || _ownedMenu == null || !ReferenceEquals(Game1.activeClickableMenu, _ownedMenu)) return false;
+        if (ReferenceEquals(_ownedMenu, CompanionMenuClock.OwnedQuestion))
+        {
+            _f8Active = false;
+            _next = null;
+            _ownedMenu.exitThisMenu(playSound: false);
+        }
+        else if (_ownedMenu is CompanionNpcDialogueBox or CompanionSpeechInputMenu)
+            _ownedMenu.receiveKeyPress(Keys.F8);
+        else _ownedMenu.exitThisMenu(playSound: false);
+        return true;
+    }
+
+    private void ShowF8Unread()
+    {
+        if (Game1.activeClickableMenu != null || Game1.eventUp) return;
+        var entry = _f8Flow.TakeNext(_state);
+        if (entry == null) { ShowF8Choices(); return; }
+        ShowSpeech(entry.Text, false, () => _f8Flow.Presented(_state, entry.Id));
+        _afterPages = ShowF8Unread;
+    }
+
+    private void ShowF8Choices()
+    {
+        if (Game1.activeClickableMenu != null || Game1.eventUp) return;
+        Ask("", new[]
+        {
+            new Response("reply", "直接回复"),
+            new Response("history", "历史记录"),
+            new Response("memory", "偏好和约定"),
+            new Response("settings", "设置和用量"),
+        }, key =>
+        {
+            switch (key)
+            {
+                case "reply": (_replyInput ?? _conversation ?? (() => ShowInput("chat")))(); break;
+                case "history": (_records ?? _progress)(); OwnF8Child(); break;
+                case "memory": _memory(); OwnF8Child(); break;
+                case "settings": (_hubSettings ?? _settings)(); OwnF8Child(); break;
+            }
+        });
+    }
+
+    public void OpenReplyInput(Func<string, string?, bool, bool> submit, string? noticeId = null)
+    {
+        UseReadableDialogueFont();
+        string? target = _f8Flow.PendingReplyTarget(_state, noticeId ?? CompanionConversationMenu.DraftDecisionId, includePresented: _f8Active);
+        CompanionConversationMenu.DraftDecisionId = target;
+        string prompt = target == null ? $"对{DisplayName}说……"
+            : $"答复{DisplayName}的待决定事项（回车发送并确认选择）";
+        _ownedMenu = new CompanionSpeechInputMenu(DisplayName, text =>
+        {
+            // Recheck the notice after typing; it may have been resolved by another reply.
+            string? pendingTarget = _f8Flow.PendingReplyTarget(_state, target, includePresented: false);
+            if (submit(text, pendingTarget, pendingTarget != null))
+            {
+                CompanionConversationMenu.DraftText = string.Empty;
+                CompanionConversationMenu.DraftDecisionId = null;
+                _next = _f8Active ? ShowF8Choices : _conversation ?? Open;
+            }
+            else
+            {
+                ShowSpeech(_connectionProblem() ?? "消息未发送，请稍后重试。", false);
+                _afterPages = () => OpenReplyInput(submit, target);
+            }
+        }, ReturnToConversation, prompt, initialText: CompanionConversationMenu.DraftText,
+            saveDraft: text => CompanionConversationMenu.DraftText = text);
+        _pages = null;
+        _next = null;
+        Game1.activeClickableMenu = _ownedMenu;
+    }
 
     public void OpenDashboard(CompanionHubActions actions, Action<string?> openConversation, int tab = 0)
     {
@@ -232,6 +340,7 @@ public sealed class CompanionDialogueController
         UseReadableDialogueFont();
         if (Game1.keyboardDispatcher != null) Game1.keyboardDispatcher.Subscriber = null;
         _ownedMenu = new CompanionDashboardMenu(_state, actions, openConversation, tab);
+        if (_f8Active) _ownedMenu.exitFunction = ReturnToF8Choices;
         _pages = null; _next = null;
         Game1.activeClickableMenu = _ownedMenu;
     }
@@ -239,6 +348,7 @@ public sealed class CompanionDialogueController
     public void OpenConversation(Func<string, string?, bool, bool> submit, Action openRecords, string? noticeId = null)
     {
         if (Game1.eventUp) return;
+        _f8Active = false;
         UseReadableDialogueFont();
         _ownedMenu = new CompanionConversationMenu(_state, submit, MakeDialogue, _connectionProblem, openRecords, noticeId);
         _pages = null;
@@ -290,8 +400,7 @@ public sealed class CompanionDialogueController
         else if (CompanionFirstMeeting.NeedsMeeting(_state)) ShowFirstMeeting();
         else if (_inbox.HasUnreadReply && _inbox.Reply != null)
         {
-            _inbox.MarkRead();
-            if (_conversation != null) _conversation(); else ShowSpeech(_inbox.Reply, true);
+            if (_conversation != null) _conversation(); else ShowSpeech(_inbox.Reply, true, _inbox.MarkRead);
         }
         else if (_state.IsChatPending)
         { if (_conversation != null) _conversation(); else ShowSpeech("我还在想这件事。你先忙，想好了我会叫你。", false); }
@@ -552,10 +661,10 @@ public sealed class CompanionDialogueController
         _afterPages = ShowGreeting;
     }
 
-    private void ShowSpeech(string text, bool responses)
+    private void ShowSpeech(string text, bool responses, Action? onDisplayed = null)
     {
         UseReadableDialogueFont();
-        _pages = _ownedMenu = new CompanionNpcDialogueBox(MakeDialogue(text));
+        _pages = _ownedMenu = new CompanionNpcDialogueBox(MakeDialogue(text), onDisplayed);
         _returnAfterPages = responses;
         Game1.activeClickableMenu = _pages;
     }

@@ -15,6 +15,10 @@ public sealed class FarmerMechanicsActor : IFarmerActor
     private readonly Farmer? _gameFarmer;
     private readonly Action<string, StardewModdingAPI.LogLevel>? _log;
     private int _lastAnimIndex = -1;
+    private bool _eatingAnimation;
+    private Item? _previousEatingItem;
+    private bool _movedThisTick;
+    private bool _wasWalking;
 
     private void Log(string message, StardewModdingAPI.LogLevel level = StardewModdingAPI.LogLevel.Info) => _log?.Invoke(message, level);
     private WateringCan? _wateringCan;
@@ -105,7 +109,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
     public string? ActiveTaskId => _activeTaskId;
 
     public bool IsUsingTool => _isUsingTool;
-    public int CurrentFrame => _currentFrame;
+    public int CurrentFrame => _gameFarmer?.FarmerSprite?.CurrentFrame ?? _currentFrame;
     public ToolAnimationPhase AnimationPhase => _animPhase;
 
 
@@ -317,6 +321,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
         {
             var nextPos = PixelPosition + new Vector2(dx, dy);
             PixelPosition = nextPos;
+            _movedThisTick |= dx != 0 || dy != 0;
 
             // Determine facing direction from movement delta
             if (Math.Abs(dx) >= Math.Abs(dy))
@@ -349,11 +354,11 @@ public sealed class FarmerMechanicsActor : IFarmerActor
     {
         lock (_lock)
         {
+            _movedThisTick = false;
+            _wasWalking = false;
             if (_isUsingTool)
             {
-                _isUsingTool = false;
-                _animPhase = ToolAnimationPhase.None;
-                if (_gameFarmer is not null) Farmer.canMoveNow(_gameFarmer);
+                EndUsingTool();
             }
 
             if (_gameFarmer != null)
@@ -362,6 +367,11 @@ public sealed class FarmerMechanicsActor : IFarmerActor
                 _gameFarmer.UsingTool = false;
                 _gameFarmer.canReleaseTool = true;
                 _gameFarmer.Halt();
+                if (!_gameFarmer.isInBed.Value && _gameFarmer.FarmerSprite is { } sprite)
+                {
+                    sprite.setCurrentFrame(NativeCompanionAnimation.WalkingIndex(Facing));
+                    sprite.UpdateSourceRect();
+                }
             }
         }
     }
@@ -399,6 +409,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             }
 
             _isUsingTool = true;
+            _eatingAnimation = false;
             _animPhase = ToolAnimationPhase.Windup;
             _lastAnimIndex = -1;
 
@@ -421,12 +432,8 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             tool.beginUsing(_gameFarmer.currentLocation, (int)_pixelPosition.X, (int)_pixelPosition.Y, _gameFarmer);
             tool.endUsing(_gameFarmer.currentLocation, _gameFarmer);
 
-            // Detached-farmer adaptation: the native watering frames carry static behaviors
-            // (Farmer.showToolSwipeEffect / Farmer.useTool / Farmer.canMoveNow) which
-            // AnimatedSprite.animateOnce(GameTime) invokes with a NULL farmer, causing an NRE
-            // for our detached companion Farmer. Farmer.useTool would also double-apply the
-            // physical effect owned by NormalWateringCanAdapter. Strip the behaviors only:
-            // frame timing/indices stay native; the physical effect stays with the adapter.
+            // The adapter owns the physical effect. Preserve native poses and tool
+            // frames, while detaching callbacks which would apply that effect again.
             var toolFrames = _gameFarmer.FarmerSprite.CurrentAnimation;
             if (toolFrames != null)
             {
@@ -440,14 +447,69 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             }
             Log($"Tool animation started: {toolName}, {toolFrames?.Count ?? 0} native frames, frame behaviors detached (physical effect handled by adapter).");
 
-            // The native loop interval is 0 for this animation (advance every tick, ~66ms/loop).
-            // Restore human-like pacing so the pour is visibly distinguishable on real frames.
-            if (_gameFarmer.FarmerSprite.interval <= 0f)
-            {
-                _gameFarmer.FarmerSprite.interval = 125f;
-            }
-
             _currentFrame = _gameFarmer.FarmerSprite.currentFrame;
+        }
+    }
+
+    public void BeginEating(string? itemId)
+    {
+        lock (_lock)
+        {
+            if (_gameFarmer?.FarmerSprite is not { } sprite)
+                throw new InvalidOperationException("Companion sprite is unavailable.");
+            var food = _gameFarmer.Items.OfType<StardewValley.Object>().FirstOrDefault(item =>
+                (string.Equals(item.QualifiedItemId, itemId, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(item.ItemId, itemId, StringComparison.OrdinalIgnoreCase)) && item.Stack > 0);
+            if (food is null || food.Edibility < 0 || food.QualifiedItemId == "(O)434" || _gameFarmer.hasBuff("6"))
+                throw new InvalidOperationException("Companion has no supported food ready to eat.");
+            _previousEatingItem = _gameFarmer.itemToEat;
+            _eatingAnimation = true;
+            _isUsingTool = true;
+            _animPhase = ToolAnimationPhase.Windup;
+            _lastAnimIndex = -1;
+            _gameFarmer.itemToEat = food.getOne();
+            _gameFarmer.Halt();
+            _gameFarmer.faceDirection(2);
+            _gameFarmer.UsingTool = false;
+            _gameFarmer.CanMove = false;
+            // Native performEatAnimation uses the 216 animation, 80 ms and eight
+            // frames. The adapter calls doneEating once at the last visual frame.
+            // Keep isEating false so the sprite completion cannot call it twice.
+            _gameFarmer.isEating = false;
+            sprite.animateOnce(216, 80f, 8);
+            if (sprite.CurrentAnimation is { } frames)
+                for (int i = 0; i < frames.Count; i++)
+                {
+                    var frame = frames[i];
+                    frame.frameStartBehavior = null;
+                    frame.frameEndBehavior = null;
+                    frames[i] = frame;
+                }
+        }
+    }
+
+    /// <summary>Advance presentation after mechanics; never calls Farmer.Update or moves the actor.</summary>
+    public void UpdateMovementAnimation(GameTime? time)
+    {
+        lock (_lock)
+        {
+            bool moved = _movedThisTick;
+            _movedThisTick = false;
+            if (_gameFarmer?.FarmerSprite is not { } sprite || _isUsingTool ||
+                _gameFarmer.isInBed.Value || sprite.PauseForSingleAnimation) return;
+            if (moved)
+            {
+                sprite.animate(NativeCompanionAnimation.WalkingIndex(Facing),
+                    time ?? new GameTime(TimeSpan.Zero, TimeSpan.FromMilliseconds(16.6667)));
+                _wasWalking = true;
+            }
+            else if (_wasWalking)
+            {
+                sprite.StopAnimation();
+                sprite.setCurrentFrame(NativeCompanionAnimation.WalkingIndex(Facing));
+                sprite.UpdateSourceRect();
+                _wasWalking = false;
+            }
         }
     }
 
@@ -468,7 +530,10 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             // clears CurrentAnimation by itself — the human path stops on button release.
             // Completion for our one-shot pour is detected below via frame-index wrap.
             var gameTime = time ?? new GameTime(TimeSpan.Zero, TimeSpan.FromMilliseconds(16.6667));
-            _gameFarmer.FarmerSprite.animateOnce(gameTime);
+            if (_gameFarmer.FarmerSprite.interval <= 0f) _gameFarmer.FarmerSprite.interval = 125f;
+            // FarmerSprite's GameTime overload is private. Calling animateOnce
+            // here resolves to AnimatedSprite and skips Farmer tool rendering.
+            _gameFarmer.FarmerSprite.checkForSingleAnimation(gameTime);
 
             var sprite = _gameFarmer.FarmerSprite;
             _currentFrame = sprite.currentFrame;
@@ -479,7 +544,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             bool completedOnePass = frameCount > 0 && _lastAnimIndex >= frameCount - 1 && animIndex < _lastAnimIndex;
             _lastAnimIndex = animIndex;
 
-            if (!isOnToolAnim || sprite.CurrentAnimation == null || completedOnePass)
+            if ((_eatingAnimation ? !sprite.PauseForSingleAnimation : !isOnToolAnim) || sprite.CurrentAnimation == null || completedOnePass)
             {
                 _animPhase = ToolAnimationPhase.Completed;
             }
@@ -487,7 +552,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             {
                 _animPhase = ToolAnimationPhase.Windup;
             }
-            else if (animIndex == 1)
+            else if (_eatingAnimation ? animIndex >= frameCount - 1 : animIndex == 1)
             {
                 // Physical tool effect point: water pours from spout
                 _animPhase = ToolAnimationPhase.EffectPoint;
@@ -510,6 +575,11 @@ public sealed class FarmerMechanicsActor : IFarmerActor
 
             if (_gameFarmer != null)
             {
+                if (_eatingAnimation)
+                {
+                    _gameFarmer.itemToEat = _previousEatingItem;
+                    _gameFarmer.isEating = false;
+                }
                 // Native animation frame callbacks are detached above. Perform
                 // the native completion callback ourselves for this actor: merely
                 // StopAnimation leaves PauseForSingleAnimation set, blocking pet.
@@ -518,7 +588,11 @@ public sealed class FarmerMechanicsActor : IFarmerActor
                 _gameFarmer.UsingTool = false;
                 _gameFarmer.canReleaseTool = true;
                 _gameFarmer.Halt();
+                _gameFarmer.FarmerSprite?.setCurrentFrame(NativeCompanionAnimation.WalkingIndex(Facing));
+                _gameFarmer.FarmerSprite?.UpdateSourceRect();
             }
+            _eatingAnimation = false;
+            _previousEatingItem = null;
         }
     }
 

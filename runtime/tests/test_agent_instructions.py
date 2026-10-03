@@ -52,7 +52,7 @@ def test_decision_policy_stays_in_core_and_continuation_only_repeats_flag(tmp_pa
     assert first.count(core) == 1
     # The policy has one source even when life-specific instructions are appended.
     for policy in ("任务物品的指定用途", "已承诺支出", "承担不可恢复的损失",
-                   "当前游戏模式的恢复能力", "未经成功回包不宣称"):
+                   "原生作息控制器会安全收尾", "未经成功回包不宣称"):
         assert first.count(policy) == 1
         assert policy not in continuation
     assert first.count("playerConfirmedDecision") == 1

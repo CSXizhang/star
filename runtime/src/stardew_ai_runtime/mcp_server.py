@@ -112,8 +112,28 @@ def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
 
 def _unwrap_item_array(value: Any) -> Any:
     """Accept the provider's unambiguous XML-style array wrapper only."""
-    if isinstance(value, dict) and set(value) == {"item"} and isinstance(value["item"], list):
-        return value["item"]
+    for _ in range(8):
+        if isinstance(value, dict) and set(value) == {"item"}:
+            value = value["item"]
+        elif isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict) and set(value[0]) == {"item"}:
+            value = value[0]["item"]
+        else:
+            break
+    return value
+
+
+def _normalize_wire_arrays(value: Any, annotation: Any) -> Any:
+    """Unwrap only fields whose declared type is an array; keep other objects intact."""
+    origin, args = get_origin(annotation), get_args(annotation)
+    if origin is Annotated:
+        return _normalize_wire_arrays(value, args[0])
+    if origin in (Union, UnionType):
+        array_type = next((variant for variant in args if get_origin(variant) is list), None)
+        return _normalize_wire_arrays(value, array_type) if array_type else value
+    if origin is list:
+        value = _unwrap_item_array(value)
+        if isinstance(value, list):
+            return [_normalize_wire_arrays(item, args[0]) for item in value]
     return value
 
 
@@ -454,7 +474,8 @@ BASE_TOOLS = frozenset(
         "observe_machines",
         "observe_livestock",
         # common actions exposed directly
-        "plant_crop_workflow",
+        "plant_seeds",
+        "eat_food",
         "water_auto",
         "harvest_auto",
         "navigate_to",
@@ -762,6 +783,7 @@ def create_mcp_server(
             pre_parsed = metadata.pre_parse_json(args)
             for key, value in pre_parsed.items():
                 if field := metadata.arg_model.model_fields.get(key):
+                    value = pre_parsed[key] = _normalize_wire_arrays(value, field.annotation)
                     _reject_integer_booleans(value, field.annotation)
             parsed = metadata.arg_model.model_validate(pre_parsed)
         except ValueError as ex:
@@ -2629,7 +2651,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def plant_seeds(
-        seed_item_id: str, tiles: list[dict[str, int]], detail: bool = False
+        seed_item_id: str, tiles: Annotated[list[dict[str, ChestCoordinate]], BeforeValidator(_unwrap_item_array)], detail: bool = False
     ) -> dict[str, Any]:
         """Plant specified seeds into tilled empty tiles (1..64 coordinates).
 
@@ -2887,11 +2909,11 @@ def create_mcp_server(
     @mcp.tool()
     async def navigate_to(
         location_id: str,
-        tile_x: int | None = None,
-        tile_y: int | None = None,
-        x: int | None = None,
-        y: int | None = None,
-        tile: dict[str, int] | None = None,
+        tile_x: ChestCoordinate | None = None,
+        tile_y: ChestCoordinate | None = None,
+        x: ChestCoordinate | None = None,
+        y: ChestCoordinate | None = None,
+        tile: dict[str, ChestCoordinate] | None = None,
         landmark: str | None = None,
         detail: bool = False,
     ) -> dict[str, Any]:
@@ -3621,9 +3643,35 @@ def create_mcp_server(
                 raise ToolError("SHORT_JOB_UNSUPPORTED: choose a discoverable native plan operation")
             if args:
                 raise ToolError("Short job parameters must be named")
+            params = validate_base_arguments(name, dict(kwargs))
+            if name == "navigate_to":
+                destinations = [params.get("tile")]
+                for x_key, y_key in (("tile_x", "tile_y"), ("x", "y")):
+                    x_value, y_value = params.pop(x_key, None), params.pop(y_key, None)
+                    if x_value is not None or y_value is not None:
+                        if x_value is None or y_value is None:
+                            raise ToolError("Both x and y coordinates must be specified. No job selected.")
+                        destinations.append({"x": x_value, "y": y_value})
+                destinations = [tile for tile in destinations if tile is not None]
+                if destinations and any(tile != destinations[0] for tile in destinations):
+                    raise ToolError("Conflicting navigation coordinates. No job selected.")
+                if destinations:
+                    params["tile"] = destinations[0]
+                if params.get("tile") is None:
+                    snapshot = sched.latest_snapshot
+                    payload = snapshot.get("payload", {}) if isinstance(snapshot, dict) else {}
+                    shop = payload.get("shop") if isinstance(payload, dict) else None
+                    if (isinstance(shop, dict) and isinstance(shop.get("interactionTile"), dict)
+                            and str(shop.get("locationId") or "SeedShop").casefold()
+                            == str(params.get("location_id") or "").casefold()):
+                        params["tile"] = shop["interactionTile"]
+                    else:
+                        raise ToolError("navigate_to needs an observed destination tile. No job selected.")
+                if any(type(params["tile"].get(key)) is not int or params["tile"][key] < 0 for key in ("x", "y")):
+                    raise ToolError("Destination must contain non-negative integer x and y. No job selected.")
             try:
                 selected = store.submit_plan(sid, goal_text="Current model-selected short job",
-                    tasks=[{"title": name, "steps": [{"operation": name, "params": dict(kwargs)}]}],
+                    tasks=[{"title": name, "steps": [{"operation": name, "params": params}]}],
                     decision_token=decision_token())
             except WorkStateError as ex:
                 raise ToolError(str(ex)) from None

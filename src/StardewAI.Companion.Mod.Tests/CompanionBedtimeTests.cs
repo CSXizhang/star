@@ -67,11 +67,34 @@ public class CompanionBedtimeTests
     {
         var old = JsonSerializer.Deserialize<CompanionActorState>("{}")!;
         Assert.Equal(2400, old.PreferredBedtime);
-        var saved = new CompanionActorState { PreferredBedtime = 2300, SleepDay = 4, SleepStartedAt = 2250 };
+        Assert.False(old.SleepIsDaytime);
+        var saved = new CompanionActorState { PreferredBedtime = 2300, SleepDay = 4, SleepStartedAt = 1250, SleepIsDaytime = true };
         var restored = JsonSerializer.Deserialize<CompanionActorState>(JsonSerializer.Serialize(saved))!;
         Assert.Equal(2300, restored.PreferredBedtime);
         Assert.Equal(4, restored.SleepDay);
-        Assert.Equal(2250, restored.SleepStartedAt);
+        Assert.Equal(1250, restored.SleepStartedAt);
+        Assert.True(restored.SleepIsDaytime);
         Assert.Contains("\"bedtime\":2300", JsonSerializer.Serialize(new LifeProfilePatchDto(Bedtime: 2300)));
+    }
+
+    [Fact]
+    public void BedtimePreviewStartsInEveningAndCacheExpiresOrInvalidatesForMovedOriginAndBed()
+    {
+        Assert.False(CompanionBedtime.ShouldPreviewRoute(1200, 2400));
+        Assert.False(CompanionBedtime.ShouldPreviewRoute(1950, 2400));
+        Assert.True(CompanionBedtime.ShouldPreviewRoute(2000, 2400));
+        Assert.True(CompanionBedtime.ShouldPreviewRoute(1900, 2300));
+        var cache = new CompanionBedtimeRouteEstimate();
+        var tile = new TileCoordinate(60, 15);
+        var bed = new TileCoordinate(10, 10);
+        cache.Store(4, 2400, "Farm", tile, "FarmHouse", bed, 2000, 40);
+        Assert.True(cache.TryGet(4, 2400, "Farm", tile, "FarmHouse", bed, 2020, out int minutes));
+        Assert.Equal(40, minutes);
+        Assert.False(cache.TryGet(4, 2400, "Farm", tile, "FarmHouse", bed, 2030, out _));
+        Assert.False(cache.TryGet(4, 2400, "Town", tile, "FarmHouse", bed, 2010, out _));
+        Assert.False(cache.TryGet(5, 2400, "Farm", tile, "FarmHouse", bed, 2010, out _));
+        Assert.False(cache.TryGet(4, 2300, "Farm", tile, "FarmHouse", bed, 2010, out _));
+        Assert.False(cache.TryGet(4, 2400, "Farm", new TileCoordinate(80, 15), "FarmHouse", bed, 2010, out _));
+        Assert.False(cache.TryGet(4, 2400, "Farm", tile, "FarmHouse", new TileCoordinate(12, 10), 2010, out _));
     }
 }

@@ -39,9 +39,9 @@ def _life_session_key(backend: str, save_id: str) -> str:
     return f"life:{backend}:{save_id}"
 
 
-def _life_fingerprint(profile_revision: int, memory_revision: int) -> str:
+def _life_fingerprint(profile_revision: int, instruction_revision: int) -> str:
     material = json.dumps(
-        {"profileRevision": profile_revision, "memoryRevision": memory_revision,
+        {"profileRevision": profile_revision, "memoryInstructionRevision": instruction_revision,
          "instructionsRevision": instructions_revision(), "gameToolProfile": CODEX_GAME_TOOL_PROFILE_VERSION},
         sort_keys=True,
     )
@@ -110,11 +110,11 @@ class LifeChatService:
         self,
         save_id: str,
         profile_revision: int,
-        memory_revision: int,
+        instruction_revision: int,
     ) -> str | None:
         """Return current conversation_id to resume, or None if a fresh session is needed."""
         fp_key = f"life:{self.backend_name}:{save_id}"
-        current_fp = _life_fingerprint(profile_revision, memory_revision)
+        current_fp = _life_fingerprint(profile_revision, instruction_revision)
         recorded_fp = self._fingerprints.get(fp_key)
 
         current_cid = self.get_session_id(save_id)
@@ -140,10 +140,10 @@ class LifeChatService:
         return current_cid
 
     def record_fingerprint(
-        self, save_id: str, profile_revision: int, memory_revision: int
+        self, save_id: str, profile_revision: int, instruction_revision: int
     ) -> None:
         fp_key = f"life:{self.backend_name}:{save_id}"
-        self._fingerprints[fp_key] = _life_fingerprint(profile_revision, memory_revision)
+        self._fingerprints[fp_key] = _life_fingerprint(profile_revision, instruction_revision)
         self._save_fingerprints()
 
     def discussion_context(self, save_id: str, mode: str) -> list[dict[str, str]]:
@@ -232,6 +232,7 @@ class LifeChatService:
         permission = "直接回应玩家；明确派活就propose并adopt，node_id使用真实节点id，询问意见只讨论。暂停/继续/取消或作息用manage_companion。"
         permission += "待决定事项的playerConfirmedDecision为false时只继续商量，为true时才提交该事项的决定。"
         facts = {"live": live, "work": work_summary,
+                 "recentSharedEvents": (memory_render or {}).get("recentEvents", []),
                  "milestones": milestones or []}
         return (
             permission + "\n继续使用已确认的人格和偏好；本轮明确意愿优先。"

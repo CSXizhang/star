@@ -1,4 +1,5 @@
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using StardewValley;
 using StardewValley.BellsAndWhistles;
@@ -9,15 +10,26 @@ namespace StardewAI.Companion.Mod.Menus;
 /// <summary>Stardew's portrait dialogue, with its text area fitted to the UI viewport.</summary>
 public sealed class CompanionNpcDialogueBox : DialogueBox
 {
-    public CompanionNpcDialogueBox(Dialogue dialogue) : base(dialogue)
+    private Action? _onDisplayed;
+    public CompanionNpcDialogueBox(Dialogue dialogue, Action? onDisplayed = null) : base(dialogue)
     {
+        _onDisplayed = onDisplayed;
         FitToViewport(dialogue.getCurrentDialogue());
+    }
+
+    public override void draw(SpriteBatch b)
+    {
+        base.draw(b);
+        if (characterIndexInDialogue <= 0 && getCurrentString().Length > 0) return;
+        var displayed = _onDisplayed;
+        _onDisplayed = null;
+        displayed?.Invoke();
     }
 
     public override void receiveKeyPress(Keys key)
     {
         if (key == Keys.Enter) { receiveLeftClick(x + width / 2, y + height / 2); return; }
-        if (key == Keys.Escape) { closeDialogue(); return; }
+        if (key is Keys.Escape or Keys.F8) { closeDialogue(); return; }
         base.receiveKeyPress(key);
     }
 

@@ -44,7 +44,8 @@ public sealed partial class GameWorldObserver
         var center = new TileCoordinate(width / 2, height / 2);
         // Scan the whole requested map, including indoor eggs. Bounded facts, explicit truncation.
         var ground = ScanGroundItems(locationName, center, Math.Max(width,height),257);
-        var water = FindWaterRefillTiles(locationName, center, Math.Max(width,height),33);
+        var waterCenter = actor.LocationName == locationName ? actor.Tile : center;
+        var water = FindWaterRefillTiles(locationName, waterCenter, Math.Max(width,height),33);
         var foods = actor.GameFarmer?.Items.OfType<StardewValley.Object>()
             .Where(i => i.Stack > 0 && i.Edibility >= 0 && i.QualifiedItemId != "(O)434" && i.staminaRecoveredOnConsumption() > 0)
             .Select(i => new { itemId=i.QualifiedItemId, name=i.DisplayName, stack=i.Stack,

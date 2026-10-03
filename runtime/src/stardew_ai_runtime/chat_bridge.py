@@ -1103,6 +1103,8 @@ class ChatBridge:
         self._autonomy_last_snapshot_at: dict[str, float] = {}
         self._autonomy_pending_snapshot: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
         self._autonomy_debounce_tasks: dict[str, asyncio.Task] = {}
+        self._autonomy_wakeup_tasks: dict[str, asyncio.Task] = {}
+        self._autonomy_wakeup_snapshots: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
         self._autonomy_pending_task_fingerprints: dict[str, tuple[str, str]] = {}
         self._bind_autonomy_store()
         # Durable per-save goals/tasks/todos; bound once a run dir is known
@@ -1633,6 +1635,11 @@ class ChatBridge:
         self.abort_active_task("Game save reloaded")
         self._autonomy_generation += 1
         self._break_command_chain(save_id)
+        wakeup = self._autonomy_wakeup_tasks.pop(save_id, None)
+        if wakeup is not None and wakeup is not asyncio.current_task():
+            wakeup.cancel()
+            await asyncio.gather(wakeup, return_exceptions=True)
+        self._autonomy_wakeup_snapshots.pop(save_id, None)
         if self._plan_worker is not None:
             await self._plan_worker.stop()
         active = self._active_task.async_task if self._active_task else None
@@ -1653,7 +1660,7 @@ class ChatBridge:
         self._bind_work_store()
         self._bind_companion_stores()
         if self._life_chat is not None:
-            self._life_chat.record_fingerprint(save_id, self._profile_revision(save_id), self._memory_revision(save_id))
+            self._life_chat.record_fingerprint(save_id, self._profile_revision(save_id), self._memory_instruction_revision(save_id))
         mark_game_load_applied(self.run_dir, request)
         logger.info("Restored game-save facts with retained player-intent summary for %s", save_id)
 
@@ -1807,12 +1814,14 @@ class ChatBridge:
                 debounce.cancel()
             self._autonomy_debounce_tasks.clear()
             self._autonomy_pending_snapshot.clear()
+            self._autonomy_wakeup_snapshots.clear()
             cleanup_tasks = tracked_tasks | self._deferred_care_tasks
             for task in list(cleanup_tasks):
                 if task is not asyncio.current_task() and not task.done():
                     task.cancel()
             if cleanup_tasks:
                 await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            self._autonomy_wakeup_tasks.clear()
             if self._chat_ws is ws:
                 self._chat_ws = None
 
@@ -1830,6 +1839,20 @@ class ChatBridge:
                     self.instance_id, notice["id"], "player-decision", notice["message"], save_id=save_id))
                 if delivered:
                     self._work_store.acknowledge_player_notice(save_id, notice["id"])
+        rest_state = ((envelope.payload or {}).get("companion") or {}).get("restState")
+        self._autonomy.observe_rest_state(save_id, rest_state)
+        # A single queued wakeup owns the latest snapshot until the shared model
+        # slot is available. In particular, care cannot consume the morning
+        # decision merely by reaching the lock before a created submit task.
+        if save_id in self._autonomy_wakeup_tasks:
+            self._autonomy_wakeup_snapshots[save_id] = (envelope, tracked_tasks, ws)
+            return
+        state = self._autonomy.state(save_id)
+        if ((not state.enabled and not state.goal_scope) or state.paused
+                or self._autonomy.is_cooling_down(save_id)
+                or rest_state == "resting"
+                or self._bedtime_winding_down(save_id, envelope.payload)):
+            return
         now = time.monotonic()
         previous = self._autonomy_last_snapshot_at.get(save_id)
         self._autonomy_last_snapshot_at[save_id] = now
@@ -1844,17 +1867,58 @@ class ChatBridge:
                         await self._maybe_schedule_autonomy(pending[0], save_id, pending[1], pending[2], force=True)
                 self._autonomy_debounce_tasks[save_id] = asyncio.create_task(flush())
             return
+        self._autonomy_wakeup_snapshots[save_id] = (envelope, tracked_tasks, ws)
+        generation = self._autonomy_generation
+
+        async def dispatch() -> None:
+            request_id = None
+            consumed = None
+            try:
+                async with self._busy_lock:
+                    if generation != self._autonomy_generation:
+                        return
+                    consumed = self._autonomy_wakeup_snapshots.pop(save_id, None)
+                    if consumed is None:
+                        return
+                    current, _, current_ws = consumed
+                    prepared = self._prepare_autonomy_decision(current, save_id)
+                    if prepared is None:
+                        return
+                    fingerprint, prompt = prepared
+                    if not self._autonomy.record_world_event(save_id, fingerprint, current.world_revision):
+                        return
+                    request_id = f"autonomy-{uuid.uuid4().hex}"
+                    self._autonomy_requests[request_id] = fingerprint
+                    # Keep the claimed slot through submit: queued life waiters
+                    # cannot intervene after the wakeup fingerprint is consumed.
+                    await self.handle_chat_submit(current_ws, request_id, prompt, save_id, _slot_owned=True)
+            finally:
+                if request_id:
+                    self._autonomy_requests.pop(request_id, None)
+                self._autonomy_wakeup_tasks.pop(save_id, None)
+                pending = self._autonomy_wakeup_snapshots.pop(save_id, None)
+                if pending and generation == self._autonomy_generation:
+                    await self._maybe_schedule_autonomy(pending[0], save_id, pending[1], pending[2], force=True)
+
+        task = asyncio.create_task(dispatch())
+        self._autonomy_wakeup_tasks[save_id] = task
+        tracked_tasks.add(task)
+        task.add_done_callback(tracked_tasks.discard)
+
+    def _prepare_autonomy_decision(self, envelope: Envelope, save_id: str) -> tuple[str, str] | None:
+        """Re-evaluate the latest wakeup while owning the single model slot."""
         state = self._autonomy.state(save_id)
         if (
             (not state.enabled and not state.goal_scope)
             or state.paused
             or self._active_task is not None
-            or self._busy_lock.locked()
             or save_id in self._command_chains
             or self._autonomy.is_cooling_down(save_id)
         ):
             return
         snapshot = envelope.payload or {}
+        if (snapshot.get("companion") or {}).get("restState") == "resting":
+            return None  # Daytime recovery wakes again when the native actor is awake.
         if self._bedtime_winding_down(save_id, snapshot):
             return
         if self._work_store is not None:
@@ -1902,8 +1966,6 @@ class ChatBridge:
         if candidate is None:
             return
         fingerprint = self._autonomy.fingerprint(save_id, snapshot, candidate, state)
-        if not self._autonomy.record_world_event(save_id, fingerprint, envelope.world_revision):
-            return
         compact = build_decision_context(
             {"payload": snapshot, "worldRevision": envelope.world_revision},
             work=self._work_context(save_id),
@@ -1930,13 +1992,7 @@ class ChatBridge:
             "按玩家目标、实际资金与材料自行安排建造、升级和购置，无需设置每日购买额度。"
             "伙伴在自身地图操作，玩家位于屋内不影响农场动作。"
         )
-        # Unique per-request identity: a worldRevision may repeat (revision reset /
-        # same-revision decisions) and must never collide across epochs.
-        request_id = f"autonomy-{uuid.uuid4().hex}"
-        self._autonomy_requests[request_id] = fingerprint
-        task = asyncio.create_task(self.handle_chat_submit(ws, request_id, prompt, save_id))
-        tracked_tasks.add(task)
-        task.add_done_callback(tracked_tasks.discard)
+        return fingerprint, prompt
 
     def _apply_work_control(self, save_id: str, action: str, params: dict[str, Any]) -> None:
         """Keep durable work scheduling in step with F8 pause/resume/cancel controls."""
@@ -2062,6 +2118,12 @@ class ChatBridge:
             return int((self._memory_store.list(save_id) or {}).get("memoryRevision") or 0)
         except Exception:
             return 0
+
+    def _memory_instruction_revision(self, save_id: str | None) -> int:
+        """Only corrections to agreements/preferences invalidate provider history."""
+        if self._memory_store is None or not save_id:
+            return 0
+        return self._memory_store.instruction_revision(save_id)
 
     def _life_work_projection(self, save_id: str) -> dict[str, Any]:
         """Read-only autonomy + WorkStore projection for life.profile.state (§1.3)."""
@@ -2812,6 +2874,44 @@ class ChatBridge:
             else:
                 env["STARDEW_LIFE_PROPOSAL_ID"] = previous_proposal
 
+    async def _join_interrupted_provider(self, active_task: ActiveChatTask, future: asyncio.Future) -> None:
+        """Keep the model slot until its executor has restored turn-local state."""
+        active_task.cancelled = True
+        active_task.abort_reason = active_task.abort_reason or "Chat channel closed"
+        proc = active_task.process
+        if proc is not None and proc.poll() is None:
+            try:
+                terminate = getattr(self._backend, "terminate", None)
+                if callable(terminate):
+                    terminate(proc)
+                else:
+                    proc.kill()
+            except Exception:
+                logger.warning("Could not stop interrupted provider", exc_info=True)
+        while True:
+            try:
+                await asyncio.shield(future)
+                break
+            except asyncio.CancelledError:
+                # Repeated cancel/disconnect requests still cannot abandon an
+                # executor which owns process-global turn environment variables.
+                if future.cancelled():
+                    break
+            except Exception:
+                logger.debug("Interrupted provider exited with an error", exc_info=True)
+                break
+
+    async def _await_work_provider(
+        self, active_task: ActiveChatTask, conversation_id: str | None, prompt: str,
+    ) -> dict[str, Any]:
+        future = asyncio.get_running_loop().run_in_executor(
+            None, self._execute_turn, active_task, conversation_id, prompt)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await self._join_interrupted_provider(active_task, future)
+            raise
+
     async def _await_life_provider(
         self, active_task: ActiveChatTask, conversation_id: str | None,
         prompt: str, mode: str | None = None,
@@ -2827,24 +2927,9 @@ class ChatBridge:
                 await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            active_task.cancelled = True
-            active_task.abort_reason = "Chat channel closed"
-            proc = active_task.process
-            if proc is not None and proc.poll() is None:
-                try:
-                    terminate = getattr(self._backend, "terminate", None)
-                    if callable(terminate):
-                        terminate(proc)
-                    else:
-                        proc.kill()
-                except Exception:
-                    logger.warning("Could not stop interrupted life-chat provider", exc_info=True)
             # Cancelling an executor await does not stop the executor thread.
             # Wait for this owned turn before releasing the model/native slot.
-            try:
-                await asyncio.shield(future)
-            except Exception:
-                logger.debug("Interrupted life-chat provider exited with an error", exc_info=True)
+            await self._join_interrupted_provider(active_task, future)
             logger.info("Life provider [%s] interrupted by channel shutdown", active_task.request_id)
             raise
 
@@ -2870,11 +2955,13 @@ class ChatBridge:
                     else None
                 )
                 existing_cid = None
+                session_profile_revision = self._profile_revision(save_id)
+                session_instruction_revision = self._memory_instruction_revision(save_id)
                 if self._life_chat is not None and save_id:
                     existing_cid = self._life_chat.rotate_if_needed(
                         save_id,
-                        self._profile_revision(save_id),
-                        self._memory_revision(save_id),
+                        session_profile_revision,
+                        session_instruction_revision,
                     )
                 preparation_before = {
                     n["id"]: dict(n.get("todoIds") or {})
@@ -2963,11 +3050,8 @@ class ChatBridge:
                 if cid and self._life_chat is not None and save_id:
                     self._life_chat.record_session_id(save_id, str(cid))
                     self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
-                    self._life_chat.record_fingerprint(
-                        save_id,
-                        self._profile_revision(save_id),
-                        self._memory_revision(save_id),
-                    )
+                    # rotate_if_needed bound the context actually delivered at
+                    # turn start. Edits during generation must rotate next time.
                 if success and self._life_chat is not None:
                     if cid:
                         self._life_chat.mark_prompt_delivered(save_id, str(cid), mode)
@@ -3239,28 +3323,59 @@ class ChatBridge:
         world: dict[str, Any] | None = None,
     ) -> str | None:
         """Ask the life-session model for one short care message (§2)."""
-        memory_render = (
-            self._memory_store.render_for_context(save_id)
-            if self._memory_store is not None
-            else None
-        )
         if world is None:
             world = {}
             if isinstance(self._latest_snapshot_payload, dict):
                 world = self._latest_snapshot_payload.get("world") or {}
         weather = world.get("weather") or world.get("weatherIcon")
-        prompt = LifeChatService.build_care_prompt(
-            profile, memory_render, kind, game_date, weather, ref_event
-        )
-        active_task = ActiveChatTask(
-            request_id=f"care-{uuid.uuid4().hex[:8]}",
-            save_id=save_id,
-            command_id="",
-            prompt=prompt,
-        )
         try:
+            # Snapshot work has priority even when its created task has not yet
+            # reached the lock. Waiting is event driven, never a model poll.
+            while (wakeup := self._autonomy_wakeup_tasks.get(save_id)) is not None:
+                await asyncio.shield(wakeup)
+            if self._life_queue:
+                await self._drain_life_queue(self._chat_ws)
             async with self._busy_lock:
-                result = await self._await_life_provider(active_task, None, prompt)
+                # Deferred care uses the current profile/memory after any player
+                # edits, and skips a greeting queued for a now obsolete day.
+                if self._current_game_day_key and self._current_game_day_key != game_date:
+                    return None
+                current_profile = self._profile_store.get(save_id).get("profile") if self._profile_store else None
+                profile = current_profile or profile
+                if profile.get("careFrequency") == "quiet":
+                    return None
+                memory_render = self._memory_store.render_for_context(save_id) if self._memory_store else None
+                existing_cid = None
+                session_profile_revision = self._profile_revision(save_id)
+                session_instruction_revision = self._memory_instruction_revision(save_id)
+                if self._life_chat:
+                    existing_cid = self._life_chat.rotate_if_needed(
+                        save_id, session_profile_revision, session_instruction_revision)
+                    system_prompt = self._life_chat.build_turn_prompt(
+                        save_id, existing_cid, profile, memory_render, self._life_work_summary(save_id, "chat"),
+                        mode="chat", milestones=self._life_milestone_summary(save_id, "chat"),
+                        live_context=self._decision_context(save_id, origin="care"))
+                else:
+                    system_prompt = LifeChatService.build_system_prompt(profile, memory_render, None)
+                prompt = system_prompt + "\n\n" + LifeChatService.build_care_prompt(
+                    profile, memory_render, kind, game_date, weather, ref_event)
+                prompt += "\n这是主动关怀，不是玩家新输入。本轮只输出问候，不调用工具、不变更工作安排，不承接旧对话中的派活或确认。"
+                active_task = ActiveChatTask(
+                    request_id=f"care-{uuid.uuid4().hex[:8]}", save_id=save_id,
+                    command_id="", prompt=prompt, async_task=asyncio.current_task())
+                result = await self._await_life_provider(active_task, existing_cid, prompt)
+                cid = result.get("conversation_id") or existing_cid
+                if cid and self._life_chat:
+                    self._life_chat.record_session_id(save_id, str(cid))
+                    self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
+                    if result.get("success"):
+                        self._life_chat.mark_prompt_delivered(save_id, str(cid), "chat")
+                self._record_command(
+                    request_id=active_task.request_id, save_id=save_id, conversation_id=cid,
+                    prompt=f"[主动关怀:{kind}] {game_date}",
+                    status="completed" if result.get("success") else "failed", start_idx=-1, end_idx=-1,
+                    usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
+                    error=result.get("error"), duration=time.monotonic() - active_task.start_time)
         except Exception:
             logger.warning("Care text generation raised", exc_info=True)
             return None
@@ -4003,6 +4118,7 @@ class ChatBridge:
         request_id: str,
         text: str,
         save_id: str | None,
+        *, _slot_owned: bool = False,
     ) -> None:
         """Processes a user chat submit message."""
         logger.info("Processing chat submit [%s]: %s (saveId=%s)", request_id, text, save_id)
@@ -4038,7 +4154,7 @@ class ChatBridge:
                 self._register_command_chain(save_id, text, ws, request_id)
 
         # 1. Concurrency deduplication guard
-        if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
+        if not _slot_owned and (self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled)):
             logger.warning("Chat submit [%s] rejected (companion busy)", request_id)
             busy_reply = Envelope.create_chat_reply(
                 sender_instance_id=self.instance_id,
@@ -4053,7 +4169,7 @@ class ChatBridge:
             await self._send_reply(ws, busy_reply)
             return
 
-        async with self._busy_lock:
+        async with contextlib.nullcontext() if _slot_owned else self._busy_lock:
             instructions = load_instruction_bundle()
             # A changed profile/tool surface (or a legacy session without a
             # recorded fingerprint) must not reuse the old provider session.
@@ -4130,12 +4246,7 @@ class ChatBridge:
                 )
 
                 # 4. Invoke agy CLI in executor
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    None,
-                    self._execute_turn,
-                    active_task, existing_cid, prompt,
-                )
+                result = await self._await_work_provider(active_task, existing_cid, prompt)
 
                 # If task was cancelled during execution, handle_chat_cancel already handled reply & record
                 if active_task.cancelled:
@@ -4321,7 +4432,7 @@ class ChatBridge:
                 reply_status = status
                 job_selected = False
                 day_rebased = False
-                if not active_task.read_only and status == "completed" and self._work_store and save_id:
+                if not active_task.read_only and self._work_store and save_id:
                     selected = self._work_store.state(save_id).decision
                     if selected.get("selected") and not selected.get("finished"):
                         reply_status = "selected"
@@ -4330,8 +4441,11 @@ class ChatBridge:
                         chain = self._command_chains.get(save_id)
                         if chain is not None:
                             chain.waiting_task_id = selected.get("taskId")
-                        reply_text = "已选择短作业，等待原生执行。\n" + (reply_text or "")
-                    else:
+                        selected_task = next((task for task in self._work_store.state(save_id).tasks
+                                              if task.id == selected.get("taskId")), None)
+                        title = selected_task.title if selected_task else "短作业"
+                        reply_text = f"已选择「{title}」，等待原生执行；结果尚未确认。"
+                    elif status == "completed":
                         reply_status = "decision-completed"
                 if not active_task.read_only and (not job_selected or status != "completed"):
                     day_rebased = self._rebase_chain_after_day_advance(active_task, status)

@@ -1092,8 +1092,7 @@ def test_mcp_server_call_navigate_to(mock_scheduler, tmp_path):
         mock_scheduler.execute_navigate_to.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Town", "tile_x": 43, "tile_y": 58,
-                               "x": None, "y": None, "tile": None, "landmark": None,
+        assert step.params == {"location_id": "Town", "tile": {"x": 43, "y": 58}, "landmark": None,
                                "detail": False}
 
     asyncio.run(run())
@@ -1479,22 +1478,22 @@ def test_mcp_server_call_plant_crop_workflow(mock_scheduler):
     asyncio.run(run())
 
 
-def test_mcp_server_call_navigate_to_with_landmark(mock_scheduler, tmp_path):
+def test_mcp_server_call_navigate_to_resolves_observed_shop_landmark(mock_scheduler, tmp_path):
+    mock_scheduler.latest_snapshot = {"payload": {"shop": {"locationId": "SeedShop", "interactionTile": {"x": 4, "y": 5}}}}
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         store = _grant_decision(tmp_path, mock_scheduler)
         with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
             _, data = await server.call_tool(
                 "navigate_to",
-                {"location_id": "Farm", "landmark": "shipping_bin"},
+                {"location_id": "SeedShop", "landmark": "counter"},
             )
         assert data["status"] == "job-selected"
         mock_scheduler.execute_navigate_to.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Farm", "landmark": "shipping_bin",
-                               "tile_x": None, "tile_y": None, "x": None, "y": None,
-                               "tile": None, "detail": False}
+        assert step.params == {"location_id": "SeedShop", "landmark": "counter",
+                               "tile": {"x": 4, "y": 5}, "detail": False}
 
     asyncio.run(run())
 
@@ -1601,8 +1600,7 @@ def test_mcp_server_navigate_to_xy_and_executing_status(mock_scheduler, tmp_path
         mock_scheduler.execute_navigate_to.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Farm", "x": 61, "y": 17,
-                               "tile_x": None, "tile_y": None, "tile": None,
+        assert step.params == {"location_id": "Farm", "tile": {"x": 61, "y": 17},
                                "landmark": None, "detail": False}
 
     asyncio.run(run())
@@ -1834,7 +1832,8 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
 
         assert "call_capability" in light_names
         assert "discover_capabilities" in light_names
-        assert "plant_crop_workflow" in light_names
+        assert "plant_crop_workflow" not in light_names  # Composite legacy jobs are rejected.
+        assert {"plant_seeds", "eat_food"} <= light_names
         # Common actions are exposed directly on the game surface.
         assert "water_auto" in light_names
         assert "harvest_auto" in light_names
@@ -1887,7 +1886,7 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
         # call_capability passes params through without schema default injection.
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Farm", "x": 61, "y": 17}
+        assert step.params == {"location_id": "Farm", "tile": {"x": 61, "y": 17}}
 
         with pytest.raises(ToolError):
             await light_server.call_tool("call_capability", {"tool": "not_a_tool", "params": {}})

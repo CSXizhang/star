@@ -63,6 +63,7 @@ class SaveAutonomyState:
     breaker_tripped: bool = False
     breaker_cooldown_until: float | None = None
     breaker_reason: str | None = None
+    observed_rest_state: str | None = None
 
     def __post_init__(self) -> None:
         # ``enabled`` was the pre-free-mode public field.  Read old files as
@@ -337,6 +338,17 @@ class AutonomyController:
             state.breaker_reason = None
         return self._mutate(save_id, mutate)
 
+    def observe_rest_state(self, save_id: str, rest_state: Any) -> None:
+        """A completed daytime rest is one native wakeup, even within a resource band."""
+        if not isinstance(rest_state, str) or self.state(save_id).observed_rest_state == rest_state:
+            return
+        def mutate(state: SaveAutonomyState) -> None:
+            if state.observed_rest_state == "resting" and rest_state == "awake":
+                state.decision_epoch += 1
+                state.last_decision_fingerprint = None
+            state.observed_rest_state = rest_state
+        self._mutate(save_id, mutate)
+
     def next_candidate(self, save_id: str, snapshot: dict[str, Any], *, now: float | None = None, work_signal: str = "") -> dict[str, Any] | None:
         """Return one explainable task from fresh native data, or None when idle."""
         state = self.state(save_id)
@@ -384,6 +396,15 @@ class AutonomyController:
         pending = farm.get("cropUnwateredTiles", []) if isinstance(farm, dict) else []
         pending = pending if isinstance(pending, list) else []
         pending_summary = sorted((x.get("x"), x.get("y")) for x in pending if isinstance(x, dict))
+        companion = snapshot.get("companion") if isinstance(snapshot.get("companion"), dict) else {}
+        # Recovery changes what the next short job can do even if crops and
+        # inventory are unchanged. Use capability bands rather than waking on
+        # every point gained/spent; explicit resource todos retain their exact
+        # thresholds in workSignal. Position and clock ticks are not wakeups.
+        stamina = companion.get("stamina")
+        stamina = ("exhausted" if stamina < 2 else "low" if stamina < 10 else "usable") if isinstance(stamina, (int, float)) and not isinstance(stamina, bool) else None
+        water = companion.get("waterCanLevel")
+        water = ("empty" if water <= 0 else "usable") if isinstance(water, int) and not isinstance(water, bool) else None
         signature = (
             f"{save_id}:{world.get('year', '?')}:{world.get('season', '?')}:{world.get('dayOfMonth', '?')}:"
             f"{candidate.get('kind')}:{candidate.get('reason')}:{mature_summary}:{pending_summary}:"
@@ -391,7 +412,7 @@ class AutonomyController:
             f"{json.dumps(items, sort_keys=True)}:{json.dumps(chest_summary)}:{shop.get('isOpen', shop.get('open'))}:"
             f"{state.preferences_revision if state else None}:"
             f"{world.get('weatherIcon')}:{world.get('isRaining')}:"
-            f"{(snapshot.get('companion') or {}).get('availableMoney')}"
+            f"{companion.get('availableMoney')}:{stamina}:{water}:{companion.get('restState')}"
         )
 
         return hashlib.sha256(signature.encode("utf-8")).hexdigest()

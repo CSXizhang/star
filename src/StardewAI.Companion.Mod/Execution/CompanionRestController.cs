@@ -2,55 +2,75 @@ using Microsoft.Xna.Framework;
 using StardewValley;
 using StardewValley.Locations;
 using StardewValley.Objects;
+using StardewAI.Companion.Mod.Adapters;
 using StardewAI.Companion.Mod.Domain;
 using StardewAI.Companion.Mod.Menus;
 
 namespace StardewAI.Companion.Mod.Execution;
 
-/// <summary>Local bedtime routine; never calls the player's sleep/day-end action.</summary>
+/// <summary>Local daytime rest and bedtime; never calls the player's sleep/day-end action.</summary>
 public sealed class CompanionRestController
 {
     private readonly IFarmerActor _actor;
     private readonly NavigationStateMachine _navigation;
     private int _lastAttemptTime = -1;
+    private int _lastPreviewTime = -1;
     private bool _cancelRequested;
+    private readonly CompanionBedtimeRouteEstimate _routeEstimate = new();
+    private string? _recoveryFailure;
     public bool Paused { get; set; }
     public int Bedtime { get; set; } = CompanionBedtime.Default;
     public string State { get; private set; } = "awake";
     public string? Reason { get; private set; }
     public int? SleepStartedAt { get; private set; }
+    public bool IsDaytimeRest { get; private set; }
     public bool IsResting => State != "awake";
 
     public CompanionRestController(IFarmerActor actor, NavigationStateMachine navigation)
     { _actor = actor; _navigation = navigation; }
 
-    public void RestoreSleep(int startedAt)
+    public void RestoreSleep(int startedAt, bool daytime = false)
     {
         SleepStartedAt = startedAt;
-        State = "sleeping";
+        IsDaytimeRest = daytime;
+        State = daytime ? "resting" : "sleeping";
         if (_actor.GameFarmer is { } farmer)
         {
             farmer.isInBed.Value = true;
             farmer.timeWentToBed.Value = startedAt;
             farmer.CanMove = false;
-            farmer.FarmerSprite.setCurrentFrame(farmer.FacingDirection * 8);
+            farmer.regenTimer = 500;
+            NativeCompanionAnimation.SleepPose(farmer);
         }
     }
 
     public void Wake()
     {
-        _navigation.RequestCancel("New day");
-        _navigation.Update(null, 0);
+        // An idle rest navigator shares the actor with work. Do not clear or halt
+        // a newer work task merely because its old navigation request still exists.
+        if (_navigation.IsExecuting)
+        {
+            _navigation.RequestCancel("Rest finished");
+            _navigation.Update(null, 0);
+        }
         State = "awake";
         Reason = null;
         SleepStartedAt = null;
+        IsDaytimeRest = false;
         _cancelRequested = false;
         _lastAttemptTime = -1;
+        _lastPreviewTime = -1;
+        _routeEstimate.Clear();
+        _recoveryFailure = null;
         if (_actor.GameFarmer is { } farmer)
         {
             if (farmer.isInBed.Value) BedFurniture.ShiftPositionForBed(farmer);
             farmer.isInBed.Value = false;
+            farmer.timeWentToBed.Value = 0;
+            farmer.currentEyes = 0;
+            farmer.blinkTimer = 0;
             farmer.CanMove = true;
+            farmer.Halt();
             farmer.FarmerSprite.StopAnimation();
         }
     }
@@ -61,7 +81,9 @@ public sealed class CompanionRestController
         // Pause boundaries finish and verify the current effect before the partial
         // result is emitted, preserving accurate progress for tomorrow.
         if (!work.IsPaused) { work.RequestPause(); return; }
-        work.RequestCancel("BEDTIME: wrapping up for sleep; preserve unfinished work for tomorrow.");
+        work.RequestCancel(IsDaytimeRest
+            ? "LOW_STAMINA_REST: wrapping up to recover in bed; preserve unfinished work until awake."
+            : "BEDTIME: wrapping up for sleep; preserve unfinished work for tomorrow.");
         _cancelRequested = true;
     }
 
@@ -85,14 +107,63 @@ public sealed class CompanionRestController
     public void Update(GameTime? time, long tick, ISkillExecutionMachine? work)
     {
         if (Paused || Game1.paused || Game1.eventUp || CompanionMenuClock.HasBlockingMenu) return;
-        if (State == "sleeping") return;
+        // The same native time boundary applies to movement and resource recovery.
+        if (time is not null && !Game1.shouldTimePass()) return;
         int now = Game1.timeOfDay;
-        if (!IsResting && now < 1200) return;
+        if (State is "sleeping" or "resting")
+        {
+            if (IsDaytimeRest && CompanionBedtime.ShouldWindDown(now, Bedtime, 0))
+            {
+                IsDaytimeRest = false;
+                SleepStartedAt = now;
+                State = "sleeping";
+                if (_actor.GameFarmer is { } sleepingFarmer) sleepingFarmer.timeWentToBed.Value = now;
+                return;
+            }
+            if (IsDaytimeRest && CompanionBedtime.HasRecovered(_actor.Stamina, _actor.MaxStamina))
+            {
+                Wake();
+                return;
+            }
+            if (time is not null && _actor.GameFarmer is { } restingFarmer && _recoveryFailure is null)
+            {
+                if (!restingFarmer.isInBed.Value || restingFarmer.currentLocation is null ||
+                    BedFurniture.GetBedAtTile(restingFarmer.currentLocation, _actor.Tile.X, _actor.Tile.Y) is null)
+                {
+                    restingFarmer.isInBed.Value = false;
+                    restingFarmer.CanMove = true;
+                    SleepStartedAt = null;
+                    State = "waiting-for-bed";
+                    Reason = "休息的床已不可用，需要重新找床。";
+                    return;
+                }
+                try { NativeBedRecovery.Apply(restingFarmer, time); }
+                catch (Exception ex)
+                {
+                    _recoveryFailure = $"床上恢复未能执行：{ex.Message}";
+                    Reason = _recoveryFailure;
+                }
+            }
+            return;
+        }
+        // Rest requires a physical native farmer and bed. Offline mechanics tests
+        // have neither and must not resolve the global game world when stamina falls.
+        if (_actor.GameFarmer is null) return;
+        if (!IsResting)
+        {
+            if (CompanionBedtime.NeedsDaytimeRest(_actor.Stamina, _actor.MaxStamina))
+            {
+                IsDaytimeRest = !CompanionBedtime.ShouldWindDown(now, Bedtime, 0);
+                State = "winding-down";
+                Reason = IsDaytimeRest ? "体力偏低，收尾后回床恢复。" : null;
+            }
+            else if (!CompanionBedtime.ShouldPreviewRoute(now, Bedtime)) return;
+        }
         var house = Game1.getLocationFromName("FarmHouse") as FarmHouse;
         var bed = house?.GetPlayerBed();
         if (house == null || bed == null)
         {
-            if (CompanionBedtime.ShouldWindDown(now, Bedtime, 30))
+            if (IsResting || CompanionBedtime.ShouldWindDown(now, Bedtime, 30))
             {
                 State = "waiting-for-bed"; Reason = "家里没有可用的床。";
                 FinishWorkAtSafePoint(work);
@@ -103,10 +174,15 @@ public sealed class CompanionRestController
         var target = new TileCoordinate(spot.X, spot.Y);
         if (!IsResting)
         {
-            if (_lastAttemptTime == now) return;
-            _lastAttemptTime = now;
-            var route = _navigation.PreviewRoute(house.NameOrUniqueName, target);
-            int travel = route.TryGetValue("estimatedGameMinutes", out var estimate) && estimate is int minutes ? minutes : 60;
+            int day = Game1.Date.TotalDays;
+            if (!_routeEstimate.TryGet(day, Bedtime, _actor.LocationName, _actor.Tile, house.NameOrUniqueName, target, now, out int travel))
+            {
+                if (_lastPreviewTime == now) return;
+                _lastPreviewTime = now;
+                var route = _navigation.PreviewRoute(house.NameOrUniqueName, target);
+                travel = route.TryGetValue("estimatedGameMinutes", out var estimate) && estimate is int minutes ? minutes : 60;
+                _routeEstimate.Store(day, Bedtime, _actor.LocationName, _actor.Tile, house.NameOrUniqueName, target, now, travel);
+            }
             if (!CompanionBedtime.ShouldWindDown(now, Bedtime, travel)) return;
             State = "winding-down";
         }
@@ -118,10 +194,15 @@ public sealed class CompanionRestController
         if (_navigation.IsExecuting)
         {
             _navigation.Update(time, tick);
+            if (!_navigation.IsExecuting && _navigation.FinalResult is { FinalState: ExecutionState.Failed } failed)
+            {
+                State = "waiting-for-bed";
+                Reason = failed.ErrorMessage ?? "暂时走不到床边。";
+            }
             return;
         }
         if (bed.IsBeingSleptIn())
-        { State = "waiting-for-bed"; Reason = "床正有人使用，等空出来再睡。"; return; }
+        { _actor.Halt(); State = "waiting-for-bed"; Reason = "床正有人使用，等空出来再睡。"; return; }
         if (_actor.LocationName == house.NameOrUniqueName &&
             CanEnterBed(house, bed, _actor.Tile, target) &&
             _actor.GameFarmer is { } farmer)
@@ -141,19 +222,20 @@ public sealed class CompanionRestController
             farmer.isInBed.Value = true;
             farmer.timeWentToBed.Value = now;
             farmer.CanMove = false;
-            farmer.FarmerSprite.setCurrentFrame(farmer.FacingDirection * 8);
+            farmer.regenTimer = 500;
+            NativeCompanionAnimation.SleepPose(farmer);
             farmer.lastSleepLocation.Value = house.NameOrUniqueName;
             farmer.lastSleepPoint.Value = farmer.TilePoint;
             farmer.mostRecentBed = farmer.Position;
             farmer.doEmote(24);
             SleepStartedAt = now;
-            State = "sleeping";
+            State = IsDaytimeRest ? "resting" : "sleeping";
             Reason = null;
             return;
         }
         if (State is "returning-home" or "waiting-for-bed" && _lastAttemptTime == now) return;
         _lastAttemptTime = now;
-        var request = new NavigationRequest("bedtime", $"bedtime-{Game1.Date.TotalDays}-{now}", house.NameOrUniqueName, target, 180);
+        var request = new NavigationRequest("bedtime", $"rest-{Game1.Date.TotalDays}-{now}", house.NameOrUniqueName, target, 180);
         if (_navigation.Start(request, out var failure))
         { State = "returning-home"; Reason = null; }
         else

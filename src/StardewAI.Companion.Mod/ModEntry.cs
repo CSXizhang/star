@@ -128,7 +128,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void OnDayEnding(object? sender, DayEndingEventArgs e)
     {
-        _overnightBedtime = _coordinator?.Rest.SleepStartedAt ?? Game1.timeOfDay;
+        _overnightBedtime = _coordinator?.Rest.IsDaytimeRest == false
+            ? _coordinator.Rest.SleepStartedAt ?? Game1.timeOfDay : Game1.timeOfDay;
         _dayTransition = true;
         _actor?.Halt();
     }
@@ -372,7 +373,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 nativeActionAdapter: _nativeActionAdapter);
             _coordinator.Rest.Bedtime = CompanionBedtime.Normalize(activeState.PreferredBedtime);
             if (activeState.SleepDay == Game1.Date.TotalDays && activeState.SleepStartedAt is { } sleepTime)
-                _coordinator.Rest.RestoreSleep(sleepTime);
+                _coordinator.Rest.RestoreSleep(sleepTime, activeState.SleepIsDaytime);
             _lastRestState = _coordinator.Rest.State;
 
             // 4. Start WebSocket server on loopback with rotating session token
@@ -410,6 +411,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _lifeStartSequence.Abort();
             _lifeMenuUiState.Reset();
             CompanionConversationMenu.DraftText = string.Empty;
+            CompanionConversationMenu.DraftDecisionId = null;
             _conversationSaveId = saveId;
             try
             {
@@ -508,7 +510,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (_coordinator != null && _lastRestState != _coordinator.Rest.State)
         {
             _lastRestState = _coordinator.Rest.State;
-            if (_coordinator.Rest.SleepStartedAt is { } asleepAt) _overnightBedtime = asleepAt;
+            if (!_coordinator.Rest.IsDaytimeRest && _coordinator.Rest.SleepStartedAt is { } asleepAt) _overnightBedtime = asleepAt;
             PersistActorState("bedtime transition");
         }
         if (e.IsMultipleOf(15) && _coordinator != null)
@@ -639,6 +641,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 state.OvernightBedtime = _overnightBedtime;
                 state.PreferredBedtime = _coordinator?.Rest.Bedtime ?? CompanionBedtime.Default;
                 state.SleepStartedAt = _coordinator?.Rest.SleepStartedAt;
+                state.SleepIsDaytime = _coordinator?.Rest.IsDaytimeRest == true;
                 state.SleepDay = state.SleepStartedAt.HasValue ? Game1.Date.TotalDays : null;
                 state.Exhausted = _actor.GameFarmer?.exhausted.Value == true;
                 _stateRepository.Save(state);
@@ -679,6 +682,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             _conversationSaveId = null;
             _lifeMenuUiState.Reset();
             CompanionConversationMenu.DraftText = string.Empty;
+            CompanionConversationMenu.DraftDecisionId = null;
             _lifeControls.Supersede();
             CompanionCommandMenu.TaskState.Reset();
             _companionDialogue?.Reset();
@@ -771,7 +775,11 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
             if (Game1.activeClickableMenu != null)
             {
-                if (Game1.activeClickableMenu is CompanionConversationMenu)
+                if (_companionDialogue?.HandleF8() == true)
+                {
+                    Helper.Input.Suppress(e.Button);
+                }
+                else if (Game1.activeClickableMenu is CompanionConversationMenu)
                 {
                     ((CompanionConversationMenu)Game1.activeClickableMenu).OpenRecords();
                     Helper.Input.Suppress(e.Button);
@@ -789,10 +797,10 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 return;
             }
 
-            OpenCompanionHub(0);
+            TryAutoStartChatBridge();
+            GetCompanionDialogue().OpenF8();
             Helper.Input.Suppress(e.Button);
-            Monitor.Log("Companion records opened (F8).", LogLevel.Info);
-            DispatchLifeProfileRefresh();
+            Monitor.Log("Companion options opened (F8).", LogLevel.Info);
             ProjectBridgeConnection();
         }
     }
@@ -1536,7 +1544,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             () => !_lifeMenuUiState.WorkPaused && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested &&
                 !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl &&
                 !_lifeMenuUiState.IsChatPending && (_coordinator == null || _coordinator.GetActivityStatus() == "idle"),
-            OpenTaskPanel, GetBridgeConnectionProblem, OpenCompanionConversation);
+            OpenTaskPanel, GetBridgeConnectionProblem, OpenCompanionConversation,
+            () => OpenCompanionHub(0), () => OpenCompanionHub(2), () => OpenCompanionReplyInput(null));
         return _companionDialogue;
     }
 
@@ -1554,7 +1563,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     {
         DispatchLifeProfileRefresh();
         GetCompanionDialogue().OpenConversation((text, id, resolve) => DispatchLifeChat(text, "chat", null, id, resolve),
-            () => OpenCompanionHub(0), noticeId);
+            () => GetCompanionDialogue().OpenF8(), noticeId);
+    }
+
+    private void OpenCompanionReplyInput(string? noticeId)
+    {
+        GetCompanionDialogue().OpenReplyInput((text, id, resolve) => DispatchLifeChat(text, "chat", null, id, resolve), noticeId);
     }
 
     private void OpenCompanionHub(int tab)
@@ -1562,14 +1576,14 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         DispatchLifeProfileRefresh();
         var actions = new CompanionHubActions(RequestPauseMenuAction, RequestResumeMenuAction, RequestCancelMenuAction,
             ToggleAutonomyMode, SendLifeProfileSetOnly, OpenCompanionMemoryForDashboard, DispatchDecisionVisibility);
-        GetCompanionDialogue().OpenDashboard(actions, OpenCompanionConversationForNotice, tab);
+        GetCompanionDialogue().OpenDashboard(actions, OpenCompanionReplyInput, tab);
     }
 
     private void OpenCompanionMemoryForDashboard()
     {
         OpenCompanionMemory();
-        if (Game1.activeClickableMenu is CompanionLifeMenu memoryMenu)
-            memoryMenu.exitFunction = () => GetCompanionDialogue().ReturnToDashboard(() => OpenCompanionHub(2));
+        if (Game1.activeClickableMenu is CompanionLifeMenu)
+            GetCompanionDialogue().OwnF8Child(() => GetCompanionDialogue().ReturnToDashboard(() => OpenCompanionHub(2)));
     }
 
     private readonly Dictionary<string, Dictionary<string, string>> _decisionEdits = new();
@@ -1948,7 +1962,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     string text = !string.IsNullOrWhiteSpace(reply.ReplyText) ? reply.ReplyText
                         : !string.IsNullOrWhiteSpace(reply.Error) ? $"这次没能回复：{reply.Error}" : "这次没有收到回复，请再试一次。";
                     if (_lifeMenuUiState.RecordConversation(reply.RequestId + ":companion", _lifeMenuUiState.CompanionName,
-                        text, GetCurrentGameDate(), isPlayer: false, unread: !visible))
+                        text, GetCurrentGameDate(), isPlayer: false, unread: true))
                     {
                         if (!visible)
                         {
@@ -2007,9 +2021,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
             if (state.Profile != null)
             {
-                _lifeMenuUiState.Bedtime = CompanionBedtime.Normalize(state.Profile.Bedtime);
+                bool bedtimeChanged = _lifeMenuUiState.ApplyBedtime(state.Profile.Bedtime, _coordinator?.Rest.Bedtime);
                 if (_coordinator != null) _coordinator.Rest.Bedtime = _lifeMenuUiState.Bedtime;
-                PersistActorState("bedtime preference");
+                if (bedtimeChanged) PersistActorState("bedtime preference");
                 _lifeMenuUiState.ApplyProfileState(
                     state.Profile.Onboarded,
                     state.Profile.Skipped,

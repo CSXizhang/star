@@ -17,6 +17,8 @@ public sealed class CompanionDashboardMenu : IClickableMenu
     private readonly List<(Vector2 Position, string Text)> _labels = new();
     private readonly Dictionary<Vector2, Color> _labelColors = new();
     private readonly HashSet<Rectangle> _quietButtons = new();
+    private readonly Dictionary<Rectangle, Vector2> _buttonSizes = new();
+    private readonly CompanionDashboardRefreshState _refreshState = new();
     private readonly List<int> _dividers = new();
     private CompanionDashboardLayout _layout = null!;
     private readonly List<string> _visibleUnread = new();
@@ -29,12 +31,14 @@ public sealed class CompanionDashboardMenu : IClickableMenu
     private string? _feedback;
     private string[] _undoIds = Array.Empty<string>();
     private DateTime _undoUntil;
+    private bool _undoVisible;
 
     public CompanionDashboardMenu(LifeMenuUiState state, CompanionHubActions actions, Action<string?> openConversation, int tab = 0)
     {
         _state = state; _actions = actions; _openConversation = openConversation; _tab = tab;
         _style = state.PlayStyle; _personality = state.Personality; _frequency = state.CareFrequency;
         _profileLoaded = state.HasProfileState; _revision = state.ConversationRevision;
+        _usage = tab == 2;
         _name = new TextBox(Game1.content.Load<Texture2D>(@"LooseSprites\textBox"), null, Game1.smallFont, Game1.textColor)
             { limitWidth = false, textLimit = 20, Text = state.CompanionName };
         Layout();
@@ -44,6 +48,7 @@ public sealed class CompanionDashboardMenu : IClickableMenu
     {
         var rect = new Rectangle(x, y, w, 44);
         _buttons.Add((rect, text, click, fixedPosition));
+        _buttonSizes[rect] = Game1.smallFont.MeasureString(text);
         if (quiet) _quietButtons.Add(rect);
     }
     private void Label(int x, ref int y, string text, int w, Color? color = null)
@@ -76,7 +81,6 @@ public sealed class CompanionDashboardMenu : IClickableMenu
         int wanted = _tab == 0 && _jumpToBottom ? _maxScroll : Math.Clamp(_scroll, 0, _maxScroll);
         if (_tab == 0) _jumpToBottom = false;
         if (wanted != _scroll) { _scroll = wanted; BuildContent(); }
-        foreach (string id in _visibleUnread) _state.MarkConversationRead(id);
         int thumbHeight = Math.Max(30, (int)((double)_body.Height * _body.Height / (_body.Height + _maxScroll)));
         _thumb = new(_track.X, _track.Y + (_maxScroll == 0 ? 0 : (int)((double)_scroll / _maxScroll * (_track.Height - thumbHeight))), 12, thumbHeight);
         int? focusedId = currentlySnappedComponent?.myID;
@@ -85,14 +89,16 @@ public sealed class CompanionDashboardMenu : IClickableMenu
             .Select(b => new ClickableComponent(b.Button.Rect, b.Button.Text) { myID = b.Id }).ToList();
         allClickableComponents.Add(new ClickableComponent(_layout.Close, "关闭") { myID = 999 });
         currentlySnappedComponent = allClickableComponents.FirstOrDefault(c => c.myID == focusedId);
+        _undoVisible = _undoIds.Length > 0 && DateTime.UtcNow < _undoUntil;
+        _refreshState.Changed(_state, CompanionCommandMenu.TaskState, Game1.uiViewport.Width, Game1.uiViewport.Height, _tab, _scroll);
     }
     private void BuildContent()
     {
-        _buttons.Clear(); _labels.Clear(); _labelColors.Clear(); _quietButtons.Clear(); _dividers.Clear(); _visibleUnread.Clear();
+        _buttons.Clear(); _buttonSizes.Clear(); _labels.Clear(); _labelColors.Clear(); _quietButtons.Clear(); _dividers.Clear(); _visibleUnread.Clear();
         string[] tabs = { "记录", "工作", "设置" };
         for (int i = 0; i < 3; i++) { int target = i; var rect = _layout.Tabs[i]; AddButton(rect.X, rect.Y, rect.Width, tabs[i], () => Switch(target), true); }
         int footerWidth = Math.Min(160, (_layout.Footer.Width - 12) / 2);
-        AddButton(_layout.Footer.X, _layout.Footer.Y, footerWidth, "找伙伴说话", () => _openConversation(null), true);
+        AddButton(_layout.Footer.X, _layout.Footer.Y, footerWidth, "直接回复", () => Reply(null), true);
         if (_undoIds.Length > 0 && DateTime.UtcNow < _undoUntil)
             AddButton(_layout.Footer.Right - footerWidth, _layout.Footer.Y, footerWidth, "撤销删除", () => {
                 if (_actions.SetDecisionVisibility(_undoIds, false)) { _undoIds = Array.Empty<string>(); _feedback = "已撤销删除。"; }
@@ -108,14 +114,14 @@ public sealed class CompanionDashboardMenu : IClickableMenu
             if (entries.Length == 0) Label(x, ref y, "还没有交谈记录。找伙伴聊聊吧。", contentWidth);
             foreach (var entry in entries)
             {
-                int entryTop = y;
                 Label(x, ref y, $"{entry.Speaker} · {entry.GameDate}" + (entry.RolledBack ? " · 读档前" : ""), contentWidth, Color.SaddleBrown);
+                int textTop = y;
                 Label(x + 12, ref y, entry.Text, contentWidth - 12);
-                if (entry.Unread && entryTop < _body.Bottom && y > _body.Top) _visibleUnread.Add(entry.Id);
+                if (entry.Unread && textTop < _body.Bottom && y - 14 > _body.Top) _visibleUnread.Add(entry.Id);
                 if (entry.DecisionStatus == "pending")
                 {
                     var captured = entry;
-                    AddButton(x + 12, y, 104, "答复", () => _openConversation(captured.DecisionId));
+                    AddButton(x + 12, y, 104, "答复", () => Reply(captured.DecisionId));
                     AddButton(x + 132, y, 90, "删除", () => Delete(new[] { captured.DecisionId! })); y += 54;
                 }
                 Divider(ref y);
@@ -163,7 +169,7 @@ public sealed class CompanionDashboardMenu : IClickableMenu
                 Label(x, ref y, entry.Text, wide ? contentWidth - 220 : contentWidth);
                 int buttonY = wide ? rowY : y, buttonX = wide ? _body.Right - 204 : x;
                 int answerWidth = Math.Min(104, (contentWidth - 12) / 2);
-                AddButton(buttonX, buttonY, answerWidth, "答复", () => _openConversation(captured.DecisionId));
+                AddButton(buttonX, buttonY, answerWidth, "答复", () => Reply(captured.DecisionId));
                 AddButton(buttonX + answerWidth + 12, buttonY, Math.Min(88, contentWidth - answerWidth - 12), "删除", () => Delete(new[] { captured.DecisionId! }), quiet: true);
                 y = Math.Max(y, buttonY + 44) + 20;
             }
@@ -215,6 +221,11 @@ public sealed class CompanionDashboardMenu : IClickableMenu
         if (!_actions.SetDecisionVisibility(ids, true)) { _feedback = "操作未发送，请检查连接或稍后重试。"; return; }
         _undoIds = ids; _undoUntil = DateTime.UtcNow.AddSeconds(8); _feedback = "已删除，可在 8 秒内撤销。";
     }
+    private void Reply(string? decisionId)
+    {
+        exitThisMenu(playSound: false);
+        _openConversation(decisionId);
+    }
     public override void update(GameTime time)
     {
         base.update(time);
@@ -235,7 +246,9 @@ public sealed class CompanionDashboardMenu : IClickableMenu
             else _newMessages = true;
             _revision = _state.ConversationRevision;
         }
-        Layout();
+        if (_refreshState.Changed(_state, CompanionCommandMenu.TaskState, Game1.uiViewport.Width, Game1.uiViewport.Height, _tab, _scroll)
+            || (_tab == 0 && _jumpToBottom) || _undoVisible != (_undoIds.Length > 0 && DateTime.UtcNow < _undoUntil))
+            Layout();
         if (_tab == 0 && _scroll >= _maxScroll) _newMessages = false;
     }
     public override void receiveScrollWheelAction(int direction) { _scroll = Math.Clamp(_scroll + (direction > 0 ? -80 : 80), 0, _maxScroll); Layout(); }
@@ -298,11 +311,14 @@ public sealed class CompanionDashboardMenu : IClickableMenu
             if (!_quietButtons.Contains(b.Rect))
                 drawTextureBox(batch, Game1.menuTexture, new Rectangle(0, 256, 60, 60), b.Rect.X, b.Rect.Y, b.Rect.Width, b.Rect.Height, hovered ? new Color(255, 240, 195) : Color.White, .5f, false);
             if (selected) batch.Draw(Game1.fadeToBlackRect, new Rectangle(b.Rect.X + 12, b.Rect.Bottom - 5, b.Rect.Width - 24, 3), Color.DarkOliveGreen);
-            Vector2 size = Game1.smallFont.MeasureString(b.Text);
+            Vector2 size = _buttonSizes[b.Rect];
             ClippedSpriteText.Draw(batch, Game1.smallFont, b.Text, new(b.Rect.X + Math.Max(12, (b.Rect.Width - size.X) / 2), b.Rect.Y + (b.Rect.Height - size.Y) / 2), selected ? Color.DarkOliveGreen : _quietButtons.Contains(b.Rect) ? Color.SaddleBrown : Game1.textColor, new(b.Rect.X + 10, b.Rect.Y + 4, b.Rect.Width - 20, b.Rect.Height - 8));
         }
         if (_maxScroll > 0) { batch.Draw(Game1.fadeToBlackRect, _track, Color.SaddleBrown * .25f); batch.Draw(Game1.fadeToBlackRect, _thumb, Color.SaddleBrown * .7f); }
-        string footerText = _feedback ?? "Esc / F8 关闭";
+        // Only entries included in this rendered viewport have actually been shown.
+        foreach (string id in _visibleUnread) _state.MarkConversationRead(id);
+        _visibleUnread.Clear();
+        string footerText = _feedback ?? "Esc / F8 返回";
         ClippedSpriteText.Draw(batch, Game1.smallFont, footerText, new(_layout.Footer.X, _layout.Footer.Y + 48), Color.SaddleBrown, new(_layout.Footer.X, _layout.Footer.Y + 46, _layout.Footer.Width, 24));
         drawMouse(batch);
     }

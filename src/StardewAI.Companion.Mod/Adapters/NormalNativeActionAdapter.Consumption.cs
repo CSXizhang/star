@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Microsoft.Xna.Framework;
 using StardewValley;
 using StardewAI.Companion.Mod.Domain;
 using StardewAI.Companion.Mod.Execution;
@@ -120,5 +121,61 @@ internal static class NativeOvernightRecovery
         }
         _=Transpiler(Array.Empty<CodeInstruction>());
         throw new NotSupportedException("Native overnight recovery was not patched.");
+    }
+}
+
+/// <summary>Reverse-copy the native bed resource tick for one detached farmer. No world or player update runs.</summary>
+internal static class NativeBedRecovery
+{
+    private static bool _patched;
+    public static void Apply(Farmer farmer, GameTime time)
+    {
+        if (ReferenceEquals(farmer, Game1.player)) throw new InvalidOperationException("Expected the detached companion.");
+        if (!farmer.isInBed.Value || time.ElapsedGameTime <= TimeSpan.Zero) return;
+        if (!_patched)
+        {
+            new Harmony("StardewAI.Companion.NativeBedRecovery").CreateReversePatcher(
+                AccessTools.Method(typeof(Farmer), nameof(Farmer.Update), new[] { typeof(GameTime), typeof(GameLocation) }),
+                new HarmonyMethod(typeof(NativeBedRecovery), nameof(Recover))).Patch();
+            _patched = true;
+        }
+        Recover(farmer, time, farmer.currentLocation);
+    }
+
+    internal static IEnumerable<CodeInstruction> ResourceBlock(IEnumerable<CodeInstruction> instructions)
+    {
+        var code = instructions.ToList();
+        var timer = AccessTools.Field(typeof(Farmer), nameof(Farmer.regenTimer));
+        var health = AccessTools.Field(typeof(Farmer), nameof(Farmer.health));
+        int first = code.FindIndex(i => i.opcode == OpCodes.Ldfld && Equals(i.operand, timer)) - 2;
+        int last = first >= 0 ? code.FindIndex(first, i => i.opcode == OpCodes.Stfld && Equals(i.operand, health)) : -1;
+        if (first < 0 || last <= first || last + 1 >= code.Count ||
+            code[first].opcode != OpCodes.Ldarg_0 || code[first + 1].opcode != OpCodes.Ldarg_0)
+            throw new InvalidOperationException("Unsupported native bed resource block.");
+        var slice = code.GetRange(first, last - first + 1);
+        // The native branches all exit immediately after this resource block.
+        // Retain that exact destination on our return; reject any other outside branch.
+        var exit = new CodeInstruction(OpCodes.Ret);
+        exit.labels.AddRange(code[last + 1].labels);
+        var labels = slice.SelectMany(i => i.labels).Concat(exit.labels).ToHashSet();
+        if (slice.Any(i => i.operand is Label target && !labels.Contains(target)) ||
+            slice.Count(i => i.opcode == OpCodes.Stfld && Equals(i.operand, timer)) != 2 ||
+            !slice.Any(i => i.opcode == OpCodes.Ldc_I4 && Equals(i.operand, 500)) ||
+            slice.Any(i => i.operand is MethodInfo method &&
+                method.DeclaringType != typeof(Farmer) && method.DeclaringType != typeof(GameTime) && method.DeclaringType != typeof(TimeSpan)))
+            throw new InvalidOperationException("Native bed recovery escaped its resource block.");
+        slice.Add(exit);
+        return slice;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Recover(Farmer farmer, GameTime time, GameLocation location)
+    {
+        // Ownership, menu and clock checks are performed by the rest controller.
+        // Only the native regenTimer, stamina and health instructions are copied;
+        // the single-player/multiplayer gate is outside this isolated block.
+        static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions) => ResourceBlock(instructions);
+        _ = Transpiler(Array.Empty<CodeInstruction>());
+        throw new NotSupportedException("Native bed recovery was not patched.");
     }
 }

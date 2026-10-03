@@ -312,6 +312,7 @@ def test_scheduler_refill_without_observation_is_an_actionable_error() -> None:
 
     async def run():
         scheduler = CompanionScheduler(client=_client(_snapshot_env()))
+        scheduler.query_production = AsyncMock(return_value={"waterRefillTiles": [], "waterRefillMapComplete": True})
         with pytest.raises(SchedulerError, match="no native watering-can refill tile|farming"):
             await scheduler.refill_watering_can(location_id="Farm", max_tiles=2)
 

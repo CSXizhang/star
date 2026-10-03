@@ -93,10 +93,10 @@ def test_bridge_reload_retains_provider_session_and_does_not_repeat_on_reconnect
     async def scenario():
         bridge = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)
         bridge._life_chat.record_session_id("farm", "existing-dialogue")
-        bridge._life_chat.record_fingerprint("farm", bridge._profile_revision("farm"), bridge._memory_revision("farm"))
+        bridge._life_chat.record_fingerprint("farm", bridge._profile_revision("farm"), bridge._memory_instruction_revision("farm"))
         request(tmp_path)
         await bridge._prepare_game_load("farm", "new-session")
-        assert bridge._life_chat.rotate_if_needed("farm", bridge._profile_revision("farm"), bridge._memory_revision("farm")) == "existing-dialogue"
+        assert bridge._life_chat.rotate_if_needed("farm", bridge._profile_revision("farm"), bridge._memory_instruction_revision("farm")) == "existing-dialogue"
         bridge._work_store.add_goal("farm", "new goal after reload")
         await bridge._prepare_game_load("farm", "new-session")
         assert bridge._work_store.state("farm").goals[0].text == "new goal after reload"

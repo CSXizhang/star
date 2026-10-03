@@ -120,6 +120,13 @@ public sealed class LifeMenuUiState
     /// Play-style: <c>"earn"</c>, <c>"workhorse"</c>, <c>"community"</c>, or <c>"decor"</c>.
     /// </summary>
     public int Bedtime { get; set; } = 2400;
+    /// <summary>Projects the normalized preference and reports an actual actor-state change.</summary>
+    public bool ApplyBedtime(int bedtime, int? actorBedtime = null)
+    {
+        int previous = actorBedtime ?? Bedtime;
+        Bedtime = CompanionBedtime.Normalize(bedtime);
+        return Bedtime != previous;
+    }
     public string PlayStyle { get; private set; } = "earn";
 
     /// <summary>

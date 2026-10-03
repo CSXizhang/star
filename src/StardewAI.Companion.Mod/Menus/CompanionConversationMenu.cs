@@ -26,6 +26,7 @@ public sealed class CompanionConversationMenu : IClickableMenu
     private int _revision;
     private LifeChatStatus _status;
     public static string DraftText { get; set; } = "";
+    public static string? DraftDecisionId { get; set; }
 
     public CompanionConversationMenu(LifeMenuUiState state, Func<string, string?, bool, bool> submit,
         Func<string, Dialogue> dialogue, Func<string?> connection, Action openRecords, string? noticeId = null)
@@ -34,7 +35,7 @@ public sealed class CompanionConversationMenu : IClickableMenu
         _input = new TextBox(Game1.content.Load<Texture2D>(@"LooseSprites\textBox"), null, Game1.smallFont, Game1.textColor)
             { limitWidth = false, textLimit = 500, Text = DraftText };
         _input.OnEnterPressed += _ => Send(false);
-        var selected = state.PendingDecisions.FirstOrDefault(e => e.DecisionId == noticeId);
+        var selected = state.PendingDecisions.FirstOrDefault(e => e.DecisionId == (noticeId ?? DraftDecisionId));
         _replyTo = selected?.DecisionId;
         ShowEntry(selected ?? state.Conversation.LastOrDefault(e => e.DecisionStatus != "dismissed"));
         if (state.IsChatPending) _status = LifeChatStatus.Idle;
@@ -49,9 +50,8 @@ public sealed class CompanionConversationMenu : IClickableMenu
     {
         string text = entry == null ? _connection() ?? "我在这里，想聊什么就告诉我。" : entry.IsPlayer ? "你：" + entry.Text : entry.Text;
         if (entry?.RolledBack == true) text = "读档前的交谈：" + text;
-        _speech = new CompanionNpcDialogueBox(_dialogue(text));
+        _speech = new CompanionNpcDialogueBox(_dialogue(text), entry == null ? null : () => _state.MarkConversationRead(entry.Id));
         _revision = _state.ConversationRevision; _status = _state.ChatStatus;
-        if (entry != null) _state.MarkConversationRead(entry.Id);
         Layout();
     }
     private void Layout()
@@ -68,8 +68,8 @@ public sealed class CompanionConversationMenu : IClickableMenu
     {
         string text = _input.Text.Trim();
         if (text.Length == 0 || _state.IsChatPending) return;
-        if (!_submit(text, confirm ? _replyTo : null, confirm)) { _feedback = "消息未发送，请检查连接。"; return; }
-        _input.Text = DraftText = ""; _replyTo = null; _feedback = null; _status = LifeChatStatus.Idle; Focus();
+        if (!_submit(text, _replyTo, confirm)) { _feedback = "消息未发送，请检查连接。"; return; }
+        _input.Text = DraftText = ""; _replyTo = DraftDecisionId = null; _feedback = null; _status = LifeChatStatus.Idle; Focus();
     }
     public override void update(GameTime time)
     {
@@ -92,7 +92,8 @@ public sealed class CompanionConversationMenu : IClickableMenu
         if (key == Keys.Enter) Send(false);
         if (key == Keys.F8) OpenRecords();
     }
-    public void OpenRecords() { DraftText = _input.Text; _openRecords(); }
+    public void PreserveDraft() { DraftText = _input.Text; DraftDecisionId = _replyTo; }
+    public void OpenRecords() { PreserveDraft(); exitThisMenu(playSound: false); _openRecords(); }
     public override void receiveLeftClick(int x, int y, bool playSound = true)
     {
         foreach (var b in _buttons) if (b.Rect.Contains(x, y)) { b.Click(); return; }
@@ -113,7 +114,7 @@ public sealed class CompanionConversationMenu : IClickableMenu
     }
     protected override void cleanupBeforeExit()
     {
-        DraftText = _input.Text;
+        PreserveDraft();
         if (Game1.keyboardDispatcher?.Subscriber == _input) Game1.keyboardDispatcher.Subscriber = null;
         if (!Game1.eventUp) { Game1.dialogueUp = false; if (Game1.player != null && !Game1.player.UsingTool) Game1.player.CanMove = true; }
         base.cleanupBeforeExit();

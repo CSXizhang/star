@@ -45,7 +45,7 @@ class CompanionProfileStore:
                careFrequency, companionName, profileRevision}}``
 
     A missing file or missing saveId key is treated as not-onboarded
-    (profile=None). Every successful ``set()`` increments ``profileRevision``.
+    (profile=None). Changed settings increment ``profileRevision``; repeat saves do not.
     """
 
     def __init__(self, state_path: Path | str) -> None:
@@ -241,7 +241,12 @@ class CompanionProfileStore:
                     return
                 record["companion_name"] = name
 
-            record["profile_revision"] = current_rev + 1
+            defaults = self._default_record()
+            changed = any(record.get(field, default) != persisted.get(field, default)
+                          for field, default in defaults.items() if field != "profile_revision")
+            # The first explicit save establishes a profile even if it happens
+            # to match all defaults. Further identical saves preserve sessions.
+            record["profile_revision"] = current_rev + int(changed or current_rev == 0)
             persisted.clear()
             persisted.update(record)
             new_rev = record["profile_revision"]
@@ -252,7 +257,7 @@ class CompanionProfileStore:
                 "playStyle": record.get("play_style", "earn"),
                 "personality": record.get("personality", "gentle"),
                 "careFrequency": record.get("care_frequency", "moderate"),
-            "bedtime": record.get("bedtime", 2400),
+                "bedtime": record.get("bedtime", 2400),
                 "companionName": record.get("companion_name", DEFAULT_COMPANION_NAME),
             }
 

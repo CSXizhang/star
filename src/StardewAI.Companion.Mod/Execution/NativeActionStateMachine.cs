@@ -419,6 +419,13 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         _actionEffectExecuted = false;
         _lastStepResult = null;
         _nativeToolAnimation = false;
+        if (_currentRequest!.Kind == NativeActionKind.EatFood && _actor is FarmerMechanicsActor eatingActor)
+        {
+            try { eatingActor.BeginEating(_currentRequest.ItemId); _nativeToolAnimation = true; }
+            catch (Exception ex) { eatingActor.EndUsingTool(); Log($"Eating animation unavailable: {ex.Message}", LogLevel.Warn); }
+            CurrentState = ExecutionState.Acting;
+            return;
+        }
         var animationTool = _adapter.GetAnimationTool(_actor, _currentRequest!, _currentTarget);
         if (animationTool is not null)
         {

@@ -2991,19 +2991,19 @@ class CompanionScheduler:
         tiles: list[dict[str, Any]] | None = None,
         location_id: str = "Farm",
         max_tiles: int = 4,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
         task_id: str | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Refills the companion's watering can at native refill tiles.
 
-        With no explicit tiles, the native snapshot's refillWaterTiles for the
-        companion's own map are used (never an invented coordinate).
+        With no explicit tiles, use local native observations first, then inspect
+        the requested map once for distant native refill sources.
         """
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
-        if isinstance(max_tiles, bool) or not isinstance(max_tiles, int) or max_tiles < 1:
-            raise PolicyViolationError("max_tiles must be a positive integer")
+        if isinstance(max_tiles, bool) or not isinstance(max_tiles, int) or not 1 <= max_tiles <= 8:
+            raise PolicyViolationError("max_tiles must be an integer from 1 to 8")
 
         if tiles:
             validated = validate_action_tiles(tiles, max_tiles=8)
@@ -3038,7 +3038,18 @@ class CompanionScheduler:
                         "message": "Watering can is already full; no refill needed.",
                         "terminalState": "none",
                     }
-            validated = self._snapshot_farming_refill_tiles(max_tiles)
+            try:
+                farming = payload.get("farming") or {}
+                if farming.get("location", location_id) != location_id:
+                    raise SchedulerError("Local refill observation belongs to another map.")
+                validated = self._snapshot_farming_refill_tiles(max_tiles)
+            except SchedulerError as local_error:
+                production = await self.query_production(location_id=location_id)
+                observed = production.get("waterRefillTiles")
+                if not isinstance(observed, list) or not observed:
+                    scope = "this map" if production.get("waterRefillMapComplete") else "the inspected area"
+                    raise SchedulerError(f"No native watering-can refill tile was found on {scope}. {local_error}") from None
+                validated = validate_action_tiles(observed[:max_tiles], max_tiles=8)
 
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(

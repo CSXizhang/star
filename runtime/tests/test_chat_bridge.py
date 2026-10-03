@@ -817,7 +817,7 @@ def test_autonomy_chat_channel_lifecycle_replays_initial_snapshot_and_enable(tmp
             )
 
     asyncio.run(exercise())
-    assert len(bridge._autonomy_requests) == 1
+    assert not bridge._autonomy_requests  # finished dispatch reservations are released
     # Native profile synchronization is allowed; routine completion sends no chat reply.
     families = [json.loads(message)["messageType"] for message in sent]
     assert "chat.reply" not in families

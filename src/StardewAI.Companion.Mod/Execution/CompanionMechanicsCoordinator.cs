@@ -221,6 +221,9 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
         _purchaseMachine?.Update(time, tickCount);
         _nativeActionMachine?.Update(time, tickCount);
         _navigationMachine.Update(time, tickCount);
+        if (_actor is FarmerMechanicsActor nativeActor && !Rest.Paused && !Game1.paused && !Game1.eventUp &&
+            !StardewAI.Companion.Mod.Menus.CompanionMenuClock.HasBlockingMenu)
+            nativeActor.UpdateMovementAnimation(time);
     }
 
     /// <summary>
@@ -592,7 +595,9 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
     {
         if (Rest.IsResting)
         {
-            rejectReason = "BEDTIME: companion is resting; resume unfinished work tomorrow.";
+            rejectReason = Rest.IsDaytimeRest
+                ? "LOW_STAMINA_REST: companion is recovering in bed; resume unfinished work when awake."
+                : "BEDTIME: companion is resting; resume unfinished work tomorrow.";
             return false;
         }
         if (_actor.ActiveTaskId is not null || _stateMachine.IsExecuting ||
@@ -1434,7 +1439,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 WaterCanLevel: _actor.WaterLeft,
                 MaxWaterCanLevel: _actor.MaxWater,
                 HasWateringCan: true,
-                Activity: activeMachine is not null ? DescribeActivity(activeMachine) : "idle",
+                Activity: Rest.IsResting ? Rest.State : activeMachine is not null ? DescribeActivity(activeMachine) : "idle",
                 AvailableMoney: companionMoney,
                 MoneyStatus: companionMoneyStatus,
                 RestState: Rest.State,

@@ -4565,6 +4565,14 @@ class ChatBridge:
                 logger.info("handle_chat_submit [%s] cancelled.", request_id)
                 if not active_task.read_only:
                     self._break_command_chain(save_id)
+                fingerprint = self._autonomy_requests.pop(request_id, None)
+                if fingerprint and self._autonomy is not None and save_id:
+                    decision = self._work_store.state(save_id).decision if self._work_store else {}
+                    if not decision.get("selected"):
+                        # No native work owns this consumed wakeup. Permit one
+                        # fresh decision on reconnect; selected jobs keep their
+                        # existing execution/reconciliation gate unchanged.
+                        self._autonomy.request_job_decision(save_id)
                 if not getattr(active_task, "recorded", False):
                     duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
                     cid = self.get_conversation_id(save_id)

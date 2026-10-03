@@ -225,16 +225,17 @@ public sealed class CompanionTaskPanelState
         NextStep = Running ? "伙伴正在工作，需要时可暂停或取消。" : "点击继续可恢复，或取消当前工作。";
     }
 
-    public void SetRestState(string state, string? reason)
+    public void SetRestState(string state, string? reason, bool daytime = false)
     {
         if (_paused) { ShowPause(); return; }
         Stage = state switch { "sleeping" => "已就寝", "resting" => "休息恢复体力", "returning-home" => "回家", "winding-down" => "收尾中", _ => "等待休息" };
         Current = reason ?? (state == "resting" ? "伙伴正在床上恢复体力。"
-            : state == "sleeping" ? "伙伴已经上床休息。" : "准备回家睡觉，剩下的工作明天继续。");
+            : state == "sleeping" ? "伙伴已经上床休息。"
+            : daytime ? "准备回床休息，恢复体力后继续工作。" : "准备回家睡觉，剩下的工作明天继续。");
         Progress = null;
         WaitReason = reason;
         Running = state is "winding-down" or "returning-home";
-        NextStep = state == "resting" ? "恢复体力后继续原来的工作。" : "明天醒来后继续安排。";
+        NextStep = daytime || state == "resting" ? "恢复体力后继续原来的工作。" : "明天醒来后继续安排。";
     }
 
     public void Complete(string text, bool failed = false)

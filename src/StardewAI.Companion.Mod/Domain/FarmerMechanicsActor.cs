@@ -544,7 +544,10 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             bool completedOnePass = frameCount > 0 && _lastAnimIndex >= frameCount - 1 && animIndex < _lastAnimIndex;
             _lastAnimIndex = animIndex;
 
-            if ((_eatingAnimation ? !sprite.PauseForSingleAnimation : !isOnToolAnim) || sprite.CurrentAnimation == null || completedOnePass)
+            // Native completion clears the single-animation flag before the
+            // detached canMoveNow callback clears UsingTool. isOnToolAnimation
+            // can therefore remain true after the final frame has stopped ticking.
+            if (!sprite.PauseForSingleAnimation || (!_eatingAnimation && !isOnToolAnim) || sprite.CurrentAnimation == null || completedOnePass)
             {
                 _animPhase = ToolAnimationPhase.Completed;
             }

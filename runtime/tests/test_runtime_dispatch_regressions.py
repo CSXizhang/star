@@ -165,6 +165,71 @@ def test_cancelled_work_keeps_model_slot_until_executor_restores_state(tmp_path)
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("job_selected", [False, True])
+def test_disconnected_autonomy_rearms_only_when_no_native_job_was_selected(tmp_path, job_selected):
+    async def run():
+        bridge = bridge_for_work(tmp_path)
+        bridge._snapshot_care_hooks = AsyncMock()
+        started, release = threading.Event(), threading.Event()
+        disconnected = asyncio.Event()
+        envelope = snapshot()
+
+        def provider(active, *args):
+            bridge._work_store.begin_decision("save", "disconnected-choice")
+            if job_selected:
+                bridge._work_store.submit_plan("save", goal_text="浇地", decision_token="disconnected-choice", tasks=[{
+                    "title": "给水壶补水", "steps": [{"operation": "refill_watering_can", "params": {}}]}])
+            started.set()
+            assert release.wait(3)
+            return {"success": True, "response": "待命。", "conversation_id": "work-session"}
+
+        bridge._execute_turn.side_effect = provider
+        ws = MagicMock(send_text=AsyncMock())
+        reads = 0
+
+        async def receive_text(timeout):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return json.dumps(envelope.to_mapping())
+            await disconnected.wait()
+            raise ConnectionError("chat websocket disconnected")
+
+        ws.receive_text = receive_text
+        reader = asyncio.create_task(bridge._receive_loop(ws, "save"))
+        assert await asyncio.to_thread(started.wait, 1)
+        consumed = bridge._autonomy.state("save").last_decision_fingerprint
+        selected_before = dict(bridge._work_store.state("save").decision)
+        assert consumed
+        disconnected.set()
+        await asyncio.sleep(0)
+        assert bridge._active_task.cancelled
+        release.set()
+        with pytest.raises(ConnectionError, match="chat websocket disconnected"):
+            await reader
+        assert not bridge._busy_lock.locked()
+        assert not bridge._autonomy_wakeup_tasks and not bridge._autonomy_requests
+
+        # Reopen the persisted stores as a reconnect/restarted bridge would.
+        reconnected = bridge_for_work(tmp_path)
+        tracked = set()
+        await reconnected._maybe_schedule_autonomy(envelope, "save", tracked, None, force=True)
+        await finish_tracked(tracked)
+        await reconnected._maybe_schedule_autonomy(envelope, "save", tracked, None, force=True)
+        await finish_tracked(tracked)
+        if job_selected:
+            reconnected._execute_turn.assert_not_called()
+            assert reconnected._autonomy.state("save").last_decision_fingerprint == consumed
+            state = reconnected._work_store.state("save")
+            assert state.decision == selected_before
+            assert len(state.tasks) == 1 and state.tasks[0].id == selected_before["taskId"]
+            assert state.tasks[0].steps[0].attempts == 0
+        else:
+            assert reconnected._execute_turn.call_count == 1
+            assert reconnected._autonomy.state("save").last_decision_fingerprint != consumed
+    asyncio.run(run())
+
+
 def test_care_and_player_chat_share_persisted_session_and_refresh_corrected_memory(tmp_path):
     async def run():
         bridge = bridge_for_work(tmp_path)

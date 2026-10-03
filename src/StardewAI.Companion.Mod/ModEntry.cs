@@ -579,7 +579,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             };
         }
         if (_coordinator?.Rest.IsResting == true)
-            CompanionCommandMenu.TaskState.SetRestState(_coordinator.Rest.State, _coordinator.Rest.Reason);
+            CompanionCommandMenu.TaskState.SetRestState(_coordinator.Rest.State, _coordinator.Rest.Reason, _coordinator.Rest.IsDaytimeRest);
         ProjectChatUiAvailability();
         if (Game1.activeClickableMenu is CompanionCommandMenu && !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested && _transportServer?.IsChatConnected != true)
             CompanionCommandMenu.CurrentStatusText = GetBridgeConnectionProblem() ?? "桥接未连接，输入会保留";

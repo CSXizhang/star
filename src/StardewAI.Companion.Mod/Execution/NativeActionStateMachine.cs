@@ -508,6 +508,14 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             // (see HandleActing); this stage only records the per-target effect.
             _completed.Add(new NativeActionEffect(targetLabel, result.State, null, result.ItemId, result.ItemCount, _currentTarget.Tile));
             EmitProgress("verifying", result.State);
+            // Water tiles are alternative refill sources, not separate jobs.
+            // Once the native adapter confirms a refill, the whole request is satisfied.
+            if (_currentRequest!.Kind == NativeActionKind.RefillWateringCan)
+            {
+                _currentTargetIndex++;
+                FinishExecution(ExecutionState.Succeeded, null, null);
+                return;
+            }
         }
         else if (result.PreconditionFailed)
         {

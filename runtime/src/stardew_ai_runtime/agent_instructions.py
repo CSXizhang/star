@@ -34,17 +34,15 @@ def _tool_links(text: str) -> str:
 
 def _format_instructions(core: str, index: str) -> str:
     return _tool_links(core + "\n\n" + index) + (
-        "\n\n工具入口：仅用 stardew-companion 操作游戏。"
-        "领域指导和执行方法通过 read_guidance(topic) 读取；工作模式可在 knowledge 能力组发现并调用，"
-        "生活对话直接调用只读 read_guidance。首次行动需要执行细节时读 execution。"
-        "参数用 discover_capabilities(group) 获取，再用 call_capability(tool,params) 调用；"
-        "submit_plan 选择一项短作业，get_status 获取必要的当前状态。"
-        "若工具经 exec 宿主提供，首次只按精确名称 "
-        "mcp__stardew_companion__discover_capabilities、mcp__stardew_companion__call_capability、"
-        "mcp__stardew_companion__submit_plan、mcp__stardew_companion__get_status 查入口；"
-        "入口发现单独完成，读到真实方法后在下一次 exec 调用；未发现的方法不能直接调用。"
-        "不要广搜或输出全部 ALL_TOOLS。工具回包取 structuredContent，无此字段则读 content。"
-        "不要读取本地文件或调用终端。直接对话用manage_milestones接下明确任务、manage_companion处理暂停/继续/取消/作息；征求意见仅讨论，选择偏好不是派活。动作交给执行器，当前对话不接管原生连接。"
+        "\n\n工具入口：用 stardew-companion 操作游戏。"
+        "已有状态和结果足够时直接行动；缺参数时 discover_capabilities(group) 返回必填、嵌套形状和示例。"
+        "submit_plan 提交一项顺序作业，可包含导航、取料、开垦、种植和精确 water_tiles 浇水；"
+        "原生部分成功或结果未知时先核对效果，再选择剩余行动。"
+        "需要领域知识或执行细节时 read_guidance(topic)。"
+        "工具回包读 structuredContent，无此字段则读 content。"
+        "仅查当前所需的真实工具入口，不广搜 ALL_TOOLS，不读取本地文件或调用终端。"
+        "直接对话用 manage_milestones 保存明确任务，用 manage_companion 处理暂停/继续/取消/作息；"
+        "征求意见仅讨论，动作交给执行器。"
     )
 
 

@@ -14,6 +14,50 @@ from stardew_ai_runtime.plan_executor import StepExecution
 from stardew_ai_runtime.protocol import Envelope
 
 
+@pytest.mark.parametrize("known_no_work", [True, False])
+def test_empty_scope_feedback_does_not_wake_itself_but_uncertain_terminal_does(
+    tmp_path, known_no_work,
+):
+    bridge = bridge_for_work(tmp_path)
+    goal = bridge._work_store.add_goal("save", "照料指定田区", source="user")
+    bridge._autonomy.set_goal_scope("save", goal.id)
+    envelope = snapshot(stamina=270, water=40)
+    first = bridge._prepare_autonomy_decision(envelope, "save")
+    assert first is not None
+    bridge._autonomy.record_world_event("save", first[0], 1)
+    epoch = bridge._autonomy.state("save").decision_epoch
+    bridge._work_store.begin_decision("save", "empty-scope-result")
+    bridge._work_store.finish_job("save", {"knownNoWork": known_no_work,
+        "goalSatisfied": known_no_work, "effects": []})
+
+    next_turn = bridge._prepare_autonomy_decision(envelope, "save")
+    assert (next_turn is None) is known_no_work
+    assert bridge._autonomy.state("save").decision_epoch == epoch + (not known_no_work)
+    if known_no_work:
+        # A resource change and a player's changed goal remain legitimate wakes.
+        changed = bridge._prepare_autonomy_decision(snapshot(stamina=1, water=0), "save")
+        assert changed is not None
+        bridge._autonomy.record_world_event("save", changed[0], 2)
+        bridge._work_store.revise_goal("save", goal.id, text="明天照料指定田区")
+        assert bridge._prepare_autonomy_decision(snapshot(stamina=1, water=0), "save")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_accepted_work_context_reports_actual_idle_help_preference(tmp_path, enabled):
+    bridge = bridge_for_work(tmp_path)
+    goal = bridge._work_store.add_goal("save", "继续已接受的工作", source="user")
+    bridge._autonomy.set_enabled("save", enabled)
+    bridge._autonomy.set_goal_scope("save", goal.id)
+    prepared = bridge._prepare_autonomy_decision(snapshot(), "save")
+    assert prepared is not None
+    prompt = prepared[1]
+    context = json.loads(prompt.split("实时上下文：", 1)[1].split("\n", 1)[0])
+    assert context["idleHelpEnabled"] is enabled
+    assert context["autonomyMode"] == ("free" if enabled else "command")
+    assert context["origin"] == ("free-mode" if enabled else "accepted-work")
+    assert ("闲时主动帮忙当前开启" if enabled else "闲时主动帮忙当前关闭") in prompt
+
+
 def snapshot(*, stamina=2, water=0, rest="awake", revision=1):
     return Envelope.from_mapping({
         "protocolVersion": "0.1", "messageType": "world.snapshot", "messageId": f"snapshot-{revision}",

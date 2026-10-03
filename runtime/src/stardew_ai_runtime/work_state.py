@@ -80,6 +80,7 @@ ALLOWED_OPERATIONS = frozenset(
         "query_shop",
         "query_wiki",
         "water_zone",
+        "water_tiles",
         "water_auto",
         "harvest_auto",
         "deposit_to_chest",
@@ -90,7 +91,6 @@ ALLOWED_OPERATIONS = frozenset(
         "ship_items",
         "purchase_items",
         "navigate_to",
-        "plant_crop_workflow",
         "pause_task",
         "resume_task",
         "cancel_task",
@@ -122,6 +122,14 @@ TERMINAL_STEP_STATUSES = frozenset({"completed", "partial", "cancelled", "failed
 
 class WorkStateError(ValueError):
     """Invalid work-state mutation (validation failure)."""
+
+
+PLANT_WORKFLOW_PLAN_ERROR = json.dumps({
+    "errorCode": "COMPOSITE_STEP_UNSUPPORTED", "saved": False,
+    "execution": "not_started", "operation": "plant_crop_workflow",
+    "recommendedAction": "submit_plan",
+    "message": "未执行、未保存作业。plant_crop_workflow 是旧多阶段兼容接口，不能作为一个可对账的持久化步骤。请按已观察的种子、箱子和地块，拆成独立 withdraw_from_chest / hoe_tiles / plant_seeds / water_tiles 步骤；需要时在同一任务中加入导航。不同类型、地图和数量的合法原子操作仍可组合。",
+}, ensure_ascii=False)
 
 
 # Supported explicit waiting conditions. A waiting step is only re-claimable when
@@ -274,6 +282,7 @@ class Step:
     outcome: str | None = None
     reason_code: str | None = None
     effects: list[dict[str, Any]] = field(default_factory=list)
+    feedback: dict[str, Any] = field(default_factory=dict)
     lease_owner: str | None = None
     lease_until: float = 0.0
     attempts: int = 0
@@ -368,6 +377,37 @@ def _current_constraints(value: Any) -> Any:
     if isinstance(value, list):
         return [_current_constraints(item) for item in value]
     return value
+
+
+def bind_execution_scope_params(operation: str, params: dict[str, Any],
+                                goal_constraints: dict[str, Any] | None) -> dict[str, Any]:
+    """Project an accepted exact scope into auto selection without mutating a plan."""
+    result = dict(params)
+    if operation not in {"water_auto", "harvest_auto"}:
+        return result
+    objective = (goal_constraints or {}).get("objectiveScope")
+    scope = objective.get("executionScope") if isinstance(objective, dict) else None
+    if not isinstance(scope, dict):
+        return result
+    location = scope.get("locationId")
+    if not isinstance(location, str) or not location.strip():
+        raise WorkStateError("Saved executionScope requires an observed locationId")
+
+    def coordinates(value: Any) -> list[dict[str, int]]:
+        if not isinstance(value, list) or any(
+            not isinstance(tile, dict) or any(type(tile.get(key)) is not int or tile[key] < 0
+                                             for key in ("x", "y")) for tile in value
+        ):
+            raise WorkStateError("executionScope target tiles require non-negative integer x/y coordinates")
+        return [{"x": x, "y": y} for x, y in sorted({(tile["x"], tile["y"]) for tile in value})]
+
+    tiles = coordinates(scope.get("tiles"))
+    if result.get("target_tiles") is not None:
+        requested = {(tile["x"], tile["y"]) for tile in coordinates(result["target_tiles"])}
+        tiles = [tile for tile in tiles if (tile["x"], tile["y"]) in requested]
+    result["target_tiles"] = tiles
+    result["location_id"] = location
+    return result
 
 
 class WorkStore:
@@ -478,7 +518,14 @@ class WorkStore:
                 "branchFailures": state.branch_failures[-60:],
             }
         temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(self.state_path)
+        for attempt in range(4):
+            try:
+                temp.replace(self.state_path)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                _time.sleep(0.05 * (attempt + 1))
 
     def _mutate(self, save_id: str, mutate: Callable[[SaveWorkState], Any]) -> Any:
         if not save_id:
@@ -493,6 +540,11 @@ class WorkStore:
                 result = mutate(state)
                 self._write_unlocked()
                 return result
+            except Exception:
+                # A rejected mutation or failed replacement is not persisted
+                # work. Discard its prepared in-memory goals/todos as well.
+                self._load()
+                raise
             finally:
                 self._unlock(lock)
 
@@ -635,11 +687,15 @@ class WorkStore:
         self, save_id: str, milestone_id: str, *, text: str,
         constraints: dict[str, Any], todos: list[dict[str, Any]], active: bool,
         existing_goal_id: str | None = None,
+        before_write: Callable[[str, dict[str, str]], None] | None = None,
     ) -> tuple[str, dict[str, str]]:
         """Atomically reconcile a milestone's authorization, including retry recovery.
 
         Stable milestone identity prevents duplicate goals after a failed milestone
         file write. Changed terms invalidate old child plans before replacement.
+        When supplied, before_write persists the canonical milestone and its
+        prepared links while this work lock is held, before any work-file write.
+        It also runs for an unchanged retry; its failure leaves work untouched.
         """
         def mutate(state: SaveWorkState) -> tuple[str, dict[str, str]]:
             goal = next((g for g in state.goals
@@ -652,10 +708,13 @@ class WorkStore:
                 state.goals.append(goal)
             unchanged = goal.constraints.get("milestoneSpec") == signature
             if unchanged and goal.status == ("active" if active else "paused"):
-                return goal.id, {
+                ids = {
                     t.intent.split("：", 1)[0]: t.id for t in state.todos
                     if t.goal_id == goal.id and t.status in {"pending", "due", "done"}
                 }
+                if before_write is not None:
+                    before_write(goal.id, dict(ids))
+                return goal.id, ids
             self._cancel_goal_children(state, goal.id)
             goal.text = text
             goal.constraints = {**desired, "milestoneSpec": signature}
@@ -671,6 +730,8 @@ class WorkStore:
                                 expiry=dict(spec["expiry"]) if spec.get("expiry") else None)
                     state.todos.append(todo)
                     ids[spec["key"]] = todo.id
+            if before_write is not None:
+                before_write(goal.id, dict(ids))
             return goal.id, ids
 
         return self._mutate(save_id, mutate)
@@ -774,6 +835,8 @@ class WorkStore:
                 if not isinstance(raw_step, dict):
                     raise WorkStateError("each step must be an object")
                 operation = str(raw_step.get("operation") or "")
+                if operation == "plant_crop_workflow":
+                    raise WorkStateError(PLANT_WORKFLOW_PLAN_ERROR)
                 if operation not in ALLOWED_OPERATIONS:
                     raise WorkStateError(
                         f"operation '{operation}' is not an allowed plan operation"
@@ -917,103 +980,17 @@ class WorkStore:
 
     @staticmethod
     def validate_short_job(tasks: list[dict[str, Any]]) -> None:
+        """Select one serial job; native operations validate their own prerequisites."""
         if len(tasks) != 1:
-            raise WorkStateError('ONE_SHORT_JOB_REQUIRED: nothing selected. Submit exactly one task without dependencies, e.g. tasks=[{"title":"浇水","steps":[{"operation":"water_auto","params":{"max_tiles":10}}]}]. Record remaining business with remember_intent; select it in the next decision.')
+            raise WorkStateError("ONE_SHORT_JOB_REQUIRED: submit exactly one task with sequential steps")
         task = tasks[0]
         steps = task.get("steps") or []
         if not 1 <= len(steps) <= 32 or task.get("dependencies"):
-            raise WorkStateError("Short job requires 1..32 bounded steps and no business dependencies")
+            raise WorkStateError("Job requires 1..32 sequential steps and no task dependencies")
         if any(s.get("wait") for s in steps):
             raise WorkStateError("FUTURE_WAIT_IS_INTENT: select a job only when its prerequisites hold")
-        operations = {s.get("operation") for s in steps} - READ_ONLY_OPERATIONS - {"navigate_to"}
-        planting_batch = {"plant_seeds", "water_zone"}.issubset(operations) and operations.issubset({"cut_grass", "hoe_tiles", "plant_seeds", "water_zone"})
-        production_cycle = len(operations) > 1 and "collect_machine" in operations and operations.issubset({"collect_machine", "deposit_to_chest", "insert_machine"})
-        animal_care = operations.issubset({"feed_animals", "pet_animal", "collect_animal_produce", "pickup_items"})
-        if (len(operations) > 1 and not (planting_batch or production_cycle or animal_care)) or operations & {"plant_crop_workflow", "purchase_and_plant"}:
-            raise WorkStateError("MULTIPLE_BUSINESSES: navigation may accompany one native business kind only")
-        if production_cycle:
-            machines: set[tuple[int, int]] = set()
-            delivery_started = False
-            insertion_started = False
-            chests: set[tuple[int, int]] = set()
-            for step in steps:
-                operation = step.get("operation")
-                params = step.get("params") or {}
-                if operation == "collect_machine":
-                    tiles = params.get("tiles") or []
-                    if delivery_started or insertion_started or not tiles or any(not isinstance(t, dict) or any(type(t.get(a)) is not int or t[a] < 0 for a in ("x", "y")) for t in tiles):
-                        raise WorkStateError("PRODUCTION_CYCLE_REQUIRED: collect declared machine tiles first")
-                    machines.update((t["x"], t["y"]) for t in tiles)
-                elif operation == "deposit_to_chest":
-                    ids = params.get("item_ids")
-                    x, y = params.get("chest_x"), params.get("chest_y")
-                    if insertion_started or not isinstance(ids, list) or not ids or any(not isinstance(i, str) or not i for i in ids) or any(type(v) is not int or v < 0 for v in (x, y)):
-                        raise WorkStateError("PRODUCTION_CYCLE_REQUIRED: deliver explicit products to one observed chest before inserting")
-                    delivery_started = True
-                    chests.add((x, y))
-                elif operation == "insert_machine":
-                    tile = params.get("tile") or {}
-                    if not isinstance(tile, dict) or any(type(tile.get(a)) is not int for a in ("x", "y")) or (tile.get("x"), tile.get("y")) not in machines:
-                        raise WorkStateError("PRODUCTION_CYCLE_REQUIRED: reinsert only into this cycle's collected machines")
-                    insertion_started = True
-            if len(chests) > 1:
-                raise WorkStateError("PRODUCTION_CYCLE_REQUIRED: use one delivery chest for this cycle")
-        if planting_batch:
-            planted: set[tuple[int, int]] = set()
-            hoed: set[tuple[int, int]] = set()
-            cleared: set[tuple[int, int]] = set()
-            watered: set[tuple[int, int]] = set()
-            watering_started = False
-            planting_started = False
-            for step in steps:
-                params = step.get("params") or {}
-                if step.get("operation") == "cut_grass":
-                    if hoed or planting_started or watering_started or params.get("location_id", "Farm") != "Farm":
-                        raise WorkStateError("PLANTING_BATCH_REQUIRED: clear declared seed tiles before preparation")
-                    tiles = params.get("tiles") or []
-                    if not tiles or any(not isinstance(tile, dict) or any(type(tile.get(axis)) is not int or tile[axis] < 0 for axis in ("x", "y")) for tile in tiles):
-                        raise WorkStateError("PLANTING_BATCH_REQUIRED: name exact clearing tiles")
-                    cleared.update((tile["x"], tile["y"]) for tile in tiles)
-                elif step.get("operation") == "hoe_tiles":
-                    if planting_started or watering_started or params.get("location_id", "Farm") != "Farm":
-                        raise WorkStateError("PLANTING_BATCH_REQUIRED: prepare declared seed tiles before planting")
-                    tiles = params.get("tiles") or []
-                    if not tiles or any(not isinstance(tile, dict) or any(type(tile.get(axis)) is not int or tile[axis] < 0 for axis in ("x", "y")) for tile in tiles):
-                        raise WorkStateError("PLANTING_BATCH_REQUIRED: name exact preparation tiles")
-                    hoed.update((tile["x"], tile["y"]) for tile in tiles)
-                elif step.get("operation") == "plant_seeds":
-                    planting_started = True
-                    if watering_started or params.get("location_id", "Farm") != "Farm":
-                        raise WorkStateError("PLANTING_BATCH_REQUIRED: plant first on the same Farm batch, then water it")
-                    tiles = params.get("tiles") or []
-                    if not tiles or any(not isinstance(tile, dict) or any(type(tile.get(axis)) is not int or tile[axis] < 0
-                                              for axis in ("x", "y")) for tile in tiles):
-                        raise WorkStateError("PLANTING_BATCH_REQUIRED: name the exact seed tiles")
-                    planted.update((tile["x"], tile["y"]) for tile in tiles)
-                elif step.get("operation") == "water_zone":
-                    watering_started = True
-                    x, y, radius = params.get("center_x"), params.get("center_y"), params.get("radius", 0)
-                    if any(type(value) is not int or value < 0 for value in (x, y, radius)) or radius > 3:
-                        raise WorkStateError("PLANTING_BATCH_REQUIRED: name a bounded watering area")
-                    watered.update((tx, ty) for tx in range(x - radius, x + radius + 1)
-                                   for ty in range(y - radius, y + radius + 1))
-            if not planted.issubset(watered) or not hoed.issubset(planted) or not cleared.issubset(planted):
-                raise WorkStateError("PLANTING_BATCH_REQUIRED: water the same declared seed batch")
-        units = 0
-        for step in steps:
-            if step.get("operation") not in operations:
-                continue
-            params = step.get("params") or {}
-            units += ((2 * int(params.get("radius") or 0) + 1) ** 2 if step.get("operation") == "water_zone" else
-                      max(1, len(params.get("tiles") or params.get("target_tiles") or []), int(params.get("max_tiles") or params.get("count") or 1)))
-            if int(params.get("radius") or 0) > 3:
-                raise WorkStateError("Short job area exceeds bounded radius")
-        if units > 64:
-            raise WorkStateError("Short job exceeds 64 native targets")
-        locations = {s.get("params", {}).get("location_id", "Farm" if planting_batch or production_cycle else None)
-                     for s in steps if s.get("operation") in operations}
-        if len(locations) > 1 and not animal_care:
-            raise WorkStateError("Short business job must stay within one location")
+        if any(s.get("operation") == "plant_crop_workflow" for s in steps):
+            raise WorkStateError(PLANT_WORKFLOW_PLAN_ERROR)
 
     def submit_plan(
         self,
@@ -1330,50 +1307,78 @@ class WorkStore:
 
     @staticmethod
     def effect_summary(effects: list[dict[str, Any]]) -> str:
-        """A short description of confirmed native changes for both work views."""
+        """Describe every confirmed native category, without using the job title."""
+        excluded = {"skipped", "unknown", "failed", "rejected"}
+        navigation = [e for e in effects if isinstance(e, dict) and (
+            e.get("state") in {"navigated", "arrived"} or
+            (e.get("state") is None and isinstance(e.get("location"), str)
+             and type(e.get("pathLength")) is int and e["pathLength"] >= 0))]
         effects = [e for e in effects if isinstance(e, dict)
-                   and e.get("state") not in {None, "skipped", "unknown", "failed", "rejected"}]
-        if not effects:
+                   and e.get("state") is not None and e.get("state") not in excluded]
+        if not effects and not navigation:
             return "未确认实际变化"
         states = [e.get("state") for e in effects]
-        if "building-construction-ordered" in states:
-            return "建造已下单，等待施工"
-        if "building-upgrade-ordered" in states:
-            return "扩建已下单，等待施工"
-        if "refilled" in states:
-            return "水壶已补满"
-        if "ate-food" in states:
-            count = sum(int(e.get("stack", 1)) for e in effects if e.get("state") == "ate-food")
-            return f"已吃 {count} 份食物恢复体力"
-        if "animal-purchased" in states:
-            count = sum(int(e.get("stack", 1)) for e in effects if e.get("state") == "animal-purchased")
-            return f"已买入 {count} 只动物"
-        if "petted" in states:
-            return f"已抚摸 {states.count('petted')} 只动物"
-        if "fed" in states:
-            count = sum(int(e.get("stack", 0)) for e in effects if e.get("state") == "fed")
-            return f"已放入 {count} 份饲料"
-        if "planted" in states and "watered" in states:
-            return f"已种下 {states.count('planted')} 格，已浇水 {states.count('watered')} 格"
         summaries = []
-        for state, label in (("deposited", "已入箱"), ("inserted", "已投入原料"),
-                             ("collected", "已收取"), ("picked-up", "已拾取")):
-            count = sum(int(e.get("stack", 1)) for e in effects if e.get("state") == state)
+        handled = {"navigated", "arrived"}
+
+        def tiles(kinds: tuple[str, ...], label: str) -> None:
+            handled.update(kinds)
+            count = sum(states.count(kind) for kind in kinds)
             if count:
-                summaries.append(f"{label} {count} 件")
-        if summaries:
-            return "，".join(summaries)
-        for state, label in (("harvested", "已收获"), ("planted", "已种下"), ("watered", "已浇水"), ("hoed", "已开垦"), ("tilled", "已开垦"), ("placed", "已放置")):
-            count = states.count(state)
+                summaries.append(f"{label} {count} 格")
+
+        def items(state: str, label: str, unit: str = "件", default: int = 1) -> None:
+            handled.add(state)
+            count = sum(int(e.get("stack", e.get("count", default)))
+                        for e in effects if e.get("state") == state)
             if count:
-                return f"{label} {count} 格"
-        purchases = [e for e in effects if isinstance(e, dict) and e.get("state") == "purchased"]
-        if purchases:
-            count = sum(int(e.get("count", e.get("stack", 0))) for e in purchases)
-            cost = sum(int(e.get("subtotal", 0)) for e in purchases)
-            if count:
-                return f"已买入 {count} 件" + (f"，花费 {cost} 金" if cost else "")
-        return f"记录 {len(effects)} 项实际变化"
+                summaries.append(f"{label} {count} {unit}")
+
+        if navigation:
+            summaries.append(f"已记录 {len(navigation)} 段行程")
+        handled.add("refilled")
+        if "refilled" in states:
+            count = states.count("refilled")
+            summaries.append("水壶已补满" + (f" {count} 次" if count > 1 else ""))
+        handled.add("ate-food")
+        count = sum(int(e.get("stack", 1)) for e in effects if e.get("state") == "ate-food")
+        if count:
+            summaries.append(f"已吃 {count} 份食物恢复体力")
+        tiles(("cleared-weeds", "cleared-stone", "cleared-twig", "cleared-dead-crop", "clump-cleared", "cut-grass"), "已清理")
+        tiles(("tree-felled",), "已砍倒")
+        tiles(("hoed", "tilled"), "已开垦")
+        tiles(("planted",), "已种下")
+        tiles(("watered",), "已浇水")
+        tiles(("fertilized",), "已施肥")
+        tiles(("harvested",), "已收获")
+        tiles(("placed",), "已放置")
+        for state, label in (("withdrawn", "已取出"), ("deposited", "已入箱"),
+                             ("inserted", "已投入原料"), ("collected", "已收取"),
+                             ("picked-up", "已拾取"), ("crafted", "已制作"),
+                             ("removed-and-recovered", "已回收")):
+            items(state, label)
+        handled.add("purchased")
+        purchases = [e for e in effects if e.get("state") == "purchased"]
+        count = sum(int(e.get("count", e.get("stack", 0))) for e in purchases)
+        cost = sum(int(e.get("subtotal", 0)) for e in purchases)
+        if count:
+            summaries.append(f"已买入 {count} 件" + (f"，花费 {cost} 金" if cost else ""))
+        items("animal-purchased", "已买入", "只动物")
+        handled.add("petted")
+        if "petted" in states:
+            summaries.append(f"已抚摸 {states.count('petted')} 只动物")
+        items("fed", "已放入", "份饲料", default=0)
+        for state, label in (("building-construction-ordered", "建造已下单，等待施工"),
+                             ("building-upgrade-ordered", "扩建已下单，等待施工"),
+                             ("building-moved", "建筑已移动"), ("door-opened", "动物门已打开"),
+                             ("door-closed", "动物门已关闭")):
+            handled.add(state)
+            if state in states:
+                summaries.append(label)
+        other = sum(state not in handled for state in states)
+        if other:
+            summaries.append(f"记录 {other} 项实际变化")
+        return "，".join(summaries) if summaries else f"记录 {len(effects)} 项实际变化"
 
     # ----------------------------------------------------------- claiming
     @staticmethod
@@ -1653,7 +1658,7 @@ class WorkStore:
             if name in params:
                 value = params[name]
                 return value if isinstance(value, str) and value else None
-        return "Farm" if operation in {"plant_seeds", "water_zone"} else None
+        return "Farm" if operation in {"plant_seeds", "water_zone", "water_tiles"} else None
 
     @staticmethod
     def _execution_location(state: SaveWorkState, task: Task, step: Step,
@@ -1716,6 +1721,7 @@ class WorkStore:
         step_id: str,
         outcome: str,
         effects: list[dict[str, Any]] | None = None,
+        feedback: dict[str, Any] | None = None,
         reason_code: str | None = None,
         snapshot_revision: int | None = None,
         command_id: str | None = None,
@@ -1736,6 +1742,8 @@ class WorkStore:
                 raise WorkStateError(
                     "cannot mark a step completed before its command id is persisted"
                 )
+            if command_id and step.command_id and command_id != step.command_id:
+                raise WorkStateError("Result command id does not match the persisted step command")
             if command_id and not step.command_id:
                 step.command_id = command_id
 
@@ -1743,6 +1751,7 @@ class WorkStore:
             step.outcome = outcome
             step.reason_code = reason_code
             step.effects = list(effects or [])
+            step.feedback = dict(feedback or {})
             step.lease_owner = None
             step.lease_until = 0.0
             state.executions.append(

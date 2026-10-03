@@ -51,9 +51,10 @@ from stardew_ai_runtime.scheduler import (
     SchedulerError,
     extract_chest_summary,
     extract_non_tool_items,
+    validate_action_tiles,
 )
 from stardew_ai_runtime.wiki import WikiLookup
-from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+from stardew_ai_runtime.work_state import PLANT_WORKFLOW_PLAN_ERROR, WorkStateError, WorkStore, bind_execution_scope_params
 
 
 def _compact_plan_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -74,8 +75,15 @@ def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
     effect coordinates/target arrays are available via the same tool's detail flag.
     """
     result = dict(overview)
+    decision = overview.get("decision") or {}
+    selected_goal = decision.get("goalScope") or decision.get("goalId")
+    selected_task = decision.get("taskId") or (overview.get("lastJob") or {}).get("taskId")
+    goals = overview.get("goals") or []
+    tasks = overview.get("tasks") or []
+    result["goalCount"], result["taskCount"] = len(goals), len(tasks)
     result["goals"] = []
-    for goal in overview.get("goals") or []:
+    ranked_goals = sorted(goals, key=lambda g: (g.get("id") != selected_goal, g.get("status") != "active"))
+    for goal in ranked_goals[:3]:
         row = {key: goal[key] for key in ("id", "text", "source", "priority", "status") if key in goal}
         # milestoneSpec duplicates the goal/todos; other constraints remain exact.
         row["constraints"] = {key: value for key, value in (goal.get("constraints") or {}).items() if key != "milestoneSpec"}
@@ -87,7 +95,15 @@ def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
             row["project"]["openQuestions"] = row["project"]["openQuestions"][:3]
         row["detailsAvailable"] = bool(project or (goal.get("constraints") or {}).get("milestoneSpec"))
         result["goals"].append(row)
-    result["tasks"] = [_compact_plan_task(task) for task in overview.get("tasks") or []]
+    ranked_tasks = sorted(tasks, key=lambda t: (t.get("id") != selected_task,
+                         t.get("status") in {"completed", "cancelled"}))
+    result["tasks"] = [_compact_plan_task(task) for task in ranked_tasks[:3]]
+    result["currentTask"] = next((t for t in result["tasks"] if t.get("id") == selected_task), None)
+    for key in ("dueTodos", "waitingConditions", "blockedBranches", "blockedDependencies", "anomalies"):
+        if isinstance(overview.get(key), list):
+            entries = sorted(overview[key], key=lambda row: row.get("goalId", row.get("goal_id")) != selected_goal)
+            result[key] = entries[:6]
+            result[key + "Count"] = len(entries)
     next_step = overview.get("nextStep")
     if isinstance(next_step, dict):
         result["nextStep"] = {key: value for key, value in next_step.items() if key != "params"}
@@ -97,7 +113,7 @@ def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
             result["nextStep"]["targetCount"] = len(params["tiles"])
         result["nextStep"]["detailsAvailable"] = bool(params)
     result["recentExecutions"] = []
-    for execution in overview.get("recentExecutions") or []:
+    for execution in (overview.get("recentExecutions") or [])[:2]:
         row = {key: execution[key] for key in ("command_id", "task_id", "step_id", "operation", "outcome", "reason_code", "game_date", "snapshot_revision") if execution.get(key) is not None}
         row["effectCount"] = len(execution.get("effects") or [])
         result["recentExecutions"].append(row)
@@ -105,6 +121,11 @@ def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
         result["lastJob"] = {key: value for key, value in overview["lastJob"].items() if key != "effects"}
         if "effectCount" not in result["lastJob"]:
             result["lastJob"]["effectSampleCount"] = len(overview["lastJob"].get("effects") or [])
+    evidence = overview.get("plantingEvidence")
+    if isinstance(evidence, dict):
+        result["plantingEvidence"] = {key: value for key, value in evidence.items() if key not in {"batches", "recentBatches"}}
+        result["plantingEvidence"]["batches"] = [{key: value for key, value in batch.items() if key != "tiles"} for batch in evidence.get("batches", [])[:3]]
+        result["plantingEvidence"]["detailsAvailable"] = True
     result["detailsAvailable"] = True
     result["detailHint"] = "Use detail=True for full project/layout, step targets and native effects. For partial/unknown outcomes inspect those facts and remaining targets before replanning; never replay the original target list blindly."
     return result
@@ -254,24 +275,119 @@ async def _safe_wait_for_fresh_snapshot(
         return None, False
 
 
+_TILE_SHAPE = {"type": "object", "required": ["x", "y"],
+               "properties": {"x": {"type": "integer", "minimum": 0},
+                              "y": {"type": "integer", "minimum": 0}}}
+_ITEM_COUNT_SHAPE = {"type": "object", "required": ["itemId", "count"],
+                     "properties": {"itemId": {"type": "string", "minLength": 1},
+                                    "count": {"type": "integer", "minimum": 1}}}
+_EXECUTION_SCOPE_SCHEMA = {
+    "anyOf": [
+        {"type": "null"},
+        {"type": "object", "maxProperties": 0},
+        {"type": "object", "required": ["locationId", "tiles"], "properties": {
+            "locationId": {"type": "string", "minLength": 1},
+            "tiles": {"type": "array", "items": {"anyOf": [
+                _TILE_SHAPE,
+                {"type": "array", "minItems": 2, "maxItems": 2,
+                 "items": {"type": "integer", "minimum": 0}},
+            ]}},
+        }},
+    ],
+    "examples": [{"locationId": "Farm", "tiles": [{"x": 69, "y": 18}, {"x": 64, "y": 23}]}, {}],
+}
+_CAPABILITY_EXAMPLES = {
+    "navigate_to": {"location_id": "Farm", "tile": {"x": 55, "y": 17}},
+    "withdraw_from_chest": {"chest_x": 55, "chest_y": 17,
+                            "items": [{"itemId": "(O)475", "count": 20}]},
+    "deposit_to_chest": {"chest_x": 55, "chest_y": 17, "item_ids": ["(O)475"]},
+    "hoe_tiles": {"tiles": [{"x": 69, "y": 18}, {"x": 64, "y": 23}]},
+    "plant_seeds": {"seed_item_id": "(O)475", "tiles": [{"x": 69, "y": 18}, {"x": 64, "y": 23}]},
+    "water_tiles": {"tiles": [{"x": 69, "y": 18}, {"x": 64, "y": 23}], "location_id": "Farm"},
+    "water_zone": {"center_x": 69, "center_y": 18, "radius": 0},
+    "water_auto": {"max_tiles": 100},
+    "harvest_auto": {"max_tiles": 100},
+    "plant_crop_workflow": {"seed_item_id": "(O)475", "count": 20},
+    "purchase_items": {"items": [{"itemId": "(O)475", "count": 20}], "budget_limit": 1000},
+    "ship_items": {"items": [{"itemId": "(O)24", "count": 10}]},
+    "query_planting_options": {"location_id": "Farm", "region": {"x": 60, "y": 15, "width": 20, "height": 20}},
+    "manage_goal": {"action": "create", "text": "种完已交付的土豆种子"},
+    "manage_todo": {"action": "create", "intent": "体力恢复后接续播种", "trigger": {"type": "resource", "resource": "stamina", "minAmount": 100}},
+    "manage_plan": {"goal_id": "observed-active-goal-id", "tasks": [{"title": "浇水", "steps": [{"operation": "water_auto", "params": {"max_tiles": 100}}]}]},
+    "read_guidance": {"topic": "execution"},
+    "query_wiki": {"query": "Potato"},
+    "pet_animal": {"animal_id": "observed-animal-id", "location_id": "Farm"},
+    "collect_animal_produce": {"animal_id": "observed-animal-id", "location_id": "Farm"},
+    "toggle_animal_door": {"building_name": "observed-building-name", "location_id": "Farm"},
+}
+
+
+def capability_parameter_shape(key: str, value: Any, schema: dict[str, Any]) -> dict[str, Any]:
+    """Inline local references so discovery carries usable nested shapes."""
+    def resolve(node: Any) -> Any:
+        if isinstance(node, list):
+            return [resolve(part) for part in node]
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            name = node["$ref"].rsplit("/", 1)[-1]
+            return resolve({**schema.get("$defs", {}).get(name, {}),
+                            **{k: v for k, v in node.items() if k != "$ref"}})
+        return {k: resolve(v) for k, v in node.items() if k not in {"title", "$defs"}}
+
+    shape = resolve(value)
+    nullable = any(part.get("type") == "null" for part in shape.get("anyOf", []))
+    nested = None
+    if key in {"tiles", "target_tiles"}:
+        nested = {"type": "array", "minItems": 0 if key == "target_tiles" else 1, "items": _TILE_SHAPE}
+    elif key in {"tile", "chest_tile"}:
+        nested = _TILE_SHAPE
+    elif key == "items":
+        nested = {"type": "array", "minItems": 1, "items": _ITEM_COUNT_SHAPE}
+    if nested is not None:
+        shape = {"anyOf": [nested, {"type": "null"}]} if nullable else nested
+        if isinstance(value, dict):
+            shape = {**shape, **{key: value[key] for key in ("default", "description") if key in value}}
+    return shape
+
+
+def capability_example(name: str, schema: dict[str, Any], properties: dict[str, Any]) -> dict[str, Any]:
+    """Examples are parameter objects, not claims about the current world."""
+    if name in _CAPABILITY_EXAMPLES:
+        return _CAPABILITY_EXAMPLES[name]
+
+    def sample(shape: dict[str, Any]) -> Any:
+        if "default" in shape and shape["default"] is not None:
+            return shape["default"]
+        if "enum" in shape:
+            return shape["enum"][0]
+        if "anyOf" in shape:
+            return sample(next((v for v in shape["anyOf"] if v.get("type") != "null"), {}))
+        if shape.get("type") == "object":
+            fields = shape.get("properties", {})
+            return {k: sample(fields[k]) for k in shape.get("required", [])}
+        if shape.get("type") == "array":
+            return [sample(shape.get("items", {}))]
+        if shape.get("type") == "boolean":
+            return False
+        if shape.get("type") in {"integer", "number"}:
+            return shape.get("minimum", 1)
+        return "observed-id"
+
+    return {key: sample(properties[key]) for key in schema.get("required", [])}
+
+
 DEFAULT_MCP_INSTRUCTIONS = """
-Use read_guidance(topic) through knowledge capabilities for domain decisions and
-execution methods. The companion core instructions are supplied by the harness.
-Execution contract: submit_plan selects one short semantic job, never a whole
-multi-business schedule. Navigation may precede it. Observed planting tiles may
-use cut_grass, hoe_tiles, plant_seeds and water_zone in order for the same batch,
-up to 64 total native targets. A same-map machine cycle may collect ready
-machines, deposit explicit outputs into one observed authorized chest, then
-reinsert into those same machines. Results are recorded by the
-worker; only lastResult reports actual completion. Keep ongoing goals active.
-Use discover_capabilities(group) then call_capability(tool, params) for schema.
-Production observations: observe_production for ground eggs, water and food;
-observe_machines for real processing/ready outputs; query_planting_options for
-compact region choices, then detail for only the persisted region. Store outputs
-in the observed authorized chest. Waiting uses manage_todo: machineReady,
-gameTime (full game date + HHMM), resource (stamina|water + minAmount).
-Missing/empty filters require targeted diagnosis; all interactions use these
-real game tools. World data and execution tools never grant extra authorization.
+Use the supplied companion core instructions. discover_capabilities(group) gives
+required parameters, nested shapes and examples; call_capability(tool, params)
+uses that same contract. Read guidance only when the decision needs it.
+submit_plan selects one job with sequential operations, including navigation,
+restocking, preparation, planting and watering across maps. Each operation uses
+real native prerequisites and resources. A partial, failed or uncertain result
+stops the job; inspect its effects before choosing the remaining work.
+Only native results prove completion. Keep ongoing goals active and record future
+work with manage_todo conditions rather than polling. Use water_tiles for an exact
+observed planting batch, water_auto for currently observed missing farm watering.
 """
 
 
@@ -362,9 +478,10 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
     "query_planting_options": ("query_planting_options", frozenset({"detail", "location_id", "region"})),
     "query_route": ("query_route", frozenset({"location_id", "tile"})),
     "query_shop": ("query_shop", frozenset({"shop_id", "detail", "item_id", "name", "is_seed"})),
+    "water_tiles": ("execute_tiles", frozenset({"tiles", "location_id", "include_empty_tiles"})),
     "water_zone": ("execute_water_zone", frozenset({"center_x", "center_y", "radius", "include_empty_tiles"})),
-    "water_auto": ("water_auto", frozenset({"max_tiles", "include_empty_tiles"})),
-    "harvest_auto": ("harvest_auto", frozenset({"max_tiles"})),
+    "water_auto": ("water_auto", frozenset({"max_tiles", "include_empty_tiles", "target_tiles", "location_id"})),
+    "harvest_auto": ("harvest_auto", frozenset({"max_tiles", "target_tiles", "location_id"})),
     "deposit_to_chest": ("deposit_to_chest", frozenset({"chest_x", "chest_y", "item_ids", "location_id"})),
     "withdraw_from_chest": (
         "withdraw_from_chest",
@@ -379,22 +496,6 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
         frozenset({"items", "budget_limit", "shop_id", "location_id"}),
     ),
     "navigate_to": ("execute_navigate_to", frozenset({"location_id", "tile", "landmark"})),
-    "plant_crop_workflow": (
-        "plant_crop_workflow",
-        frozenset(
-            {
-                "crop_name_or_id",
-                "count",
-                "target_tiles",
-                "auto_till",
-                "auto_water",
-                "withdraw_from_chest",
-                "chest_tile",
-                "location_id",
-                "water",
-            }
-        ),
-    ),
     "pause_task": ("pause_task", frozenset()),
     "resume_task": ("resume_task", frozenset()),
     "cancel_task": ("cancel_task", frozenset({"reason"})),
@@ -519,6 +620,7 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
         "query_farm_work",
         "query_planting_options",
         "water_zone",
+        "water_tiles",
         "water_auto",
         "harvest_auto",
         "hoe_tiles",
@@ -616,7 +718,7 @@ MEMORY_WRITE_SCHEMA: dict[str, Any] = {
     "submit_plan": {
         "purpose": "Select exactly ONE current semantic short job; subsequent business requires a new model decision.",
         "parameters": {
-            "tasks": "array, required, exactly 1 task: {title, steps:[{operation, params}], id?, completionCondition?}. 1..32 steps, one business plus navigation; same Farm planting batch may cut_grass/hoe_tiles then plant_seeds/water_zone; same-map machine cycle may collect_machine, deposit_to_chest (explicit item_ids, one chest), insert_machine (only collected machine tiles). 64 total targets; no dependencies or future waits.",
+            "tasks": "array, required, exactly 1 task: {title, steps:[{operation, params}], id?, completionCondition?}. 1..32 sequential native operations, including navigation across maps and related supplies/preparation. No task dependencies or future waits; partial or uncertain native results stop the job.",
             "goal_id": "string | null. Existing active goal id from context; may be omitted only when this decision has one bound active goal, or goal_text is supplied.",
             "goal_text": "string | null. Used when goal_id is absent (creates an agent goal).",
             "replace": "boolean (default false). Supersedes the goal's still-pending tasks only.",
@@ -786,14 +888,26 @@ def create_mcp_server(
                     value = pre_parsed[key] = _normalize_wire_arrays(value, field.annotation)
                     _reject_integer_booleans(value, field.annotation)
             parsed = metadata.arg_model.model_validate(pre_parsed)
-        except ValueError as ex:
+            for key in ("tiles", "target_tiles"):
+                if pre_parsed.get(key) is not None:
+                    value = getattr(parsed, key)
+                    coordinates = [] if key == "target_tiles" and value == [] else validate_action_tiles(value, preserve_order=True)
+                    setattr(parsed, key, coordinates)
+        except (ValueError, PolicyViolationError) as ex:
             raise ToolError(f"Invalid parameters for '{name}': {ex}") from None
         if for_plan:
             # Durable params must contain plain JSON values, including nested models.
             # Preserve allowed plan-only keys (e.g. location_id for hoe_tiles).
-            return {**args, **parsed.model_dump(exclude_unset=True)}
-        return {key: value for key, value in parsed.model_dump_one_level().items()
-                if key in parsed.model_fields_set}
+            result = {**args, **parsed.model_dump(exclude_unset=True)}
+        else:
+            result = {key: value for key, value in parsed.model_dump_one_level().items()
+                      if key in parsed.model_fields_set}
+        if name in {"water_auto", "harvest_auto"}:
+            # FastMCP passes function defaults to the guarded wrapper. Preserve
+            # the old omitted-None contract while retaining an explicit [].
+            result = {key: value for key, value in result.items()
+                      if key not in {"target_tiles", "location_id"} or value is not None}
+        return result
 
     def autonomy_for_run() -> AutonomyController:
         actual_run_dir = getattr(sched, "run_dir", None) or run_dir
@@ -827,10 +941,15 @@ def create_mcp_server(
         Mod command) so the persisted id is the idempotency identity, not a label.
         Composite operations derive deterministic sub-command ids from it.
         """
+        if operation == "plant_crop_workflow":
+            raise ToolError(PLANT_WORKFLOW_PLAN_ERROR)
         entry = _PLAN_OPERATION_CALLS.get(operation)
         allowed = entry[1] if entry else frozenset()
+        goal_constraints: dict[str, Any] = {}
 
         def _params_match(step_p: dict[str, Any], call_p: dict[str, Any]) -> bool:
+            step_p = bind_execution_scope_params(operation, step_p or {}, goal_constraints)
+            call_p = bind_execution_scope_params(operation, call_p or {}, goal_constraints)
             if step_p == call_p:
                 return True
             if allowed:
@@ -842,6 +961,9 @@ def create_mcp_server(
             state = work_for_run().state(sid)
             d = state.decision
             task = next((t for t in state.tasks if t.id == d.get("taskId")), None)
+            goal = next((goal for goal in state.goals if task and goal.id == task.goal_id), None)
+            goal_constraints = goal.constraints if goal is not None else {}
+            params = bind_execution_scope_params(operation, params, goal_constraints)
             if not task or task.status == "cancelled" or state.paused or d.get("expires", 0) <= time.time() or d.get("finished") or not any(
                 step.command_id == command_id and step.operation == operation and _params_match(step.params, params) and step.status == "running"
                 for step in task.steps
@@ -980,7 +1102,8 @@ def create_mcp_server(
     async def get_work_overview(detail: bool = False) -> dict[str, Any]:
         """Get consolidated farm work, companion backpack, and candidate chests overview.
 
-        Returns crop/soil counts, backpack space/items, and candidate chests with merge status.
+        Default returns counts, backpack/chest summaries and current-priority work.
+        detail=True includes exact coordinates, full work records and native effects.
         """
         try:
             if external_codex and external_selected and external_save_id:
@@ -989,7 +1112,23 @@ def create_mcp_server(
             if resolved_surface == "life":
                 cached = life_snapshot()
                 return {"saveId": cached["saveId"], "worldRevision": cached.get("worldRevision"), **cached["payload"]}
-            return await sched.get_work_overview(detail=detail)
+            native = await sched.get_work_overview(detail=detail)
+            native = dict(native)
+            if not detail:
+                native["farmWork"] = {key: value for key, value in (native.get("farmWork") or {}).items() if not key.endswith("Tiles") and key != "matureCrops"}
+                if isinstance(native.get("chests"), list):
+                    native["chestCount"] = len(native["chests"])
+                    native["chests"] = native["chests"][:5]
+                native["detailsAvailable"] = True
+            sid = native.get("saveId")
+            if isinstance(sid, str):
+                cached = sched.latest_snapshot
+                payload = cached.get("payload") if isinstance(cached, dict) else None
+                world = (payload or {}).get("world") or {}
+                work = work_for_run().overview(sid, snapshot=payload,
+                    game_date={"year": world.get("year"), "season": world.get("season"), "day": world.get("dayOfMonth")})
+                native["work"] = work if detail else compact_work_overview(work)
+            return native
         except SchedulerError as ex:
             raise ToolError(f"Failed to get work overview: {ex}") from None
         except Exception as ex:
@@ -1356,7 +1495,7 @@ def create_mcp_server(
     @mcp.tool()
     async def manage_milestones(
         action: str,
-        node_id: str | None = None,
+        node_id: Annotated[str | None, Field(description="Current node ID for write actions; with action='list', returns this node's complete saved scope without list/coordinate truncation.")] = None,
         title: str | None = None,
         target_date: str | None = None,
         summary: str | None = None,
@@ -1365,7 +1504,8 @@ def create_mcp_server(
         planned_count: int | None = None,
         terms_note: str | None = None,
         reason: str | None = None,
-        preparation: list[str] | None = None,
+        preparation: Annotated[list[str] | None, Field(description="For custom propose/revise nodes, capability keys: water, harvest, clear, plant, animals, machines, store, ship, pickup, layout, production. On revise, omitted/null keeps current preparation; a list replaces it and [] clears it, synchronizing the adopted goal and todos. Fixed catalog nodes do not accept preparation changes.")] = None,
+        execution_scope: Annotated[dict[str, Any] | None, Field(description="Optional exact observed candidate scope: {locationId:'Farm',tiles:[{x:69,y:18},{x:64,y:23}]} (integer [x,y] pairs also accepted). On revise, omitted/null keeps the saved scope; {} clears it; locationId plus tiles:[] saves an explicit empty candidate range. Candidate tile count is independent of planned_count/seed count; keep a fixed saved range instead of expanding it to consume more seeds. Read the full saved range with action='list', node_id='<node.id>'.", json_schema_extra=_EXECUTION_SCOPE_SCHEMA)] = None,
         id: str | None = None,
         nodeId: str | None = None,
     ) -> dict[str, Any]:
@@ -1386,11 +1526,26 @@ def create_mcp_server(
         revision, and manual/capability preparation: do not list again just to
         confirm that write. Saving is not proof that physical work has run.
 
-        For a custom proposal, preparation optionally lists existing capabilities:
+        For a custom proposal or revision, preparation lists existing capabilities:
         water, harvest, clear, plant (existing seeds), animals, machines, store,
         ship (explicitly approved sale items only), pickup, layout (persistent multi-day design/construction) or production (ongoing farming/husbandry including necessary seed purchases, coop construction, animal acquisition and feed). A player assignment such as "you handle crops and animals" MUST use production, never downgrade it into today-only water/animals. Summary must retain
         location, scope and protected items. For today's ordinary work, omit
         target_date to use the observed game date; no festival node is required.
+        When changing accepted work, revise the existing node with its current
+        scope: update title and terms_note if those old descriptions no longer
+        apply, and preparation if the required capabilities change. Omitting
+        preparation keeps the existing items; an explicit list replaces them,
+        and [] clears them. These changes synchronize the adopted goal/todos.
+        Fixed catalog nodes keep their preparation facts. A failed second adopt
+        returns recommendedAction=revise and acceptedFields, including preparation
+        and execution_scope. execution_scope records the observed locationId and
+        exact candidate tiles; integer [x,y] pairs are also accepted. These are
+        candidate positions, not a requirement to consume one seed per position.
+        planned_count records the agreed seed/work quantity separately. Retain a
+        fixed candidate range rather than expanding it to satisfy planned_count.
+        On revise, omitted/null keeps execution_scope and {} clears it. Use
+        {"action":"list","node_id":"<node.id>"} to read the complete saved node
+        and exact coordinates if the injected goal context is abbreviated.
         Infer a modest proposal from the live snapshot; budget/count are optional,
         never ask the player to fill internal parameters. A clear instruction or "you decide" authorizes propose and adopt in the SAME turn; a question or preference alone does not.
         adopt persists the node and wires each ``capability`` prep item into the
@@ -1414,6 +1569,10 @@ def create_mcp_server(
                 "day": world.get("dayOfMonth"),
             }
         action_clean = (action or "").strip().lower()
+        identifiers = {value.strip() for value in (node_id, id, nodeId) if value and value.strip()}
+        if len(identifiers) > 1:
+            raise ToolError("CONFLICTING_NODE_ID: node_id/id/nodeId disagree; pass only node_id from the current node snapshot.")
+        node_id = next(iter(identifiers), None)
         if action_clean == "list":
             play_style = None
             try:
@@ -1424,7 +1583,14 @@ def create_mcp_server(
                 profile = profile_res.get("profile")
                 if isinstance(profile, dict):
                     play_style = profile.get("playStyle")
-            nodes = store.merged_nodes(sid, game_date, play_style)
+            if node_id:
+                by_id = {node["id"]: node for node in store.list_nodes(sid) if node.get("id")}
+                for node in store.suggest(game_date, play_style):
+                    by_id.setdefault(node["id"], node)
+                node = by_id.get(node_id)
+                nodes = [node] if node is not None else []
+            else:
+                nodes = store.merged_nodes(sid, game_date, play_style)
             return {
                 "saveId": sid,
                 "revision": store.revision(sid),
@@ -1442,10 +1608,6 @@ def create_mcp_server(
             )
         # The conversation model judges player agreement; this gate only checks
         # the conversation context, alongside the current-turn/stop checks above.
-        identifiers = {value.strip() for value in (node_id, id, nodeId) if value and value.strip()}
-        if len(identifiers) > 1:
-            raise ToolError("CONFLICTING_NODE_ID: node_id/id/nodeId disagree; pass only node_id from the current node snapshot.")
-        node_id = next(iter(identifiers), None)
         if action_clean != "propose" and not node_id:
             raise ToolError(
                 'NODE_ID_REQUIRED: use {"action":"' + action_clean + '","node_id":"<node.id>"}; '
@@ -1472,6 +1634,7 @@ def create_mcp_server(
                     summary=summary,
                     source_url=source_url,
                     preparation=preparation,
+                    execution_scope=execution_scope,
                     game_date=game_date,
                 )
                 return saved(node)
@@ -1499,6 +1662,8 @@ def create_mcp_server(
                     reserved_funds=reserved_funds,
                     planned_count=planned_count,
                     terms_note=terms_note,
+                    preparation=preparation,
+                    execution_scope=execution_scope,
                     game_date=game_date,
                     target_date=target_date,
                     work_store=work_for_run(),
@@ -1522,11 +1687,12 @@ def create_mcp_server(
             )
             return saved(node)
         except MilestoneError as ex:
-            raise ToolError(str(ex)) from None
+            return {"saveId": sid, "error": str(ex), "execution": "not_started_by_this_tool",
+                    "saved": False, **getattr(ex, "details", {})}
 
     @mcp.tool()
     async def submit_plan(
-        tasks: Annotated[list[ShortJobTask], BeforeValidator(_unwrap_item_array), Field(min_length=1, max_length=1, description="Exactly one current short job. Submit remaining business in a new decision, without dependencies.")],
+        tasks: Annotated[list[ShortJobTask], BeforeValidator(_unwrap_item_array), Field(min_length=1, max_length=1, description="Exactly one current job with sequential native operations; no task dependencies or future waits.")],
         goal_id: str | None = None,
         goal_text: str | None = None,
         replace: bool = False,
@@ -1534,15 +1700,11 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Select ONE semantic short job for the CURRENT provider decision.
 
-        One task may combine navigation and bounded steps of one business kind,
-        or optional cut_grass/hoe_tiles then plant_seeds and water_zone covering
-        the same observed Farm seed batch.
-        A same-map machine cycle may collect ready machines, deposit explicit
-        products into one observed authorized chest, then reinsert only into
-        those same collected machines. Partial/failed steps stop the cycle.
-        A second job in this decision is rejected. Future plans are memory only.
-        One animal-care trip may combine feeding, petting and picking up observed
-        produce, with navigation between the house and outdoor animals.
+        One task may combine sequential navigation, inventory transfers,
+        preparation, planting and exact-tile watering across maps. Native map,
+        resource and ownership checks apply to every operation; partial, failed
+        or unknown results stop the job for a new decision. Future waits belong
+        in remembered todos. Selection acknowledges work; it does not prove effects.
         Default acknowledges task ids/states without echoing full submitted targets;
         detail=True returns the full persisted task. It never means execution succeeded.
 
@@ -1814,7 +1976,7 @@ def create_mcp_server(
             raise ToolError(
                 f"unknown capability group '{group}'; available: {', '.join(sorted(CAPABILITY_GROUPS))}"
             )
-        selected = {group: CAPABILITY_GROUPS[group]} if group else CAPABILITY_GROUPS
+        selected = {group: CAPABILITY_GROUPS[group]} if group else {}
         groups: dict[str, list[dict[str, Any]]] = {}
         for group_name, names in selected.items():
             entries: list[dict[str, Any]] = []
@@ -1824,7 +1986,7 @@ def create_mcp_server(
                 properties = parameters.get("properties") or {}
                 description = str(schema.get("description") or "").split("\n")[0]
                 direct_parameters = {
-                    key: (value.get("type") or "any" if isinstance(value, dict) else "any")
+                    key: capability_parameter_shape(key, value, parameters)
                     for key, value in properties.items()
                 }
                 allowed_values = {}
@@ -1841,10 +2003,13 @@ def create_mcp_server(
                         "description": description[:140],
                         "directCall": {"required": list(parameters.get("required") or []),
                                        "parameters": direct_parameters,
-                                       "allowedValues": allowed_values},
+                                       "allowedValues": allowed_values,
+                                       "example": capability_example(name, parameters, direct_parameters)},
                         "planStep": ({"operation": name,
-                                      "parameters": {key: direct_parameters.get(key, "any")
+                                      "required": [key for key in parameters.get("required", []) if key in plan_spec[1]],
+                                      "parameters": {key: direct_parameters.get(key, {"type": "string", "default": "Farm"} if key == "location_id" else {})
                                                      for key in sorted(plan_spec[1])},
+                                      "example": {"operation": name, "params": {key: value for key, value in capability_example(name, parameters, direct_parameters).items() if key in plan_spec[1]}},
                                       "unknownKeys": "rejected"} if plan_spec else None),
                     }
                 )
@@ -1853,11 +2018,13 @@ def create_mcp_server(
         response: dict[str, Any] = {
             "groups": groups,
             "availableGroups": sorted(CAPABILITY_GROUPS),
+            "groupCounts": {name: len(tools) for name, tools in CAPABILITY_GROUPS.items()},
+            "discoveryHint": "Choose one relevant group to get required parameters, nested shapes and examples.",
             "callWith": "call_capability(tool, params)",
             "planWith": "Use planStep.operation and only planStep.parameters keys in submit_plan steps; null means direct-call-only. Direct-call aliases are not accepted in steps.",
             "fullToolListExposed": resolved_surface == "full",
         }
-        if group in (None, "memory"):
+        if group == "memory":
             # The exact nested write schema, so the model never has to guess
             # trigger kinds such as "daily"/"date"/"next_day".
             response["memoryWriteSchema"] = MEMORY_WRITE_SCHEMA
@@ -1872,6 +2039,8 @@ def create_mcp_server(
         """
         if tool == "observe_map_image":
             raise ToolError("Call observe_map_image directly to receive native image content")
+        if tool == "plant_crop_workflow":
+            raise ToolError(PLANT_WORKFLOW_PLAN_ERROR)
         if tool not in base_tools:
             raise ToolError(f"unknown capability '{tool}'; call discover_capabilities first")
         schema = base_schemas.get(tool, {})
@@ -1926,10 +2095,31 @@ def create_mcp_server(
             raise ToolError(f"Wiki lookup unavailable: {ex}") from None
 
     @mcp.tool()
+    async def water_tiles(
+        tiles: Annotated[list[dict[str, ChestCoordinate]], BeforeValidator(_unwrap_item_array)],
+        location_id: str = "Farm",
+        include_empty_tiles: bool = False,
+        detail: bool = False,
+    ) -> dict[str, Any]:
+        """Water exactly the observed coordinate list, including scattered planting tiles.
+
+        tiles=[{"x":69,"y":18},{"x":64,"y":23}]. Native water/stamina and
+        route rules may stop early; counts and effects describe only real actions.
+        """
+        try:
+            result = await sched.execute_tiles(tiles=tiles, location_id=location_id,
+                                              include_empty_tiles=include_empty_tiles)
+            return result if detail else {**_native_action_response("water-tiles", result),
+                "targetCount": result.get("targetCount"),
+                "unprocessedTargetCount": result.get("unprocessedTargetCount")}
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(f"Water tiles execution rejected: {ex}") from None
+
+    @mcp.tool()
     async def water_zone(
         center_x: int, center_y: int, radius: int = 0, include_empty_tiles: bool = False, detail: bool = False
     ) -> dict[str, Any]:
-        """Water crops around center (center_x, center_y) with radius 0 (1x1), 1 (3x3), or 2 (5x5).
+        """Water crops around an observed center with a non-negative integer radius.
 
         Returns terminalState, counts, and remaining unwatered crops.
         """
@@ -1978,13 +2168,25 @@ def create_mcp_server(
             raise ToolError(f"Water zone execution failed: {ex}") from None
 
     @mcp.tool()
-    async def water_auto(max_tiles: int = 25, include_empty_tiles: bool = False, detail: bool = False) -> dict[str, Any]:
-        """Water crops only by default; include empty prepared soil only when explicitly enabled."""
+    async def water_auto(
+        max_tiles: int = 25, include_empty_tiles: bool = False, detail: bool = False,
+        target_tiles: Annotated[list[dict[str, ChestCoordinate]] | None, BeforeValidator(_unwrap_item_array), Field(description="Optional exact candidate coordinates [{x:62,y:27},{x:66,y:23}]. Intersect with freshly observed unwatered crops; omitted/null uses observed work, [] selects no work. Coordinates outside this list are never selected.")] = None,
+        location_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Water freshly observed crops in target_tiles when provided; [] means no work.
+
+        Omitted target_tiles keeps ordinary auto selection. location_id, if given,
+        must match the observed work map. Include empty soil only when enabled.
+        """
         pre_rev = getattr(sched, "latest_world_revision", 0)
         try:
             auto_kwargs = {"max_tiles": max_tiles}
             if include_empty_tiles:
                 auto_kwargs["include_empty_tiles"] = True
+            if target_tiles is not None:
+                auto_kwargs["target_tiles"] = target_tiles
+            if location_id is not None:
+                auto_kwargs["location_id"] = location_id
             res = await sched.water_auto(**auto_kwargs)
             if res.get("status") == "no-work":
                 return {
@@ -2289,14 +2491,25 @@ def create_mcp_server(
             raise ToolError(f"Unexpected error querying shop: {ex}") from None
 
     @mcp.tool()
-    async def harvest_auto(max_tiles: int = 16, detail: bool = False) -> dict[str, Any]:
-        """Auto-harvest up to max_tiles (1..64) mature crops. Stops early if inventory is full.
+    async def harvest_auto(
+        max_tiles: int = 16, detail: bool = False,
+        target_tiles: Annotated[list[dict[str, ChestCoordinate]] | None, BeforeValidator(_unwrap_item_array), Field(description="Optional exact candidate coordinates [{x:62,y:27},{x:66,y:23}]. Intersect with freshly observed mature crops; omitted/null uses observed work, [] selects no work. Coordinates outside this list are never selected.")] = None,
+        location_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Auto-harvest up to a positive max_tiles mature crops. Stops early if inventory is full.
 
-        Returns remaining mature crop count and updated backpack space.
+        target_tiles bounds candidates to freshly observed mature crops; [] selects
+        no work. Omitted/null keeps ordinary auto selection. location_id, if given,
+        must match the observed work map. Returns remaining count and backpack space.
         """
         pre_rev = getattr(sched, "latest_world_revision", 0)
         try:
-            res = await sched.harvest_auto(max_tiles=max_tiles)
+            auto_kwargs = {"max_tiles": max_tiles}
+            if target_tiles is not None:
+                auto_kwargs["target_tiles"] = target_tiles
+            if location_id is not None:
+                auto_kwargs["location_id"] = location_id
+            res = await sched.harvest_auto(**auto_kwargs)
             if res.get("status") == "no-work":
                 return {
                     "status": "no-work",
@@ -2584,7 +2797,7 @@ def create_mcp_server(
     async def hoe_tiles(
         tiles: list[dict[str, int]], detail: bool = False
     ) -> dict[str, Any]:
-        """Use hoe on specified dirt tiles (1..64 coordinates) to till them.
+        """Use hoe on the specified non-empty list of dirt tiles to till them.
 
         Protects existing crops and objects.
         Returns terminalState, counts, affectedTiles, candidateTiles (fresh=True/False), and status.
@@ -2658,7 +2871,7 @@ def create_mcp_server(
     async def plant_seeds(
         seed_item_id: str, tiles: Annotated[list[dict[str, ChestCoordinate]], BeforeValidator(_unwrap_item_array)], detail: bool = False
     ) -> dict[str, Any]:
-        """Plant specified seeds into tilled empty tiles (1..64 coordinates).
+        """Plant specified seeds into the declared tilled empty tiles.
 
         Consumes seeds from companion backpack. Protects existing crops.
         Returns terminalState, counts, plantedTiles, remainingSeedStack, and status.
@@ -3022,12 +3235,12 @@ def create_mcp_server(
         location_id: str = "Farm",
         detail: bool = False,
     ) -> dict[str, Any]:
-        """Composite farming workflow tool: acquires seeds (backpack or chest),
-        identifies planting tiles, tills dirt if necessary (auto_till), plants seeds,
-        and waters planted crops (auto_water).
+        """Legacy composite interface retained for parameter compatibility.
 
-        Recommended for natural language requests such as 'plant 3 carrots' or 'take seeds from chest and plant them'.
-        Returns structured outcome with seedsPlanted, tilesHoed, tilesWatered, and pendingDecision if blocked.
+        Model calls select no job and execute nothing. Submit independent
+        withdraw_from_chest, hoe_tiles, plant_seeds and water_tiles steps instead,
+        with navigation as needed; legal atomic operations may freely combine.
+        The scheduler's existing direct workflow API remains available to callers.
         """
         crop_param = seed_item_id or crop_name_or_id
         if not crop_param or not isinstance(crop_param, str):
@@ -3136,7 +3349,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def place_items(tiles: list[dict[str, Any]], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
-        """Place up to 64 copies of one real backpack item at explicit tiles.
+        """Place copies of one real backpack item at the declared tiles.
 
         Native placement rules, inventory consumption and partial results apply.
         """
@@ -3629,6 +3842,8 @@ def create_mcp_server(
         @functools.wraps(fn)
         async def guarded(*args, **kwargs):
             nonlocal external_selected
+            if name == "plant_crop_workflow":
+                raise ToolError(PLANT_WORKFLOW_PLAN_ERROR)
             sid = await current_save_id()
             store = work_for_run()
             if name in {"pause_task", "resume_task"}:
@@ -3642,8 +3857,6 @@ def create_mcp_server(
                 if store.state(sid).decision.get("selected"):
                     store.revoke_decision(sid)
                 return await fn(*args, **kwargs)
-            if name == "plant_crop_workflow":
-                raise ToolError("MULTIPLE_BUSINESSES: choose one short planting, watering or inventory job")
             if name not in _PLAN_OPERATION_CALLS:
                 raise ToolError("SHORT_JOB_UNSUPPORTED: choose a discoverable native plan operation")
             if args:
@@ -3675,7 +3888,10 @@ def create_mcp_server(
                 if any(type(params["tile"].get(key)) is not int or params["tile"][key] < 0 for key in ("x", "y")):
                     raise ToolError("Destination must contain non-negative integer x and y. No job selected.")
             try:
-                selected = store.submit_plan(sid, goal_text="Current model-selected short job",
+                decision = store.state(sid).decision
+                bound_goal_id = decision.get("goalScope") or decision.get("goalId")
+                selected = store.submit_plan(sid, goal_id=bound_goal_id,
+                    goal_text=None if bound_goal_id else "Current model-selected short job",
                     tasks=[{"title": name, "steps": [{"operation": name, "params": params}]}],
                     decision_token=decision_token())
             except WorkStateError as ex:
@@ -3683,7 +3899,7 @@ def create_mcp_server(
             if external_codex:
                 external_selected = True
                 await sched.close()
-            return {"status": "job-selected", "taskId": selected["tasks"][0]["id"],
+            return {"status": "job-selected", "taskId": selected["tasks"][0]["id"], "goalId": selected["goalId"],
                     "effectStatus": "not_executed_yet", "nextBusiness": "new_model_decision_required"}
         return guarded
 

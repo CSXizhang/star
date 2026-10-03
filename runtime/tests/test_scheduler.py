@@ -73,7 +73,7 @@ def test_expand_water_zone_near_origin_filters_negatives():
     ]
 
 
-@pytest.mark.parametrize("invalid_radius", [-1, 3, 5, 10, "1", 1.5, True, False])
+@pytest.mark.parametrize("invalid_radius", [-1, "1", 1.5, True, False])
 def test_expand_water_zone_invalid_radius(invalid_radius):
     with pytest.raises(PolicyViolationError, match="radius"):
         expand_water_zone(64, 15, radius=invalid_radius)
@@ -511,11 +511,6 @@ def test_scheduler_execute_tiles_validation(mock_transport_client):
         with pytest.raises(PolicyViolationError, match="non-empty"):
             await scheduler.execute_tiles([])
 
-        # Exceeds 64
-        too_many = [{"x": i, "y": 0} for i in range(65)]
-        with pytest.raises(PolicyViolationError, match="exceeds maximum"):
-            await scheduler.execute_tiles(too_many)
-
         # Invalid tile format
         with pytest.raises(PolicyViolationError, match="invalid tile format"):
             await scheduler.execute_tiles([{"x": 1}])
@@ -531,7 +526,7 @@ def test_scheduler_execute_tiles_validation(mock_transport_client):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("invalid_max", [0, -1, 65, 100, "25", 25.5, True, False])
+@pytest.mark.parametrize("invalid_max", [0, -1, "25", 25.5, True, False])
 def test_scheduler_water_auto_invalid_max_tiles(mock_transport_client, invalid_max):
     async def run():
         scheduler = CompanionScheduler(client=mock_transport_client)
@@ -799,7 +794,7 @@ def _make_skill_result_envelope(
     })
 
 
-@pytest.mark.parametrize("invalid_max", [0, -1, 65, 100, "16", 16.5, True, False])
+@pytest.mark.parametrize("invalid_max", [0, -1, "16", 16.5, True, False])
 def test_scheduler_harvest_auto_invalid_max_tiles(mock_transport_client, invalid_max):
     async def run():
         scheduler = CompanionScheduler(client=mock_transport_client)
@@ -1502,10 +1497,9 @@ def test_validate_action_tiles():
         input_tiles[0], input_tiles[1], input_tiles[3],
     ]
 
-    # Exceeds 64 unique tiles
-    too_many = [{"x": i, "y": 0} for i in range(65)]
-    with pytest.raises(PolicyViolationError, match="exceeds maximum"):
-        validate_action_tiles(too_many)
+    # The native actor, rather than a Python batch quota, limits real work.
+    tiles = [{"x": i, "y": 0} for i in range(100)]
+    assert validate_action_tiles([*tiles, tiles[0]]) == tiles
 
 
 def test_validate_seed_item_id():
@@ -2939,3 +2933,236 @@ def test_scheduler_plant_crop_workflow_derives_deterministic_subcommand_ids(mock
 
 
 
+
+
+@pytest.mark.parametrize("operation", ["execute_tiles", "execute_hoe_tiles", "execute_plant_seeds", "water_auto", "harvest_auto"])
+def test_spatial_batch_over_64_reaches_native_and_keeps_partial_resources(mock_transport_client, native_compatible_run_dir, operation):
+    async def run():
+        tiles = [{"x": n, "y": 5} for n in range(100)]
+        mock_transport_client.latest_snapshot.payload["farmWork"] = {
+            "locationId": "Farm", "observationStatus": "observed",
+            "cropUnwateredTiles": tiles, "cropUnwateredCount": 100,
+            "tilledUnwateredTiles": tiles, "tilledUnwateredCount": 100,
+            "matureCrops": [{**tile, "cropId": "(O)24"} for tile in tiles], "matureCropCount": 100,
+        }
+        method = {"execute_tiles": "execute_water_zone", "water_auto": "execute_water_zone",
+                  "execute_hoe_tiles": "execute_hoe_tiles", "execute_plant_seeds": "execute_plant_seeds",
+                  "harvest_auto": "execute_harvest_zone"}[operation]
+        native = AsyncMock(return_value="cmd-large")
+        setattr(mock_transport_client, method, native)
+        state = {"execute_tiles": "watered", "water_auto": "watered", "execute_hoe_tiles": "hoed",
+                 "execute_plant_seeds": "planted", "harvest_auto": "harvested"}[operation]
+        effects = [{"tile": tile, "state": state} for tile in tiles[:40]]
+        receipt = _make_skill_result_envelope(
+            command_id="cmd-large", terminal_state="partially-succeeded", completed=40,
+            effects=effects, error={"code": "OUT_OF_WATER", "message": "Native resources exhausted"})
+        receipt.payload.update(finalWorldRevision=77, resources={"waterCanLevel": 0},
+                               resourceDelta={"waterCanLevel": -40},
+                               inventoryDelta=[{"itemId": "(O)24", "delta": 40}])
+        mock_transport_client.wait_for_result = AsyncMock(return_value=receipt)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        kwargs = {"max_tiles": 100} if operation in {"water_auto", "harvest_auto"} else {"tiles": [*tiles, tiles[0]]}
+        if operation == "execute_plant_seeds":
+            kwargs["seed_item_id"] = "(O)475"
+        result = await getattr(scheduler, operation)(**kwargs)
+        assert native.await_count == 1
+        assert native.await_args.kwargs["tiles"] == tiles
+        assert result["completedCount"] == 40
+        assert result["unprocessedTargetCount"] == 60
+        assert result["effects"] == effects
+        assert result["terminalState"] == "partially-succeeded"
+        assert result["error"]["code"] == "OUT_OF_WATER"
+        assert result["commandId"] == "cmd-large"
+        assert result["worldRevision"] == 77
+        assert result["resources"] == {"waterCanLevel": 0}
+        assert result["resourceDelta"] == {"waterCanLevel": -40}
+        assert result["inventoryDelta"] == [{"itemId": "(O)24", "delta": 40}]
+        if operation == "water_auto":
+            assert result["remainingUnwateredCount"] == 60
+        elif operation == "harvest_auto":
+            assert result["remainingMatureCount"] == 60
+        if operation in {"water_auto", "harvest_auto"}:
+            assert result["snapshotRevision"] == 77
+            assert result["reasonCode"] == "OUT_OF_WATER"
+    asyncio.run(run())
+
+
+def test_water_zone_can_expand_beyond_old_fixed_quota():
+    assert len(expand_water_zone(10, 10, radius=5)) == 121
+
+
+@pytest.mark.parametrize("candidate_count,skipped", [(4, 0), (100, 99)])
+def test_refill_observed_batch_has_no_fixed_tile_quota(mock_transport_client, native_compatible_run_dir,
+                                                    candidate_count, skipped):
+    async def run():
+        tiles = [{"x": x, "y": 5} for x in range(candidate_count)]
+        mock_transport_client.latest_snapshot.payload["farming"] = {
+            "location": "Farm", "refillWaterTiles": tiles,
+        }
+        mock_transport_client.execute_native_action = AsyncMock(return_value="cmd-refill")
+        mock_transport_client.wait_for_result = AsyncMock(return_value=_make_skill_result_envelope(
+            command_id="cmd-refill", completed=1, skipped=skipped,
+            effects=[{"state": "refilled", "tile": tiles[0]}],
+        ))
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        result = await scheduler.refill_watering_can(max_tiles=candidate_count)
+        sent = mock_transport_client.execute_native_action.await_args.kwargs
+        assert sent["skill_id"] == "refill-watering-can"
+        assert sent["parameters"]["tiles"] == tiles
+        assert result["candidateCount"] == candidate_count
+        assert result["targetCount"] == 1
+        assert result["completedCount"] == 1 and result["skippedCount"] == skipped
+        assert result["unprocessedTargetCount"] == 0
+    asyncio.run(run())
+
+
+def test_unknown_refill_does_not_turn_candidates_into_unprocessed_work():
+    async def run():
+        scheduler = CompanionScheduler()
+        tiles = [{"x": x, "y": 5} for x in range(4)]
+        scheduler._execute_native_action = AsyncMock(return_value={
+            "status": "executing", "terminalState": "running", "effects": [],
+            "completedCount": 0, "skippedCount": 0, "failedCount": 0,
+            "targetCount": 4, "unprocessedTargetCount": 4,
+        })
+        result = await scheduler.refill_watering_can(tiles=tiles)
+        assert result["candidateCount"] == 4
+        assert "targetCount" not in result and "unprocessedTargetCount" not in result
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("terminal_state,omit_counts", [("unknown", False), ("succeeded", True)])
+def test_execute_skill_cannot_infer_unprocessed_from_unconfirmed_or_missing_counts(
+    mock_transport_client, native_compatible_run_dir, terminal_state, omit_counts,
+):
+    async def run():
+        receipt = _make_skill_result_envelope(command_id="cmd-uncounted", terminal_state=terminal_state,
+                                            completed=0, effects=[])
+        if omit_counts:
+            for key in ("completedCount", "skippedCount", "failedCount"):
+                receipt.payload.pop(key)
+        mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-uncounted")
+        mock_transport_client.wait_for_result = AsyncMock(return_value=receipt)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        result = await scheduler.execute_tiles(tiles=[{"x": x, "y": 5} for x in range(80)])
+        assert result["unprocessedTargetCount"] is None
+        assert result["effects"] == []
+        assert mock_transport_client.execute_water_zone.await_count == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
+def test_scoped_auto_intersects_fresh_candidates_before_max_tiles(
+    mock_transport_client, native_compatible_run_dir, operation,
+):
+    async def run():
+        outside = {"x": 65, "y": 15}
+        inside = [{"x": 66, "y": 23}, {"x": 62, "y": 27}]
+        observed = [outside, *inside]
+        mock_transport_client.latest_snapshot.payload["farmWork"] = {
+            "locationId": "Farm", "observationStatus": "observed",
+            "cropUnwateredTiles": observed, "cropUnwateredCount": 3,
+            "matureCrops": observed, "matureCropCount": 3,
+        }
+        method = "execute_water_zone" if operation == "water_auto" else "execute_harvest_zone"
+        native = AsyncMock(return_value="scoped-native")
+        setattr(mock_transport_client, method, native)
+        state = "watered" if operation == "water_auto" else "harvested"
+        mock_transport_client.wait_for_result = AsyncMock(return_value=_make_skill_result_envelope(
+            command_id="scoped-native", completed=2,
+            effects=[{"state": state, "tile": tile} for tile in inside]))
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        result = await getattr(scheduler, operation)(max_tiles=2,
+            target_tiles=[*inside, {"x": 64, "y": 23}, inside[0]], location_id="Farm")
+        assert native.await_args.kwargs["tiles"] == inside
+        assert result["completedCount"] == 2 and result["targetCount"] == 2
+        assert result["goalSatisfied"] is True
+        assert result["remainingUnwateredCount" if operation == "water_auto" else "remainingMatureCount"] == 0
+        assert result["effects"] == [{"state": state, "tile": tile} for tile in inside]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
+@pytest.mark.parametrize("scope", [[], [{"x": 999, "y": 1}]])
+def test_scoped_auto_empty_intersection_never_falls_back_to_full_farm(
+    mock_transport_client, native_compatible_run_dir, operation, scope,
+):
+    async def run():
+        mock_transport_client.latest_snapshot.payload["farmWork"] = {
+            "locationId": "Farm", "observationStatus": "observed",
+            "cropUnwateredTiles": [{"x": 1, "y": 1}], "cropUnwateredCount": 1,
+            "matureCrops": [{"x": 1, "y": 1}], "matureCropCount": 1,
+        }
+        method = "execute_water_zone" if operation == "water_auto" else "execute_harvest_zone"
+        native = AsyncMock()
+        setattr(mock_transport_client, method, native)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        result = await getattr(scheduler, operation)(target_tiles=scope, location_id="Farm")
+        assert result["status"] == "no-work" and result["effects"] == []
+        assert result["goalSatisfied"] is True and result["targetCount"] == 0
+        native.assert_not_awaited()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
+@pytest.mark.parametrize("published_inside", [False, True])
+@pytest.mark.parametrize("truncation_evidence", ["per_list_flag", "count", "aggregate_flag"])
+def test_scoped_auto_truncated_observation_cannot_claim_hidden_scope_complete(
+    mock_transport_client, native_compatible_run_dir, operation, published_inside, truncation_evidence,
+):
+    async def run():
+        published = [{"x": x, "y": 1} for x in range(64)]
+        mock_transport_client.latest_snapshot.payload["farmWork"] = {
+            "locationId": "Farm", "observationStatus": "observed",
+            "cropUnwateredTiles": published, "cropUnwateredCount": 64,
+            "matureCrops": published, "matureCropCount": 64,
+        }
+        work = mock_transport_client.latest_snapshot.payload["farmWork"]
+        if truncation_evidence == "per_list_flag":
+            work.update(cropUnwateredTruncated=True, matureCropsTruncated=True)
+        elif truncation_evidence == "count":
+            work.update(cropUnwateredCount=100, matureCropCount=100)
+        else:
+            work["isTruncated"] = True
+        method = "execute_water_zone" if operation == "water_auto" else "execute_harvest_zone"
+        native = AsyncMock(return_value="scoped-part")
+        setattr(mock_transport_client, method, native)
+        state = "watered" if operation == "water_auto" else "harvested"
+        mock_transport_client.wait_for_result = AsyncMock(return_value=_make_skill_result_envelope(
+            command_id="scoped-part", completed=1, effects=[{"state": state, "tile": published[0]}]))
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        requested = ([published[0]] if published_inside else []) + [{"x": 999, "y": 1}]
+        result = await getattr(scheduler, operation)(target_tiles=requested, location_id="Farm")
+        assert result["goalSatisfied"] is False and result["scopeObservationIncomplete"] is True
+        assert result["reasonCode"] == "OBSERVATION_TRUNCATED"
+        assert result["remainingUnwateredCount" if operation == "water_auto" else "remainingMatureCount"] is None
+        if published_inside:
+            assert result["outcome"] == "partial" and result["completedCount"] == 1
+            assert native.await_args.kwargs["tiles"] == [published[0]]
+        else:
+            assert result["outcome"] == "unknown" and result["effects"] == []
+            native.assert_not_awaited()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
+def test_scoped_auto_rejects_other_map_and_invalid_coordinates_without_dispatch(
+    mock_transport_client, native_compatible_run_dir, operation,
+):
+    async def run():
+        mock_transport_client.latest_snapshot.payload["farmWork"] = {
+            "locationId": "Farm", "observationStatus": "observed",
+            "cropUnwateredTiles": [], "cropUnwateredCount": 0,
+            "matureCrops": [], "matureCropCount": 0,
+        }
+        method = "execute_water_zone" if operation == "water_auto" else "execute_harvest_zone"
+        native = AsyncMock()
+        setattr(mock_transport_client, method, native)
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        with pytest.raises(PolicyViolationError, match="Requested work belongs"):
+            await getattr(scheduler, operation)(target_tiles=[{"x": 1, "y": 1}], location_id="IslandWest")
+        with pytest.raises(PolicyViolationError):
+            await getattr(scheduler, operation)(target_tiles=[{"x": True, "y": 1}], location_id="Farm")
+        native.assert_not_awaited()
+    asyncio.run(run())

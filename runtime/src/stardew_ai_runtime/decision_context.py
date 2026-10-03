@@ -20,7 +20,8 @@ Rules enforced here:
   ``currentLocation/timeOfDay/season/dayOfMonth/year/weather/isRaining``,
   companion ``locationId/tileX/tileY/stamina/maxStamina/waterCanLevel/
   availableMoney``, inventory ``capacity/freeSlots/slots[itemId/name/stack/isTool]``.
-* No full farm tile list, chest dump or shop inventory is included by default.
+* Only bounded actionable tile and seed-source observations are included, never
+  the full farm, chest contents or shop inventory.
 * The context is rebuilt from the latest snapshot every time; old snapshots are
   never appended (so it cannot grow without bound). Note this bounds the *payload
   formatter*; it does not erase the provider's own earlier prompt history, which
@@ -66,6 +67,205 @@ def _revision_of(snapshot: Any) -> Any:
     return UNKNOWN
 
 
+def objective_scope(goal: Any) -> dict[str, Any] | None:
+    """Authoritative objective material, excluding project notes and epochs.
+
+    The bridge can use this unabridged projection for its wake fingerprint. Older
+    milestone goals keep their objective in the work-item specification.
+    """
+    if not isinstance(goal, dict):
+        return None
+    constraints = goal.get("constraints")
+    constraints = constraints if isinstance(constraints, dict) else {}
+    scope = constraints.get("objectiveScope")
+    if not isinstance(scope, dict) and isinstance(goal.get("scope"), dict):
+        scope = goal["scope"]  # Already formatted work contexts retain their scope.
+    if isinstance(scope, dict):
+        if isinstance(scope.get("workItems"), list):
+            return {"workItems": scope["workItems"]}
+        return {**{key: scope.get(key) for key in
+                   ("summary", "targetDate", "plannedCount", "termsNote", "preparation")},
+                **({"executionScope": scope["executionScope"]} if isinstance(scope.get("executionScope"), dict) else {})}
+    spec = constraints.get("milestoneSpec")
+    if not isinstance(spec, dict) or not isinstance(spec.get("todos"), list):
+        return None
+    return {"workItems": [
+        {key: row.get(key) for key in ("key", "intent", "trigger", "expiry")}
+        for row in spec["todos"] if isinstance(row, dict)
+    ]}
+
+
+def goal_context(goal: dict[str, Any]) -> dict[str, Any]:
+    """Small model projection of a goal, with its explicit saved scope."""
+    result = {**({"id": goal["id"]} if goal.get("id") else {}),
+              "text": goal.get("text"), "source": goal.get("source")}
+    constraints = goal.get("constraints")
+    if isinstance(constraints, dict) and constraints:
+        visible = {key: value for key, value in constraints.items()
+                   if key not in {"milestoneSpec", "objectiveScope"}}
+        if visible:
+            result["constraints"] = visible
+    scope = objective_scope(goal)
+    if scope is not None:
+        previous_scope = goal.get("scope") if isinstance(goal.get("scope"), dict) else {}
+        truncated = bool(previous_scope.get("truncated"))
+        compact = dict(scope)
+        for key, limit in (("summary", 1200), ("termsNote", 600)):
+            value = compact.get(key)
+            if isinstance(value, str) and len(value) > limit:
+                compact[key] = value[:limit]
+                truncated = True
+        for key in ("preparation", "workItems"):
+            rows = compact.get(key)
+            if isinstance(rows, list):
+                compact[key] = rows[:6]
+                truncated |= len(rows) > 6
+        if "workItems" in compact:
+            compact["workItems"] = [dict(row) for row in compact["workItems"]]
+            for row in compact["workItems"]:
+                if isinstance(row.get("intent"), str) and len(row["intent"]) > 1200:
+                    row["intent"] = row["intent"][:1200]
+                    truncated = True
+        execution = compact.get("executionScope")
+        if isinstance(execution, dict):
+            execution = dict(execution)
+            rows = execution.get("tiles")
+            if isinstance(rows, list):
+                execution["tiles"] = [dict(row) for row in rows[:128]]
+                execution["tileCount"] = execution.get("tileCount", len(rows))
+                execution["truncated"] = bool(execution.get("truncated")) or len(rows) > 128
+                truncated |= execution["truncated"]
+                if execution["truncated"] and isinstance(constraints, dict) and constraints.get("milestoneId"):
+                    execution["detailQuery"] = {"tool": "manage_milestones", "params": {
+                        "action": "list", "node_id": constraints["milestoneId"]}}
+            compact["executionScope"] = execution
+        result["scope"] = {**compact, "revision": goal.get("epoch", previous_scope.get("revision", UNKNOWN)),
+                           "truncated": truncated}
+    if goal.get("project"):
+        result["project"] = project_context(goal["project"])
+    return result
+
+
+def _tiles(rows: Any, limit: int = 16) -> list[dict[str, int]]:
+    return [{"x": row["x"], "y": row["y"]} for row in rows
+            if isinstance(row, dict) and all(isinstance(row.get(key), int)
+               and not isinstance(row[key], bool) for key in ("x", "y"))][:limit] if isinstance(rows, list) else []
+
+
+def _truncated(rows: Any, native_flag: Any, limit: int) -> Any:
+    if not isinstance(rows, list):
+        return UNKNOWN
+    if len(rows) > limit or native_flag is True:
+        return True
+    return False if native_flag is False else UNKNOWN
+
+
+def _seed(row: dict[str, Any]) -> dict[str, Any]:
+    result = {"itemId": _value(row, "itemId"), "name": _value(row, "name"),
+              "count": _value(row, "stack")}
+    for key in ("canPlantCurrentSeason", "seasons", "growthDays", "regrows", "isRaised"):
+        if key in row:
+            result[key] = row[key]
+    return result
+
+
+def _action_facts(payload: dict[str, Any], location: Any, revision: Any,
+                  farm_work: dict[str, Any], farm_observed: bool,
+                  work: dict[str, Any]) -> dict[str, Any]:
+    """Project current native observations; absence never means empty stock."""
+    planting = payload.get("planting")
+    planting = planting if isinstance(planting, dict) else {}
+    candidates = planting.get("candidateTiles")
+    candidates = candidates if isinstance(candidates, dict) else {}
+    facts: dict[str, Any] = {"worldRevision": revision}
+    if planting:
+        facts["planting"] = {
+            "locationId": location, "observationStatus": "observed",
+            "searchBounds": planting.get("searchBounds", UNKNOWN),
+            "tiles": {key: {
+                "count": _value(candidates, key + "Count"),
+                "coordinates": _tiles(candidates.get(key + "Tiles")),
+                "truncated": _truncated(candidates.get(key + "Tiles"), candidates.get(key + "Truncated"), 16),
+            } for key in ("tilledEmpty", "tillable")},
+        }
+    else:
+        facts["planting"] = {"locationId": location, "observationStatus": "unknown",
+                             "tiles": UNKNOWN}
+    preparation = set()
+    for goal in work.get("goals", []) if isinstance(work.get("goals"), list) else []:
+        scope = objective_scope(goal) or {}
+        keys = scope.get("preparation")
+        if isinstance(keys, list):
+            preparation.update(key for key in keys if isinstance(key, str))
+        preparation.update(row.get("key") for row in scope.get("workItems", []) if isinstance(row, dict))
+    operation = (work.get("nextStep") or {}).get("operation") if isinstance(work.get("nextStep"), dict) else None
+    related = []
+    if preparation & {"water", "plant", "plant-after", "production"} or operation in {"water_auto", "water_zone", "water_tiles"}:
+        related.append(("unwatered", "cropUnwateredTiles", "cropUnwateredCount", "cropUnwateredTruncated"))
+    if preparation & {"harvest", "production"} or operation == "harvest_auto":
+        related.append(("harvestable", "matureCrops", "matureCropCount", "matureCropsTruncated"))
+    if related:
+        facts["farm"] = {"locationId": farm_work.get("locationId", "Farm"),
+                         "observationStatus": "observed" if farm_observed else "not-observed",
+                         "currentCompanionLocationId": location,
+                         "needsNavigation": location != farm_work.get("locationId", "Farm") if location != UNKNOWN else UNKNOWN}
+        for label, tiles_key, count_key, truncated_key in related:
+            rows = farm_work.get(tiles_key) if farm_observed else None
+            facts["farm"][label] = {"coordinates": _tiles(rows) if isinstance(rows, list) else UNKNOWN,
+                                   "count": _value(farm_work, count_key) if farm_observed else UNKNOWN,
+                                   "truncated": _truncated(rows, farm_work.get(truncated_key), 16)}
+
+    seeds = planting.get("seeds")
+    known_seeds = [row for row in seeds if isinstance(row, dict)] if isinstance(seeds, list) else []
+    seed_ids = {row.get("itemId") for row in known_seeds if row.get("itemId")}
+    sources: dict[str, Any] = {"inventory": {
+        "observationStatus": "observed" if isinstance(seeds, list) else "unknown",
+        "seeds": [_seed(row) for row in known_seeds[:16]] if isinstance(seeds, list) else UNKNOWN,
+        "truncated": len(known_seeds) > 16 if isinstance(seeds, list) else UNKNOWN,
+    }}
+    chests = payload.get("chests")
+    chests = chests if isinstance(chests, dict) else {}
+    rows = chests.get("items")
+    observed = isinstance(rows, list) and chests.get("observationStatus") not in {"not-observed", "unknown", "unavailable"}
+    chest_sources = []
+    uncertain = False
+    total = 0
+    for chest in rows if observed else []:
+        if not isinstance(chest, dict) or not isinstance(chest.get("contents"), list):
+            uncertain = True
+            continue
+        native_seeds = []
+        for item in chest["contents"]:
+            if not isinstance(item, dict):
+                continue
+            if item.get("isSeed") is True or item.get("itemId") in seed_ids:
+                native_seeds.append(item)
+            elif "isSeed" not in item:
+                uncertain = True
+        if native_seeds:
+            total += len(native_seeds)
+            chest_sources.append({"tile": chest.get("tile", UNKNOWN),
+                                  "seeds": [_seed(row) for row in native_seeds[:16]],
+                                  "truncated": len(native_seeds) > 16})
+    # Native legacy chest snapshots scan Farm; explicit scope takes precedence.
+    sources["chests"] = {"locationId": chests.get("locationId", "Farm"),
+                         "observationStatus": "observed" if observed else "unknown",
+                         "sources": chest_sources[:8] if observed else UNKNOWN,
+                         "truncated": True if observed and (total > 16 or len(chest_sources) > 8)
+                                      else _truncated(rows, chests.get("truncated"), len(rows)) if observed else UNKNOWN,
+                         "queryNeeded": not observed or chests.get("truncated") is not False or uncertain or total > 16 or len(chest_sources) > 8}
+    # Bound seed rows across all chest sources, not just within each chest.
+    remaining = 16
+    for chest in sources["chests"]["sources"] if observed else []:
+        chest["truncated"] |= len(chest["seeds"]) > remaining
+        chest["seeds"] = chest["seeds"][:remaining]
+        remaining -= len(chest["seeds"])
+    if observed:
+        sources["chests"]["sources"] = [row for row in sources["chests"]["sources"] if row["seeds"]]
+    facts["seedSources"] = sources
+    return facts
+
+
 def build_decision_context(
     snapshot: Any,
     *,
@@ -100,6 +300,7 @@ def build_decision_context(
             "location": UNKNOWN,
             "playerLocation": UNKNOWN,
             "stamina": UNKNOWN,
+            "restState": UNKNOWN,
             "funds": UNKNOWN,
             "inventory": {"items": [], "freeSlots": UNKNOWN, "tools": []},
             "goals": [],
@@ -161,6 +362,7 @@ def build_decision_context(
     player_location = _value(world, "currentLocation")
 
     farm_work = payload.get("farmWork") or world.get("farmWork") or {}
+    farm_work = farm_work if isinstance(farm_work, dict) else {}
     farm_scope = farm_work.get("locationId")
     farm_observed = farm_work.get("observationStatus") not in {"not-observed", "unavailable", "unknown"} and (
         farm_scope == "Farm" or (farm_scope is None and companion_snapshot.get("locationId") == "Farm"))
@@ -214,11 +416,7 @@ def build_decision_context(
 
     work = work if isinstance(work, dict) else {}
     overview_goals = work.get("goals") if isinstance(work.get("goals"), list) else []
-    goals = [
-        {**({"id": g["id"]} if g.get("id") else {}),
-         "text": g.get("text"), "source": g.get("source"),
-         **({"constraints": {key: value for key, value in g["constraints"].items() if key != "milestoneSpec"}} if g.get("constraints") else {}),
-         **({"project": project_context(g["project"])} if g.get("project") else {})}
+    goals = [goal_context(g)
         for g in overview_goals
         if isinstance(g, dict) and g.get("text")
     ][:3]
@@ -269,6 +467,7 @@ def build_decision_context(
         "location": location_block,
         "playerLocation": player_location,
         "stamina": stamina_block,
+        "restState": _value(companion_snapshot, "restState"),
         "funds": funds,
         "resources": {
             "player": {"money": _value(world, "playerMoney"),
@@ -289,6 +488,8 @@ def build_decision_context(
         "inventory": inventory_block,
         "goals": goals,
         "currentTask": current_task,
+        "farmActionFacts": _action_facts(payload, location, _revision_of(snapshot),
+                                         farm_work, farm_observed, work),
     }
     if "paused" in work:
         context["paused"] = bool(work.get("paused"))

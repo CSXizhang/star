@@ -44,6 +44,7 @@ from stardew_ai_runtime.agent_backends import (
     McodeBackend,
 )
 from stardew_ai_runtime.agent_instructions import instructions_revision, load_instruction_bundle
+from stardew_ai_runtime.agy_process import run_agy_process, terminate_agy_process
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
 from stardew_ai_runtime.codex_game_profile import CODEX_GAME_TOOL_PROFILE_VERSION
@@ -54,9 +55,14 @@ from stardew_ai_runtime.companion_milestones import (
     wire_node,
 )
 from stardew_ai_runtime.companion_profile import CompanionProfileStore
-from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
+from stardew_ai_runtime.decision_context import (
+    build_decision_context,
+    goal_context,
+    objective_scope,
+    render_decision_context,
+)
 from stardew_ai_runtime.decision_policy import decision_policy, project_context
-from stardew_ai_runtime.job_feedback import compact_job_feedback
+from stardew_ai_runtime.job_feedback import compact_job_feedback, compact_task_feedback
 from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
 from stardew_ai_runtime.life_chat import LifeChatService
 from stardew_ai_runtime.owner_process import OwnerProcessGuard
@@ -83,6 +89,7 @@ from stardew_ai_runtime.scheduler import (
     resolve_discovery,
 )
 from stardew_ai_runtime.usage_display import UsageDisplay
+from stardew_ai_runtime.usage_meter import normalize_usage
 from stardew_ai_runtime.websocket_client import (
     ConnectionClosed,
     WebSocketClient,
@@ -302,6 +309,7 @@ def _parse_usage_from_gen_metadata(data: bytes) -> dict[str, int]:
     usage["cache_read_tokens"] = u.get(5, [(0, 0)])[0][1]
     usage["thinking_tokens"] = u.get(9, [(0, 0)])[0][1]
     usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    usage["input_context_measured"] = any(key in u for key in (2, 5))
     return usage
 
 
@@ -364,6 +372,8 @@ def get_command_usage_delta(conversation_id: str | None, start_idx: int) -> dict
             cache += u.get("cache_read_tokens", 0)
             thinking += u.get("thinking_tokens", 0)
 
+        latest = _parse_usage_from_gen_metadata(rows[-1][1])
+        measured = latest.get("input_context_measured", False)
         return {
             "input_tokens": inp,
             "output_tokens": out,
@@ -374,6 +384,9 @@ def get_command_usage_delta(conversation_id: str | None, start_idx: int) -> dict
             "start_idx": start_idx + 1,
             "end_idx": rows[-1][0],
             "source": "db_gen_metadata_delta",
+            "input_includes_cache": False,
+            "input_context_measured": measured,
+            "latestRequestInputContext": latest["input_tokens"] + latest["cache_read_tokens"] if measured else None,
         }
     except Exception as ex:
         logger.warning(
@@ -829,10 +842,12 @@ class PlanWorker:
                 self.pending_decisions.extend(execution.recovery_decisions)
             if execution.task_status == "completed" or execution.needs_model or execution.outcome in {"failed", "partial", "unknown", "rejected", "cancelled"} or (execution.outcome == "waiting" and (execution.result or {}).get("waitCondition", {}).get("type") != "transportRetry"):
                 completed_task = next((t for t in self.store.state(save_id).tasks if t.id == execution.task_id), None)
-                all_effects = [effect for step in completed_task.steps for effect in step.effects] if completed_task else execution.effects
-                feedback = compact_job_feedback({**(execution.result or {}), "effects": all_effects, "reasonCode": execution.reason_code, "commandId": execution.command_id, "message": execution.message}, operation=execution.operation or "", status=execution.outcome)
-                feedback["effectCount"] = len(all_effects)
-                feedback["stepsCompleted"] = sum(step.status == "completed" for step in completed_task.steps) if completed_task else 0
+                feedback = compact_task_feedback(completed_task,
+                    {**(execution.result or {}), "effects": execution.effects,
+                     "reasonCode": execution.reason_code, "commandId": execution.command_id,
+                     "message": execution.message},
+                    operation=execution.operation or "", status=execution.outcome)
+                feedback["effectCount"] = sum(len(step.effects) for step in completed_task.steps) if completed_task else len(execution.effects)
                 # Publish finished only after releasing the native owner: an
                 # external client may immediately observe upon seeing this flag.
                 await self._release_idle_session()
@@ -889,23 +904,21 @@ class PlanWorker:
                         outcome=outcome, effects=effects, reason_code=reason,
                         snapshot_revision=revision, command_id=step.command_id,
                         game_date=self._fresh_state()[1],
+                        feedback=compact_job_feedback(native, operation=step.operation, status=outcome, params=step.params),
                     )
+                recovered_task = next((item for item in self.store.state(save_id).tasks if item.id == task.id), None)
                 execution = StepExecution(
                     status="executed", task_id=task.id, goal_id=task.goal_id,
                     step_id=step.id, operation=step.operation,
                     command_id=step.command_id, outcome=outcome,
-                    task_status=next(
-                        (item.status for item in self.store.state(save_id).tasks if item.id == task.id),
-                        "unknown",
-                    ),
+                    task_status=recovered_task.status if recovered_task else "unknown",
                     reason_code=reason, effects=effects, result=native,
                 )
-                feedback = compact_job_feedback(
-                    {"commandId": step.command_id, "reasonCode": reason,
+                feedback = compact_task_feedback(recovered_task,
+                    {**(native if isinstance(native, dict) else {}), "commandId": step.command_id, "reasonCode": reason,
                      "terminalState": native.get("terminalState", "unknown") if isinstance(native, dict) else "unknown",
                      "effects": effects}, operation=step.operation, status=outcome,
                 )
-                feedback["effectCount"] = len(effects)
                 self.store.finish_job(save_id, feedback, task_id=task.id)
                 self.pending_reasons.append(reason or "NATIVE_RECOVERED")
                 if self.terminal_callback:
@@ -991,6 +1004,7 @@ class ActiveChatTask:
     recorded: bool = False
     decision_token: str | None = None
     decision_day: str | None = None
+    provider_conversation_id: str | None = None
     chain_generation: int | None = None
     instructions_text: str | None = None
     read_only: bool = False
@@ -1062,6 +1076,9 @@ class ChatBridge:
         if self.backend_name == "dsh":
             from stardew_ai_runtime.usage_meter import recover_dsh_receipts
             recover_dsh_receipts(self._commands_file.parent, self._commands_file)
+        elif self.backend_name == "agy":
+            from stardew_ai_runtime.usage_meter import recover_agy_receipts
+            recover_agy_receipts(self._commands_file.parent)
         self._sessions: dict[str, str] = self._load_sessions()
         self._autonomy: AutonomyController | None = None
         self._autonomy_requests: dict[str, str] = {}
@@ -1120,6 +1137,7 @@ class ChatBridge:
         self._chain_requests: set[str] = set()
         self._chain_generation = 0
         self._chain_tasks: set[asyncio.Task] = set()
+        self._life_drain_tasks: set[asyncio.Task] = set()
         # Serializes native command-socket ownership between the provider turn and
         # the internal plan worker (the Mod transport accepts one command client).
         self._execution_lock = asyncio.Lock()
@@ -1512,7 +1530,9 @@ class ChatBridge:
                 try:
                     backend = self._backend
                     terminate = getattr(backend, "terminate", None)
-                    if callable(terminate):
+                    if self.backend_name == "agy":
+                        terminate_agy_process(proc)
+                    elif callable(terminate):
                         terminate(proc)
                     else:
                         proc.kill()
@@ -1816,7 +1836,7 @@ class ChatBridge:
             self._autonomy_debounce_tasks.clear()
             self._autonomy_pending_snapshot.clear()
             self._autonomy_wakeup_snapshots.clear()
-            cleanup_tasks = tracked_tasks | self._deferred_care_tasks
+            cleanup_tasks = tracked_tasks | self._deferred_care_tasks | self._life_drain_tasks
             for task in list(cleanup_tasks):
                 if task is not asyncio.current_task() and not task.done():
                     task.cancel()
@@ -1946,7 +1966,9 @@ class ChatBridge:
                 else:
                     return
             last_job = job_state.last_job
-            if last_job.get("decisionId"):
+            # Keep confirmed empty selections parked until native resources,
+            # world facts or the accepted objective change their fingerprint.
+            if last_job.get("decisionId") and last_job.get("knownNoWork") is not True:
                 self._autonomy.request_job_decision(save_id, str(last_job["decisionId"]))
         work_signal = ""
         if self._work_store is not None:
@@ -1958,7 +1980,8 @@ class ChatBridge:
                 # new work. Wake only for changed objectives/authorization/state,
                 # otherwise a blocked planner could wake itself by editing notes.
                 "goals": [(g.id, g.text, g.priority, g.status,
-                           {k: v for k, v in g.constraints.items() if k != "milestoneSpec"})
+                           {k: v for k, v in g.constraints.items() if k not in {"milestoneSpec", "objectiveScope"}},
+                           objective_scope({"constraints": g.constraints}))
                           for g in job_state.goals if g.status == "active"
                           and (not state.goal_scope or g.id == state.goal_scope)],
                 "due": sorted(t["id"] for t in due if not state.goal_scope or t.get("goal_id") == state.goal_scope),
@@ -1970,10 +1993,12 @@ class ChatBridge:
         compact = build_decision_context(
             {"payload": snapshot, "worldRevision": envelope.world_revision},
             work=self._work_context(save_id),
-            origin="free-mode",
+            origin="free-mode" if state.enabled else "accepted-work",
         )
         compact["boxRange"] = state.box_preference or "none"
         compact["idlePreference"] = state.idle_preference
+        compact["idleHelpEnabled"] = state.enabled
+        compact["autonomyMode"] = state.mode
         compact["lastResult"] = self._work_store.state(save_id).last_job if self._work_store else state.last_event_key or "none"
         compact["wakeReason"] = candidate.get("reason", "state-change")
         compact["objective"] = state.goal or "由当前状态决定"
@@ -1981,14 +2006,18 @@ class ChatBridge:
             compact["projectScope"] = state.goal_scope
             scoped = next((g for g in job_state.goals if g.id == state.goal_scope), None)
             if scoped:
-                compact["goals"] = [{"id": scoped.id, "text": scoped.text, "source": scoped.source,
-                                     "constraints": {k: v for k, v in scoped.constraints.items() if k != "milestoneSpec"},
-                                     "project": project_context(scoped.project)}]
+                compact["goals"] = [goal_context({"id": scoped.id, "text": scoped.text, "source": scoped.source,
+                                                  "constraints": scoped.constraints, "epoch": scoped.epoch,
+                                                  "project": scoped.project})]
         prompt = (
+            f"闲时主动帮忙当前{'开启' if state.enabled else '关闭'}。"
             "推进玩家已交付的工作；仅在空闲主动帮忙开启时自行找新事情。暂停或临近就寝不派新工作。\n"
             f"实时上下文：{render_decision_context(compact)}\n"
-            "经submit_plan选择唯一语义短作业；可含导航及同一业务的多步动作。"
-            "同批已观察地块可连续清理、开垦、播种与覆盖该批的浇水，合计最多64目标。"
+            "经submit_plan提交一段可中断的连续行动；可组合导航、取物、开垦、种植和浇水。"
+            "任务没有64格总预算；按真实体力、水量、路径与执行结果推进，并保留未完成部分。"
+            "目标含executionScope时，它是玩家指定的候选范围；范围未完整显示就先读取节点详情。"
+            "候选格已占用、已处理或不合适时据实跳过，不为凑plannedCount或消耗剩余种子另开范围外土地。"
+            "一次性候选安排全部已处理或据实跳过时，按实际结果结束该安排；余下种子留待新目标。"
             "长期目标未结束保持active；加工/营业等记条件待办，不轮询。"
             "按玩家目标、实际资金与材料自行安排建造、升级和购置，无需设置每日购买额度。"
             "伙伴在自身地图操作，玩家位于屋内不影响农场动作。"
@@ -2035,7 +2064,7 @@ class ChatBridge:
             return None
         return {
             "goals": [
-                {key: g.get(key) for key in ("id", "text", "source", "constraints", "project")}
+                {key: g.get(key) for key in ("id", "text", "source", "constraints", "project", "epoch")}
                 for g in overview.get("goals", [])[:3]
             ],
             "duePreparation": [
@@ -2412,7 +2441,7 @@ class ChatBridge:
         )
 
     def _life_milestone_summary(self, save_id: str, mode: str) -> list[dict[str, Any]] | None:
-        """Compact milestone snapshot injected into the plan-mode prompt (§3.4)."""
+        """Compact milestone snapshot shared by life conversation prompts."""
         if mode not in {"chat", "plan"} or self._milestone_store is None or not save_id:
             return None
         game_date, play_style = self._life_game_date_playstyle(save_id)
@@ -2840,9 +2869,13 @@ class ChatBridge:
             if isinstance(backend, (KimiBackend, CodexBackend, DshBackend, McodeBackend)):
                 backend.progress = getattr(self, "_backend_progress_callback", None)
             start_idx = get_max_gen_idx(conversation_id) if self.backend_name == "agy" else -1
+            active_task.start_max_idx = start_idx
+            active_task.start_max_step_idx = get_max_step_idx(conversation_id) if self.backend_name == "agy" else -1
             offset = wire_offset(conversation_id, cwd=project_root()) if self.backend_name == "kimi" else 0
             result = backend.run(active_task, conversation_id, prompt)
             cid = result.get("conversation_id") or conversation_id
+            if cid != conversation_id:
+                start_idx = -1
             if self.backend_name == "kimi":
                 result["usage"] = read_usage_since(cid, offset, cwd=project_root())
             elif self.backend_name == "agy":
@@ -2883,7 +2916,9 @@ class ChatBridge:
         if proc is not None and proc.poll() is None:
             try:
                 terminate = getattr(self._backend, "terminate", None)
-                if callable(terminate):
+                if self.backend_name == "agy":
+                    terminate_agy_process(proc)
+                elif callable(terminate):
                     terminate(proc)
                 else:
                     proc.kill()
@@ -2964,11 +2999,7 @@ class ChatBridge:
                         session_profile_revision,
                         session_instruction_revision,
                     )
-                preparation_before = {
-                    n["id"]: dict(n.get("todoIds") or {})
-                    for n in (self._milestone_store.list_nodes(save_id)
-                              if self._milestone_store is not None and save_id else [])
-                }
+                preparation_before = self._accepted_preparation_state(save_id)
                 proposals_before = {node["id"]: node.get("updatedAt") for node in
                                     (self._milestone_store.list_nodes(save_id) if self._milestone_store else [])}
                 milestone_revision_before = (
@@ -3126,8 +3157,7 @@ class ChatBridge:
             proposal = self._current_life_proposal(save_id)
             if item.get("mode") != "plan" or not proposal or proposal["id"] != item["accepted_node_id"]:
                 raise ValueError("建议已更新、暂缓或方向已改变，请先重新商量；没有派发工作。")
-            before = {node["id"]: dict(node.get("todoIds") or {})
-                      for node in self._milestone_store.list_nodes(save_id)}
+            before = self._accepted_preparation_state(save_id)
             _, game_date = self._plan_snapshot_state()
             adopted = self._milestone_store.adopt(
                 save_id, proposal["id"], work_store=self._work_store, game_date=game_date,
@@ -3146,8 +3176,17 @@ class ChatBridge:
             reply_text=note or "已保留这个安排。需要玩家完成的部分，我会和你继续商量可接手的准备。",
             proposal_ready=False, activity=self._player_activity(save_id)))
 
+    def _accepted_preparation_state(self, save_id: str) -> dict[str, dict[str, Any]]:
+        if self._milestone_store is None or self._work_store is None:
+            return {}
+        goals = {goal.id: goal for goal in self._work_store.state(save_id).goals}
+        return {node["id"]: {"todoIds": dict(node.get("todoIds") or {}),
+                "scope": objective_scope({"constraints": goals[node["goalId"]].constraints})
+                if node.get("goalId") in goals else None}
+                for node in self._milestone_store.list_nodes(save_id)}
+
     async def _start_accepted_preparation(
-        self, ws: WebSocketClient | None, save_id: str, before: dict[str, dict[str, str]]
+        self, ws: WebSocketClient | None, save_id: str, before: dict[str, dict[str, Any]]
     ) -> str | None:
         """One normal work turn for newly authorized, currently due preparation."""
         if self._milestone_store is None or self._work_store is None:
@@ -3155,9 +3194,13 @@ class ChatBridge:
         new_todo_ids: set[str] = set()
         layout_project = False
         layout_goal_id = None
+        current = self._accepted_preparation_state(save_id)
         for node in self._milestone_store.list_nodes(save_id):
             todos = node.get("todoIds") or {}
-            if node.get("status") == "adopted" and todos != before.get(node["id"], {}):
+            previous = before.get(node["id"], {})
+            previous_todos = previous.get("todoIds", previous)
+            scope_changed = "scope" in previous and previous["scope"] != current[node["id"]]["scope"]
+            if node.get("status") == "adopted" and (todos != previous_todos or scope_changed):
                 new_todo_ids.update(todos.values())
                 layout_project = layout_project or bool({"layout", "production"} & todos.keys())
                 layout_goal_id = node.get("goalId")
@@ -3185,9 +3228,14 @@ class ChatBridge:
             "玩家刚在商量计划中明确认可了以下准备安排，现交给你执行一个当前可做的短作业。"
             "这是本次具体安排的执行授权，不开启全局自由模式；不要再问预算/数量或重复确认。"
             "只处理以下范围，先看真实状态，遵守现有资金/体力/暂停保护，不取消其他工作。"
+            "保存的objectiveScope是当前目标范围；若旧待办描述与它不同，以当前保存范围为准。"
+            "executionScope保留玩家明确指定的地点与候选格；候选数量不是必须消耗的种子数量。"
+            "已占格据实跳过，不为凑plannedCount或消耗剩余种子另开范围外土地。"
             "从中选择一个有用短作业，用现有submit_plan和执行器完成；没有可做工作就自然说明待命。"
             "保存不等于完成，结果只依据原生终态；用自然中文反馈，不提goal/todo或内部参数。"
-            + json.dumps([{"intent": t["intent"], "goalId": t.get("goal_id")} for t in due], ensure_ascii=False)
+            + json.dumps([{"intent": t["intent"], "goalId": t.get("goal_id"),
+                "objectiveScope": objective_scope({"constraints": next((g.constraints for g in state.goals if g.id == t.get("goal_id")), {})})}
+                for t in due], ensure_ascii=False)
         )
         # Reuse the existing command path; its ownership and busy checks still
         # apply. Await it so the turn remains tracked by the life queue task.
@@ -3197,7 +3245,7 @@ class ChatBridge:
         if after.last_job and after.last_job != previous_job:
             outcome = after.last_job.get("status") or after.last_job.get("outcome")
             if outcome == "completed":
-                return "刚才接手的这一小项已经完成，后续准备仍按约定保留。"
+                return f"这次执行的实际结果：{after.last_job.get('progressSummary') or after.last_job.get('actualSummary') or '执行器已结束，具体变化尚未确认'}。后续准备仍按约定保留。"
             if outcome in {"partial", "failed", "cancelled", "unknown", "rejected"}:
                 return "安排已经保存，但刚才这项工作没有确认全部完成；我会保留实际进度，不把它算作做完。"
         if after.decision.get("selected") and not after.decision.get("finished"):
@@ -3591,8 +3639,8 @@ class ChatBridge:
         if usage.get("input_includes_cache"):
             value = usage.get("input_tokens")
             return value if usage.get("generations_count", 1) == 1 and isinstance(value, int) else None
-        # Non-Kimi sources (agy DB delta) have no per-request split; fall back to
-        # that request's input-side counters when the source is a single request.
+        # A legacy single-generation receipt can still supply its input-side
+        # counters. Never interpret a multi-generation aggregate as context.
         generations = usage.get("generations_count", usage.get("requestCount"))
         if generations not in (1, None):
             return None
@@ -3639,10 +3687,7 @@ class ChatBridge:
         if request_count is not None and request_count > 0:
             self._session_requests[save_id] = self._session_requests.get(save_id, 0) + request_count
         else:
-            generations = usage.get("generations_count", usage.get("requestCount")) if isinstance(usage, dict) else None
-            self._session_requests[save_id] = self._session_requests.get(save_id, 0) + (
-                generations if isinstance(generations, int) and generations > 0 else 1
-            )
+            self._session_requests[save_id] = self._session_requests.get(save_id, 0) + 1
 
         # Codex cumulative billing cannot measure context. Only the explicitly
         # recorded latest request input may trigger the engineering budget.
@@ -3656,13 +3701,13 @@ class ChatBridge:
         if context_tokens is None:
             # Unknown measurement: never invent a context length, use the bounded
             # request-count checkpoint instead (explicitly labelled by reason).
-            if self._session_request_checkpoint and (
-                self._session_requests.get(save_id, 0) >= self._session_request_checkpoint
-            ):
+            state["unmeasuredRequests"] = state.get("unmeasuredRequests", 0) + (request_count if request_count and request_count > 0 else 1)
+            if self._session_request_checkpoint and state["unmeasuredRequests"] >= self._session_request_checkpoint:
                 return "SESSION_REQUEST_CHECKPOINT"
             return None
 
         state["measured"] = True
+        state["unmeasuredRequests"] = 0
         state["latestInputContext"] = context_tokens
         previous_max = state.get("maxInputContext")
         state["maxInputContext"] = (
@@ -3766,12 +3811,18 @@ class ChatBridge:
             "job-waiting" if execution.outcome == "waiting" else
             "job-completed" if execution.task_status == "completed" and execution.outcome == "completed" else
             "job-failed" if execution.outcome in {"failed", "partial", "unknown", "cancelled", "rejected"} or execution.status == "deferred" else "job-running")
-        labels = {"job-running": "正在处理", "job-waiting": "正在等待", "job-completed": "已完成", "job-failed": "未能完成"}
+        labels = {"job-running": "正在处理", "job-waiting": "正在等待", "job-completed": "本次执行结束", "job-failed": "本次执行中止"}
         task = next((task for task in self._work_store.state(save_id).tasks if task.id == execution.task_id), None) if self._work_store else None
         title = task.title if task else "这项农场工作"
         detail = execution.message or execution.reason_code or ""
         if execution.result and isinstance(execution.result, dict):
             detail = detail or str(execution.result.get("error") or execution.result.get("message") or "")
+        if execution.status == "executed":
+            feedback = compact_task_feedback(task,
+                {**(execution.result or {}), "effects": execution.effects,
+                 "reasonCode": execution.reason_code, "commandId": execution.command_id},
+                operation=execution.operation or "", status=execution.outcome)
+            detail = feedback["progressSummary"] + (f"；{detail}" if detail and not feedback.get("reason") else "")
         chain = self._command_chains.get(save_id)
         command_complete = phase in {"job-completed", "job-failed"} and not (
             chain is not None and chain.root_request_id == command_id
@@ -3950,7 +4001,6 @@ class ChatBridge:
             active_req = task.request_id
             active_save = task.save_id or save_id or ""
             active_prompt = task.prompt
-            start_idx = task.start_max_idx
 
             self.abort_active_task(f"Cancel requested: {reason}")
             old_async_task = task.async_task
@@ -3964,7 +4014,9 @@ class ChatBridge:
                     native_ok = False
 
             # Resolve conversation id and compute any usage produced before cancellation
-            cid = self.get_conversation_id(active_save)
+            # The drained init event can establish a new CID and reset its baseline.
+            start_idx = task.start_max_idx
+            cid = task.provider_conversation_id or self.get_conversation_id(active_save)
             usage_delta = None
             if self.backend_name == "kimi":
                 end_idx = -1
@@ -3989,7 +4041,7 @@ class ChatBridge:
 
             if self.backend_name not in {"codex", "mcode"} and not task.recorded:
                 self._record_command(
-                    request_id=request_id or active_req,
+                    request_id=active_req,
                     save_id=active_save,
                     conversation_id=cid,
                     prompt=active_prompt,
@@ -4003,15 +4055,16 @@ class ChatBridge:
                 )
                 task.recorded = True
 
+            display_usage = normalize_usage(self.backend_name, usage_delta)
             reply = Envelope.create_chat_reply(
                 sender_instance_id=self.instance_id,
                 request_id=request_id or active_req,
                 status="cancelled" if native_ok else "job-waiting",
                 reply_text="任务已由玩家取消。" if native_ok else "取消已请求，原生作业终态尚未确认。",
                 save_id=active_save,
-                tokens_used=usage_delta["total_tokens"] if usage_delta else None,
-                prompt_tokens=usage_delta["input_tokens"] if usage_delta else None,
-                output_tokens=usage_delta["output_tokens"] if usage_delta else None,
+                tokens_used=display_usage.get("total_tokens") if display_usage else None,
+                prompt_tokens=display_usage.get("input_tokens") if display_usage else None,
+                output_tokens=display_usage.get("output_tokens") if display_usage else None,
                 cached_tokens=usage_delta["cache_read_tokens"] if usage_delta else None,
                 conversation_id=cid,
                 error="PLAYER_CANCELLED" if native_ok else "NATIVE_CANCEL_UNCONFIRMED",
@@ -4254,18 +4307,20 @@ class ChatBridge:
                     logger.info("Task [%s] was cancelled during execution; cancel handler finished.", request_id)
                     if not getattr(active_task, "recorded", False):
                         duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
-                        cid = self.get_conversation_id(save_id)
+                        cid = active_task.provider_conversation_id or result.get("conversation_id") or self.get_conversation_id(save_id)
+                        interrupted_usage = (get_command_usage_delta(cid, active_task.start_max_idx) if self.backend_name == "agy"
+                            else self._codex_turn_usage(result) if self.backend_name == "codex"
+                            else result.get("usage") if self.backend_name == "mcode" else None)
                         self._record_command(
                             request_id=request_id,
                             save_id=save_id,
                             conversation_id=cid,
                             prompt=text,
                             status="interrupted",
-                            start_idx=start_max_idx,
+                            start_idx=active_task.start_max_idx,
                             end_idx=-1,
-                            usage=(self._codex_turn_usage(result) if self.backend_name == "codex"
-                                   else result.get("usage") if self.backend_name == "mcode" else None),
-                            missing_reason=None if result.get("usage") else "interrupted_usage_unknown",
+                            usage=interrupted_usage,
+                            missing_reason=None if interrupted_usage else "interrupted_usage_unknown",
                             error=getattr(active_task, "abort_reason", None) or "INTERRUPTED",
                             duration=duration,
                         )
@@ -4397,8 +4452,9 @@ class ChatBridge:
                         )
 
                 if usage:
-                    tokens_used = usage.get("total_tokens")
-                    prompt_tokens = usage.get("input_tokens")
+                    display_usage = normalize_usage(self.backend_name, usage)
+                    tokens_used = display_usage.get("total_tokens")
+                    prompt_tokens = display_usage.get("input_tokens")
                     if prompt_tokens is None:
                         prompt_tokens = usage.get("prompt_tokens")
                     output_tokens = usage.get("output_tokens")
@@ -4576,17 +4632,18 @@ class ChatBridge:
                         self._autonomy.request_job_decision(save_id)
                 if not getattr(active_task, "recorded", False):
                     duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
-                    cid = self.get_conversation_id(save_id)
+                    cid = active_task.provider_conversation_id or self.get_conversation_id(save_id)
+                    interrupted_usage = get_command_usage_delta(cid, active_task.start_max_idx) if self.backend_name == "agy" else None
                     self._record_command(
                         request_id=request_id,
                         save_id=save_id,
                         conversation_id=cid,
                         prompt=active_task.prompt,
                         status="interrupted",
-                        start_idx=start_max_idx,
+                        start_idx=active_task.start_max_idx,
                         end_idx=-1,
-                        usage=None,
-                        missing_reason="interrupted",
+                        usage=interrupted_usage,
+                        missing_reason=None if interrupted_usage else "interrupted",
                         error=getattr(active_task, "abort_reason", None) or "INTERRUPTED",
                         duration=duration,
                     )
@@ -4616,7 +4673,9 @@ class ChatBridge:
                 # life-chat submits FIFO (each always reaches a terminal state).
                 if self._life_queue:
                     try:
-                        asyncio.get_running_loop().create_task(self._drain_life_queue(ws))
+                        task = asyncio.get_running_loop().create_task(self._drain_life_queue(ws))
+                        self._life_drain_tasks.add(task)
+                        task.add_done_callback(self._life_drain_tasks.discard)
                     except RuntimeError:
                         pass
 
@@ -4648,9 +4707,9 @@ class ChatBridge:
             "每次请求都会附带以下紧凑实时上下文（字段缺失为 unknown）；工具结果是执行后的最新事实，"
             "不要为了确认再重复查询。\n"
             f"实时上下文：{context}\n"
-            "用submit_plan选择本次唯一语义短作业；内部导航和同一业务的多步操作由运行时执行。"
-            "remember_intent记录目标与待办，它们不是执行授权。不要预排第二种业务；"
-            "下一业务须下一次模型决策。job-selected仅表示已选择，未执行成功；"
+            "用submit_plan提交一段可中断的连续行动；导航和不同类型的合法操作由运行时依序执行。"
+            "remember_intent记录目标与待办，它们不是执行授权。已知条件允许时可组合多种操作；"
+            "实际结果与预期不符时，回到模型决策调整。job-selected仅表示已选择，未执行成功；"
             "下一次输入lastResult是实际终态，信任它，不重复核查。\n"
             "自主执行，不要向玩家询问坐标或请求额外确认。不要读写代码文件或执行终端命令。\n"
             f"{instructions or decision_policy()}\n\n"
@@ -4723,6 +4782,7 @@ class ChatBridge:
             # by commandId) and evaluate the work-done care hook (contract §2/§4).
             # Failures/cancellals/plans never reach this branch.
             task_title: str | None = None
+            task = None
             if self._work_store is not None:
                 try:
                     job_state = self._work_store.state(save_id)
@@ -4736,7 +4796,12 @@ class ChatBridge:
             if not task_title:
                 task_title = execution.operation or "农场作业"
             event_ref = execution.command_id or execution.task_id or task_title
-            self._record_memory_event(save_id, f"完成了「{task_title}」", event_ref)
+            feedback = compact_task_feedback(task,
+                {**(execution.result or {}), "effects": execution.effects,
+                 "reasonCode": execution.reason_code},
+                operation=execution.operation or "", status=execution.outcome)
+            fact = f"作业「{task_title}」的实际结果：{feedback['progressSummary']}"
+            self._record_memory_event(save_id, fact, event_ref)
             world: dict[str, Any] = {}
             if isinstance(self._latest_snapshot_payload, dict):
                 world = self._latest_snapshot_payload.get("world") or {}
@@ -4744,7 +4809,7 @@ class ChatBridge:
             autonomous = bool(pending_af or (binding and str(binding[0]).startswith("autonomy-")))
             if not autonomous:
                 await self._maybe_fire_care(
-                    save_id, "work-done", event_ref, world, fact=f"完成了「{task_title}」"
+                    save_id, "work-done", event_ref, world, fact=fact
                 )
         if pending_af and self._autonomy is not None and execution.reason_code != "BEDTIME" and execution.outcome not in {"failed", "rejected", "partial"}:
             af_save_id, af_fingerprint = pending_af
@@ -4936,9 +5001,9 @@ class ChatBridge:
             "不要为了确认再重复查询。\n"
             f"实时上下文：{context}\n"
             f"这是对玩家指令『{instruction}』的继续。若指令意图已全部完成，直接向玩家总结收尾（本轮不要 submit_plan）；若还有下一业务，用 submit_plan 选择下一个短作业。\n"
-            "用submit_plan选择本次唯一语义短作业；内部导航和同一业务的多步操作由运行时执行。"
-            "remember_intent记录目标与待办，它们不是执行授权。不要预排第二种业务；"
-            "下一业务须下一次模型决策。job-selected仅表示已选择，未执行成功；"
+            "用submit_plan提交一段可中断的连续行动；导航和不同类型的合法操作由运行时依序执行。"
+            "remember_intent记录目标与待办，它们不是执行授权。已知条件允许时可组合多种操作；"
+            "实际结果与预期不符时，回到模型决策调整。job-selected仅表示已选择，未执行成功；"
             "下一次输入lastResult是实际终态，信任它，不重复核查。\n"
             "自主执行，不要向玩家询问坐标或请求额外确认。不要读写代码文件或执行终端命令。\n"
             f"{instructions or decision_policy()}\n"
@@ -4993,6 +5058,7 @@ class ChatBridge:
         prompt: str,
     ) -> dict[str, Any]:
         """Executes agy CLI command synchronously in background thread with cancellation support."""
+        requested_cid = conversation_id
         cmd = [self.agy_cmd]
 
         # Keep the configured provider model on resume as well: agy otherwise
@@ -5010,8 +5076,6 @@ class ChatBridge:
             "--mode", "accept-edits",
             "--dangerously-skip-permissions",
             "--print-timeout", "10m",
-            "--output-format", "json",
-            "--print", prompt,
         ])
 
         logger.info("Executing agy CLI: %s", " ".join(cmd[:6]) + " ...")
@@ -5029,50 +5093,19 @@ class ChatBridge:
             }
 
         try:
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                active_task.process = proc
-            except Exception as ex:
-                logger.error("Failed to execute agy CLI: %s", ex, exc_info=True)
-                return {
-                    "success": False,
-                    "response": f"调用后台 AI 服务发生异常：{ex}",
-                    "error": str(ex),
-                    "conversation_id": conversation_id,
-                }
+            def on_conversation(cid: str) -> None:
+                if cid != requested_cid:
+                    active_task.start_max_idx = -1
+                    active_task.start_max_step_idx = -1
 
-            # Check AFTER spawn (cancel race condition guard)
-            if active_task.cancelled:
-                logger.info(
-                    "Task [%s] was cancelled immediately after Popen spawn; killing proc PID %d.",
-                    active_task.request_id,
-                    proc.pid,
-                )
-                try:
-                    proc.kill()
-                except Exception as ex:
-                    logger.debug("Error killing process on post-spawn cancel: %s", ex)
-                return {
-                    "success": False,
-                    "response": "任务已取消。",
-                    "error": "CANCELLED",
-                    "conversation_id": conversation_id,
-                    "duration": time.monotonic() - start_time,
-                    "status": "interrupted",
-                }
-
-            try:
-                stdout, stderr = proc.communicate(timeout=600)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
+            outcome = run_agy_process(active_task, cmd, prompt, conversation_id,
+                run_dir=self._commands_file.parent,
+                model=self.model or "", start_idx=active_task.start_max_idx,
+                timeout_seconds=600, on_conversation=on_conversation)
+            conversation_id = outcome.conversation_id or conversation_id
+            returncode = outcome.returncode
+            stdout, stderr = outcome.stdout, outcome.stderr
+            if outcome.timed_out:
                 logger.error("agy CLI timed out after 600s")
                 return {
                     "success": False,
@@ -5087,7 +5120,7 @@ class ChatBridge:
             stdout = stdout or ""
             stderr = stderr or ""
 
-            if active_task.cancelled:
+            if active_task.cancelled or outcome.cancelled:
                 return {
                     "success": False,
                     "response": "任务已取消。",
@@ -5136,7 +5169,7 @@ class ChatBridge:
             # Check for genuine fresh quota evidence:
             # 1. Authoritative DB steps check: new step_type=17 with idx > start_max_step_idx
             # Reset step baseline if agy established a new session / changed conversation_id
-            step_baseline = -1 if (cid and conversation_id and cid != conversation_id) else active_task.start_max_step_idx
+            step_baseline = -1 if (cid and requested_cid and cid != requested_cid) else active_task.start_max_step_idx
             is_new_quota_step, step_err_text = check_new_quota_error(
                 cid, step_baseline
             )
@@ -5187,7 +5220,7 @@ class ChatBridge:
                 }
 
             # 3. For new conversation only (not resumed), parsed.get("error") is fresh evidence
-            is_new_session = conversation_id is None
+            is_new_session = requested_cid is None
             if is_new_session and parsed and parsed.get("error"):
                 new_session_err = str(parsed.get("error"))
                 if hard_quota_pattern.search(new_session_err):
@@ -5233,17 +5266,17 @@ class ChatBridge:
                     }
 
             # 5. Non-zero exit code or failed status
-            is_error = (proc.returncode != 0) or (op_status not in ("SUCCESS", None))
+            is_error = (returncode != 0) or (op_status not in ("SUCCESS", None))
             if is_error:
                 cli_err = (parsed.get("error") or "") if is_new_session else ""
                 err_text = f"{stderr}\n{cli_err}".strip()
                 if err_text:
                     err_marker = err_text[:200]
-                    resp = response_text if response_text else f"AI 执行出错 (退出码 {proc.returncode})：{err_text[:200]}"
+                    resp = response_text if response_text else f"AI 执行出错 (退出码 {returncode})：{err_text[:200]}"
                 else:
-                    err_marker = f"AGY_EXIT_{proc.returncode}" if proc.returncode != 0 else f"AGY_STATUS_{op_status}"
-                    resp = response_text if response_text else f"AI 执行出错 (退出码 {proc.returncode})"
-                logger.error("agy exited with error: code=%d, status=%s, err=%s", proc.returncode, op_status, err_text[:300] or err_marker)
+                    err_marker = f"AGY_EXIT_{returncode}" if returncode != 0 else f"AGY_STATUS_{op_status}"
+                    resp = response_text if response_text else f"AI 执行出错 (退出码 {returncode})"
+                logger.error("agy exited with error: code=%s, status=%s, err=%s", returncode, op_status, err_text[:300] or err_marker)
                 return {
                     "success": False,
                     "response": resp,
@@ -5254,7 +5287,7 @@ class ChatBridge:
 
             # Plain text output fallback if proc.returncode == 0
             clean_stdout = stdout.strip()
-            if proc.returncode == 0 and clean_stdout:
+            if returncode == 0 and clean_stdout:
                 return {
                     "success": True,
                     "response": clean_stdout,
@@ -5264,7 +5297,7 @@ class ChatBridge:
 
             return {
                 "success": False,
-                "response": f"AI 未能正常生成回复 (code {proc.returncode})",
+                "response": f"AI 未能正常生成回复 (code {returncode})",
                 "error": "NO_OUTPUT",
                 "conversation_id": conversation_id,
                 "duration": duration,

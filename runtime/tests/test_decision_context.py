@@ -14,6 +14,8 @@ from pathlib import Path
 from stardew_ai_runtime.decision_context import (
     UNKNOWN,
     build_decision_context,
+    goal_context,
+    objective_scope,
     render_decision_context,
 )
 
@@ -212,6 +214,161 @@ def test_context_rebuild_is_bounded_not_append_only() -> None:
     rebuilt = build_decision_context(newer)
     assert rebuilt["date"]["day"] == 7
     assert len(render_decision_context(rebuilt)) <= len(render_decision_context(first)) + 8
+
+
+def test_current_goal_scope_survives_repeated_context_projection_and_is_bounded():
+    goal = {"id": "g", "text": "种菜", "source": "user", "epoch": 7,
+            "constraints": {"objectiveScope": {"summary": "种" * 1500, "targetDate": "1:spring:16",
+                                              "plannedCount": None, "termsNote": None, "preparation": ["plant"]}}}
+    first = goal_context(goal)
+    assert len(first["scope"]["summary"]) == 1200
+    assert first["scope"]["truncated"] is True
+    assert first["scope"]["revision"] == 7
+    assert goal_context(first) == first
+    context = build_decision_context(_snapshot(), work={"goals": [first]})
+    assert context["goals"][0] == first
+    # Wake material uses the unabridged store goal, never the display truncation.
+    assert len(objective_scope(goal)["summary"]) == 1500
+    assert len(goal["constraints"]["objectiveScope"]["summary"]) == 1500
+
+
+def test_explicit_candidate_scope_survives_new_session_context_and_double_projection():
+    tiles = [{"x": 62 + index, "y": 27} for index in range(19)]
+    goal = {"id": "g", "text": "同一批候选", "epoch": 4, "constraints": {
+        "milestoneId": "custom-candidates", "objectiveScope": {"summary": "候选19格，已种跳过",
+        "plannedCount": 19, "preparation": ["plant", "water"],
+        "executionScope": {"locationId": "Farm", "tiles": tiles}}}}
+    projected = goal_context(goal)
+    execution = projected["scope"]["executionScope"]
+    assert execution == {"locationId": "Farm", "tiles": tiles, "tileCount": 19, "truncated": False}
+    assert goal_context(projected) == projected
+    assert build_decision_context(_snapshot(), work={"goals": [projected]})["goals"][0] == projected
+    assert "tileCount" not in objective_scope(goal)["executionScope"]
+
+
+def test_large_candidate_scope_is_display_bounded_but_raw_wake_and_detail_are_exact():
+    tiles = [{"x": index, "y": 27} for index in range(180)]
+    goal = {"id": "g", "text": "大批候选", "epoch": 9, "constraints": {
+        "milestoneId": "custom-large", "objectiveScope": {"preparation": ["plant"],
+        "executionScope": {"locationId": "Farm", "tiles": tiles}}}}
+    projected = goal_context(goal)
+    execution = projected["scope"]["executionScope"]
+    assert len(execution["tiles"]) == 128 and execution["tileCount"] == 180
+    assert execution["truncated"] is True and projected["scope"]["truncated"] is True
+    assert execution["detailQuery"] == {"tool": "manage_milestones", "params": {
+        "action": "list", "node_id": "custom-large"}}
+    assert len(objective_scope(goal)["executionScope"]["tiles"]) == 180
+    assert goal_context(projected) == projected
+    original = json.loads(json.dumps(objective_scope(goal)))
+    goal["epoch"] += 1
+    goal["project"] = {"summary": "路线备注", "phase": "observe"}
+    assert objective_scope(goal) == original
+    goal["constraints"]["objectiveScope"]["executionScope"]["tiles"][-1]["y"] = 28
+    assert objective_scope(goal) != original
+    assert goal_context(goal)["scope"]["executionScope"]["tiles"] == execution["tiles"]
+
+
+def test_legacy_goal_does_not_invent_candidate_scope_from_seed_count():
+    goal = {"text": "种19颗", "constraints": {"plannedCount": 19,
+        "objectiveScope": {"plannedCount": 19, "preparation": ["plant"]}}}
+    assert "executionScope" not in objective_scope(goal)
+    assert "executionScope" not in goal_context(goal)["scope"]
+
+
+def test_legacy_milestone_scope_excludes_notes_epochs_but_tracks_actual_range():
+    goal = {"id": "g", "text": "菜地", "epoch": 1, "project": {"summary": "观察路线"},
+            "constraints": {"milestoneSpec": {"todos": [
+                {"key": "plant", "intent": "只种包内", "trigger": {"type": "calendar", "day": 20}, "expiry": None},
+            ]}}}
+    signal = objective_scope(goal)
+    projected = goal_context(goal)
+    assert projected["scope"]["workItems"][0]["intent"] == "只种包内"
+    assert goal_context(projected) == projected
+    goal["epoch"] += 1
+    goal["project"]["summary"] = "路线备注更新"
+    assert objective_scope(goal) == signal
+    goal["constraints"]["milestoneSpec"]["todos"][0]["intent"] = "包内和箱内全部种"
+    assert objective_scope(goal) != signal
+
+
+def test_rest_and_local_planting_facts_have_revision_limits_and_seed_sources():
+    snapshot = _snapshot()
+    payload = snapshot["payload"]
+    payload["companion"]["restState"] = "resting"
+    payload["planting"] = {"seeds": [{"itemId": "(O)472", "name": "Parsnip Seeds", "stack": 17,
+                                       "canPlantCurrentSeason": True, "seasons": ["spring"]}],
+                           "candidateTiles": {"tilledEmptyCount": 20,
+                                              "tilledEmptyTiles": [{"x": 68 + x, "y": 28} for x in range(20)],
+                                              "tilledEmptyTruncated": False,
+                                              "tillableCount": 0, "tillableTiles": [], "tillableTruncated": False},
+                           "searchBounds": {"center": {"x": 61, "y": 17}, "radius": 15}}
+    result = {"taskId": "done", "actualSummary": {"plantedCount": 2, "skippedCount": 17}}
+    context = build_decision_context(snapshot, work={"lastJob": result})
+    assert context["restState"] == "resting"
+    facts = context["farmActionFacts"]
+    assert facts["worldRevision"] == 42
+    assert facts["planting"]["locationId"] == "Farm"
+    assert len(facts["planting"]["tiles"]["tilledEmpty"]["coordinates"]) == 16
+    assert facts["planting"]["tiles"]["tilledEmpty"]["truncated"] is True
+    assert facts["planting"]["tiles"]["tillable"] == {"count": 0, "coordinates": [], "truncated": False}
+    assert facts["seedSources"]["inventory"]["seeds"][0]["count"] == 17
+    assert facts["seedSources"]["chests"]["sources"][0]["tile"] == {"x": 66, "y": 20}
+    assert facts["seedSources"]["chests"]["sources"][0]["seeds"][0]["count"] == 12
+    assert context["lastResult"] == result
+    from stardew_ai_runtime.life_chat import LifeChatService
+    live = LifeChatService.compact_live_context(context)
+    assert live["restState"] == "resting" and live["farmActionFacts"] == facts
+    assert live["lastResult"] == result
+    assert "contents" not in render_decision_context(context)
+
+
+def test_unobserved_chests_and_seed_classification_never_invent_stock():
+    snapshot = {"worldRevision": 5, "payload": {"companion": {"locationId": "FarmHouse"},
+                 "inventory": {"slots": [{"itemId": "(O)472", "name": "Seeds", "stack": 17}]}}}
+    context = build_decision_context(snapshot)
+    sources = context["farmActionFacts"]["seedSources"]
+    assert context["restState"] == UNKNOWN
+    assert sources["inventory"]["observationStatus"] == "unknown"
+    assert sources["inventory"]["seeds"] == UNKNOWN
+    assert sources["chests"]["observationStatus"] == "unknown"
+    assert sources["chests"]["sources"] == UNKNOWN
+    assert sources["chests"]["queryNeeded"] is True
+    # A suggestive display name is not authoritative native seed classification.
+    snapshot["payload"]["chests"] = {"items": [{"tile": {"x": 1, "y": 2}, "contents": [
+        {"name": "种子", "itemId": "custom", "stack": 99},
+    ]}], "truncated": False}
+    chest = build_decision_context(snapshot)["farmActionFacts"]["seedSources"]["chests"]
+    assert chest["sources"] == [] and chest["queryNeeded"] is True
+
+
+def test_seed_chest_rows_are_bounded_across_sources_and_mark_incomplete():
+    snapshot = {"worldRevision": 8, "payload": {"companion": {"locationId": "Farm"}, "chests": {
+        "truncated": True, "items": [{"tile": {"x": x, "y": 1}, "contents": [
+            {"itemId": f"seed-{x}-{i}", "name": "Seed", "stack": 1, "isSeed": True} for i in range(3)
+        ]} for x in range(12)],
+    }}}
+    chest = build_decision_context(snapshot)["farmActionFacts"]["seedSources"]["chests"]
+    assert len(chest["sources"]) == 6
+    assert sum(len(row["seeds"]) for row in chest["sources"]) == 16
+    assert chest["truncated"] is True and chest["queryNeeded"] is True
+
+
+def test_relevant_farm_tiles_use_real_native_fields_and_keep_off_map_scope():
+    snapshot = {"worldRevision": 81, "payload": {"companion": {"locationId": "FarmHouse"}, "farmWork": {
+        "locationId": "Farm", "observationStatus": "observed", "cropUnwateredCount": 2,
+        "cropUnwateredTiles": [{"x": 68, "y": 28}, {"x": 72, "y": 19}], "cropUnwateredTruncated": False,
+        "matureCropCount": 1, "matureCrops": [{"x": 72, "y": 24, "cropId": "24"}], "matureCropsTruncated": False,
+    }}}
+    work = {"goals": [{"text": "持续经营", "constraints": {"objectiveScope": {"preparation": ["production"]}}}]}
+    facts = build_decision_context(snapshot, work=work)["farmActionFacts"]["farm"]
+    assert facts["locationId"] == "Farm"
+    assert facts["currentCompanionLocationId"] == "FarmHouse" and facts["needsNavigation"] is True
+    assert facts["unwatered"] == {"coordinates": [{"x": 68, "y": 28}, {"x": 72, "y": 19}], "count": 2, "truncated": False}
+    assert facts["harvestable"] == {"coordinates": [{"x": 72, "y": 24}], "count": 1, "truncated": False}
+    snapshot["payload"]["farmWork"]["observationStatus"] = "not-observed"
+    unobserved = build_decision_context(snapshot, work=work)["farmActionFacts"]["farm"]
+    assert unobserved["unwatered"]["coordinates"] == UNKNOWN
+    assert unobserved["harvestable"]["count"] == UNKNOWN
 
 
 def test_companion_and_memory_blocks_are_optional() -> None:

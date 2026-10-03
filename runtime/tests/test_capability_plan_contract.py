@@ -57,18 +57,18 @@ def test_animal_care_trip_is_one_bounded_business():
                for n in range(10)],
              {"operation": "pickup_items", "params": {"location_id": "CoopA", "tiles": [{"x": 1, "y": 2}]}}]
     WorkStore.validate_short_job([{"steps": steps}])
-    with pytest.raises(Exception, match="MULTIPLE_BUSINESSES"):
-        WorkStore.validate_short_job([{"steps": [*steps, {"operation": "water_auto", "params": {}}]}])
-    steps[-1]["params"]["tiles"] = [{"x": n, "y": 2} for n in range(64)]
-    with pytest.raises(Exception, match="64 native targets"):
-        WorkStore.validate_short_job([{"steps": steps}])
+    WorkStore.validate_short_job([{"steps": [*steps, {"operation": "water_auto", "params": {}}]}])
+    steps[-1]["params"]["tiles"] = [{"x": n, "y": 2} for n in range(100)]
+    WorkStore.validate_short_job([{"steps": steps}])
 
 
 def test_all_discovered_step_keys_share_dispatch_contract_and_shop_docs():
     async def check():
         server = create_mcp_server(scheduler=MagicMock(), surface="light")
-        _, result = await server.call_tool("discover_capabilities", {})
-        entries = {e["name"]: e for group in result["groups"].values() for e in group}
+        entries = {}
+        for group in CAPABILITY_GROUPS:
+            _, result = await server.call_tool("discover_capabilities", {"group": group})
+            entries.update({e["name"]: e for e in result["groups"][group]})
         for name, entry in entries.items():
             if name in _PLAN_OPERATION_CALLS:
                 assert set(entry["planStep"]["parameters"]) == _PLAN_OPERATION_CALLS[name][1]
@@ -79,4 +79,46 @@ def test_all_discovered_step_keys_share_dispatch_contract_and_shop_docs():
         assert "revise" in entries["manage_goal"]["directCall"]["allowedValues"]["action"]
         assert "update" not in entries["manage_goal"]["directCall"]["allowedValues"]["action"]
 
+    asyncio.run(check())
+
+
+def test_discovery_gives_nested_required_shapes_and_valid_examples():
+    async def check():
+        server = create_mcp_server(scheduler=MagicMock(), surface="light")
+        _, index = await server.call_tool("discover_capabilities", {})
+        assert index["groups"] == {}
+        _, result = await server.call_tool("discover_capabilities", {"group": "farm"})
+        entries = {e["name"]: e for e in result["groups"]["farm"]}
+        plant = entries["plant_seeds"]["planStep"]
+        assert set(plant["required"]) == {"seed_item_id", "tiles"}
+        assert plant["parameters"]["tiles"]["items"]["required"] == ["x", "y"]
+        assert plant["parameters"]["tiles"]["items"]["properties"]["x"]["minimum"] == 0
+        assert entries["water_tiles"]["planStep"]["example"]["params"]["tiles"] == [{"x": 69, "y": 18}, {"x": 64, "y": 23}]
+        assert "maxItems" not in entries["water_tiles"]["planStep"]["parameters"]["tiles"]
+    asyncio.run(check())
+
+
+
+def test_mixed_cross_map_job_is_saved_with_each_operation_contract(tmp_path, monkeypatch):
+    async def check():
+        sched = MagicMock()
+        sched.run_dir = str(tmp_path)
+        sched.get_status = AsyncMock(return_value={"saveId": "S"})
+        store = WorkStore(tmp_path / "data/work-state.json")
+        store.begin_decision("S", "choice")
+        monkeypatch.setenv("STARDEW_DECISION_TOKEN", "choice")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=sched, surface="light")
+        tiles = [{"x": i, "y": 5} for i in range(100)]
+        steps = [{"operation": "navigate_to", "params": {"location_id": "FarmHouse", "tile": {"x": 1, "y": 1}}},
+                 {"operation": "withdraw_from_chest", "params": {"location_id": "FarmHouse", "chest_x": 1, "chest_y": 1, "items": [{"itemId": "(O)475", "count": 100}]}},
+                 {"operation": "navigate_to", "params": {"location_id": "Farm", "tile": {"x": 5, "y": 5}}},
+                 {"operation": "hoe_tiles", "params": {"location_id": "Farm", "tiles": tiles}},
+                 {"operation": "plant_seeds", "params": {"location_id": "Farm", "seed_item_id": "(O)475", "tiles": tiles}},
+                 {"operation": "water_tiles", "params": {"location_id": "Farm", "tiles": tiles}}]
+        _, result = await server.call_tool("submit_plan", {"goal_text": "种完箱中种子", "tasks": [{"title": "取种开垦种浇", "steps": steps}]})
+        assert result["executionScope"] == "one_short_job"
+        saved = store.state("S").tasks[0].steps
+        assert [step.operation for step in saved] == [step["operation"] for step in steps]
+        assert saved[1].params["location_id"] == "FarmHouse"
+        assert saved[-1].params["tiles"] == tiles
     asyncio.run(check())

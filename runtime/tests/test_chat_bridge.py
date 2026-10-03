@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import sqlite3
@@ -30,6 +31,19 @@ from stardew_ai_runtime.protocol import (
     Envelope,
 )
 from stardew_ai_runtime.scheduler import DiscoveryError
+
+
+def _mock_agy_stream(proc, stdout: str, stderr: str) -> None:
+    """Bridge parser tests use the native result event; transport has its own tests."""
+    output = ""
+    if stdout:
+        start, end = stdout.find("{"), stdout.rfind("}") + 1
+        output = stdout[:start] + json.dumps({"event": "result", "result": json.loads(stdout[start:end])}) + "\n"
+    proc.stdin = io.StringIO()
+    proc.stdout = io.StringIO(output)
+    proc.stderr = io.StringIO(stderr)
+    proc.poll.return_value = proc.returncode
+    proc.wait.return_value = proc.returncode
 
 
 def test_internal_client_close_releases_inflight_and_queued_calls(tmp_path: Path) -> None:
@@ -209,7 +223,7 @@ def test_execute_agy_turn_success_parsing() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -237,7 +251,7 @@ def test_execute_agy_turn_empty_response_not_falsified() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -259,7 +273,7 @@ def test_execute_agy_turn_effort_and_model_rules() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (json.dumps({"status": "SUCCESS", "response": "ok"}), "")
+        _mock_agy_stream(mock_proc, json.dumps({"status": "SUCCESS", "response": "ok"}), "")
         mock_popen.return_value = mock_proc
 
         # 1. New conversation: --model AND --effort should be present
@@ -274,6 +288,7 @@ def test_execute_agy_turn_effort_and_model_rules() -> None:
 
         # 2. Resumed conversation retains the explicitly configured model.
         task2 = ActiveChatTask(request_id="r2", save_id="s1")
+        _mock_agy_stream(mock_proc, json.dumps({"status": "SUCCESS", "response": "ok"}), "")
         bridge._execute_agy_turn(task2, conversation_id="existing-cid-999", prompt="test prompt")
         cmd_resume = mock_popen.call_args[0][0]
         assert "--conversation" in cmd_resume
@@ -292,7 +307,7 @@ def test_execute_agy_turn_quota_exhaustion() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = ("", "Error: RESOURCE_EXHAUSTED: quota exceeded for model")
+        _mock_agy_stream(mock_proc, "", "Error: RESOURCE_EXHAUSTED: quota exceeded for model")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -315,7 +330,7 @@ def test_execute_agy_turn_rate_limit_notifies_and_is_not_quota() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = ("", "429 Too Many Requests: rate limit exceeded")
+        _mock_agy_stream(mock_proc, "", "429 Too Many Requests: rate limit exceeded")
         mock_popen.return_value = mock_proc
 
         res = bridge._execute_agy_turn(
@@ -453,7 +468,7 @@ def test_old_stdout_error_ignored_on_successful_turn() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -468,7 +483,7 @@ def test_rate_limit_distinguished_from_quota() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = ("", "Error 429: rate limit exceeded. Please retry later.")
+        _mock_agy_stream(mock_proc, "", "Error 429: rate limit exceeded. Please retry later.")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -495,7 +510,9 @@ def test_cancel_race_pre_and_post_spawn() -> None:
     task_post = ActiveChatTask(request_id="r_post", save_id="s1")
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
-        mock_proc.pid = 9999
+        mock_proc.returncode = -9
+        _mock_agy_stream(mock_proc, "", "")
+        mock_proc.poll.return_value = None
 
         def popen_side_effect(*args, **kwargs):
             # Simulate cancel arriving right as process spawns
@@ -656,7 +673,7 @@ def test_resume_ignores_old_cumulative_quota_error(tmp_path: Path) -> None:
          patch("stardew_ai_runtime.chat_bridge.get_conversation_db_path", return_value=db_path):
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(
@@ -695,7 +712,7 @@ def test_resume_detects_genuine_new_step17_quota_error(tmp_path: Path) -> None:
          patch("stardew_ai_runtime.chat_bridge.get_conversation_db_path", return_value=db_path):
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(
@@ -1653,7 +1670,7 @@ def test_provider_default_effort_omits_unsupported_cli_option(conversation_id):
     with patch("subprocess.Popen") as popen:
         process = MagicMock()
         process.returncode = 0
-        process.communicate.return_value = (json.dumps({"status": "SUCCESS", "response": "ok"}), "")
+        _mock_agy_stream(process, json.dumps({"status": "SUCCESS", "response": "ok"}), "")
         popen.return_value = process
         result = bridge._execute_agy_turn(
             ActiveChatTask(request_id="effort-default", save_id="s1"),

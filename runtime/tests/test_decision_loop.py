@@ -18,7 +18,7 @@ def choose(store, token="decision-1", plan=None):
     return store.submit_plan("save", goal_text="farm care", tasks=plan or tasks(), decision_token=token)
 
 
-def test_same_decision_cannot_select_second_business_or_bundle(tmp_path):
+def test_decision_owns_one_sequence_and_can_combine_operation_kinds(tmp_path):
     store=WorkStore(tmp_path/"work.json")
     choose(store)
     with pytest.raises(WorkStateError, match="NEW_MODEL"):
@@ -26,8 +26,9 @@ def test_same_decision_cannot_select_second_business_or_bundle(tmp_path):
     store.begin_decision("save", "second")
     with pytest.raises(WorkStateError, match="ONE_SHORT"):
         store.submit_plan("save", goal_text="many", tasks=tasks()+tasks(), decision_token="second")
-    with pytest.raises(WorkStateError, match="MULTIPLE_BUSINESSES"):
-        store.submit_plan("save", goal_text="mixed", tasks=tasks(steps=[{"operation":"water_auto"},{"operation":"ship_items"}]), decision_token="second")
+    plan = store.submit_plan("save", goal_text="mixed", tasks=tasks(steps=[{"operation":"water_auto"},{"operation":"ship_items"}]), decision_token="second")
+    selected = next(task for task in store.state("save").tasks if task.id == plan["tasks"][0]["id"])
+    assert [step.operation for step in selected.steps] == ["water_auto", "ship_items"]
 
 
 def seed_batch_steps():
@@ -61,7 +62,7 @@ def test_same_seed_batch_runs_then_returns_to_model_or_stops_on_partial(tmp_path
 
 
 @pytest.mark.parametrize("mutation", ["different_area", "water_first", "different_map", "too_large"])
-def test_seed_batch_rejects_unrelated_or_unbounded_work(tmp_path, mutation):
+def test_plan_preserves_model_choices_for_native_step_validation(tmp_path, mutation):
     steps = seed_batch_steps()
     if mutation == "different_area":
         steps[1]["params"]["center_x"] = 30
@@ -73,17 +74,19 @@ def test_seed_batch_rejects_unrelated_or_unbounded_work(tmp_path, mutation):
         steps[0]["params"]["tiles"] = [{"x": x, "y": y} for x in range(7, 14) for y in range(7, 14)]
         steps[1]["params"]["radius"] = 3
     store = WorkStore(tmp_path / "work.json")
-    with pytest.raises(WorkStateError, match="PLANTING_BATCH_REQUIRED|64 native targets"):
-        choose(store, plan=tasks(steps=steps))
-    assert store.state("save").tasks == []
+    plan = choose(store, plan=tasks(steps=steps))
+    selected = next(task for task in store.state("save").tasks if task.id == plan["tasks"][0]["id"])
+    assert [step.operation for step in selected.steps] == [step["operation"] for step in steps]
+    assert [step.params for step in selected.steps] == [step["params"] for step in steps]
+    assert selected.status == "pending"
 
 
-def test_multiple_watering_areas_count_their_native_targets(tmp_path):
+def test_multiple_watering_areas_have_no_total_target_budget(tmp_path):
     steps = [{"operation": "water_zone", "params": {"center_x": 10 * index, "center_y": 10, "radius": 3}} for index in range(1, 3)]
     store = WorkStore(tmp_path / "work.json")
-    with pytest.raises(WorkStateError, match="64 native targets"):
-        choose(store, plan=tasks(steps=steps))
-    assert store.state("save").tasks == []
+    plan = choose(store, plan=tasks(steps=steps))
+    assert len(plan["tasks"]) == 1
+    assert len(store.state("save").tasks[0].steps) == 2
 
 
 def test_legacy_plan_is_intent_and_revocation_stops_next_step(tmp_path):

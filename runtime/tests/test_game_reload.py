@@ -40,11 +40,11 @@ def test_reload_preserves_intent_and_paid_usage_but_invalidates_work(tmp_path, c
           "entries": [{"kind": "agreement", "text": "不砍树"}, {"kind": "event", "text": "已买两只鸡"}]}})
     write(data / "autonomy-state.json", {"farm": {"paused": True, "daily_tokens": {"today": {"total": 99}}, "dailySpend": 100}})
     journal = tmp_path / "chat_commands.jsonl"
-    journal.write_text("paid-usage\n")
+    journal.write_text("paid-usage\n", encoding="utf-8")
     req = request(tmp_path, {"work-state.json": {"executions": [{"id": "saved"}]},
                              "autonomy-state.json": {"dailySpend": 12}} if checkpoint else None)
     restore_game_load(tmp_path, req)
-    restored = json.loads((data / "work-state.json").read_text())
+    restored = json.loads((data / "work-state.json").read_text(encoding="utf-8"))
     assert restored["other"] == {"tasks": ["untouched"]}
     restored = restored["farm"]
     assert restored["goals"][0]["status"] == "active"
@@ -53,13 +53,13 @@ def test_reload_preserves_intent_and_paid_usage_but_invalidates_work(tmp_path, c
     assert restored["tasks"] == [] and restored["decision"] == {}
     assert restored["todos"][0]["status"] == "pending"
     assert restored["executions"] == ([{"id": "saved"}] if checkpoint else [])
-    memory = json.loads((data / "companion-memory.json").read_text())["farm"]
+    memory = json.loads((data / "companion-memory.json").read_text(encoding="utf-8"))["farm"]
     assert memory["entries"] == [{"kind": "agreement", "text": "不砍树"}]
     assert memory["instructionRevision"] == 2
-    autonomy = json.loads((data / "autonomy-state.json").read_text())["farm"]
+    autonomy = json.loads((data / "autonomy-state.json").read_text(encoding="utf-8"))["farm"]
     assert autonomy["paused"] and autonomy["daily_tokens"]["today"]["total"] == 99
     assert autonomy["dailySpend"] == (12 if checkpoint else 0)
-    assert journal.read_text() == "paid-usage\n"
+    assert journal.read_text(encoding="utf-8") == "paid-usage\n"
     before = (data / "work-state.json").read_bytes()
     restore_game_load(tmp_path, req)  # Interrupted restore can safely replay its before-image.
     assert (data / "work-state.json").read_bytes() == before

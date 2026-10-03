@@ -330,3 +330,63 @@ def _chosen(store, save="Save1", task_id="a"):
     store.begin_decision(save,token)
     return store.submit_plan(save,goal_text="照料农场",decision_token=token,tasks=[{"id":task_id,"title":"one job","steps":[{"id":"sa","operation":"water_auto","params":{}}]}])
 
+
+
+
+def test_step_feedback_roundtrip_and_legacy_load(tmp_path):
+    import json
+    store = WorkStore(tmp_path / "work.json")
+    store.begin_decision("S", "choice")
+    store.submit_plan("S", goal_text="farm", decision_token="choice", tasks=[
+        {"id": "t", "title": "种浇", "steps": [{"id": "s", "operation": "water_tiles", "params": {"tiles": [{"x": 1, "y": 2}]}}]}])
+    store.claim_next_step("S", "worker")
+    store.assign_command_id("S", "t", "s", "native-id")
+    feedback = {"completedCount": 2, "skippedCount": 17, "targetCount": 19, "remaining": {"seedStack": 17}}
+    effects = [{"tile": {"x": 1, "y": 2}, "state": "watered"}]
+    with pytest.raises(WorkStateError, match="does not match"):
+        store.commit_step_result("S", task_id="t", step_id="s", outcome="completed", command_id="other-id", feedback=feedback)
+    assert store.state("S").tasks[0].steps[0].status == "running"
+    store.commit_step_result("S", task_id="t", step_id="s", outcome="completed", command_id="native-id", feedback=feedback, effects=effects)
+    loaded = WorkStore(store.state_path).state("S")
+    assert loaded.tasks[0].steps[0].feedback == feedback
+    assert loaded.executions[0].effects == effects
+    legacy = json.loads(store.state_path.read_text(encoding="utf-8"))
+    legacy["S"]["tasks"][0]["steps"][0].pop("feedback")
+    store.state_path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert WorkStore(store.state_path).state("S").tasks[0].steps[0].feedback == {}
+
+
+def test_replace_retries_only_transient_permission_errors(tmp_path, monkeypatch):
+    from pathlib import Path
+    import stardew_ai_runtime.work_state as module
+    original = Path.replace
+    attempts = []
+    sleeps = []
+    def replace(path, target):
+        attempts.append(target)
+        if len(attempts) < 3:
+            raise PermissionError("temporary reader")
+        return original(path, target)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(module._time, "sleep", sleeps.append)
+    store = WorkStore(tmp_path / "work.json")
+    store.add_goal("S", "plant", source="user")
+    assert len(attempts) == 3
+    assert sleeps == [0.05, 0.1]
+    assert WorkStore(store.state_path).state("S").goals[0].text == "plant"
+
+
+@pytest.mark.parametrize("error, expected_attempts", [(PermissionError, 4), (OSError, 1)])
+def test_replace_does_not_swallow_final_or_other_errors(tmp_path, monkeypatch, error, expected_attempts):
+    from pathlib import Path
+    import stardew_ai_runtime.work_state as module
+    attempts = []
+    def replace(path, target):
+        attempts.append(target)
+        raise error("not replaceable")
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(module._time, "sleep", lambda _: None)
+    store = WorkStore(tmp_path / "work.json")
+    with pytest.raises(error, match="not replaceable"):
+        store.add_goal("S", "plant", source="user")
+    assert len(attempts) == expected_attempts

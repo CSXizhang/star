@@ -257,3 +257,64 @@ def test_cross_midnight_terminal_remainder_is_not_double_counted(tmp_path):
     assert "暂无已记录" in display.today_text(NOW)
     assert "另有 100 token 日期无法确定，已计入累计" in display.today_text(NOW)
     assert "200 token" in display.summary_text(NOW, today=False)
+
+
+def test_legacy_agy_separate_cache_is_included_without_rewriting_raw_journal(tmp_path):
+    journal = tmp_path / "commands.jsonl"
+    raw = {"input_tokens": 100, "cache_read_tokens": 300, "output_tokens": 10,
+           "total_tokens": 110, "source": "db_gen_metadata_delta"}
+    _append(journal, _receipt(provider="agy", usage=raw))
+    original = journal.read_bytes()
+    display = UsageDisplay(journal)
+    _assert_counts(display.today_text(NOW), total="410", input_tokens="400", cache="300", output="10")
+    assert "费用暂不可用" in display.today_text(NOW)
+    assert journal.read_bytes() == original
+    assert UsageDisplay(journal).today_text(NOW) == display.today_text(NOW)
+
+
+def test_inclusive_agy_receipt_and_legacy_terminal_do_not_double_add_cache(tmp_path):
+    journal, responses = tmp_path / "commands.jsonl", tmp_path / "responses.jsonl"
+    _append(journal, _receipt(provider="agy", usage={"input_tokens": 100, "cache_read_tokens": 300,
+            "output_tokens": 10, "total_tokens": 110}))
+    _append(responses, _receipt(provider="agy", responseId="measured", usage={
+        "input_tokens": 400, "cache_read_tokens": 300, "output_tokens": 10,
+        "total_tokens": 410, "input_includes_cache": True}))
+    display = UsageDisplay(journal, responses=responses)
+    _assert_counts(display.today_text(NOW), total="410", input_tokens="400", cache="300", output="10")
+    _append(responses, _receipt(provider="agy", responseId="auxiliary", usage=None))
+    _assert_counts(display.today_text(NOW), total="410+未记录", input_tokens="400+未记录",
+                   cache="300+未记录", output="10+未记录")
+    assert "费用暂不可用" in display.today_text(NOW)
+
+
+def test_partial_agy_cache_stays_unknown_not_silent_zero(tmp_path):
+    journal = tmp_path / "commands.jsonl"
+    _append(journal, _receipt(provider="agy", usage={"input_tokens": 100, "output_tokens": 10,
+            "total_tokens": 110}))
+    text = UsageDisplay(journal).today_text(NOW)
+    assert "110+未记录 token" in text
+    assert "输入 100+未记录" in text and "缓存 未记录" in text
+
+
+def test_agy_midnight_receipts_are_normalized_before_terminal_comparison(tmp_path):
+    journal, responses = tmp_path / "commands.jsonl", tmp_path / "responses.jsonl"
+    raw = {"input_tokens": 10, "cache_read_tokens": 20, "output_tokens": 3, "total_tokens": 13}
+    _append(responses, _receipt(provider="agy", responseId="a", timestamp="2026-10-01T15:59:59Z", usage=raw),
+            _receipt(provider="agy", responseId="b", timestamp="2026-10-01T16:00:01Z", usage=raw))
+    _append(journal, _receipt(provider="agy", usage={"input_tokens": 20, "cache_read_tokens": 40,
+            "output_tokens": 6, "total_tokens": 26}))
+    display = UsageDisplay(journal, responses=responses)
+    _assert_counts(display.today_text(NOW), total="33", input_tokens="30", cache="20", output="3")
+    assert "66 token" in display.summary_text(NOW, today=False)
+
+
+def test_mixed_agy_response_dates_do_not_hide_measured_date_when_another_is_unknown(tmp_path):
+    journal = tmp_path / "commands.jsonl"
+    responses = tmp_path / "responses.jsonl"
+    usage = {"input_tokens": 10, "cache_read_tokens": 20, "output_tokens": 3, "total_tokens": 13}
+    _append(responses, _receipt(provider="agy", responseId="unallocated", usage=usage, dateUnallocated=True),
+            _receipt(provider="agy", responseId="today", usage=usage))
+    display = UsageDisplay(journal, responses=responses)
+    text = display.today_text(NOW)
+    assert "33+未记录 token" in text and "另有 33 token 日期无法确定" in text
+    assert "66+未记录 token" in display.summary_text(today=False)

@@ -58,6 +58,69 @@ def test_life_session_rotation_on_revision_change(tmp_path) -> None:
     assert svc.get_session_id("Save1") is None
 
 
+def test_life_unknown_context_checkpoint_counts_only_consecutive_unknown_turns(tmp_path) -> None:
+    svc = LifeChatService("agy", {}, tmp_path / "chat_sessions.json", {}, tmp_path / "life_fp.json")
+    svc.record_fingerprint("Save1", 0, 0)
+    svc.record_session_id("Save1", "cid-1")
+    for _ in range(19):
+        svc.record_context("Save1", "cid-1", 1000)
+    svc.record_context("Save1", "cid-1", None)
+    assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
+    state = json.loads((tmp_path / "life-context.json").read_text(encoding="utf-8"))["life:agy:Save1"]
+    assert state["turns"] == 20
+    assert state["unmeasuredTurns"] == 1
+    for _ in range(18):
+        svc.record_context("Save1", "cid-1", None)
+    assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
+    svc.record_context("Save1", "cid-1", None)
+    assert svc.rotate_if_needed("Save1", 0, 0) is None
+
+
+def test_life_measured_context_resets_unknown_streak_across_restart_and_session_change(tmp_path) -> None:
+    sessions, fingerprints = {}, {}
+    svc = LifeChatService("agy", sessions, tmp_path / "chat_sessions.json", fingerprints,
+                          tmp_path / "life_fp.json", request_checkpoint=3)
+    svc.record_fingerprint("Save1", 0, 0)
+    svc.record_session_id("Save1", "cid-1")
+    for size in (None, None, 1000, None):
+        svc.record_context("Save1", "cid-1", size)
+    restarted = LifeChatService("agy", sessions, tmp_path / "chat_sessions.json", fingerprints,
+                                tmp_path / "life_fp.json", request_checkpoint=3)
+    assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-1"
+    restarted.record_context("Save1", "cid-1", None)
+    assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-1"
+    restarted.record_session_id("Save1", "cid-2")
+    restarted.record_context("Save1", "cid-2", None)
+    assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-2"
+    restarted.record_context("Save1", "cid-2", None)
+    assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-2"
+    restarted.record_context("Save1", "cid-2", None)
+    assert restarted.rotate_if_needed("Save1", 0, 0) is None
+
+
+def test_life_legacy_context_retains_unknown_turn_checkpoint_fallback(tmp_path) -> None:
+    context_path = tmp_path / "life-context.json"
+    context_path.write_text(json.dumps({"life:agy:Save1": {
+        "session": "cid-1", "latestInput": None, "turns": 19,
+    }}), encoding="utf-8")
+    sessions, fingerprints = {}, {}
+    svc = LifeChatService("agy", sessions, tmp_path / "chat_sessions.json", fingerprints,
+                          tmp_path / "life_fp.json")
+    svc.record_fingerprint("Save1", 0, 0)
+    svc.record_session_id("Save1", "cid-1")
+    assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
+    svc.record_context("Save1", "cid-1", None)
+    assert svc.rotate_if_needed("Save1", 0, 0) is None
+    # A legacy state already at the checkpoint still rotates without a new turn.
+    state = json.loads(context_path.read_text(encoding="utf-8"))
+    state["life:agy:Save1"].pop("unmeasuredTurns")
+    context_path.write_text(json.dumps(state), encoding="utf-8")
+    restarted = LifeChatService("agy", sessions, tmp_path / "chat_sessions.json", fingerprints,
+                                tmp_path / "life_fp.json")
+    restarted.record_session_id("Save1", "cid-1")
+    assert restarted.rotate_if_needed("Save1", 0, 0) is None
+
+
 def test_life_system_prompt_contains_profile_memory_and_work() -> None:
     profile = {"companionName": "小星", "personality": "tsundere", "playStyle": "earn",
                "careFrequency": "moderate", "onboarded": True, "skipped": False}
@@ -934,6 +997,125 @@ def test_confirmed_current_preparation_uses_existing_work_path_once(tmp_path):
     asyncio.run(run())
 
 
+def test_same_todo_ids_scope_revision_starts_due_work_once_without_global_autonomy(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+        proposal = bridge._milestone_store.propose("S", title="照料菜地", summary="浇这片菜地",
+                                                   target_date="1:spring:11", preparation=["water"])
+        node = bridge._milestone_store.adopt("S", proposal["id"], planned_count=20, work_store=bridge._work_store)
+        before = bridge._accepted_preparation_state("S")
+        goal = bridge._work_store.list_goals("S")[0]
+        assert before[node["id"]]["scope"]["plannedCount"] == 20
+        assert not bridge._autonomy.state("S").enabled
+        constraints = json.loads(json.dumps(goal["constraints"]))
+        constraints["plannedCount"] = 100
+        constraints["objectiveScope"]["plannedCount"] = 100
+        # Compatibility producers can update a saved scope without replacing
+        # todo identities; the service must read the linked goal's actual range.
+        bridge._work_store.revise_goal("S", node["goalId"], constraints=constraints)
+        bridge._milestone_store.revise("S", node["id"], planned_count=100)
+        after = bridge._accepted_preparation_state("S")
+        assert after[node["id"]]["todoIds"] == before[node["id"]]["todoIds"]
+        assert after[node["id"]]["scope"]["plannedCount"] == 100
+        delivered_contexts = []
+        async def existing_work_path(*args):
+            delivered_contexts.append(bridge._decision_context("S", origin="preparation"))
+        bridge.handle_chat_submit = AsyncMock(side_effect=existing_work_path)
+        await bridge._start_accepted_preparation(None, "S", before)
+        bridge.handle_chat_submit.assert_awaited_once()
+        assert delivered_contexts[0]["goals"][0]["id"] == node["goalId"]
+        assert delivered_contexts[0]["goals"][0]["scope"]["plannedCount"] == 100
+        assert not bridge._autonomy.state("S").enabled
+        # Same persisted scope and pure project notes cannot reissue a decision.
+        bridge._work_store.revise_goal("S", node["goalId"], project={"phase": "observe", "summary": "路线备注变了"})
+        assert bridge._accepted_preparation_state("S") == after
+        await bridge._start_accepted_preparation(None, "S", after)
+        bridge.handle_chat_submit.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_life_preparation_revision_delivers_updated_business_scope_without_free_mode(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+        node = bridge._milestone_store.propose("S", title="农场浇水安排", summary="浇完80格",
+                                               target_date="1:spring:11", preparation=["water"])
+        node = bridge._milestone_store.adopt("S", node["id"], planned_count=80,
+                                             terms_note="只浇水和必要补水", work_store=bridge._work_store)
+        before = bridge._accepted_preparation_state("S")
+        revised = bridge._milestone_store.revise("S", node["id"], title="播种并浇水",
+                                                 summary="播种19个候选格并浇水", planned_count=19,
+                                                 terms_note="播种与浇水，已有作物的跳过",
+                                                 preparation=["plant", "water"], work_store=bridge._work_store)
+        contexts = []
+        async def choose_updated_scope(*args):
+            contexts.append(bridge._decision_context("S", origin="preparation"))
+        bridge.handle_chat_submit = AsyncMock(side_effect=choose_updated_scope)
+        await bridge._start_accepted_preparation(None, "S", before)
+        bridge.handle_chat_submit.assert_awaited_once()
+        scope = contexts[0]["goals"][0]["scope"]
+        assert contexts[0]["goals"][0]["id"] == revised["goalId"] == node["goalId"]
+        assert scope["preparation"] == ["plant", "water"]
+        assert scope["plannedCount"] == 19 and scope["termsNote"] == revised["termsNote"]
+        prompt = bridge.handle_chat_submit.await_args.args[2]
+        materials = json.loads(prompt[prompt.index("["):])
+        assert {row["intent"].split("：", 1)[0] for row in materials} == {"plant", "water"}
+        assert all(row["objectiveScope"]["preparation"] == ["plant", "water"] for row in materials)
+        assert not any("只浇水" in row["intent"] for row in materials)
+        assert not bridge._autonomy.state("S").enabled
+    asyncio.run(run())
+
+
+def test_life_exact_candidate_revision_wakes_once_and_delivers_saved_coordinates(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+        node = bridge._milestone_store.propose("S", title="同一批候选", summary="候选已种跳过",
+            target_date="1:spring:11", preparation=["plant", "water"],
+            execution_scope={"locationId": "Farm", "tiles": [[62, 27], [66, 23]]})
+        node = bridge._milestone_store.adopt("S", node["id"], planned_count=19, work_store=bridge._work_store)
+        before = bridge._accepted_preparation_state("S")
+        new_scope = {"locationId": "Farm", "tiles": [{"x": 62, "y": 27}, {"x": 65, "y": 18}]}
+        revised = bridge._milestone_store.revise("S", node["id"], execution_scope=new_scope, work_store=bridge._work_store)
+        bridge.handle_chat_submit = AsyncMock()
+        await bridge._start_accepted_preparation(None, "S", before)
+        bridge.handle_chat_submit.assert_awaited_once()
+        prompt = bridge.handle_chat_submit.await_args.args[2]
+        materials = json.loads(prompt[prompt.index("["):])
+        assert all(row["objectiveScope"]["executionScope"] == new_scope for row in materials)
+        assert {row["goalId"] for row in materials} == {node["goalId"]}
+        scope = bridge._decision_context("S", origin="preparation")["goals"][0]["scope"]["executionScope"]
+        assert scope["tiles"] == new_scope["tiles"] and scope["tileCount"] == 2
+        after = bridge._accepted_preparation_state("S")
+        await bridge._start_accepted_preparation(None, "S", after)
+        bridge.handle_chat_submit.assert_awaited_once()
+        bridge._work_store.revise_goal("S", revised["goalId"], project={"phase": "observe", "summary": "只改路线备注"})
+        assert bridge._accepted_preparation_state("S") == after
+        assert not bridge._autonomy.state("S").enabled
+    asyncio.run(run())
+
+
+def test_same_todo_ids_scope_revision_respects_future_and_paused_preparation(tmp_path):
+    async def run():
+        for target, paused in ((20, False), (11, True)):
+            bridge = _bridge(tmp_path / f"case-{target}-{paused}")
+            bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+            proposal = bridge._milestone_store.propose("S", title="照料菜地", target_date=f"1:spring:{target}", preparation=["water"])
+            node = bridge._milestone_store.adopt("S", proposal["id"], planned_count=20, work_store=bridge._work_store)
+            before = bridge._accepted_preparation_state("S")
+            goal = bridge._work_store.list_goals("S")[0]
+            constraints = json.loads(json.dumps(goal["constraints"]))
+            constraints["objectiveScope"]["plannedCount"] = 100
+            bridge._work_store.revise_goal("S", node["goalId"], constraints=constraints)
+            bridge._work_store.set_paused("S", paused)
+            assert bridge._accepted_preparation_state("S")[node["id"]]["todoIds"] == before[node["id"]]["todoIds"]
+            bridge.handle_chat_submit = AsyncMock()
+            await bridge._start_accepted_preparation(None, "S", before)
+            bridge.handle_chat_submit.assert_not_awaited()
+    asyncio.run(run())
+
+
 def test_preparation_keeps_pause_and_unrelated_active_work(tmp_path):
     async def run():
         bridge = _bridge(tmp_path)
@@ -1033,7 +1215,8 @@ def test_bridge_only_marks_successful_life_prompt_as_delivered(tmp_path):
         assert "你是农场伙伴" in prompts[0]
         assert "你是农场伙伴" in prompts[1]
         assert "你是农场伙伴" not in prompts[2]
-        assert "明确派活就propose并adopt" in prompts[2]
+        assert "已有adopted安排用revise" in prompts[2]
+        assert "保存失败不能宣称接下新范围" in prompts[2]
     asyncio.run(run())
 
 

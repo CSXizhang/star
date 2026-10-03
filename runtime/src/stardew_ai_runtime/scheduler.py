@@ -84,15 +84,16 @@ def _project_farm_work(raw: dict[str, Any] | None, companion_location: str | Non
         "tilledUnwateredCount": raw.get("tilledUnwateredCount", len(unwatered or [])) if observed else None,
         "cropUnwateredTiles": raw.get("cropUnwateredTiles") if observed else None,
         "cropUnwateredCount": raw.get("cropUnwateredCount") if observed else None,
+        "cropUnwateredTruncated": bool(raw.get("cropUnwateredTruncated", raw.get("isTruncated", raw.get("truncated", False)))) if observed else False,
         "isTruncated": bool(raw.get("isTruncated", False) or raw.get("truncated", False)) if observed else False,
         "matureCropCount": raw.get("matureCropCount", len(mature or [])) if observed else None,
         "matureCrops": mature,
-        "matureCropsTruncated": bool(raw.get("matureCropsTruncated", False)) if observed else False,
+        "matureCropsTruncated": bool(raw.get("matureCropsTruncated", raw.get("isTruncated", raw.get("truncated", False)))) if observed else False,
         "deadCropCount": raw.get("deadCropCount") if observed else None,
     }
 
 
-def _farm_action_location(work_info: dict[str, Any]) -> str:
+def _farm_action_location(work_info: dict[str, Any], requested_location: str | None = None) -> str:
     """Reject unknown or off-map work before NO_WORK or any coordinate dispatch."""
     farm_work = work_info.get("farmWork") or {}
     companion_location = (work_info.get("companion") or {}).get("locationId")
@@ -102,7 +103,32 @@ def _farm_action_location(work_info: dict[str, Any]) -> str:
         raise SchedulerError("Farm work is not observed for Farm; navigate to Farm first and query fresh Farm work. Unknown counts are not zero.")
     if not isinstance(companion_location, str) or companion_location.casefold() != location.casefold():
         raise PolicyViolationError(f"Farm work belongs to {location}, but companion is at {companion_location or 'unknown'}. Navigate to {location} first; no action dispatched.")
+    if requested_location is not None:
+        if not isinstance(requested_location, str) or not requested_location.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
+        if requested_location.strip().casefold() != location.casefold():
+            raise PolicyViolationError(f"Requested work belongs to {requested_location}, but observed farm work belongs to {location}; no action dispatched.")
     return location
+
+
+def _auto_target_coordinates(tiles: list[dict[str, int]] | None) -> set[tuple[int, int]] | None:
+    """None selects observed work; an explicit empty list selects no work."""
+    if tiles is None:
+        return None
+    if not isinstance(tiles, list):
+        raise PolicyViolationError("target_tiles must be a list of non-negative integer x/y coordinates")
+    validated = validate_action_tiles(tiles) if tiles else []
+    return {(tile["x"], tile["y"]) for tile in validated}
+
+
+def _scoped_observation_incomplete(allowed: set[tuple[int, int]] | None,
+                                   candidates: list[dict[str, Any]], total: Any,
+                                   truncated: bool) -> bool:
+    if allowed is None:
+        return False
+    published = {(tile["x"], tile["y"]) for tile in candidates}
+    incomplete = truncated or (type(total) is int and total > len(published))
+    return incomplete and bool(allowed - published)
 
 
 
@@ -112,7 +138,7 @@ def _farm_action_location(work_info: dict[str, Any]) -> str:
 def expand_water_zone(center_x: int, center_y: int, radius: int = 0) -> list[dict[str, int]]:
     """Expands center coordinates and radius into a list of grid coordinates.
 
-    Radius must be between 0 and 2 inclusive:
+    Radius must be a non-negative integer; for example:
     - radius 0: 1x1 (1 tile)
     - radius 1: 3x3 (up to 9 tiles)
     - radius 2: 5x5 (up to 25 tiles)
@@ -122,9 +148,9 @@ def expand_water_zone(center_x: int, center_y: int, radius: int = 0) -> list[dic
     """
     if isinstance(radius, bool) or not isinstance(radius, int):
         raise PolicyViolationError(f"radius must be an integer, got {type(radius).__name__}")
-    if radius < 0 or radius > 2:
+    if radius < 0:
         raise PolicyViolationError(
-            f"Invalid radius: {radius}. Radius must be between 0 and 2 (inclusive)."
+            f"Invalid radius: {radius}. Radius must be non-negative."
         )
 
     if isinstance(center_x, bool) or not isinstance(center_x, int):
@@ -162,7 +188,7 @@ def requested_task_id(command_id: str) -> str:
 
 
 def validate_action_tiles(
-    tiles: Any, max_tiles: int = 64, *, preserve_order: bool = False
+    tiles: Any, *, preserve_order: bool = False
 ) -> list[dict[str, int]]:
     """Validates and deduplicates tile coordinates for action skills.
 
@@ -171,7 +197,6 @@ def validate_action_tiles(
     - each tile must be a dict with 'x' and 'y'
     - 'x' and 'y' must be non-negative integers (booleans strictly rejected)
     - deduplication of (x, y) coordinates
-    - batch limit: 1..max_tiles after deduplication
     - returns row-major coordinates (y, x), or first occurrence order when requested
     """
     if not isinstance(tiles, list) or len(tiles) == 0:
@@ -202,11 +227,6 @@ def validate_action_tiles(
 
     if len(unique_tiles) == 0:
         raise PolicyViolationError("tiles list must contain at least 1 coordinate")
-    if len(unique_tiles) > max_tiles:
-        raise PolicyViolationError(
-            f"tiles count ({len(unique_tiles)}) exceeds maximum allowed batch limit ({max_tiles})"
-        )
-
     if not preserve_order:
         unique_tiles.sort(key=lambda item: (item["y"], item["x"]))
     return unique_tiles
@@ -1286,38 +1306,15 @@ class CompanionScheduler:
         """Executes watering on an explicit list of tiles through policy validation and tracking.
 
         Enforces:
-        - tiles count between 1 and 64
+        - a non-empty, deduplicated list of tiles
         - coordinate non-negative integers
         - deterministic row-major ordering (y, x)
         - single active task concurrency check
         - idempotency key generation: {saveId}:{taskId}:attempt-1
         """
-        if not isinstance(tiles, list) or len(tiles) == 0:
-            raise PolicyViolationError("tiles must be a non-empty list")
-        if len(tiles) > 64:
-            raise PolicyViolationError(
-                f"tiles count ({len(tiles)}) exceeds maximum allowed batch limit (64)"
-            )
-
-        validated_tiles: list[dict[str, int]] = []
-        for t in tiles:
-            if not isinstance(t, dict) or "x" not in t or "y" not in t:
-                raise PolicyViolationError(f"invalid tile format: {t}")
-            x = t["x"]
-            y = t["y"]
-            if (
-                isinstance(x, bool)
-                or not isinstance(x, int)
-                or isinstance(y, bool)
-                or not isinstance(y, int)
-            ):
-                raise PolicyViolationError(f"tile coordinates must be integers: {t}")
-            if x < 0 or y < 0:
-                raise PolicyViolationError(f"tile coordinates must be non-negative: {t}")
-            validated_tiles.append({"x": x, "y": y})
-
-        # Sort deterministically row-major: y, then x
-        validated_tiles.sort(key=lambda item: (item["y"], item["x"]))
+        validated_tiles = validate_action_tiles(tiles)
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
 
         async def dispatch(
             client: TransportClient,
@@ -1458,6 +1455,17 @@ class CompanionScheduler:
             terminal_state = payload.get("terminalState", "unknown")
             self._active_task.status = terminal_state
             self._active_task.is_terminal = True
+            native_counts = [payload.get(key) for key in ("completedCount", "skippedCount", "failedCount")]
+            confirmed_terminal = terminal_state in {
+                "succeeded", "partially-succeeded", "partial", "failed",
+                "rejected", "cancelled", "canceled",
+            }
+            unprocessed_count = None
+            if confirmed_terminal and all(
+                isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                for count in native_counts
+            ):
+                unprocessed_count = max(0, len(self._active_task.tiles) - sum(native_counts))
 
             return {
                 "status": "executed",
@@ -1467,10 +1475,15 @@ class CompanionScheduler:
                 "completedCount": payload.get("completedCount", 0),
                 "skippedCount": payload.get("skippedCount", 0),
                 "failedCount": payload.get("failedCount", 0),
+                "targetCount": len(self._active_task.tiles),
+                "unprocessedTargetCount": unprocessed_count,
                 "effects": payload.get("effects", []),
                 "details": payload.get("details"),
+                "resources": payload.get("resources"),
+                "inventoryDelta": payload.get("inventoryDelta"),
+                "resourceDelta": payload.get("resourceDelta"),
                 "error": payload.get("error"),
-                "worldRevision": payload.get("worldRevision"),
+                "worldRevision": payload.get("finalWorldRevision", payload.get("worldRevision", getattr(result_env, "world_revision", None))),
                 "saveId": result_env.save_id,
                 "gameSessionId": result_env.game_session_id,
             }
@@ -1847,11 +1860,13 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        target_tiles: list[dict[str, int]] | None = None,
+        location_id: str | None = None,
     ) -> dict[str, Any]:
         """Automatically harvests mature crops without manual coordinates.
 
         Policy rules:
-        - max_tiles must be an integer between 1 and 64 (inclusive).
+        - max_tiles must be a positive integer.
         - Rejects execution if another task is already active.
         - Reads mature crops from the snapshot farmWork.matureCrops section
           (already sorted Y-X by the mod).
@@ -1859,14 +1874,16 @@ class CompanionScheduler:
         - Takes up to max_tiles and executes via the harvest-zone skill.
         - Returns execution outcome with targeted tiles and remaining count
           (an estimate; re-query after the task for ground truth).
+        - Optional target_tiles bounds candidates to their observed intersection;
+          [] selects no work. location_id must match the observed work map.
         """
         if isinstance(max_tiles, bool) or not isinstance(max_tiles, int):
             raise PolicyViolationError(
                 f"max_tiles must be an integer, got {type(max_tiles).__name__}"
             )
-        if max_tiles < 1 or max_tiles > 64:
+        if max_tiles < 1:
             raise PolicyViolationError(
-                f"Invalid max_tiles: {max_tiles}. Value must be between 1 and 64 (inclusive)."
+                f"Invalid max_tiles: {max_tiles}. Value must be positive."
             )
 
         if self.has_active_task and self._active_task:
@@ -1876,13 +1893,27 @@ class CompanionScheduler:
                 "Concurrent tasks are not permitted."
             )
 
+        allowed_coordinates = _auto_target_coordinates(target_tiles)
         work_info = await self.query_farm_work()
-        location_id = _farm_action_location(work_info)
+        location_id = _farm_action_location(work_info, location_id)
         farm_work = work_info.get("farmWork", {})
         mature_crops = farm_work.get("matureCrops", [])
         total_mature = farm_work.get("matureCropCount", len(mature_crops))
+        scope_incomplete = _scoped_observation_incomplete(
+            allowed_coordinates, mature_crops, total_mature, bool(farm_work.get("matureCropsTruncated")))
+        if allowed_coordinates is not None:
+            mature_crops = [crop for crop in mature_crops
+                            if (crop["x"], crop["y"]) in allowed_coordinates]
+            total_mature = len(mature_crops)
 
         if not mature_crops:
+            if scope_incomplete:
+                return {**build_unified_outcome(outcome="unknown", goal_satisfied=False, effects=[],
+                    remaining={"matureCrops": None}, reason_code="OBSERVATION_TRUNCATED",
+                    snapshot_revision=work_info.get("worldRevision")),
+                    "status": "unknown", "terminalState": "unknown", "targetTiles": [], "targetCount": 0,
+                    "remainingMatureCount": None, "scopeObservationIncomplete": True,
+                    "message": "The truncated observation cannot confirm the saved harvest scope. Query that scope or use explicit harvest targets; no action dispatched."}
             return {
                 **build_unified_outcome(
                     outcome="completed",
@@ -1893,7 +1924,7 @@ class CompanionScheduler:
                     snapshot_revision=work_info.get("worldRevision"),
                 ),
                 "status": "no-work",
-                "message": "No mature crops ready for harvest on the farm. "
+                "message": "No observed mature crops ready for harvest in the selected scope. "
                 "Companion remains idle.",
                 "targetTiles": [],
                 "targetCount": 0,
@@ -1905,7 +1936,7 @@ class CompanionScheduler:
         target_tiles = [{"x": c["x"], "y": c["y"]} for c in selected]
         target_count = len(target_tiles)
         remaining = max(0, total_mature - target_count)
-        is_truncated = bool(farm_work.get("matureCropsTruncated", False))
+        is_truncated = bool(farm_work.get("matureCropsTruncated", False) or scope_incomplete)
 
         async def dispatch(
             client: TransportClient,
@@ -1937,36 +1968,47 @@ class CompanionScheduler:
         )
 
         terminal_state = exec_res["terminalState"]
+        remaining = max(0, total_mature - (exec_res.get("completedCount", 0) or 0))
         if terminal_state == "succeeded":
-            outcome_name, goal_satisfied, reason_code = "completed", remaining <= 0, "OK"
+            outcome_name = "partial" if scope_incomplete else "completed"
+            goal_satisfied = remaining <= 0 and not scope_incomplete
+            reason_code = "OBSERVATION_TRUNCATED" if scope_incomplete else "OK"
         elif terminal_state in {"running", "unknown", None}:
             outcome_name, goal_satisfied, reason_code = "unknown", False, "IN_PROGRESS"
         else:
             completed_now = exec_res.get("completedCount", 0) or 0
             outcome_name = "partial" if completed_now > 0 else "unknown"
             goal_satisfied, reason_code = False, "HARVEST_INCOMPLETE"
+            native_error = exec_res.get("error")
+            if isinstance(native_error, dict) and native_error.get("code"):
+                reason_code = native_error["code"]
 
         return {
+            **{key: exec_res[key] for key in ("commandId", "taskId", "worldRevision", "resources", "inventoryDelta", "resourceDelta") if key in exec_res},
             **build_unified_outcome(
                 outcome=outcome_name,
                 goal_satisfied=goal_satisfied,
                 effects=exec_res.get("effects", []),
-                remaining={"matureCrops": remaining},
+                remaining={"matureCrops": None, "observedMatureCrops": remaining} if scope_incomplete else {"matureCrops": remaining},
                 reason_code=reason_code,
-                snapshot_revision=work_info.get("worldRevision"),
+                snapshot_revision=exec_res.get("worldRevision", work_info.get("worldRevision")),
             ),
-            "status": "executed",
+            "status": exec_res.get("status", "executed"),
             "terminalState": terminal_state,
             "completedCount": exec_res["completedCount"],
             "skippedCount": exec_res["skippedCount"],
             "failedCount": exec_res["failedCount"],
             "targetTiles": target_tiles,
             "targetCount": target_count,
-            "remainingMatureCount": remaining,
+            "remainingMatureCount": None if scope_incomplete else remaining,
+            "scopeObservationIncomplete": scope_incomplete,
+            "remainingCountSource": "pre_dispatch_scoped_observation_minus_native_completed" if allowed_coordinates is not None else "pre_dispatch_observation_minus_native_completed",
+            "unprocessedTargetCount": exec_res.get("unprocessedTargetCount"),
             "isTruncated": is_truncated,
             "effects": exec_res.get("effects", []),
             "details": exec_res.get("details"),
             "error": exec_res.get("error"),
+            "message": "The truncated observation leaves part of the saved harvest scope unconfirmed; use explicit targets or query that scope." if scope_incomplete else exec_res.get("message"),
         }
 
     async def deposit_to_chest(
@@ -2613,10 +2655,10 @@ class CompanionScheduler:
     ) -> dict[str, Any]:
         """Executes hoe-tiles skill on validated dirt tiles.
 
-        Validates 1..64 coordinates, non-negative integers (no booleans), deduplicates,
+        Validates a non-empty coordinate list, non-negative integers (no booleans), deduplicates,
         and dispatches via single-active-task scheduler.
         """
-        validated_tiles = validate_action_tiles(tiles, max_tiles=64)
+        validated_tiles = validate_action_tiles(tiles)
 
         async def dispatch(
             client: TransportClient,
@@ -2658,11 +2700,11 @@ class CompanionScheduler:
     ) -> dict[str, Any]:
         """Executes plant-seeds skill on validated hoed empty tiles.
 
-        Validates seed_item_id, 1..64 coordinates, non-negative integers (no booleans),
+        Validates seed_item_id, a non-empty coordinate list, non-negative integers (no booleans),
         deduplicates, and dispatches via single-active-task scheduler.
         """
         clean_seed_id = validate_seed_item_id(seed_item_id)
-        validated_tiles = validate_action_tiles(tiles, max_tiles=64)
+        validated_tiles = validate_action_tiles(tiles)
 
         async def dispatch(
             client: TransportClient,
@@ -2827,7 +2869,7 @@ class CompanionScheduler:
                             command_id: str | None = None) -> dict[str, Any]:
         if not isinstance(building_name, str) or not building_name.strip():
             raise PolicyViolationError("building_name must be the observed building identity")
-        validated = validate_action_tiles([tile], max_tiles=1)
+        validated = validate_action_tiles([tile])
         return await self._execute_native_action(
             "move-building", {"locationId": location_id, "buildingName": building_name, "tile": validated[0]},
             tiles=validated, timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
@@ -2876,7 +2918,7 @@ class CompanionScheduler:
     async def build_building(self, building_type: str, tile: dict[str, int], budget_limit: int,
                              location_id: str = "Farm", timeout_seconds: float = 30.0,
                              task_id: str | None = None, command_id: str | None = None) -> dict[str, Any]:
-        validated = validate_action_tiles([tile], max_tiles=1)
+        validated = validate_action_tiles([tile])
         return await self._building_service("build-building", {"locationId": location_id,
             "buildingType": building_type, "tile": validated[0]}, budget_limit, timeout_seconds, task_id, command_id)
 
@@ -2934,7 +2976,7 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0, task_id: str | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Place up to 64 copies of one carried item through real game rules."""
+        """Place copies of one carried item at the declared tiles through real game rules."""
         return await self._layout_items("place-items", tiles, item_id, location_id,
                                        timeout_seconds, task_id, command_id)
 
@@ -2949,7 +2991,7 @@ class CompanionScheduler:
 
     async def _layout_items(self, skill_id, tiles, item_id, location_id,
                             timeout_seconds, task_id, command_id) -> dict[str, Any]:
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         if not isinstance(item_id, str) or not item_id.strip():
             raise PolicyViolationError("item_id must identify the exact native item")
         if not isinstance(location_id, str) or not location_id.strip():
@@ -2997,7 +3039,7 @@ class CompanionScheduler:
     async def cut_grass(self, tiles: list[dict[str, Any]], location_id: str = "Farm",
                         timeout_seconds: float = 30.0, task_id: str | None = None,
                         command_id: str | None = None) -> dict[str, Any]:
-        validated = validate_action_tiles(tiles, max_tiles=64, preserve_order=True)
+        validated = validate_action_tiles(tiles, preserve_order=True)
         return await self._execute_native_action("cut-grass", {"locationId": location_id, "tiles": validated},
             tiles=validated, timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
 
@@ -3030,11 +3072,11 @@ class CompanionScheduler:
         """
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
-        if isinstance(max_tiles, bool) or not isinstance(max_tiles, int) or not 1 <= max_tiles <= 8:
-            raise PolicyViolationError("max_tiles must be an integer from 1 to 8")
+        if isinstance(max_tiles, bool) or not isinstance(max_tiles, int) or max_tiles < 1:
+            raise PolicyViolationError("max_tiles must be a positive integer")
 
         if tiles:
-            validated = validate_action_tiles(tiles, max_tiles=8)
+            validated = validate_action_tiles(tiles)
         else:
             client = await self.ensure_connected()
             await self._refresh_snapshot(client)
@@ -3077,10 +3119,10 @@ class CompanionScheduler:
                 if not isinstance(observed, list) or not observed:
                     scope = "this map" if production.get("waterRefillMapComplete") else "the inspected area"
                     raise SchedulerError(f"No native watering-can refill tile was found on {scope}. {local_error}") from None
-                validated = validate_action_tiles(observed[:max_tiles], max_tiles=8)
+                validated = validate_action_tiles(observed[:max_tiles])
 
         parameters = {"locationId": location_id, "tiles": validated}
-        return await self._execute_native_action(
+        result = await self._execute_native_action(
             "refill-watering-can",
             parameters,
             tiles=validated,
@@ -3088,6 +3130,18 @@ class CompanionScheduler:
             task_id=task_id,
             command_id=command_id,
         )
+        # These tiles are alternative sources for one refill, not separate jobs.
+        # Native completed/skipped/failed counters remain unchanged; only a
+        # confirmed success establishes that the single resource service settled.
+        result["candidateCount"] = len(validated)
+        result.pop("targetCount", None)
+        result.pop("unprocessedTargetCount", None)
+        if result.get("terminalState") == "succeeded":
+            result["targetCount"] = 1
+            result["unprocessedTargetCount"] = 0
+            result["targetCountSource"] = "singleRefillService"
+            result["unprocessedTargetCountSource"] = "nativeSuccessfulRefill"
+        return result
 
     async def apply_fertilizer(
         self,
@@ -3099,7 +3153,7 @@ class CompanionScheduler:
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Applies one explicit fertilizer item to explicit tilled tiles."""
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         if not isinstance(fertilizer_item_id, str) or not fertilizer_item_id.strip():
             raise PolicyViolationError("fertilizer_item_id must be a non-empty string")
         parameters = {
@@ -3130,7 +3184,7 @@ class CompanionScheduler:
         for stones, Axe/Pickaxe for twigs); other objects return an unsupported reason
         and a missing tool returns an actionable ``missing-tool:<Tool>`` precondition.
         """
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "clear-debris",
@@ -3151,7 +3205,7 @@ class CompanionScheduler:
     ) -> dict[str, Any]:
         """Picks up dropped debris / spawned items on explicitly selected tiles."""
         # Picking up an entry tile can open the route to the following targets.
-        validated = validate_action_tiles(tiles, max_tiles=64, preserve_order=True)
+        validated = validate_action_tiles(tiles, preserve_order=True)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "pickup-items",
@@ -3175,7 +3229,7 @@ class CompanionScheduler:
         Fruit trees are protected (``protected-tree``); tiles without a choppable
         target return ``no-tree`` and a missing Axe returns ``missing-tool:Axe``.
         """
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "chop-tree",
@@ -3197,7 +3251,7 @@ class CompanionScheduler:
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Inserts an explicit companion item stack into an explicit machine."""
-        validated = validate_action_tiles([tile], max_tiles=1)
+        validated = validate_action_tiles([tile])
         if not isinstance(item_id, str) or not item_id.strip():
             raise PolicyViolationError("item_id must be a non-empty string")
         if isinstance(item_count, bool) or not isinstance(item_count, int) or not 1 <= item_count <= 36:
@@ -3226,7 +3280,7 @@ class CompanionScheduler:
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Collects ready machine output from explicit machine tiles."""
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "collect-machine",
@@ -3266,7 +3320,7 @@ class CompanionScheduler:
         """Pets one named animal at its last observed tile."""
         if tile is None:
             tile = await self._observed_animal_tile(animal_name, animal_id, location_id)
-        validated = validate_action_tiles([tile], max_tiles=1)
+        validated = validate_action_tiles([tile])
         if not animal_id and (not isinstance(animal_name, str) or not animal_name.strip()):
             raise PolicyViolationError("animal_name must be a non-empty string")
         parameters = {
@@ -3300,7 +3354,7 @@ class CompanionScheduler:
         """Collects one animal's produce through its applicable native path."""
         if tile is None:
             tile = await self._observed_animal_tile(animal_name, animal_id, location_id)
-        validated = validate_action_tiles([tile], max_tiles=1)
+        validated = validate_action_tiles([tile])
         if not animal_id and (not isinstance(animal_name, str) or not animal_name.strip()):
             raise PolicyViolationError("animal_name must be a non-empty string")
         parameters = {
@@ -3366,7 +3420,7 @@ class CompanionScheduler:
                 raise PolicyViolationError("building_name must identify one observed animal building with a door")
             door = matches[0]["doorTile"]
             tiles = [{"x": int(door["x"]), "y": int(door["y"])}]
-        validated = validate_action_tiles(tiles, max_tiles=8)
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "toggle-animal-door",
@@ -3389,7 +3443,7 @@ class CompanionScheduler:
     ) -> dict[str, Any]:
         """Executes a water-zone task through policy validation and tracking.
 
-        - Validates radius (0..2) and coordinates.
+        - Validates a non-negative integer radius and coordinates.
         - Expands into tiles.
         - Dispatches via execute_tiles.
         """
@@ -3412,24 +3466,28 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        target_tiles: list[dict[str, int]] | None = None,
+        location_id: str | None = None,
     ) -> dict[str, Any]:
         """Automatically waters unwatered tilled farm tiles without manual coordinates.
 
         Policy rules:
-        - max_tiles must be an integer between 1 and 64 (inclusive).
+        - max_tiles must be a positive integer.
         - Rejects execution if another task is already active.
         - Queries available farm work from snapshot.
         - If no unwatered tiles: returns status 'no-work' without sending command.
         - Takes up to max_tiles and executes via execute_tiles.
         - Returns execution outcome with targeted tiles and remaining count.
+        - Optional target_tiles bounds candidates to their observed intersection;
+          [] selects no work. location_id must match the observed work map.
         """
         if isinstance(max_tiles, bool) or not isinstance(max_tiles, int):
             raise PolicyViolationError(
                 f"max_tiles must be an integer, got {type(max_tiles).__name__}"
             )
-        if max_tiles < 1 or max_tiles > 64:
+        if max_tiles < 1:
             raise PolicyViolationError(
-                f"Invalid max_tiles: {max_tiles}. Value must be between 1 and 64 (inclusive)."
+                f"Invalid max_tiles: {max_tiles}. Value must be positive."
             )
 
         if self.has_active_task and self._active_task:
@@ -3442,12 +3500,14 @@ class CompanionScheduler:
                     "Concurrent tasks are not permitted."
                 )
 
+        allowed_coordinates = _auto_target_coordinates(target_tiles)
         work_info = await self.query_farm_work()
-        location_id = _farm_action_location(work_info)
+        location_id = _farm_action_location(work_info, location_id)
         farm_work = work_info.get("farmWork", {})
         if include_empty_tiles:
             unwatered_tiles = farm_work.get("tilledUnwateredTiles", [])
             total_unwatered = farm_work.get("tilledUnwateredCount", len(unwatered_tiles))
+            observation_truncated = bool(farm_work.get("isTruncated"))
         else:
             # Crop-only is the safe default. Older mods lack the native crop list;
             # fail closed rather than silently watering empty prepared soil.
@@ -3457,8 +3517,23 @@ class CompanionScheduler:
             unwatered_tiles = native_crop_tiles
             crop_count = farm_work.get("cropUnwateredCount")
             total_unwatered = crop_count if isinstance(crop_count, int) else len(unwatered_tiles)
+            observation_truncated = bool(farm_work.get("cropUnwateredTruncated")) if isinstance(farm_work.get("cropUnwateredTiles"), list) else bool(farm_work.get("isTruncated"))
+
+        scope_incomplete = _scoped_observation_incomplete(
+            allowed_coordinates, unwatered_tiles, total_unwatered, observation_truncated)
+        if allowed_coordinates is not None:
+            unwatered_tiles = [tile for tile in unwatered_tiles
+                               if (tile["x"], tile["y"]) in allowed_coordinates]
+            total_unwatered = len(unwatered_tiles)
 
         if not unwatered_tiles:
+            if scope_incomplete:
+                return {**build_unified_outcome(outcome="unknown", goal_satisfied=False, effects=[],
+                    remaining={"unwateredTiles": None}, reason_code="OBSERVATION_TRUNCATED",
+                    snapshot_revision=work_info.get("worldRevision")),
+                    "status": "unknown", "terminalState": "unknown", "targetTiles": [], "targetCount": 0,
+                    "remainingUnwateredCount": None, "scopeObservationIncomplete": True,
+                    "message": "The truncated observation cannot confirm the saved watering scope. Use explicit water_tiles for that scope; no action dispatched."}
             return {
                 **build_unified_outcome(
                     outcome="completed",
@@ -3469,7 +3544,7 @@ class CompanionScheduler:
                     snapshot_revision=work_info.get("worldRevision"),
                 ),
                 "status": "no-work",
-                "message": "No unwatered tilled tiles found on the farm. Companion remains idle.",
+                "message": "No observed unwatered tiles found in the selected scope. Companion remains idle.",
                 "targetTiles": [],
                 "targetCount": 0,
                 "remainingUnwateredCount": 0,
@@ -3479,7 +3554,7 @@ class CompanionScheduler:
         target_tiles = unwatered_tiles[:max_tiles]
         target_count = len(target_tiles)
         remaining = max(0, total_unwatered - target_count)
-        is_truncated = bool(farm_work.get("isTruncated", False) or remaining > 0)
+        is_truncated = bool(observation_truncated or scope_incomplete or remaining > 0)
 
         effective_timeout = max(timeout_seconds, target_count * 2.5 + 15.0)
 
@@ -3489,11 +3564,15 @@ class CompanionScheduler:
             timeout_seconds=effective_timeout,
             task_id=task_id,
             command_id=command_id,
+            include_empty_tiles=include_empty_tiles,
         )
 
         terminal_state = exec_res.get("terminalState", "unknown")
         completed = exec_res.get("completedCount", 0)
-        if terminal_state == "succeeded" and remaining <= 0:
+        remaining = max(0, total_unwatered - (completed or 0))
+        if terminal_state == "succeeded" and scope_incomplete:
+            outcome_name, goal_satisfied, reason_code = "partial", False, "OBSERVATION_TRUNCATED"
+        elif terminal_state == "succeeded" and remaining <= 0:
             outcome_name, goal_satisfied, reason_code = "completed", True, "OK"
         elif terminal_state in {"running", "unknown", None}:
             outcome_name, goal_satisfied, reason_code = "unknown", False, "IN_PROGRESS"
@@ -3502,15 +3581,19 @@ class CompanionScheduler:
         else:
             outcome_name = "partial" if (completed or 0) > 0 or terminal_state in {"failed", "rejected"} else "unknown"
             goal_satisfied, reason_code = False, "WATER_INCOMPLETE"
+            native_error = exec_res.get("error")
+            if isinstance(native_error, dict) and native_error.get("code"):
+                reason_code = native_error["code"]
 
         return {
+            **{key: exec_res[key] for key in ("commandId", "worldRevision", "resources", "inventoryDelta", "resourceDelta") if key in exec_res},
             **build_unified_outcome(
                 outcome=outcome_name,
                 goal_satisfied=goal_satisfied,
                 effects=exec_res.get("effects", []),
-                remaining={"unwateredTiles": remaining},
+                remaining={"unwateredTiles": None, "observedUnwateredTiles": remaining} if scope_incomplete else {"unwateredTiles": remaining},
                 reason_code=reason_code,
-                snapshot_revision=work_info.get("worldRevision"),
+                snapshot_revision=exec_res.get("worldRevision", work_info.get("worldRevision")),
             ),
             "status": exec_res.get("status", "executed"),
             "taskId": exec_res.get("taskId") or (self._active_task.task_id if self._active_task else task_id),
@@ -3520,11 +3603,14 @@ class CompanionScheduler:
             "failedCount": exec_res.get("failedCount", 0),
             "targetTiles": target_tiles,
             "targetCount": target_count,
-            "remainingUnwateredCount": remaining,
+            "remainingUnwateredCount": None if scope_incomplete else remaining,
+            "scopeObservationIncomplete": scope_incomplete,
+            "remainingCountSource": "pre_dispatch_scoped_observation_minus_native_completed" if allowed_coordinates is not None else "pre_dispatch_observation_minus_native_completed",
+            "unprocessedTargetCount": exec_res.get("unprocessedTargetCount"),
             "isTruncated": is_truncated,
             "effects": exec_res.get("effects", []),
             "details": exec_res.get("details"),
-            "message": exec_res.get("message"),
+            "message": "The truncated observation leaves part of the saved watering scope unconfirmed; use explicit water_tiles for that scope." if scope_incomplete else exec_res.get("message"),
             "error": exec_res.get("error"),
         }
 
@@ -3632,8 +3718,8 @@ class CompanionScheduler:
             auto_water = water
         if not crop_name_or_id or not isinstance(crop_name_or_id, str):
             raise PolicyViolationError("crop_name_or_id must be a non-empty string.")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count > 64:
-            raise PolicyViolationError(f"count must be an integer between 1 and 64, got {count}.")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise PolicyViolationError(f"count must be a positive integer, got {count}.")
 
         clean_target = crop_name_or_id.strip().lower()
         snapshot_revision: int | None = None

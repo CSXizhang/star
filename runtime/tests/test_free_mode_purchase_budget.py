@@ -285,12 +285,21 @@ def test_unknown_result_keeps_reservation_and_settles_once_on_reconcile(
     it and settles exactly once before its own dispatch."""
     _free_mode(native_compatible_run_dir, budget=100)
     monkeypatch.setenv("STARDEW_NATIVE_RECONCILE_TIMEOUT_SECONDS", "1")
-    client = _make_client([
-        TimeoutError(),
-        TimeoutError(),
-        TimeoutError(),
-        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("native-2", "succeeded", 10)),
-    ])
+    client = _make_client([])
+    pending_command_id = None
+
+    async def result_for_command(command_id, **kwargs):
+        nonlocal pending_command_id
+        if pending_command_id is None:
+            pending_command_id = command_id
+        if command_id == pending_command_id:
+            raise TimeoutError()
+        return SimpleNamespace(save_id=SAVE, game_session_id="session-a",
+            payload=_purchase_result(command_id, "succeeded", 10))
+
+    # Keep the first command unknown regardless of the poll count. A fixed
+    # sequence can accidentally deliver the second command before the deadline.
+    client.wait_for_result.side_effect = result_for_command
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
     server = create_mcp_server(scheduler=scheduler, full=True)
     store = _work_store(native_compatible_run_dir)

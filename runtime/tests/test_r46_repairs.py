@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
+from stardew_ai_runtime.agy_process import AgyProcessOutcome
 from stardew_ai_runtime.decision_context import build_decision_context
 from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore
@@ -96,14 +97,9 @@ def test_failed_turn_does_not_put_response_in_error(tmp_path, monkeypatch):
     bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False, backend="agy")
     task = ActiveChatTask(request_id="req-fail", save_id="save1", prompt="p")
 
-    # Simulate agy CLI process exit 1, empty stderr, parsed response present
-    mock_proc = MagicMock()
-    mock_proc.returncode = 1
-    mock_proc.communicate.return_value = (
-        json.dumps({"status": "FAILED", "response": "这是模型的有效汇报说明", "conversation_id": "cid-1"}),
-        "",
-    )
-    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: mock_proc)
+    # Transport is covered separately; this test checks terminal error parsing.
+    outcome = AgyProcessOutcome(json.dumps({"status": "FAILED", "response": "这是模型的有效汇报说明", "conversation_id": "cid-1"}), "", "cid-1", 1)
+    monkeypatch.setattr("stardew_ai_runtime.chat_bridge.run_agy_process", lambda *args, **kwargs: outcome)
     monkeypatch.setattr("stardew_ai_runtime.chat_bridge.get_conversation_db_path", lambda *a: tmp_path / "dummy.db")
 
     result = bridge._execute_agy_turn(task, "cid-1", "prompt")
@@ -256,14 +252,9 @@ def test_quota_baseline_reset_on_session_rotation(tmp_path, monkeypatch):
         start_max_step_idx=100,  # from old session
     )
 
-    mock_proc = MagicMock()
-    mock_proc.returncode = 0
-    # agy silent new session
-    mock_proc.communicate.return_value = (
-        json.dumps({"status": "SUCCESS", "response": "ok", "conversation_id": "cid-new"}),
-        "",
-    )
-    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: mock_proc)
+    # agy silently starts a new session; its old error baseline cannot carry over.
+    outcome = AgyProcessOutcome(json.dumps({"status": "SUCCESS", "response": "ok", "conversation_id": "cid-new"}), "", "cid-new", 0)
+    monkeypatch.setattr("stardew_ai_runtime.chat_bridge.run_agy_process", lambda *args, **kwargs: outcome)
 
     called_args = []
     def fake_check(cid, baseline):

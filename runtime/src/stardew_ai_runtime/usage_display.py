@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .usage_meter import normalize_usage
+
 
 def _number(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
@@ -56,7 +58,7 @@ class UsageDisplay:
                     elif isinstance(previous.get("usage"), dict) and isinstance(row.get("usage"), dict):
                         # A later terminal can complete an interrupted receipt.
                         # Merge fields into one turn, never sum duplicate turns.
-                        previous["usage"] = {**previous["usage"], **row["usage"]}
+                        self._records[key] = {**previous, **row, "usage": {**previous["usage"], **row["usage"]}}
             return True
         except FileNotFoundError:
             return True
@@ -64,17 +66,22 @@ class UsageDisplay:
             return False
 
     def _merged_rows(self, now: datetime | None = None) -> list[dict[str, Any]]:
-        rows = {(r.get("provider"), r.get("saveId", ""), r["requestId"]): dict(r) for r in self._records.values()}
+        rows = {(r.get("provider"), r.get("saveId", ""), r["requestId"]):
+                {**r, "usage": normalize_usage(str(r.get("provider", "")), r.get("usage"))}
+                for r in self._records.values()}
         if self._responses is None:
             return list(rows.values())
         self._responses._read()
         turns: dict[tuple, dict[str, Any]] = {}
         responses: dict[tuple, list[dict[str, Any]]] = {}
         for response in self._responses._records.values():
+            response = {**response, "usage": normalize_usage(str(response.get("provider", "")), response.get("usage"))}
             key = (response.get("provider"), response.get("saveId", ""), response["requestId"])
             responses.setdefault(key, []).append(response)
             turn = turns.setdefault(key, {**response, "usage": {"input_includes_cache": True}, "responseCount": 0})
             turn["responseCount"] += 1
+            if (response.get("usage") or {}).get("partial") or response.get("partialUsage"):
+                turn["partialUsage"] = True
             for field in ("total_tokens", "input_tokens", "output_tokens", "cache_read_tokens", "thinking_tokens"):
                 value = _number((response.get("usage") or {}).get(field))
                 if value is not None:
@@ -85,15 +92,17 @@ class UsageDisplay:
         for key, turn in turns.items():
             previous = rows.get(key)
             previous_total = _number((previous.get("usage") or {}).get("total_tokens")) if previous else None
+            if previous is not None and turn.get("partialUsage"):
+                previous["partialUsage"] = True
             if now is not None:
                 dated = responses[key]
                 dates = {datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")).astimezone(now.tzinfo).date()
                          for r in [*dated, *([previous] if previous else [])]}
-                if len(dates) > 1 or (previous_total is not None and previous_total > turn["usage"].get("total_tokens", 0)):
+                if len(dates) > 1 or any(r.get("dateUnallocated") for r in dated) or (previous_total is not None and previous_total > turn["usage"].get("total_tokens", 0)):
                     # A turn may straddle midnight. Keep measured responses on
                     # their own dates, even when its terminal arrives later.
                     terminal_usage = (previous.get("usage") or {}) if previous else {}
-                    incomplete = (previous_total is None or terminal_usage.get("partial")
+                    incomplete = (previous_total is None or terminal_usage.get("partial") or turn.get("partialUsage")
                                   or previous_total != turn["usage"].get("total_tokens"))
                     dated_rows.extend({**r, "partialUsage": bool(incomplete)} for r in dated)
                     rows.pop(key, None)
@@ -125,18 +134,21 @@ class UsageDisplay:
     def turn_response_usage(self, request_id: str, save_id: str, provider: str = "dsh") -> dict[str, Any] | None:
         if self._responses is None or not self._responses._read():
             return None
-        rows = [r for r in self._responses._records.values()
+        rows = [{**r, "usage": normalize_usage(provider, r.get("usage"))} for r in self._responses._records.values()
                 if r.get("requestId") == request_id and r.get("saveId") == save_id and r.get("provider") == provider]
         if not rows:
             return None
+        measured = [r for r in rows if r.get("usage")]
         usage: dict[str, Any] = {"input_includes_cache": True, "source": "durable_response_receipts",
-                                 "generations_count": len(rows), "partial": True}
+                                 "generations_count": len(measured), "model_response_count": len(rows),
+                                 "unknown_response_count": len(rows) - len(measured), "partial": True}
         for field in ("total_tokens", "input_tokens", "output_tokens", "cache_read_tokens", "thinking_tokens"):
             values = [_number((r.get("usage") or {}).get(field)) for r in rows]
             if any(v is not None for v in values):
                 usage[field] = sum(v for v in values if v is not None)
-        latest = max(rows, key=lambda r: r["timestamp"])
-        usage["latestRequestInputContext"] = (latest.get("usage") or {}).get("latestRequestInputContext")
+        contexts = [r for r in measured if (r.get("usage") or {}).get("latestRequestInputContext") is not None]
+        latest = max(contexts, key=lambda r: r["timestamp"]) if contexts else None
+        usage["latestRequestInputContext"] = (latest.get("usage") or {}).get("latestRequestInputContext") if latest else None
         return usage
 
     def summary_text(self, now: datetime | None = None, *, save_id: str | None = None, today: bool = True) -> str:
@@ -170,10 +182,6 @@ class UsageDisplay:
             out = _number(usage.get("output_tokens"))
             cache = _number(usage.get("cache_read_tokens", usage.get("cache_read_input_tokens", usage.get("cached_input_tokens"))))
             write = _number(usage.get("cache_creation_tokens", usage.get("cache_write_input_tokens")))
-            if row.get("provider") == "kimi":
-                inp = inp + cache + write if None not in (inp, cache, write) else None
-            elif row.get("provider") == "dsh" and not usage.get("input_includes_cache"):
-                inp = inp + cache if None not in (inp, cache) else None
             total = _number(usage.get("total_tokens"))
             if total is None and inp is not None and out is not None:
                 total = inp + out

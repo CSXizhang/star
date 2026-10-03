@@ -89,9 +89,14 @@ class LifeChatService:
     def record_context(self, save_id: str, conversation_id: str, input_context: int | None) -> None:
         key = _life_session_key(self.backend_name, save_id)
         previous = self._contexts.get(key) or {}
-        turns = previous.get("turns", 0) if previous.get("session") == conversation_id else 0
-        self._contexts[key] = {**(previous if previous.get("session") == conversation_id else {}),
-                               "session": conversation_id, "latestInput": input_context, "turns": turns + 1}
+        previous = previous if previous.get("session") == conversation_id else {}
+        turns = previous.get("turns", 0)
+        # Older persisted contexts only counted turns; preserve that fallback
+        # until a measured turn establishes a fresh unknown-context streak.
+        unmeasured_turns = previous.get("unmeasuredTurns", turns) + 1 if input_context is None else 0
+        self._contexts[key] = {**previous, "session": conversation_id,
+                               "latestInput": input_context, "turns": turns + 1,
+                               "unmeasuredTurns": unmeasured_turns}
         self._context_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._context_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self._contexts), encoding="utf-8")
@@ -121,7 +126,7 @@ class LifeChatService:
         context = self._contexts.get(_life_session_key(self.backend_name, save_id)) or {}
         size = context.get("latestInput") if context.get("session") == current_cid else None
         budget_reached = isinstance(size, int) and self._context_limit > 0 and size >= self._context_limit
-        checkpoint = size is None and self._request_checkpoint > 0 and context.get("session") == current_cid and context.get("turns", 0) >= self._request_checkpoint
+        checkpoint = size is None and self._request_checkpoint > 0 and context.get("session") == current_cid and context.get("unmeasuredTurns", context.get("turns", 0)) >= self._request_checkpoint
         if current_cid is not None and (recorded_fp != current_fp or budget_reached or checkpoint):
             # Rotation needed — drop the old session so deleted agreements can
             # never keep flowing through the previous context (contract §4).
@@ -229,7 +234,10 @@ class LifeChatService:
                 # This local fallback is needed only for a new/stateless session.
                 discussion=self.discussion_context(save_id, mode) if not conversation_id else None,
             )
-        permission = "直接回应玩家；明确派活就propose并adopt，node_id使用真实节点id，询问意见只讨论。暂停/继续/取消或作息用manage_companion。"
+        permission = "直接回应玩家；明确派活时，已有adopted安排用revise(node_id,summary等正式字段)更新同一目标范围，新的目标才propose再adopt；node_id使用真实节点id。保存失败不能宣称接下新范围，按工具返回的已保存安排回应；询问意见只讨论。暂停/继续/取消或作息用manage_companion。"
+        permission += "修订自定义安排的业务范围时，同时同步title、summary、terms_note和preparation；如改为播种加浇水，preparation应包含plant，terms_note不能仍只允许浇水。未变更字段可省略；preparation=[]清空准备项。"
+        permission += "玩家指定地图与候选坐标时，propose/revise必须用execution_scope={locationId,tiles}完整保存该范围；summary和terms_note保持候选集合的含义，不能改成消耗背包种子数量。固定候选已种就跳过，处理完同批就结束，不在别处开田凑planned_count或耗尽余种。省略execution_scope保留旧范围，明确取消旧坐标限制才传{}；更广的持续目标不编造坐标。"
+        permission += "nodeSaved=true且executionSynced=false仅表示安排已保存，不能说工作已接续；用revise同节点重试同步。"
         permission += "待决定事项的playerConfirmedDecision为false时只继续商量，为true时才提交该事项的决定。"
         facts = {"live": live, "work": work_summary,
                  "recentSharedEvents": (memory_render or {}).get("recentEvents", []),
@@ -276,7 +284,11 @@ class LifeChatService:
         parts.append(
             "这是统一伙伴对话。理解当前对话意图：闲聊自然回应，征求意见只讨论，明确派活直接安排。"
             "玩家说‘去浇水’‘直接开始’‘你安排’‘按刚才的来’就是对应范围的执行授权；"
-            "可同轮manage_milestones(propose)再adopt，无需换入口或再次认可。已有相同安排优先复用/修改，避免重复建立。"
+            "新的目标可同轮manage_milestones(propose)再adopt，无需换入口或再次认可。已有adopted安排应以revise(node_id,summary等正式字段)更新同一目标范围，不再adopt或另建重复目标。"
+            "summary写清本轮目标范围；不使用decision、next_action、milestone_id等非正式参数。只有工具成功保存才能确认接下新范围，保存失败按工具返回的已保存安排回应，不把失败调用的参数当成事实。"
+            "修订自定义安排的业务范围时，同时同步title、summary、terms_note和preparation；如从仅浇水改为播种加浇水，preparation应包含plant，terms_note也应反映播种范围，不能保留冲突的旧只浇水约定。未变更字段可省略；preparation=[]清空准备项。"
+            "玩家指定地图与候选坐标时，propose/revise必须用execution_scope={locationId,tiles}完整保存该范围；summary和terms_note必须区分候选数量与种子用量。固定候选已种就跳过，处理完同批就结束，不在别处开田凑planned_count或耗尽余种。省略execution_scope保留旧范围，明确取消旧坐标限制才传{}；更广的持续目标不编造坐标。"
+            "nodeSaved=true且executionSynced=false仅表示安排已保存，不能说工作已接续；用revise同节点重试同步。"
             "赚钱/干活/装修是软偏好；选择方向本身不是工作授权；‘先别做’必须保留为讨论。"
             "计划变更只写持久目标，正在执行的动作由执行器完成；聊天不抢动作连接。"
             "停止/继续/取消用manage_companion，作息时间用其bedtime动作；玩家明确‘继续/现在开始’可恢复暂停，普通聊天不能解除暂停。"

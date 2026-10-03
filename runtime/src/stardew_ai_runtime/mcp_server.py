@@ -1056,19 +1056,24 @@ def create_mcp_server(
 
     @mcp.tool()
     async def query_farm_work(detail: bool = False) -> dict[str, Any]:
-        """Query unwatered soil and mature crop counts from snapshot. Full lists if detail=True."""
+        """Query observed Farm work, independent of companion location. Unobserved counts are unknown; detail=True includes tile lists."""
         try:
             res = await sched.query_farm_work()
             if detail:
                 return res
             fw = res.get("farmWork", {})
+            companion_location = (res.get("companion") or {}).get("locationId")
             return {
                 "farmWork": {
-                    "matureCropCount": fw.get("matureCropCount", 0),
-                    "tilledUnwateredCount": fw.get("tilledUnwateredCount", 0),
+                    "locationId": fw.get("locationId"),
+                    "observationStatus": fw.get("observationStatus", "unknown"),
+                    "matureCropCount": fw.get("matureCropCount"),
+                    "tilledUnwateredCount": fw.get("tilledUnwateredCount"),
                     "cropUnwateredCount": fw.get("cropUnwateredCount"),
                     "isTruncated": fw.get("isTruncated", False),
                 },
+                "currentCompanionLocationId": companion_location,
+                "needsNavigation": companion_location.casefold() != "farm" if isinstance(companion_location, str) else None,
                 "worldRevision": res.get("worldRevision", 0),
             }
         except SchedulerError as ex:

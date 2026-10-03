@@ -69,6 +69,42 @@ COMMON_GAME_PATHS: list[str] = [
 ]
 
 
+def _project_farm_work(raw: dict[str, Any] | None, companion_location: str | None) -> dict[str, Any]:
+    """Only an observed Farm scope can supply Farm counts or actionable tiles."""
+    raw = raw or {}
+    location = raw.get("locationId") or companion_location
+    status = raw.get("observationStatus", "observed" if raw else "unknown")
+    observed = isinstance(location, str) and location.casefold() == "farm" and status == "observed"
+    unwatered = raw.get("tilledUnwateredTiles", []) if observed else None
+    mature = raw.get("matureCrops", []) if observed else None
+    return {
+        "locationId": location,
+        "observationStatus": status if observed or status != "observed" else "not-observed",
+        "tilledUnwateredTiles": unwatered,
+        "tilledUnwateredCount": raw.get("tilledUnwateredCount", len(unwatered or [])) if observed else None,
+        "cropUnwateredTiles": raw.get("cropUnwateredTiles") if observed else None,
+        "cropUnwateredCount": raw.get("cropUnwateredCount") if observed else None,
+        "isTruncated": bool(raw.get("isTruncated", False) or raw.get("truncated", False)) if observed else False,
+        "matureCropCount": raw.get("matureCropCount", len(mature or [])) if observed else None,
+        "matureCrops": mature,
+        "matureCropsTruncated": bool(raw.get("matureCropsTruncated", False)) if observed else False,
+        "deadCropCount": raw.get("deadCropCount") if observed else None,
+    }
+
+
+def _farm_action_location(work_info: dict[str, Any]) -> str:
+    """Reject unknown or off-map work before NO_WORK or any coordinate dispatch."""
+    farm_work = work_info.get("farmWork") or {}
+    companion_location = (work_info.get("companion") or {}).get("locationId")
+    location = farm_work.get("locationId") or companion_location
+    if (not isinstance(location, str) or location.casefold() != "farm"
+            or farm_work.get("observationStatus", "observed") != "observed"):
+        raise SchedulerError("Farm work is not observed for Farm; navigate to Farm first and query fresh Farm work. Unknown counts are not zero.")
+    if not isinstance(companion_location, str) or companion_location.casefold() != location.casefold():
+        raise PolicyViolationError(f"Farm work belongs to {location}, but companion is at {companion_location or 'unknown'}. Navigate to {location} first; no action dispatched.")
+    return location
+
+
 
 
 
@@ -1022,16 +1058,22 @@ class CompanionScheduler:
 
         # 1. Farm Work
         farm_work = payload.get("farmWork") or world.get("farmWork")
-        if farm_work is None:
+        projected = _project_farm_work(farm_work, companion.get("locationId"))
+        if projected["observationStatus"] != "observed":
             missing_sections.append("farmWork")
             farm_work_info: dict[str, Any] = {
+                "locationId": projected["locationId"],
+                "observationStatus": projected["observationStatus"],
                 "matureCropCount": None,
                 "tilledUnwateredCount": None,
+                "cropUnwateredCount": None,
+                "cropUnwateredTiles": None,
                 "isTruncated": False,
                 "missing": True,
-                "error": "farmWork section not found in snapshot",
+                "error": "Farm work was not observed on Farm in this snapshot",
             }
         else:
+            farm_work = projected
             unwatered_tiles = farm_work.get("tilledUnwateredTiles", [])
             unwatered_count = farm_work.get("tilledUnwateredCount", len(unwatered_tiles))
             mature_crops = farm_work.get("matureCrops", [])
@@ -1042,6 +1084,8 @@ class CompanionScheduler:
                 or farm_work.get("matureCropsTruncated", False)
             )
             farm_work_info = {
+                "locationId": farm_work["locationId"],
+                "observationStatus": farm_work["observationStatus"],
                 "matureCropCount": mature_count,
                 "tilledUnwateredCount": unwatered_count,
                 "cropUnwateredCount": farm_work.get("cropUnwateredCount"),
@@ -1173,15 +1217,8 @@ class CompanionScheduler:
                 "status": self._active_task.status,
             }
 
-        farm_work = payload.get("farmWork") or world.get("farmWork") or {}
-        unwatered_tiles = farm_work.get("tilledUnwateredTiles", [])
-        unwatered_count = farm_work.get("tilledUnwateredCount", len(unwatered_tiles))
-        is_truncated = bool(
-            farm_work.get("isTruncated", False) or farm_work.get("truncated", False)
-        )
-        mature_crop_count = farm_work.get("matureCropCount", 0)
-        mature_crops = farm_work.get("matureCrops", [])
-        mature_crops_truncated = bool(farm_work.get("matureCropsTruncated", False))
+        farm_work = _project_farm_work(
+            payload.get("farmWork") or world.get("farmWork"), companion.get("locationId"))
 
         return {
             "companion": {
@@ -1211,23 +1248,14 @@ class CompanionScheduler:
                 # Real native weather icon; ``isRaining=false`` is not "clear".
                 "weatherIcon": world.get("weatherIcon"),
             },
-            "farmWork": {
-                "tilledUnwateredTiles": unwatered_tiles,
-                "tilledUnwateredCount": unwatered_count,
-                "cropUnwateredTiles": farm_work.get("cropUnwateredTiles"),
-                "cropUnwateredCount": farm_work.get("cropUnwateredCount"),
-                "isTruncated": is_truncated,
-                "matureCropCount": mature_crop_count,
-                "matureCrops": mature_crops,
-                "matureCropsTruncated": mature_crops_truncated,
-            },
+            "farmWork": farm_work,
             "saveId": client.save_id or snap.get("saveId", "unknown"),
             "gameSessionId": client.game_session_id or snap.get("gameSessionId", "unknown"),
             "worldRevision": client.world_revision or snap.get("worldRevision", 0),
         }
 
     async def query_farm_work(self) -> dict[str, Any]:
-        """Queries farm work availability from the latest world snapshot.
+        """Queries Farm work from its observed snapshot scope; unobserved counts stay unknown.
 
         Returns:
         - farmWork: tilledUnwateredTiles, tilledUnwateredCount, isTruncated,
@@ -1849,6 +1877,7 @@ class CompanionScheduler:
             )
 
         work_info = await self.query_farm_work()
+        location_id = _farm_action_location(work_info)
         farm_work = work_info.get("farmWork", {})
         mature_crops = farm_work.get("matureCrops", [])
         total_mature = farm_work.get("matureCropCount", len(mature_crops))
@@ -1877,7 +1906,6 @@ class CompanionScheduler:
         target_count = len(target_tiles)
         remaining = max(0, total_mature - target_count)
         is_truncated = bool(farm_work.get("matureCropsTruncated", False))
-        location_id = work_info.get("companion", {}).get("locationId", "Farm")
 
         async def dispatch(
             client: TransportClient,
@@ -3415,6 +3443,7 @@ class CompanionScheduler:
                 )
 
         work_info = await self.query_farm_work()
+        location_id = _farm_action_location(work_info)
         farm_work = work_info.get("farmWork", {})
         if include_empty_tiles:
             unwatered_tiles = farm_work.get("tilledUnwateredTiles", [])
@@ -3451,7 +3480,6 @@ class CompanionScheduler:
         target_count = len(target_tiles)
         remaining = max(0, total_unwatered - target_count)
         is_truncated = bool(farm_work.get("isTruncated", False) or remaining > 0)
-        location_id = work_info.get("companion", {}).get("locationId", "Farm")
 
         effective_timeout = max(timeout_seconds, target_count * 2.5 + 15.0)
 

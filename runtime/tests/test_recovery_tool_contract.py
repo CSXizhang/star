@@ -8,9 +8,66 @@ from mcp.server.fastmcp.exceptions import ToolError
 from test_mcp_argument_validation import game as _game_fixture
 from test_native_action_farming import _client, _snapshot_env
 
+from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.scheduler import CompanionScheduler, SchedulerError
 
 game = _game_fixture
+
+
+@pytest.mark.parametrize("scope,observation,count", [
+    ("FarmHouse", "not-observed", None), ("Farm", "unavailable", None), ("Farm", "observed", 5),
+])
+def test_farm_queries_from_house_preserve_real_farm_scope_and_unknown_counts(scope, observation, count):
+    async def run():
+        tiles = [{"x": 65 + i, "y": 15} for i in range(count or 0)]
+        env = _snapshot_env({
+            "companion": {"locationId": "FarmHouse", "stamina": 270, "waterCanLevel": 40},
+            "farmWork": {"locationId": scope, "observationStatus": observation,
+                         "tilledUnwateredTiles": tiles, "tilledUnwateredCount": count or 0,
+                         "cropUnwateredTiles": tiles, "cropUnwateredCount": count or 0,
+                         "matureCrops": [], "matureCropCount": 0}})
+        client = _client(env)
+        scheduler = CompanionScheduler(client=client)
+        server = create_mcp_server(scheduler=scheduler)
+        for detail in (False, True):
+            _, result = await server.call_tool("query_farm_work", {"detail": detail})
+            farm = result["farmWork"]
+            assert farm["locationId"] == scope and farm["observationStatus"] == observation
+            assert farm["cropUnwateredCount"] == count and farm["tilledUnwateredCount"] == count
+            if detail:
+                assert result["companion"]["locationId"] == "FarmHouse"
+                assert farm["cropUnwateredTiles"] == (tiles if count is not None else None)
+            else:
+                assert result["currentCompanionLocationId"] == "FarmHouse"
+                assert result["needsNavigation"] is True
+        overview = await scheduler.get_work_overview()
+        assert overview["farmWork"]["cropUnwateredCount"] == count
+        assert overview["farmWork"]["missing"] is (count is None)
+        client.execute_native_action.assert_not_called()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
+@pytest.mark.parametrize("observed", [False, True])
+def test_auto_farm_actions_reject_house_scope_before_no_work_or_coordinate_dispatch(operation, observed):
+    async def run():
+        env = _snapshot_env({
+            "companion": {"locationId": "FarmHouse", "stamina": 270, "waterCanLevel": 40},
+            "farmWork": {"locationId": "Farm" if observed else "FarmHouse",
+                         "observationStatus": "observed" if observed else "not-observed",
+                         "tilledUnwateredTiles": [{"x": 65, "y": 15}] if observed else [],
+                         "cropUnwateredTiles": [{"x": 65, "y": 15}] if observed else [],
+                         "matureCrops": [{"x": 65, "y": 15, "cropId": "(O)24"}] if observed else []}})
+        client = _client(env)
+        scheduler = CompanionScheduler(client=client)
+        scheduler.execute_tiles = AsyncMock()
+        scheduler.execute_skill = AsyncMock()
+        with pytest.raises(SchedulerError, match="[Nn]avigate to Farm first"):
+            await getattr(scheduler, operation)()
+        scheduler.execute_tiles.assert_not_called()
+        scheduler.execute_skill.assert_not_called()
+        client.execute_native_action.assert_not_called()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("wire_tiles", [

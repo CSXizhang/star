@@ -1447,14 +1447,14 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 SleepStartedAt: Rest.SleepStartedAt
             );
 
-            // Scan farm work from observer for current location
+            // Farm work describes the Farm even while the companion is indoors.
+            // Local farming helpers and companion/world poses retain their own map.
             FarmWorkSnapshot farmWork;
             string locationName = _actor.LocationName ?? _observer.CurrentLocationName ?? "Farm";
-            if (!string.Equals(locationName, "Farm", StringComparison.OrdinalIgnoreCase))
-                farmWork = FarmWorkSnapshot.CreateEmpty(locationName, "not-observed");
-            else try
+            const string farmWorkLocation = "Farm";
+            try
             {
-                var workItems = _observer.ScanFarmWork(locationName);
+                var workItems = _observer.ScanFarmWork(farmWorkLocation);
                 if (workItems.Count > 0)
                 {
                     var unwatered = workItems
@@ -1498,18 +1498,18 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                         CropUnwateredCount: cropUnwatered.Count,
                         CropUnwateredTruncated: cropTruncated,
                         DeadCropCount: workItems.Count(w => w.IsDead),
-                        LocationId: locationName,
+                        LocationId: farmWorkLocation,
                         ObservationStatus: "observed"
                     );
                 }
                 else
                 {
-                    farmWork = FarmWorkSnapshot.CreateEmpty(locationName, "observed");
+                    farmWork = FarmWorkSnapshot.CreateEmpty(farmWorkLocation, "observed");
                 }
             }
             catch
             {
-                farmWork = FarmWorkSnapshot.CreateEmpty(locationName, "unavailable");
+                farmWork = FarmWorkSnapshot.CreateEmpty(farmWorkLocation, "unavailable");
             }
 
             var world = new WorldStateSnapshot(

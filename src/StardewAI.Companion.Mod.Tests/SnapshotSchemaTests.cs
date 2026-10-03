@@ -42,22 +42,48 @@ public class SnapshotSchemaTests
 
     [Theory]
     [InlineData("Farm", false, "observed")]
-    [InlineData("Coop-unique-one", false, "not-observed")]
+    [InlineData("Coop-unique-one", false, "observed")]
     [InlineData("Farm", true, "unavailable")]
-    public void ActualFarmWorkSnapshotIdentifiesUnobservedMapsAndFailures(string location, bool failScan, string status)
+    public void ActualFarmWorkSnapshotKeepsFarmScopeAcrossCompanionMapsAndFailures(string location, bool failScan, string status)
     {
         var actor = new MechanicsActor("farm-scope");
         actor.UpdatePose(location, new(1, 1), FacingDirection.Down);
-        var observer = new SimulatedWorldObserver { CurrentLocationName = location };
+        var observer = new SimulatedWorldObserver { CurrentLocationName = "Farm" };
         if (failScan) observer.FarmWorkScanFailure = new InvalidOperationException("Unavailable farm scan");
         var coordinator = new CompanionMechanicsCoordinator(actor, observer,
             new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
         foreach (var farm in new[] { json.RootElement.GetProperty("farmWork"), json.RootElement.GetProperty("world").GetProperty("farmWork") })
         {
-            Assert.Equal(location, farm.GetProperty("locationId").GetString());
+            Assert.Equal("Farm", farm.GetProperty("locationId").GetString());
             Assert.Equal(status, farm.GetProperty("observationStatus").GetString());
         }
+    }
+
+    [Fact]
+    public void CompanionInFarmHouseStillPublishesFiveObservedFarmCropsWithoutChangingLocalScopes()
+    {
+        var actor = new MechanicsActor("indoors-after-rest");
+        actor.UpdatePose("FarmHouse", new(10, 9), FacingDirection.Down);
+        var observer = new SimulatedWorldObserver { CurrentLocationName = "Farm" };
+        for (int x = 60; x < 65; x++)
+            observer.SetDirt(new(x, 21), TileDirtState.DryDirt(hasCrop: true));
+        var coordinator = new CompanionMechanicsCoordinator(actor, observer,
+            new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
+        var root = json.RootElement;
+        foreach (var farm in new[] { root.GetProperty("farmWork"), root.GetProperty("world").GetProperty("farmWork") })
+        {
+            Assert.Equal("Farm", farm.GetProperty("locationId").GetString());
+            Assert.Equal("observed", farm.GetProperty("observationStatus").GetString());
+            Assert.Equal(5, farm.GetProperty("tilledUnwateredCount").GetInt32());
+            Assert.Equal(5, farm.GetProperty("cropUnwateredCount").GetInt32());
+            Assert.Equal(5, farm.GetProperty("cropUnwateredTiles").GetArrayLength());
+        }
+        Assert.Equal("FarmHouse", root.GetProperty("companion").GetProperty("locationId").GetString());
+        Assert.Equal("Farm", root.GetProperty("world").GetProperty("currentLocation").GetString());
+        Assert.Equal("FarmHouse", root.GetProperty("farming").GetProperty("location").GetString());
+        Assert.Equal(new TileCoordinate(10, 9), actor.Tile);
     }
 
     [Fact]

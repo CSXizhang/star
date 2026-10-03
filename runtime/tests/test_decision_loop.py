@@ -261,11 +261,11 @@ def test_fake_provider_two_decisions_receive_real_worker_feedback(tmp_path, monk
         def run(self, task, cid, prompt):
             prompts.append(prompt)
             tokens.append(os.environ["STARDEW_DECISION_TOKEN"])
-            steps=[{"operation":"navigate_to","params":{"tile":{"x":i,"y":1}}} for i in range(3)]
+            steps=[{"operation":"navigate_to","params":{"location_id":"Farm","tile":{"x":i,"y":1}}} for i in range(3)]
             steps += [{"operation":"water_auto","params":{"max_tiles":3}}]
             asyncio.run(registered["submit_plan"](tasks=tasks(steps=steps),goal_text="care"))
             with pytest.raises(ToolError,match="NEW_MODEL"):
-                asyncio.run(registered["submit_plan"](tasks=tasks("ship_items"),goal_text="later"))
+                asyncio.run(registered["submit_plan"](tasks=tasks(steps=[{"operation":"ship_items","params":{"items":[{"itemId":"(O)24","count":1}]}}]),goal_text="later"))
             return {"success":True,"response":"selected"}
     # This test intentionally has no game/DLL; isolate the backend from packaging checks.
     monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible",lambda _:None)

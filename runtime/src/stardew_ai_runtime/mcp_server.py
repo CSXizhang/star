@@ -22,11 +22,12 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from types import UnionType
+from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from stardew_ai_runtime.agent_instructions import read_guidance as load_guidance
 from stardew_ai_runtime.autonomy import AutonomyController
@@ -109,6 +110,41 @@ def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _unwrap_item_array(value: Any) -> Any:
+    """Accept the provider's unambiguous XML-style array wrapper only."""
+    if isinstance(value, dict) and set(value) == {"item"} and isinstance(value["item"], list):
+        return value["item"]
+    return value
+
+
+def _reject_boolean_integer(value: Any) -> Any:
+    if isinstance(value, bool):
+        raise ValueError("Boolean values are not integers")
+    return value
+
+
+def _reject_integer_booleans(value: Any, annotation: Any) -> None:
+    """Keep native integer policy when Pydantic parses strings losslessly."""
+    origin, args = get_origin(annotation), get_args(annotation)
+    if annotation is int:
+        _reject_boolean_integer(value)
+    elif origin is Annotated:
+        _reject_integer_booleans(value, args[0])
+    elif origin in (Union, UnionType) and bool not in args:
+        for variant in args:
+            _reject_integer_booleans(value, variant)
+    elif origin is list and isinstance(value, list):
+        for item in value:
+            _reject_integer_booleans(item, args[0])
+    elif origin is dict and isinstance(value, dict):
+        for item in value.values():
+            _reject_integer_booleans(item, args[1])
+
+
+ChestCoordinate = Annotated[int, BeforeValidator(_reject_boolean_integer), Field(ge=0)]
+ItemCount = Annotated[int, BeforeValidator(_reject_boolean_integer), Field(ge=1)]
+
+
 class SpatialRegion(BaseModel):
     """An absolute native map rectangle for bounded observation."""
 
@@ -146,7 +182,7 @@ class ShortJobTask(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     title: str = Field(min_length=1)
-    steps: list[ShortJobStep] = Field(min_length=1, max_length=32)
+    steps: Annotated[list[ShortJobStep], BeforeValidator(_unwrap_item_array)] = Field(min_length=1, max_length=32)
     id: str | None = None
     completionCondition: str = ""
     dependencies: list[str] = Field(default_factory=list, max_length=0, description="Must be empty; select subsequent business next decision")
@@ -717,6 +753,25 @@ def create_mcp_server(
     # discovery/call closures so both surfaces expose every base op.
     base_tools: dict[str, Any] = {}
     base_schemas: dict[str, dict[str, Any]] = {}
+    base_metadata: dict[str, Any] = {}
+
+    def validate_base_arguments(name: str, args: dict[str, Any], *, for_plan: bool = False) -> dict[str, Any]:
+        """Share the real FastMCP parser without injecting defaults into jobs."""
+        metadata = base_metadata[name]
+        try:
+            pre_parsed = metadata.pre_parse_json(args)
+            for key, value in pre_parsed.items():
+                if field := metadata.arg_model.model_fields.get(key):
+                    _reject_integer_booleans(value, field.annotation)
+            parsed = metadata.arg_model.model_validate(pre_parsed)
+        except ValueError as ex:
+            raise ToolError(f"Invalid parameters for '{name}': {ex}") from None
+        if for_plan:
+            # Durable params must contain plain JSON values, including nested models.
+            # Preserve allowed plan-only keys (e.g. location_id for hoe_tiles).
+            return {**args, **parsed.model_dump(exclude_unset=True)}
+        return {key: value for key, value in parsed.model_dump_one_level().items()
+                if key in parsed.model_fields_set}
 
     def autonomy_for_run() -> AutonomyController:
         actual_run_dir = getattr(sched, "run_dir", None) or run_dir
@@ -1102,6 +1157,8 @@ def create_mcp_server(
 
         Routine progress belongs in the execution log. Identical notices deduplicate
         across restarts. This never grants permission or unpauses work.
+        delivered=False on creation means queued, not failed; the bridge delivers
+        it on a following game snapshot and records delivered=True.
         """
         sid = await current_save_id()
         try:
@@ -1442,7 +1499,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def submit_plan(
-        tasks: Annotated[list[ShortJobTask], Field(min_length=1, max_length=1, description="Exactly one current short job. Submit remaining business in a new decision, without dependencies.")],
+        tasks: Annotated[list[ShortJobTask], BeforeValidator(_unwrap_item_array), Field(min_length=1, max_length=1, description="Exactly one current short job. Submit remaining business in a new decision, without dependencies.")],
         goal_id: str | None = None,
         goal_text: str | None = None,
         replace: bool = False,
@@ -1517,6 +1574,8 @@ def create_mcp_server(
                             "INVALID_JOB_PARAMETERS: building and animal services use location_id='Farm' for the target building, "
                             "not ScienceHouse/AnimalShop. Navigate to the service counter separately. No job selected."
                         )
+                    if entry:
+                        step["params"] = validate_base_arguments(step["operation"], step.get("params") or {}, for_plan=True)
             result = store.submit_plan(
                 sid,
                 tasks=normalized_tasks,
@@ -1632,8 +1691,8 @@ def create_mcp_server(
 
     @mcp.tool()
     async def harvest_and_store(
-        chest_x: int,
-        chest_y: int,
+        chest_x: ChestCoordinate,
+        chest_y: ChestCoordinate,
         max_tiles: int = 16,
         item_ids: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -1800,6 +1859,7 @@ def create_mcp_server(
         missing = sorted(key for key in required if key not in args)
         if missing:
             raise ToolError(f"missing required parameter(s) for '{tool}': {', '.join(missing)}")
+        args = validate_base_arguments(tool, args)
         try:
             result = await base_tools[tool](**args)
         except ToolError:
@@ -2274,7 +2334,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def deposit_to_chest(
-        chest_x: int, chest_y: int, item_ids: list[str] | None = None, detail: bool = False,
+        chest_x: ChestCoordinate, chest_y: ChestCoordinate, item_ids: list[str] | None = None, detail: bool = False,
         location_id: str = "Farm",
     ) -> dict[str, Any]:
         """Deposit non-tool items into chest at (chest_x, chest_y). Tools are never deposited.
@@ -2352,10 +2412,10 @@ def create_mcp_server(
 
     @mcp.tool()
     async def withdraw_from_chest(
-        chest_x: int,
-        chest_y: int,
+        chest_x: ChestCoordinate,
+        chest_y: ChestCoordinate,
         item_id: str | None = None,
-        count: int = 1,
+        count: ItemCount = 1,
         items: list[dict[str, Any]] | None = None,
         location_id: str = "Farm",
         detail: bool = False,
@@ -2438,7 +2498,7 @@ def create_mcp_server(
             raise ToolError(f"Withdraw from chest failed: {ex}") from None
 
     @mcp.tool()
-    async def organize_chest(chest_x: int, chest_y: int, detail: bool = False) -> dict[str, Any]:
+    async def organize_chest(chest_x: ChestCoordinate, chest_y: ChestCoordinate, detail: bool = False) -> dict[str, Any]:
         """Merge same-item stacks inside chest at (chest_x, chest_y). Returns chest status."""
         pre_rev = getattr(sched, "latest_world_revision", 0)
         try:
@@ -3616,6 +3676,7 @@ def create_mcp_server(
             "description": tool.description,
             "parameters": tool.parameters,
         }
+        base_metadata[tool.name] = tool.fn_metadata
     if resolved_surface == "light":
         allowed = LIGHT_TOOLS | ({"begin_game_turn", "work_plan_overview"} if external_codex else set())
     elif resolved_surface == "internal":

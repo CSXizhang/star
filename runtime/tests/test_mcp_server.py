@@ -1314,8 +1314,8 @@ def test_mcp_server_error_handling(mock_scheduler, tmp_path):
 
 
 def test_mcp_server_new_tools_error_mapping(mock_scheduler, tmp_path):
-    """Two-layer validation: short-job budget rules reject at selection time;
-    execution-time parameter validation defers to plan dispatch."""
+    """Schema and short-job budgets reject before selection;
+    game-dependent policy violations still defer to plan dispatch."""
     async def run():
         from stardew_ai_runtime.scheduler import SchedulerError
 
@@ -1327,9 +1327,12 @@ def test_mcp_server_new_tools_error_mapping(mock_scheduler, tmp_path):
         with pytest.raises(ToolError, match="Short job exceeds 64 native targets"):
             await server.call_tool("harvest_auto", {"max_tiles": 100})
 
-        # Execution-time policy violations pass selection and become a selected job.
+        with pytest.raises(ToolError, match="chest_x"):
+            await server.call_tool("deposit_to_chest", {"chest_x": -1, "chest_y": 12})
+        assert not store.state("mock-save-123").decision["selected"]
+
+        # Other policy violations still pass selection and become a selected job.
         for tool_name, args in [
-            ("deposit_to_chest", {"chest_x": -1, "chest_y": 12}),
             ("withdraw_from_chest", {"chest_x": 70, "chest_y": 12}),
             ("organize_chest", {"chest_x": 70, "chest_y": 12}),
             ("hoe_tiles", {"tiles": []}),
@@ -2103,8 +2106,13 @@ def test_service_target_map_is_checked_before_navigation_or_selection(mock_sched
     server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
 
     async def run():
+        service_params = {
+            "build_building": {"building_type": "Coop", "tile": {"x": 40, "y": 20}},
+            "upgrade_building": {"building_name": "CoopA", "building_type": "Big Coop"},
+            "purchase_animal": {"building_name": "CoopA", "animal_type": "Chicken", "animal_name": "小鸡"},
+        }[operation]
         steps = [{"operation": "navigate_to", "params": {"location_id": "AnimalShop", "tile": {"x": 12, "y": 16}}},
-                 {"operation": operation, "params": {"location_id": "AnimalShop", "budget_limit": 800}}]
+                 {"operation": operation, "params": {**service_params, "location_id": "AnimalShop", "budget_limit": 800}}]
         with pytest.raises(ToolError, match="target building"):
             await server.call_tool("submit_plan", {"goal_text": "养鸡", "tasks": [{"title": "购鸡", "steps": steps}]})
         assert not store.state("mock-save-123").tasks

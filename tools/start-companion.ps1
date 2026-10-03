@@ -1,11 +1,15 @@
 ﻿[CmdletBinding()]
-param([switch]$CheckOnly, [Parameter(ValueFromRemainingArguments=$true)][string[]]$ForwardArgs)
+param(
+    [switch]$CheckOnly,
+    [ValidateRange(1, 2147483647)][int]$OwnerProcessId,
+    [Parameter(ValueFromRemainingArguments=$true)][string[]]$ForwardArgs
+)
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (Test-Path -LiteralPath (Join-Path $repoRoot 'release-manifest.json')) {
     . (Join-Path $PSScriptRoot 'release-package.ps1')
     try {
-        Start-ReleaseCompanion $repoRoot -CheckOnly:$CheckOnly -ForwardArgs $ForwardArgs
+        Start-ReleaseCompanion $repoRoot -CheckOnly:$CheckOnly -OwnerProcessId $OwnerProcessId -ForwardArgs $ForwardArgs
         exit 0
     } catch {
         $logDir = Join-Path $repoRoot 'data'
@@ -19,6 +23,7 @@ $python = Join-Path $repoRoot 'runtime\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { $python = (Get-Command python.exe -ErrorAction Stop).Source }
 $metadata = Join-Path $repoRoot 'config\installed-candidate.json'
 $serviceArgs = @('-m', 'stardew_ai_runtime.chat_bridge')
+if ($OwnerProcessId) { $serviceArgs += @('--owner-pid', [string]$OwnerProcessId) }
 if (Test-Path -LiteralPath $metadata) {
     $installed = Get-Content -LiteralPath $metadata -Raw -Encoding UTF8 | ConvertFrom-Json
     $manifestPath = if ([IO.Path]::IsPathRooted($installed.manifest)) { $installed.manifest } else { Join-Path $repoRoot $installed.manifest }

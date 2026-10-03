@@ -59,6 +59,7 @@ from stardew_ai_runtime.decision_policy import decision_policy, project_context
 from stardew_ai_runtime.job_feedback import compact_job_feedback
 from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
 from stardew_ai_runtime.life_chat import LifeChatService
+from stardew_ai_runtime.owner_process import OwnerProcessGuard
 from stardew_ai_runtime.plan_executor import (
     DispatchDeferred,
     PlanExecutor,
@@ -5332,6 +5333,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to run directory containing transport-discovery.json (or set STARDEW_RUN_DIR)",
     )
     parser.add_argument(
+        "--owner-pid", type=int, default=None,
+        help="Windows game process owning this automatic launch; exit when it ends",
+    )
+    parser.add_argument(
         "--backend", type=str, choices=["agy", "kimi", "codex", "dsh", "mcode"], default=None,
         help="Chat provider (overrides config/chat-backend.json)",
     )
@@ -5358,6 +5363,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--mcode-cmd", type=str, default="mcode", help="Path or name of MiniMax Code CLI")
 
     args = parser.parse_args(argv)
+    if args.owner_pid is not None and not 0 < args.owner_pid <= 0xFFFFFFFF:
+        parser.error("--owner-pid must be a positive Windows process ID")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -5365,6 +5372,21 @@ def main(argv: list[str] | None = None) -> None:
         datefmt="%H:%M:%S",
     )
 
+    owner_guard = OwnerProcessGuard(args.owner_pid) if args.owner_pid is not None else None
+    try:
+        _main_bridge(args, owner_guard)
+    finally:
+        # The module CLI keeps its daemon watchdog armed through interpreter
+        # shutdown. Explicit argv callers may release their embedded monitor.
+        if argv is not None and owner_guard is not None:
+            owner_guard.close()
+
+
+def _main_bridge(args: argparse.Namespace, owner_guard: OwnerProcessGuard | None) -> None:
+    # Start ownership monitoring before construction as configuration and model
+    # setup can block too. Manual launches retain the existing resident service.
+    if owner_guard is not None and owner_guard.owner_exited.is_set():
+        return
     bridge = ChatBridge(
         run_dir=args.run_dir,
         model=args.model,
@@ -5377,6 +5399,8 @@ def main(argv: list[str] | None = None) -> None:
 
     _, log_file_path = configure_chat_bridge_file_logging(bridge.run_dir)
     logger.info("ChatBridge 文件日志已启动: %s", log_file_path)
+    if owner_guard is not None:
+        logger.info("Game owner guard active (owner_pid=%d)", args.owner_pid)
 
     print("================================================================")
     print(">>> 星露谷伙伴后台对话服务 (Stardew Chat Bridge) 已就绪 <<<")
@@ -5408,7 +5432,7 @@ def main(argv: list[str] | None = None) -> None:
     sys.excepthook = _unhandled_exception_hook
 
     try:
-        asyncio.run(bridge.run())
+        asyncio.run(owner_guard.run(bridge.run) if owner_guard is not None else bridge.run())
     except KeyboardInterrupt:
         print("\n服务已由用户退出。")
     except Exception as ex:

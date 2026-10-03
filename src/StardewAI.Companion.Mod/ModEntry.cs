@@ -49,6 +49,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private DateTime _chatActivityAt = DateTime.UtcNow;
     private string? _watchedChatRequest;
     private readonly ReleaseBridgeStartupState _bridgeStartup = new();
+    private readonly object _bridgeLaunchGate = new();
+    private ReleaseBridgeLaunch? _ownedBridgeLaunch;
+    private bool _gameExiting;
 
     // -----------------------------------------------------------------------
     // Life-system fields
@@ -87,6 +90,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         helper.Events.Display.RenderedHud += OnRenderedHud;
         helper.Events.GameLoop.Saving += OnSaving;
         helper.Events.GameLoop.ReturnedToTitle += OnReturnedToTitle;
+        AppDomain.CurrentDomain.ProcessExit += OnGameProcessExit;
         helper.Events.Input.ButtonPressed += OnButtonPressed;
 
         helper.ConsoleCommands.Add("ai_water",
@@ -656,6 +660,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void OnReturnedToTitle(object? sender, ReturnedToTitleEventArgs e)
     {
+        StopOwnedBridgeLauncher();
         _dayTransition = false;
         try
         {
@@ -1248,9 +1253,29 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (_transportServer?.IsChatConnected == true || !_bridgeStartup.CanStart(DateTime.UtcNow)) return;
         var start = ReleaseBridgeLauncher.CreateStartInfo(Helper.DirectoryPath);
         if (start == null) return; // Source builds use the documented developer launcher.
-        _bridgeStartup.Begin(ReleaseBridgeLauncher.RunAsync(start), DateTime.UtcNow);
+        lock (_bridgeLaunchGate)
+        {
+            if (_gameExiting) return;
+            _ownedBridgeLaunch?.Dispose();
+            _ownedBridgeLaunch = ReleaseBridgeLauncher.Start(start);
+            _bridgeStartup.Begin(_ownedBridgeLaunch.Completion, DateTime.UtcNow);
+        }
         Monitor.Log("Started installed companion service launcher; waiting for connection.", LogLevel.Info);
         ProjectBridgeConnection();
+    }
+
+    private void OnGameProcessExit(object? sender, EventArgs e) => StopOwnedBridgeLauncher(gameExiting: true);
+
+    private void StopOwnedBridgeLauncher(bool gameExiting = false)
+    {
+        // ProcessExit can arrive while the game thread is publishing a startup.
+        // Keep publication and cancellation together, and never inspect unrelated processes.
+        lock (_bridgeLaunchGate)
+        {
+            _gameExiting |= gameExiting;
+            _ownedBridgeLaunch?.Dispose();
+            _ownedBridgeLaunch = null;
+        }
     }
 
     private void UpdateBridgeStartup()

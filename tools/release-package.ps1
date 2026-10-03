@@ -192,7 +192,7 @@ function Assert-ReleaseAiCli([string]$Binary, [string]$Backend, [string]$LogRoot
     } finally { $process.Dispose() }
 }
 
-function Start-ReleaseCompanion([string]$Root, [switch]$CheckOnly, [string[]]$ForwardArgs) {
+function Start-ReleaseCompanion([string]$Root, [switch]$CheckOnly, [int]$OwnerProcessId, [string[]]$ForwardArgs) {
     $package = Read-VerifiedRelease $Root -FullVerify:$CheckOnly
     $python = Get-ReleasePath $Root $package.python
     if ($ForwardArgs | Where-Object { $_ -match '^--run-dir(=|$)' }) { throw 'Release is bound to its own Mod directory.' }
@@ -224,7 +224,9 @@ function Start-ReleaseCompanion([string]$Root, [switch]$CheckOnly, [string[]]$Fo
         try {
             $env:PYTHONUTF8 = '1'
             $env:PYTHONDONTWRITEBYTECODE = '1'
-            & $python -B -m stardew_ai_runtime.chat_bridge --run-dir $Root @ForwardArgs
+            $ownerArgs = @()
+            if ($OwnerProcessId) { $ownerArgs = @('--owner-pid', [string]$OwnerProcessId) }
+            & $python -B -m stardew_ai_runtime.chat_bridge --run-dir $Root @ownerArgs @ForwardArgs
             if ($LASTEXITCODE -ne 0) { throw "Companion service exited with code $LASTEXITCODE." }
         } finally { Pop-Location }
     } finally {

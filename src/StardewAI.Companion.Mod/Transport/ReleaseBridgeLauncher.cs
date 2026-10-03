@@ -22,12 +22,21 @@ public static class ReleaseBridgeLauncher
             RedirectStandardError = true,
         };
         // ArgumentList keeps installation paths literal, including spaces and metacharacters.
-        foreach (string argument in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script })
+        foreach (string argument in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
+            "-OwnerProcessId", Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture) })
             start.ArgumentList.Add(argument);
         return start;
     }
 
+    public static ReleaseBridgeLaunch Start(ProcessStartInfo start) => new(start);
+
     public static async Task<ReleaseBridgeLaunchResult> RunAsync(ProcessStartInfo start)
+    {
+        using var launch = Start(start);
+        return await launch.Completion.ConfigureAwait(false);
+    }
+
+    internal static async Task<ReleaseBridgeLaunchResult> RunOwnedAsync(ProcessStartInfo start, ReleaseBridgeLaunch launch)
     {
         string logPath = Path.Combine(start.WorkingDirectory, "data", "release-start.log");
         long logOffset = LogLength(logPath);
@@ -43,15 +52,17 @@ public static class ReleaseBridgeLauncher
             using var process = new Process { StartInfo = start };
             process.OutputDataReceived += Capture;
             process.ErrorDataReceived += Capture;
-            if (!process.Start()) return new(-1, "无法创建伙伴启动进程，请检查安装和系统权限。");
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-            await process.WaitForExitAsync().ConfigureAwait(false);
-            // WaitForExit drains the final redirected output events too.
-            process.WaitForExit();
-            if (process.ExitCode == 0) return new(0, null);
-            reason ??= ReadNewFailure(logPath, logOffset);
-            return new(process.ExitCode, reason ?? $"伙伴启动进程退出（代码 {process.ExitCode}），请检查伙伴目录 data/release-start.log。");
+            try
+            {
+                if (!launch.StartProcess(process)) return new(-1, "无法创建伙伴启动进程，请检查安装和系统权限。");
+                await process.WaitForExitAsync().ConfigureAwait(false);
+                // WaitForExit drains the final redirected output events too.
+                process.WaitForExit();
+                if (launch.IsStopping || process.ExitCode == 0) return new(0, null);
+                reason ??= ReadNewFailure(logPath, logOffset);
+                return new(process.ExitCode, reason ?? $"伙伴启动进程退出（代码 {process.ExitCode}），请检查伙伴目录 data/release-start.log。");
+            }
+            finally { launch.ReleaseProcess(process); }
         }
         catch (System.ComponentModel.Win32Exception)
         {
@@ -118,6 +129,70 @@ public static class ReleaseBridgeLauncher
         }
         catch (IOException) { return null; }
         catch (UnauthorizedAccessException) { return null; }
+    }
+}
+
+/// <summary>Owns only the launcher started by this Mod and its descendants.</summary>
+public sealed class ReleaseBridgeLaunch : IDisposable
+{
+    private readonly object _gate = new();
+    private Process? _process;
+    private bool _stopping;
+    public Task<ReleaseBridgeLaunchResult> Completion { get; }
+    internal bool IsStopping { get { lock (_gate) return _stopping; } }
+
+    internal ReleaseBridgeLaunch(ProcessStartInfo start)
+    {
+        // Start is synchronous through process publication; the owner can stop it
+        // as soon as this handle is returned, including during launcher preflight.
+        Completion = ReleaseBridgeLauncher.RunOwnedAsync(start, this);
+    }
+
+    internal bool StartProcess(Process process)
+    {
+        lock (_gate)
+        {
+            if (_stopping) return false;
+            if (!process.Start()) return false;
+            _process = process;
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            return true;
+        }
+    }
+
+    internal void ReleaseProcess(Process process)
+    {
+        lock (_gate)
+        {
+            // An output/setup failure must not abandon a process which already started.
+            StopProcess(process);
+            if (ReferenceEquals(_process, process)) _process = null;
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            _stopping = true;
+            if (_process != null) StopProcess(_process);
+        }
+    }
+
+    private static void StopProcess(Process process)
+    {
+        try
+        {
+            if (process.HasExited) return;
+            process.Kill(entireProcessTree: true);
+            // ProcessExit cannot await the background task. Bound the synchronous
+            // wait, while allowing the launcher/mutex to finish before a new save.
+            process.WaitForExit(2000);
+        }
+        catch (InvalidOperationException) { } // It exited, or never started.
+        catch (System.ComponentModel.Win32Exception) { } // OS teardown can race exit.
+        catch (AggregateException) { } // A descendant exited during tree traversal.
     }
 }
 

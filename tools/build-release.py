@@ -62,20 +62,32 @@ def build(args) -> Path:
     for name in MOD_FILES:
         copy_file(source / name, package / name)
     # PDBs can embed developer source paths; they are intentionally not shipped.
-    for path in sorted((ROOT / "runtime/src/stardew_ai_runtime").rglob("*.py")):
-        copy_file(path, package / path.relative_to(ROOT))
+    for path in sorted((ROOT / "runtime/src/stardew_ai_runtime").rglob("*")):
+        if path.suffix in {".py", ".mjs"}:
+            copy_file(path, package / path.relative_to(ROOT))
     for name in TOOL_FILES:
         copy_file(ROOT / "tools" / name, package / "tools" / name)
     skill = Path("agent-skills/stardew-companion/SKILL.md")
     copy_file(ROOT / skill, package / skill)
+    execution = Path("agent-skills/stardew-companion/references/ingame-execution.md")
+    copy_file(ROOT / execution, package / execution)
+    # The reviewed instructions remain the single source in both development
+    # and the relocatable game package. Human integration notes are not loaded.
+    for name in ("agent-core-instructions-draft.md", "agent-domain-guidance-draft.md"):
+        copy_file(ROOT / "docs" / name, package / "docs" / name)
+    for path in sorted((ROOT / "docs/agent-guidance").glob("*.md")):
+        copy_file(path, package / path.relative_to(ROOT))
     for name in ("设置星露谷伙伴.cmd", "启动伙伴服务.cmd", "LICENSE"):
         copy_file(ROOT / name, package / name)
     guide = (ROOT / "docs/release-guide.md").read_text(encoding="utf-8-sig")
-    guide = guide.replace("(companion-guide.md)", "(docs/companion-guide.md)").replace("(mcp.md)", "(docs/mcp.md)").replace("(../CONTRIBUTING.md)", "(CONTRIBUTING.md)")
+    guide = guide.replace("(companion-guide.md", "(docs/companion-guide.md").replace("(mcp.md", "(docs/mcp.md").replace("(../CONTRIBUTING.md)", "(CONTRIBUTING.md)")
     (package / "使用说明.md").write_text(guide, encoding="utf-8")
     copy_file(ROOT / "CONTRIBUTING.md", package / "CONTRIBUTING.md")
     for name in ("release-guide.md", "companion-guide.md", "mcp.md", "farm-projects.md"):
         copy_file(ROOT / "docs" / name, package / "docs" / name)
+    release_notes = ROOT / "docs" / f"release-notes-{args.version}.md"
+    if release_notes.is_file():
+        copy_file(release_notes, package / "docs" / release_notes.name)
 
     cache = args.cache.resolve()
     cache.mkdir(parents=True, exist_ok=True)

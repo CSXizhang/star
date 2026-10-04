@@ -21,8 +21,17 @@ public sealed record AnimalScanInfo(
     string LocationName,
     TileCoordinate Tile,
     bool WasPetToday,
-    bool WasAutoPetToday
+    bool WasAutoPetToday,
+    string? AnimalId = null,
+    string? HomeBuildingId = null,
+    bool? SleepingBlocksPetting = null
 );
+
+/// <summary>The native pet sleep gate only; says nothing about route or proximity.</summary>
+public static class AnimalPettingConditions
+{
+    public static bool SleepingBlocksPetting(int timeOfDay, bool isMoving) => timeOfDay >= 1900 && !isMoving;
+}
 
 /// <summary>
 /// Read-only observation of one animal building (coop/barn) and its feed situation.
@@ -40,7 +49,10 @@ public sealed record AnimalBuildingScanInfo(
     int HayCount,
     int HayCapacity,
     int SiloHayCount,
-    IReadOnlyList<AnimalScanInfo> Animals
+    IReadOnlyList<AnimalScanInfo> Animals,
+    string? BuildingId = null,
+    int ResidentCount = 0,
+    IReadOnlyList<string>? ResidentAnimalIds = null
 );
 
 /// <summary>

@@ -150,6 +150,7 @@ def test_factory_methods() -> None:
     assert exec_env.message_type == "skill.execute"
     assert exec_env.payload["skillId"] == "water-zone"
     assert exec_env.payload["parameters"]["tiles"] == [{"x": 10, "y": 20}]
+    assert exec_env.payload["parameters"]["includeEmptyTiles"] is False
 
     cancel = Envelope.create_cancel(
         sender_instance_id="runtime-1",

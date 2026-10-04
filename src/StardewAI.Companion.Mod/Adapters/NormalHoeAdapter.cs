@@ -46,11 +46,16 @@ public sealed class NormalHoeAdapter : IHoeAdapter
             return HoeTileResult.Failed("Hoe operation rejected: must execute on the game main thread.");
         }
 
-        // 2. Current map invariant
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        // 2. The companion can work outside the human player's active map, including
+        // the morning when the player wakes indoors. Verify its own loaded location.
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return HoeTileResult.Failed(
-                $"Hoe target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Hoe target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return HoeTileResult.Failed($"Hoe target map '{locationName}' is not loaded or does not exist.");
         }
 
         // 3. Adjacency check
@@ -89,7 +94,7 @@ public sealed class NormalHoeAdapter : IHoeAdapter
                 $"Tile {targetTile} is already tilled soil.", skipReason: "already-tilled");
         }
 
-        var location = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+        var location = Game1.getLocationFromName(locationName);
         if (location is null)
         {
             return HoeTileResult.Failed($"Game location '{locationName}' not found.");

@@ -226,6 +226,11 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
         {
             if (!IsExecuting) return;
 
+            if (IsPaused && _cancelRequested)
+            {
+                FinishExecution(ExecutionState.Cancelled, _cancelReason ?? "Cancelled by request.", "CANCELLED");
+                return;
+            }
             if (IsPaused) return;
 
             if (_pauseRequested && CurrentState is ExecutionState.Navigating or ExecutionState.Facing or ExecutionState.Preparing)

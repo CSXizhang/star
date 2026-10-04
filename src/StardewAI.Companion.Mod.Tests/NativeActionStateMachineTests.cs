@@ -8,6 +8,42 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class NativeActionStateMachineTests
 {
+    [Fact]
+    public void PausedCancelSettlesAndPreservesConfirmedEffectsWithoutAnotherAction()
+    {
+        var (machine, _, _, adapter) = CreateHarness();
+        Assert.True(machine.Start(Request(NativeActionKind.PlaceItems,
+            new TileCoordinate(10, 11), new TileCoordinate(11, 10)), out _));
+        for (int tick = 0; tick < 100 && machine.CurrentTargetIndex == 0; tick++) machine.StepTicks(1);
+        Assert.Equal(1, adapter.CallCount);
+        machine.RequestPause();
+        machine.StepTicks(100);
+        Assert.True(machine.IsPaused);
+        machine.RequestCancel("cancel paused work");
+        machine.StepTicks(1);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Single(machine.FinalResult.Effects);
+        Assert.Equal(1, adapter.CallCount);
+    }
+
+    [Fact]
+    public void VisibleSwingAppliesOneEffectAndCancelPreservesOnlyThatSwing()
+    {
+        var (machine, actor, _, adapter) = CreateHarness(initialTile: new TileCoordinate(10, 10));
+        adapter.AnimationTool = "Axe";
+        adapter.ContinueCallsBeforeSuccess = 3;
+        Assert.True(machine.Start(Request(NativeActionKind.ChopTree, new TileCoordinate(10, 11)), out _));
+        for (int tick = 0; tick < 30 && adapter.CallCount == 0; tick++) machine.StepTicks(1);
+        Assert.Equal(1, adapter.CallCount);
+        machine.RequestCancel("stop after this swing");
+        machine.StepTicks(100);
+        Assert.Equal(1, adapter.CallCount);
+        Assert.Equal(269f, actor.Stamina);
+        Assert.Equal(1f, machine.FinalResult!.StaminaUsed);
+        Assert.Empty(machine.FinalResult.Effects);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult.FinalState);
+    }
+
     [Theory]
     [InlineData(11, 10)]
     [InlineData(10, 11)]
@@ -127,7 +163,7 @@ public class NativeActionStateMachineTests
         machine.OnCompleted += r => completed = r;
 
         var request = Request(
-            NativeActionKind.RefillWateringCan,
+            NativeActionKind.PlaceItems,
             new TileCoordinate(10, 12),
             new TileCoordinate(11, 12),
             new TileCoordinate(10, 11));
@@ -147,6 +183,49 @@ public class NativeActionStateMachineTests
         Assert.NotNull(completed);
         Assert.Equal("succeeded", result.ToTransportPayload().TerminalState);
         Assert.Equal(3, result.ToTransportPayload().CompletedCount);
+    }
+
+    [Fact]
+    public void RefillCandidates_StopAfterFirstRealSuccessWithoutTryingUnreachableRemainder()
+    {
+        var (machine, _, observer, adapter) = CreateHarness();
+        var first = new TileCoordinate(10, 11);
+        var other = new TileCoordinate(30, 30);
+        foreach (var tile in new[] { other, new TileCoordinate(29, 30), new TileCoordinate(31, 30),
+            new TileCoordinate(30, 29), new TileCoordinate(30, 31) }) observer.SetPassable(tile, false);
+        int terminals = 0;
+        machine.OnCompleted += _ => terminals++;
+        Assert.True(machine.Start(Request(NativeActionKind.RefillWateringCan, first, other,
+            new TileCoordinate(31, 30), new TileCoordinate(30, 31)), out _));
+        machine.StepTicks(400);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Equal(first, Assert.Single(machine.FinalResult.Effects).Tile);
+        Assert.Empty(machine.FinalResult.Skipped);
+        Assert.Equal(1, adapter.CallCount);
+        Assert.Equal(1, terminals);
+        machine.StepTicks(100);
+        Assert.Equal(1, adapter.CallCount);
+        Assert.Equal(1, terminals);
+    }
+
+    [Fact]
+    public void RefillCandidates_FirstRejectedSourceStillTriesNextSource()
+    {
+        var (machine, _, _, adapter) = CreateHarness();
+        adapter.SimulatePrecondition = true;
+        adapter.PreconditionSkipReason = "not-water-source";
+        var second = new TileCoordinate(11, 10);
+        Assert.True(machine.Start(Request(NativeActionKind.RefillWateringCan,
+            new TileCoordinate(10, 11), second, new TileCoordinate(30, 30)), out _));
+        for (int tick = 0; tick < 100 && machine.CurrentTargetIndex == 0; tick++) machine.StepTicks(1);
+        Assert.Equal(1, adapter.CallCount);
+        adapter.SimulatePrecondition = false;
+        machine.StepTicks(400);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Equal(second, Assert.Single(machine.FinalResult.Effects).Tile);
+        Assert.Single(machine.FinalResult.Skipped);
+        Assert.Equal(2, adapter.CallCount);
+        Assert.Null(machine.FinalResult.ErrorMessage);
     }
 
     [Fact]
@@ -460,7 +539,7 @@ public class NativeActionStateMachineTests
         machine.OnProgress += p => phases.Add(p);
 
         Assert.True(machine.Start(Request(
-            NativeActionKind.RefillWateringCan,
+            NativeActionKind.PlaceItems,
             new TileCoordinate(10, 12),
             new TileCoordinate(11, 12)), out _));
         machine.StepTicks(400);
@@ -472,7 +551,7 @@ public class NativeActionStateMachineTests
         Assert.Equal("completed", completed.Phase);
         Assert.Equal(2, completed.Completed);
         Assert.Equal(2, completed.Total);
-        Assert.All(phases, p => Assert.Equal(NativeActionKind.RefillWateringCan.ToString(), p.Action));
+        Assert.All(phases, p => Assert.Equal(NativeActionKind.PlaceItems.ToString(), p.Action));
 
         // The terminal payload carries the same structured progress for the bridge.
         var details = machine.FinalResult!.ToTransportPayload().Details!;

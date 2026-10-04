@@ -3,6 +3,7 @@ state machine, persistence reload, day-settle verification, reminder candidates,
 WorkStore goal/todo wiring, and reserved-funds semantics.
 """
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,8 @@ from stardew_ai_runtime.companion_milestones import (
     MilestoneError,
     wire_node,
 )
-from stardew_ai_runtime.work_state import WorkStore
+from stardew_ai_runtime.decision_context import build_decision_context, objective_scope
+from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 SAVE = "Save1"
 DATE_11 = {"year": 1, "season": "spring", "day": 11}  # 2 days before Egg Festival
@@ -479,7 +481,291 @@ def test_work_retry_after_milestone_file_write_failure_does_not_duplicate(tmp_pa
     monkeypatch.setattr(store, "_write_unlocked", lambda: (_ for _ in ()).throw(OSError("disk")))
     with pytest.raises(OSError):
         store.adopt(SAVE, STRAWBERRY_ID, work_store=work, game_date=DATE_11)
+    assert work.list_goals(SAVE) == [] and work.list_todos(SAVE) == []
     monkeypatch.setattr(store, "_write_unlocked", original_write)
     store.adopt(SAVE, STRAWBERRY_ID, work_store=work, game_date=DATE_11)
     assert len(work.list_goals(SAVE)) == 1
     assert len(work.list_todos(SAVE)) == 2
+
+
+@pytest.mark.parametrize("target_day", [16, 20])
+def test_saved_scope_revision_reuses_goal_and_changes_due_or_future_objective(tmp_path, target_day):
+    work = _work_store(tmp_path)
+    store = _store(tmp_path)
+    date = {"year": 1, "season": "spring", "day": 16}
+    old_scope = "只种眼前19格和包内种子"
+    new_scope = "包内与箱内种子全部种；地不够允许开垦"
+    node = store.propose(SAVE, title="种好菜地", summary=old_scope,
+                         target_date=f"1:spring:{target_day}", preparation=["plant"], game_date=date)
+    adopted = store.adopt(SAVE, node["id"], work_store=work, game_date=date)
+    original = work.list_goals(SAVE)[0]
+    original_ids = set(adopted["todoIds"].values())
+    assert bool(work.evaluate_todos(SAVE, snapshot=None, game_date=date)) == (target_day == 16)
+    revised = store.revise(SAVE, node["id"], summary=new_scope, work_store=work, game_date=date)
+    goal = work.list_goals(SAVE)[0]
+    assert len(work.list_goals(SAVE)) == 1
+    assert goal["id"] == original["id"] == revised["goalId"]
+    assert objective_scope(goal)["summary"] == new_scope
+    assert objective_scope(goal) != objective_scope(original)
+    assert goal["constraints"]["milestoneSpec"]["todos"][0]["intent"].find(new_scope) >= 0
+    assert all(row["status"] == "cancelled" for row in work.list_todos(SAVE) if row["id"] in original_ids)
+    assert all(new_scope in row["intent"] for row in work.list_todos(SAVE) if row["status"] == "pending")
+    snapshot = {"worldRevision": 90, "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 16}}}
+    context = build_decision_context(snapshot, work=work.overview(SAVE))
+    assert context["goals"][0]["scope"]["summary"] == new_scope
+    assert context["goals"][0]["scope"]["revision"] == goal["epoch"]
+    # Repeating the saved range changes neither its semantic fingerprint nor child ids.
+    again = store.revise(SAVE, node["id"], summary=new_scope, work_store=work, game_date=date)
+    assert again["todoIds"] == revised["todoIds"]
+    assert objective_scope(work.list_goals(SAVE)[0]) == objective_scope(goal)
+    work.revise_goal(SAVE, goal["id"], project={"summary": "仅记录下次路线", "phase": "observe"})
+    assert objective_scope(work.list_goals(SAVE)[0]) == objective_scope(goal)
+
+
+@pytest.mark.parametrize("target_day", [11, 20])
+def test_revise_custom_preparation_replaces_water_scope_on_same_goal(tmp_path, target_day):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="农场浇水安排", summary="浇完80格作物",
+                         target_date=f"1:spring:{target_day}", preparation=["water"])
+    original = store.adopt(SAVE, node["id"], planned_count=80,
+                           terms_note="只浇水和必要补水", work_store=work)
+    work.create_plan(SAVE, original["goalId"], [{"id": "old-water", "title": "旧浇水批次",
+                                               "steps": [{"operation": "water_auto"}]}])
+    revised = store.revise(SAVE, node["id"], title="播种并照料候选地块",
+                           summary="尝试播种19格防风草并浇水", planned_count=19,
+                           terms_note="播种并浇水，已种过的跳过；不出售、不采购",
+                           preparation=["plant", "water", "plant"], work_store=work, game_date=DATE_11)
+    assert revised["goalId"] == original["goalId"]
+    assert [prep["key"] for prep in revised["prepItems"]] == ["plant", "water"]
+    assert set(revised["todoIds"]) == {"plant", "water"}
+    assert set(revised["todoIds"].values()).isdisjoint(original["todoIds"].values())
+    assert len(work.list_goals(SAVE)) == 1
+    goal = work.list_goals(SAVE)[0]
+    assert "播种并照料候选地块" in goal["text"]
+    assert objective_scope(goal)["preparation"] == ["plant", "water"]
+    assert objective_scope(goal)["plannedCount"] == 19
+    assert "只浇水" not in goal["constraints"]["termsNote"]
+    todos = work.list_todos(SAVE)
+    assert all(row["status"] == "cancelled" for row in todos if row["id"] in original["todoIds"].values())
+    assert all("只浇水" not in row["intent"] for row in todos if row["status"] == "pending")
+    assert work.list_tasks(SAVE)[0]["status"] == "cancelled"
+    due = work.evaluate_todos(SAVE, snapshot=None, game_date=DATE_11)
+    assert len(due) == (2 if target_day == 11 else 0)
+    snapshot = {"worldRevision": 90, "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}}
+    context = build_decision_context(snapshot, work=work.overview(SAVE))
+    assert context["goals"][0]["scope"]["preparation"] == ["plant", "water"]
+    assert context["goals"][0]["scope"]["termsNote"] == revised["termsNote"]
+    again = store.revise(SAVE, node["id"], preparation=["plant", "water"], work_store=work)
+    assert again["todoIds"] == revised["todoIds"]
+    assert work.list_goals(SAVE)[0]["epoch"] == goal["epoch"]
+
+
+def test_revise_omitted_preparation_preserves_existing_items(tmp_path):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="浇水", summary="旧数量", target_date="1:spring:11", preparation=["water"])
+    original = store.adopt(SAVE, node["id"], planned_count=80, work_store=work)
+    revised = store.revise(SAVE, node["id"], planned_count=19, work_store=work)
+    assert revised["prepItems"] == original["prepItems"]
+    assert revised["goalId"] == original["goalId"]
+    assert objective_scope(work.list_goals(SAVE)[0])["preparation"] == ["water"]
+
+
+def test_revise_empty_preparation_clears_old_todos_without_replacing_goal(tmp_path):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="浇水", target_date="1:spring:11", preparation=["water"])
+    original = store.adopt(SAVE, node["id"], work_store=work)
+    revised = store.revise(SAVE, node["id"], preparation=[], work_store=work)
+    assert revised["prepItems"] == [] and revised["todoIds"] == {}
+    assert revised["goalId"] == original["goalId"]
+    assert len(work.list_goals(SAVE)) == 1
+    assert objective_scope(work.list_goals(SAVE)[0])["preparation"] == []
+    assert all(row["status"] == "cancelled" for row in work.list_todos(SAVE))
+    assert work.evaluate_todos(SAVE, snapshot=None, game_date=DATE_11) == []
+
+
+@pytest.mark.parametrize("catalogue", [False, True])
+def test_revise_invalid_or_catalogue_preparation_preserves_saved_scope(tmp_path, catalogue):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node_id = STRAWBERRY_ID if catalogue else store.propose(
+        SAVE, title="浇水", target_date="1:spring:11", preparation=["water"])["id"]
+    original = store.adopt(SAVE, node_id, work_store=work, game_date=DATE_11)
+    before = work.list_goals(SAVE)
+    with pytest.raises(MilestoneError, match="preparation"):
+        store.revise(SAVE, node_id, summary="不能保存的范围", preparation=["plant"] if catalogue else ["fly"], work_store=work)
+    assert store.list_nodes(SAVE)[0] == original
+    assert work.list_goals(SAVE) == before
+
+
+def test_failed_adoption_or_revision_does_not_accept_new_scope(tmp_path, monkeypatch):
+    work = _work_store(tmp_path)
+    store = _store(tmp_path)
+    node = store.propose(SAVE, title="菜地", summary="只种包内", target_date="1:spring:16", preparation=["plant"])
+    adopted = store.adopt(SAVE, node["id"], work_store=work)
+    goal_before = work.list_goals(SAVE)[0]
+    with pytest.raises(MilestoneError) as rejected:
+        store.adopt(SAVE, node["id"], terms_note="新增箱内", work_store=work)
+    assert rejected.value.details == {
+        "saved": False, "nodeId": node["id"], "currentStatus": "adopted",
+        "recommendedAction": "revise", "acceptedFields": ["node_id", "title", "summary", "target_date",
+                                                               "reserved_funds", "planned_count", "terms_note", "preparation", "execution_scope"],
+    }
+    def reject_sync(*args, **kwargs):
+        raise WorkStateError("write refused")
+    monkeypatch.setattr(work, "sync_milestone_work", reject_sync)
+    with pytest.raises(MilestoneError) as failed:
+        store.revise(SAVE, node["id"], summary="包内与箱内全部种", preparation=["production"], work_store=work)
+    assert failed.value.details["saved"] is False
+    assert store.list_nodes(SAVE)[0] == adopted
+    assert work.list_goals(SAVE)[0] == goal_before
+
+
+def test_scope_revision_preserves_dispatched_command_for_reconciliation(tmp_path):
+    work = _work_store(tmp_path)
+    store = _store(tmp_path)
+    node = store.propose(SAVE, title="菜地", summary="旧范围", target_date="1:spring:16", preparation=["plant"])
+    node = store.adopt(SAVE, node["id"], work_store=work)
+    work.begin_decision(SAVE, "old-choice")
+    work.submit_plan(SAVE, goal_id=node["goalId"], decision_token="old-choice", tasks=[{"id": "old", "title": "旧批次", "steps": [
+        {"id": "first", "operation": "water_auto"}, {"id": "later", "operation": "water_auto"},
+    ]}])
+    assert work.claim_next_step(SAVE, "worker", game_date={"year": 1, "season": "spring", "day": 16})
+    work.assign_command_id(SAVE, "old", "first", "native-in-flight")
+    store.revise(SAVE, node["id"], summary="新范围", preparation=["water"], work_store=work)
+    task = work.list_tasks(SAVE)[0]
+    assert task["status"] == "cancelled"
+    assert task["steps"][0]["status"] == "unknown"
+    assert task["steps"][0]["command_id"] == "native-in-flight"
+    assert task["steps"][1]["status"] == "cancelled"
+    assert work.claim_next_step(SAVE, "another") is None
+
+
+def test_explicit_candidates_persist_canonically_and_distinguish_proposals(tmp_path):
+    store = _store(tmp_path)
+    fields = dict(title="同一批候选", target_date="1:spring:11", preparation=["plant", "water"])
+    node = store.propose(SAVE, **fields, execution_scope={"locationId": " Farm ",
+                         "tiles": [[66, 23], {"x": 62, "y": 27}, [66, 23]]})
+    canonical = {"locationId": "Farm", "tiles": [{"x": 62, "y": 27}, {"x": 66, "y": 23}]}
+    assert node["executionScope"] == canonical
+    assert wire_node(CompanionMilestoneStore(store.state_path).list_nodes(SAVE)[0])["executionScope"] == canonical
+    assert store.propose(SAVE, **fields, execution_scope=canonical)["id"] == node["id"]
+    assert store.propose(SAVE, **fields, execution_scope={"locationId": "Farm", "tiles": [[65, 18]]})["id"] != node["id"]
+
+
+@pytest.mark.parametrize("target_day", [11, 20])
+def test_only_candidate_coordinates_revision_changes_same_goal_and_wake_material(tmp_path, target_day):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="固定候选播种", summary="只处理这批候选", target_date=f"1:spring:{target_day}",
+                         preparation=["plant", "water"], execution_scope={"locationId": "Farm", "tiles": [[62, 27], [66, 23]]})
+    old = store.adopt(SAVE, node["id"], planned_count=19, work_store=work)
+    old_goal = work.list_goals(SAVE)[0]
+    new_scope = {"locationId": "Farm", "tiles": [{"x": 62, "y": 27}, {"x": 65, "y": 18}]}
+    revised = store.revise(SAVE, node["id"], execution_scope=new_scope, work_store=work)
+    goal = work.list_goals(SAVE)[0]
+    assert goal["id"] == old_goal["id"] == revised["goalId"] and len(work.list_goals(SAVE)) == 1
+    assert objective_scope(goal)["executionScope"] == new_scope
+    assert objective_scope(goal) != objective_scope(old_goal)
+    assert set(revised["todoIds"].values()).isdisjoint(old["todoIds"].values())
+    assert all(row["status"] == "cancelled" for row in work.list_todos(SAVE) if row["id"] in old["todoIds"].values())
+    assert len(work.evaluate_todos(SAVE, snapshot=None, game_date=DATE_11)) == (2 if target_day == 11 else 0)
+    again = store.revise(SAVE, node["id"], execution_scope={"locationId": "Farm", "tiles": [[65, 18], [62, 27], [65, 18]]}, work_store=work)
+    assert again["todoIds"] == revised["todoIds"]
+    assert work.list_goals(SAVE)[0]["epoch"] == goal["epoch"]
+    store.revise(SAVE, node["id"], summary="仍是同批", work_store=work)
+    assert objective_scope(work.list_goals(SAVE)[0])["executionScope"] == new_scope
+    cleared = store.revise(SAVE, node["id"], execution_scope={}, work_store=work)
+    assert "executionScope" not in wire_node(cleared)
+    assert "executionScope" not in objective_scope(work.list_goals(SAVE)[0])
+    empty = store.revise(SAVE, node["id"], execution_scope={"locationId": "Farm", "tiles": []}, work_store=work)
+    assert empty["executionScope"] == {"locationId": "Farm", "tiles": []}
+
+
+@pytest.mark.parametrize("scope", [[], {"tiles": []}, {"locationId": "Farm"},
+                                  {"locationId": "", "tiles": []},
+                                  {"locationId": "Farm", "tiles": [[True, 1]]},
+                                  {"locationId": "Farm", "tiles": [[1.2, 3]]},
+                                  {"locationId": "Farm", "tiles": [[1]]}])
+def test_invalid_execution_scope_never_changes_saved_goal(tmp_path, scope):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="菜地", target_date="1:spring:11", preparation=["plant"])
+    node = store.adopt(SAVE, node["id"], work_store=work)
+    before = work.list_goals(SAVE)
+    with pytest.raises(MilestoneError, match="execution_scope"):
+        store.revise(SAVE, node["id"], summary="不能接下的新范围", execution_scope=scope, work_store=work)
+    assert store.list_nodes(SAVE)[0] == node
+    assert work.list_goals(SAVE) == before
+
+
+def test_node_write_failure_does_not_dispatch_new_scope_or_cancel_old_work(tmp_path, monkeypatch):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="菜地", target_date="1:spring:11", preparation=["water"])
+    node = store.adopt(SAVE, node["id"], work_store=work)
+    before = asdict(work.state(SAVE))
+    monkeypatch.setattr(store, "_write_unlocked", lambda: (_ for _ in ()).throw(OSError("node disk")))
+    with pytest.raises(OSError, match="node disk"):
+        store.revise(SAVE, node["id"], preparation=["plant", "water"],
+                     execution_scope={"locationId": "Farm", "tiles": [[62, 27]]}, work_store=work)
+    assert store.list_nodes(SAVE)[0] == node
+    assert asdict(work.state(SAVE)) == before
+    assert asdict(WorkStore(work.state_path).state(SAVE)) == before
+
+
+def test_work_write_failure_reports_saved_node_and_retries_same_goal(tmp_path, monkeypatch):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="菜地", target_date="1:spring:11", preparation=["water"])
+    node = store.adopt(SAVE, node["id"], work_store=work)
+    old_goal = work.list_goals(SAVE)[0]
+    original_write = work._write_unlocked
+    monkeypatch.setattr(work, "_write_unlocked", lambda: (_ for _ in ()).throw(OSError("work disk")))
+    with pytest.raises(MilestoneError) as failed:
+        store.revise(SAVE, node["id"], preparation=["plant", "water"],
+                     execution_scope={"locationId": "Farm", "tiles": [[62, 27]]}, work_store=work)
+    assert failed.value.details["saved"] is True and failed.value.details["nodeSaved"] is True
+    assert failed.value.details["executionSynced"] is False
+    persisted = store.list_nodes(SAVE)[0]
+    assert persisted["executionScope"]["tiles"] == [{"x": 62, "y": 27}]
+    assert work.list_goals(SAVE)[0] == old_goal
+    monkeypatch.setattr(work, "_write_unlocked", original_write)
+    repaired = store.revise(SAVE, node["id"], work_store=work)
+    assert repaired["goalId"] == old_goal["id"] and len(work.list_goals(SAVE)) == 1
+    assert objective_scope(work.list_goals(SAVE)[0])["executionScope"] == persisted["executionScope"]
+
+
+def test_synchronized_adopt_and_revise_write_canonical_node_once(tmp_path, monkeypatch):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    node = store.propose(SAVE, title="菜地", target_date="1:spring:11", preparation=["plant"])
+    original_write = store._write_unlocked
+    writes = []
+    def write_once():
+        writes.append(True)
+        if len(writes) > 1:
+            raise OSError("unexpected second node write")
+        original_write()
+    monkeypatch.setattr(store, "_write_unlocked", write_once)
+    node = store.adopt(SAVE, node["id"], work_store=work)
+    assert len(writes) == 1
+    writes.clear()
+    revised = store.revise(SAVE, node["id"], execution_scope={"locationId": "Farm", "tiles": [[62, 27]]}, work_store=work)
+    assert len(writes) == 1
+    assert store.list_nodes(SAVE)[0]["goalId"] == revised["goalId"] == node["goalId"]
+    assert objective_scope(work.list_goals(SAVE)[0])["executionScope"] == revised["executionScope"]
+
+
+def test_completed_partial_work_can_revise_same_node_to_tomorrow_water(tmp_path):
+    work, store = _work_store(tmp_path), _store(tmp_path)
+    scope = {"locationId": "Farm", "tiles": [[62, 27], [66, 23]]}
+    node = store.propose(SAVE, title="同一批播种", target_date="1:spring:11", preparation=["plant", "water"], execution_scope=scope)
+    node = store.adopt(SAVE, node["id"], work_store=work)
+    work.begin_decision(SAVE, "plant", goal_scope=node["goalId"])
+    job = work.submit_plan(SAVE, goal_id=node["goalId"], decision_token="plant", tasks=[{
+        "title": "播种两格", "steps": [{"operation": "plant_seeds", "params": {"location": "Farm", "tiles": scope["tiles"]}}]}])
+    task = job["tasks"][0]
+    step = task["steps"][0]
+    work.claim_next_step(SAVE, "worker", game_date=DATE_11)
+    work.assign_command_id(SAVE, task["id"], step["id"], "actual-plant")
+    work.commit_step_result(SAVE, task_id=task["id"], step_id=step["id"], command_id="actual-plant", outcome="completed")
+    work.complete_goal(SAVE, node["goalId"])
+    revised = store.revise(SAVE, node["id"], title="明日照料同批", target_date="1:spring:12", preparation=["water"], work_store=work)
+    assert revised["id"] == node["id"] and revised["goalId"] == node["goalId"]
+    assert len(work.list_goals(SAVE)) == 1 and work.list_goals(SAVE)[0]["status"] == "active"
+    assert objective_scope(work.list_goals(SAVE)[0])["executionScope"] == node["executionScope"]
+    assert work.evaluate_todos(SAVE, snapshot=None, game_date=DATE_11) == []

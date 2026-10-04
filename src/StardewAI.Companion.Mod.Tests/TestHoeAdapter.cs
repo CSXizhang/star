@@ -39,9 +39,9 @@ public sealed class TestHoeAdapter : IHoeAdapter
             return HoeTileResult.Failed("Hoe operation rejected: must execute on main thread.");
         }
 
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
-            return HoeTileResult.Failed($"Location mismatch: current '{_observer.CurrentLocationName}', target '{locationName}'.");
+            return HoeTileResult.Failed($"Location mismatch: companion '{actor.LocationName}', target '{locationName}'.");
         }
 
         if (actor.Hoe is null)

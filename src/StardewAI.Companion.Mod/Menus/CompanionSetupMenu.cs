@@ -10,7 +10,7 @@ namespace StardewAI.Companion.Mod.Menus;
 /// Initial companion setup wizard (single-screen).
 /// Shown on first interaction or when the player reopens it from the life menu.
 /// Allows setting companion name, play-style, personality, care frequency, and
-/// reviewing the daily spend limit.
+/// reviewing the current work mode.
 ///
 /// Layout inherits the same conventions as <see cref="CompanionCommandMenu"/>:
 /// <see cref="IClickableMenu"/>, game-native TextBox, self-drawn buttons,
@@ -26,10 +26,9 @@ public sealed class CompanionSetupMenu : IClickableMenu
 
     private static readonly (string Key, string Label, string Tooltip)[] PlayStyles = new[]
     {
-        ("earn",      "优先赚钱",            "收获出货、按需补种，遵守每日购买上限"),
-        ("workhorse", "任劳任怨",            "浇水除草收获、喂动物、收机器成品等日常杂务"),
-        ("community", "社区献祭",  "商量方案，确认可帮忙的准备与需你完成的部分"),
-        ("decor",     "农场装修",  "商量方案，确认可帮忙的准备与需你完成的部分"),
+        ("earn",      "优先赚钱",            "收获出货、按需补种"),
+        ("workhorse", "帮助干活",            "浇水除草收获、喂动物、收机器成品等日常杂务"),
+        ("decor",     "装修农场",  "安排布局、布置与清理"),
     };
 
     private static readonly (string Key, string Label)[] Personalities = new[]
@@ -64,7 +63,6 @@ public sealed class CompanionSetupMenu : IClickableMenu
     private string _playStyle;
     private string _personality;
     private string _careFrequency;
-    private readonly int _dailySpendLimit;
     private readonly string _currentWorkMode;
     private readonly LifeMenuUiState? _liveState;
     private bool _draftTouched;   // user edited the draft before/while the profile reply was pending
@@ -108,7 +106,6 @@ public sealed class CompanionSetupMenu : IClickableMenu
         string playStyle,
         string personality,
         string careFrequency,
-        int dailySpendLimit,
         string currentWorkMode,
         LifeMenuUiState? liveState,
         Action<string, string, string, string> onSave,
@@ -124,7 +121,6 @@ public sealed class CompanionSetupMenu : IClickableMenu
         _playStyle = playStyle;
         _personality = personality;
         _careFrequency = careFrequency;
-        _dailySpendLimit = dailySpendLimit;
         _currentWorkMode = currentWorkMode;
         _liveState = liveState;
         _onSave = onSave ?? throw new ArgumentNullException(nameof(onSave));
@@ -363,33 +359,25 @@ public sealed class CompanionSetupMenu : IClickableMenu
                 _careFreqRects[i].Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
         }
 
-        // Daily spend limit (read-only display)
-        int limitY = yPositionOnScreen + 378;
-        string limitLabel = _dailySpendLimit > 0
-            ? $"每日购买上限：{_dailySpendLimit} 金（可在 F8 设置中修改）"
-            : "每日购买上限：未设置（可在 F8 设置中修改）";
-        b.DrawString(Game1.smallFont, limitLabel,
-            new Vector2(xPositionOnScreen + 24, limitY), Color.DimGray);
-
         // Work-mode note
         string modeNote = _currentWorkMode == "free"
-            ? "当前：自由模式已开启"
-            : "当前：指令模式";
+            ? "空闲时：主动帮忙"
+            : "空闲时：等你安排";
         b.DrawString(Game1.smallFont, modeNote,
-            new Vector2(xPositionOnScreen + 24, limitY + 28), Color.DimGray);
+            new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 378), Color.DimGray);
 
         // Loading gate: profile.state has not arrived yet — saving would overwrite
         // the stored settings with the default form values.
         if (!ProfileLoaded)
         {
             b.DrawString(Game1.smallFont, "正在加载现有伙伴设置… 到达前请勿保存。",
-                new Vector2(xPositionOnScreen + 24, limitY + 56), Color.DarkOrange);
+                new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 406), Color.DarkOrange);
         }
 
         // Action buttons
         int mx = Game1.getOldMouseX(), my = Game1.getOldMouseY();
 
-        DrawButton(b, _startButtonRect, ProfileLoaded ? "保存并商量" : "加载中…",
+        DrawButton(b, _startButtonRect, ProfileLoaded ? "保存并返回" : "加载中…",
             ProfileLoaded ? Color.ForestGreen : Color.Gray,
             ProfileLoaded && _startButtonRect.Contains(mx, my));
 
@@ -399,16 +387,6 @@ public sealed class CompanionSetupMenu : IClickableMenu
 
         DrawButton(b, _skipButtonRect, "跳过",
             Color.SlateGray, _skipButtonRect.Contains(mx, my));
-
-        // Tooltip for planning styles
-        if (_playStyle is "community" or "decor")
-        {
-            int ttY = yPositionOnScreen + height - 104;
-            b.DrawString(Game1.smallFont, "提示：献祭/装修为商量方案，确认可帮忙的准备与需你完成的部分；",
-                new Vector2(xPositionOnScreen + 24, ttY), Color.DarkOrange);
-            b.DrawString(Game1.smallFont, "实际放置与献祭由你完成，伙伴说明能帮的部分。",
-                new Vector2(xPositionOnScreen + 24, ttY + 22), Color.DarkOrange);
-        }
 
         drawMouse(b);
     }

@@ -26,6 +26,8 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
     private const int MaxReplansPerTarget = 3;
     private const long MaxMonotonicTicks = 3600;
     private const int ActionDurationTicks = 8;
+    private const int MinToolAnimationTicks = 18;
+    private const int MaxToolAnimationTicks = 90;
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -45,12 +47,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
     private int _replanCount;
     private int _actionTicks;
     private bool _actionEffectExecuted;
+    private bool _nativeToolAnimation;
     private NativeActionStepResult? _lastStepResult;
+    private string? _firstPreconditionMessage;
 
     private readonly List<NativeActionEffect> _completed = new();
     private readonly List<NativeActionEffect> _skipped = new();
     private readonly List<NativeActionEffect> _failed = new();
     private float _staminaUsed;
+    private int _totalCost;
     private int _waterUsed;
     private long _elapsedTicks;
     private int _startClock;
@@ -136,12 +141,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             _skipped.Clear();
             _failed.Clear();
             _staminaUsed = 0f;
+            _totalCost = 0;
             _waterUsed = 0;
             _elapsedTicks = 0;
             _replanCount = 0;
             _actionTicks = 0;
             _actionEffectExecuted = false;
+            _nativeToolAnimation = false;
             _lastStepResult = null;
+            _firstPreconditionMessage = null;
             _playerActionRequired = false;
             _startClock = _observer.TimeOfDay;
             _cancelRequested = false;
@@ -162,7 +170,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             // on the companion, which may have navigated into a different interior.
             string companionLocation = _actor.LocationName;
             bool sameMap = string.Equals(companionLocation, request.LocationId, StringComparison.OrdinalIgnoreCase);
-            bool selfTargeted = request.Kind == NativeActionKind.FeedAnimals;
+            bool selfTargeted = request.Kind is NativeActionKind.FeedAnimals or NativeActionKind.BuildBuilding or NativeActionKind.UpgradeBuilding or NativeActionKind.PurchaseAnimal;
             if (!sameMap && !selfTargeted)
             {
                 CurrentState = ExecutionState.Rejected;
@@ -235,6 +243,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         lock (_stateLock)
         {
             if (!IsExecuting) return;
+            if (IsPaused && _cancelRequested)
+            {
+                FinishExecution(ExecutionState.Cancelled, _cancelReason ?? "Cancelled by request.", "CANCELLED");
+                return;
+            }
             if (IsPaused) return;
 
             if (_pauseRequested && CurrentState is ExecutionState.Navigating or ExecutionState.Facing or ExecutionState.Preparing)
@@ -405,8 +418,20 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         _actionTicks = 0;
         _actionEffectExecuted = false;
         _lastStepResult = null;
-
-
+        _nativeToolAnimation = false;
+        if (_currentRequest!.Kind == NativeActionKind.EatFood && _actor is FarmerMechanicsActor eatingActor)
+        {
+            try { eatingActor.BeginEating(_currentRequest.ItemId); _nativeToolAnimation = true; }
+            catch (Exception ex) { eatingActor.EndUsingTool(); Log($"Eating animation unavailable: {ex.Message}", LogLevel.Warn); }
+            CurrentState = ExecutionState.Acting;
+            return;
+        }
+        var animationTool = _adapter.GetAnimationTool(_actor, _currentRequest!, _currentTarget);
+        if (animationTool is not null)
+        {
+            try { _actor.BeginUsingTool(animationTool); _nativeToolAnimation = true; }
+            catch (Exception ex) { _actor.EndUsingTool(); Log($"{animationTool} animation unavailable: {ex.Message}", LogLevel.Warn); }
+        }
         CurrentState = ExecutionState.Acting;
     }
 
@@ -437,9 +462,13 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
     private void HandleActing(GameTime? time, long tickCount)
     {
         _actionTicks++;
+        var phase = _nativeToolAnimation ? _actor.UpdateToolAnimation(time, tickCount) : ToolAnimationPhase.None;
 
 
-        if (!_actionEffectExecuted && _actionTicks >= ActionDurationTicks / 2)
+        bool effectDue = _nativeToolAnimation
+            ? phase is ToolAnimationPhase.EffectPoint or ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks / 2
+            : _actionTicks >= ActionDurationTicks / 2;
+        if (!_actionEffectExecuted && effectDue)
         {
             _actionEffectExecuted = true;
             _lastStepResult = _adapter.Execute(_actor, _currentRequest!, _currentTarget);
@@ -450,11 +479,16 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             // exactly what the round consumed. Settled here once, Verifying
             // never adds it again.
             _staminaUsed += _lastStepResult.StaminaCost;
+            _totalCost += _lastStepResult.TotalCost;
             _waterUsed += _lastStepResult.WaterUsed;
         }
 
-        if (_actionTicks >= ActionDurationTicks)
+        bool finished = _nativeToolAnimation
+            ? _actionTicks >= MinToolAnimationTicks && (phase == ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks)
+            : _actionTicks >= ActionDurationTicks;
+        if (finished)
         {
+            if (_nativeToolAnimation) { _actor.EndUsingTool(); _nativeToolAnimation = false; }
             CurrentState = ExecutionState.Verifying;
         }
     }
@@ -474,10 +508,19 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             // (see HandleActing); this stage only records the per-target effect.
             _completed.Add(new NativeActionEffect(targetLabel, result.State, null, result.ItemId, result.ItemCount, _currentTarget.Tile));
             EmitProgress("verifying", result.State);
+            // Water tiles are alternative refill sources, not separate jobs.
+            // Once the native adapter confirms a refill, the whole request is satisfied.
+            if (_currentRequest!.Kind == NativeActionKind.RefillWateringCan)
+            {
+                _currentTargetIndex++;
+                FinishExecution(ExecutionState.Succeeded, null, null);
+                return;
+            }
         }
         else if (result.PreconditionFailed)
         {
             _skipped.Add(new NativeActionEffect(targetLabel, "skipped", result.SkipReason, result.ItemId, 0, _currentTarget.Tile));
+            _firstPreconditionMessage ??= result.ErrorMessage;
             _playerActionRequired |= result.PlayerActionRequired;
             EmitProgress("waiting", result.SkipReason);
         }
@@ -548,7 +591,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         if (unfulfilledSkip is not null)
         {
             errorCode = unfulfilledSkip.Reason ?? "PRECONDITION_FAILED";
-            errorMessage = $"Precondition not satisfied: {unfulfilledSkip.Reason}.";
+            errorMessage = _firstPreconditionMessage ?? $"Precondition not satisfied: {unfulfilledSkip.Reason}.";
             return _completed.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Rejected;
         }
 
@@ -608,7 +651,8 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             errorCode: errorCode ?? (_failed.Count > 0 ? "TARGET_FAILED" : null),
             retryRecommended: false,
             playerActionRequired: _playerActionRequired,
-            progress: _lastProgress
+            progress: _lastProgress,
+            totalCost: _totalCost
         );
 
         FinalResult = result;

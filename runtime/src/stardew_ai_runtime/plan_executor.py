@@ -31,7 +31,13 @@ from typing import Any
 
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 
-from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+from stardew_ai_runtime.job_feedback import compact_job_feedback
+from stardew_ai_runtime.work_state import (
+    READ_ONLY_OPERATIONS,
+    WorkStateError,
+    WorkStore,
+    bind_execution_scope_params,
+)
 
 logger = logging.getLogger("stardew_ai_runtime.plan_executor")
 
@@ -146,7 +152,7 @@ class StepExecution:
         return payload
 
 
-def classify_step_outcome(result: Any) -> tuple[str, str | None]:
+def classify_step_outcome(result: Any, operation: str | None = None) -> tuple[str, str | None]:
     """Map a real operation result to the unified outcome enum."""
     if not isinstance(result, dict) or not result:
         return "unknown", "INVALID_TOOL_RESULT"
@@ -175,6 +181,34 @@ def classify_step_outcome(result: Any) -> tuple[str, str | None]:
         return "completed", "NO_WORK"
     if terminal == "succeeded" or status == "completed":
         return "completed", reason
+    if operation in READ_ONLY_OPERATIONS:
+        if result.get("error") or status in {"error", "missing", "unknown", "unavailable"} or terminal:
+            return "unknown", reason or "OBSERVATION_UNAVAILABLE"
+        if status == "ok":
+            return "completed", None
+        # Snapshot and wiki readers return data without an action terminal/status.
+        # Require their documented payload, rather than accepting arbitrary dicts.
+        payloads = {
+            "get_status": ("companion", dict),
+            "query_farm_work": ("farmWork", dict),
+            "query_inventory": ("inventory", dict),
+            "query_chests": ("chests", list),
+            "query_planting_options": ("regions", list),
+            "get_work_overview": ("tasks", list),
+            "query_wiki": ("results", list),
+            "observe_building_services": ("animalService", dict),
+            "observe_production": ("groundItems", list),
+            "observe_farming_helpers": ("groundItems", list),
+            "observe_crafting": ("recipes", list),
+            "observe_farm_space": ("rows", list),
+            "observe_machines": ("machines", list),
+            "observe_livestock": ("buildings", list),
+        }
+        field_name, field_type = payloads.get(operation, ("", dict))
+        if not status and isinstance(result.get(field_name), field_type):
+            return "completed", None
+        if not status and operation == "query_planting_options" and isinstance(result.get("candidateTiles"), (dict, list)):
+            return "completed", None
     return "unknown", reason or "UNRECOGNIZED_TOOL_RESULT"
 
 
@@ -199,20 +233,22 @@ def normalise_native_result(
     terminal = native.get("terminalState")
     if not terminal:
         return None, None, [], None
+    error = native.get("error")
+    native_reason = native.get("reasonCode") or (error.get("code") if isinstance(error, dict) else None)
     if terminal == "succeeded":
         outcome, reason = "completed", None
     elif terminal in {"partially-succeeded", "partial"}:
-        outcome, reason = "partial", "RECONCILED_PARTIAL"
+        outcome, reason = "partial", native_reason or "RECONCILED_PARTIAL"
     elif terminal in {"failed", "rejected"}:
-        outcome, reason = "partial", "RECONCILED_FAILED"
+        outcome, reason = "partial", native_reason or "RECONCILED_FAILED"
     elif terminal in {"cancelled", "canceled"}:
-        outcome, reason = "cancelled", "RECONCILED_CANCELLED"
+        outcome, reason = "cancelled", native_reason or "RECONCILED_CANCELLED"
     else:
         return None, None, [], None
     effects = native.get("effects")
     if not isinstance(effects, list):
         effects = []
-    revision = native.get("worldRevision")
+    revision = native.get("finalWorldRevision", native.get("worldRevision"))
     if not isinstance(revision, int):
         revision = None
     return outcome, reason, effects, revision
@@ -325,6 +361,7 @@ class PlanExecutor:
                     reason_code=reason,
                     snapshot_revision=revision,
                     command_id=previous_id,
+                    feedback=compact_job_feedback(native, operation=step.operation, status=outcome, params=claim.get("params") or {}),
                 )
                 step.command_id = previous_id
                 step.outcome = outcome
@@ -347,6 +384,7 @@ class PlanExecutor:
                 save_id, task_id=claim["taskId"], step_id=claim["stepId"],
                 outcome=outcome, effects=effects, reason_code=reason,
                 snapshot_revision=revision, command_id=previous_id,
+                feedback=compact_job_feedback(native, operation=step.operation, status=outcome, params=claim.get("params") or {}),
             )
             step.command_id, step.outcome, step.reason_code = previous_id, outcome, reason
             step.effects, step.snapshot_revision = effects, revision
@@ -365,7 +403,11 @@ class PlanExecutor:
             return StepExecution(status="idle", recovery_decisions=decisions)
 
         try:
-            result = await self.dispatch(claim["operation"], claim.get("params") or {}, command_id)
+            goal = next((goal for goal in state.goals if goal.id == claim.get("goalId")), None)
+            dispatch_params = bind_execution_scope_params(
+                claim["operation"], claim.get("params") or {}, goal.constraints if goal else {},
+            )
+            result = await self.dispatch(claim["operation"], dispatch_params, command_id)
         except DispatchDeferred:
             self.store.release_unstarted_claim(save_id, claim["taskId"], claim["stepId"], worker_id, command_id)
             return StepExecution(status="idle", recovery_decisions=decisions)
@@ -387,11 +429,11 @@ class PlanExecutor:
         if wait_condition is not None:
             return self._park_for_wait(save_id, step, command_id, wait_condition, result)
 
-        outcome, reason = classify_step_outcome(result)
+        outcome, reason = classify_step_outcome(result, step.operation)
         effects = result.get("effects") if isinstance(result, dict) else None
-        revision = result.get("snapshotRevision") if isinstance(result, dict) else None
-        if revision is None and isinstance(result, dict) and isinstance(result.get("worldRevision"), int):
-            revision = result.get("worldRevision")
+        revision = next((result[key] for key in (
+            "finalWorldRevision", "worldRevision", "snapshotRevision",
+        ) if isinstance(result.get(key), int)), None) if isinstance(result, dict) else None
         native_command_id = result.get("commandId") if isinstance(result, dict) else None
 
         committed = self.store.commit_step_result(
@@ -404,6 +446,7 @@ class PlanExecutor:
             snapshot_revision=revision,
             command_id=native_command_id or command_id,
             game_date=self._fresh_state()[1],
+            feedback=compact_job_feedback(result, operation=step.operation, status=outcome, params=claim.get("params") or {}),
         )
         step.outcome = outcome
         step.reason_code = reason
@@ -516,6 +559,7 @@ class PlanExecutor:
                 outcome="unknown" if transient else "partial",
                 reason_code=reason,
                 command_id=command_id,
+                game_date=self._fresh_state()[1],
             )
         except WorkStateError as commit_ex:
             logger.warning("Could not commit failed dispatch for %s: %s", step.step_id, commit_ex)

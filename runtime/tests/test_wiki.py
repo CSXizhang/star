@@ -116,3 +116,21 @@ def test_wiki_distinguishes_page_evidence_and_refreshes_query_time(tmp_path, mon
     cached = lookup.lookup("Egg Festival")
     assert cached["cached"] is True and cached["cachedAt"] == fresh["cachedAt"]
     assert cached["queriedAt"] >= fresh["queriedAt"]
+
+
+def test_exact_page_sections_reuse_one_read_and_reach_later_tables(tmp_path, monkeypatch):
+    calls = []
+    body = "Intro " * 2200 + "\n==Growth==\n6 days\n==Prices==\nSeed cost 40; base value 90"
+    def reply(request, **kwargs):
+        calls.append(request.full_url)
+        return _Resp(json.dumps({"parse": {"title": "Radish", "wikitext": {"*": body}}}).encode())
+    monkeypatch.setattr("stardew_ai_runtime.wiki.urllib.request.urlopen", reply)
+    wiki = WikiLookup(tmp_path / "wiki.json")
+    first = wiki.lookup("Radish", exact_page=True)
+    assert first["results"][0]["excerptTruncated"]
+    prices = wiki.lookup("radish", exact_page=True, section="Prices")
+    assert prices["cached"] and prices["results"][0]["sectionFound"]
+    assert "Seed cost 40" in prices["results"][0]["pageExcerpt"]
+    missing = wiki.lookup("Radish", exact_page=True, section="Unknown")
+    assert not missing["results"][0]["sectionFound"]
+    assert len(calls) == 1

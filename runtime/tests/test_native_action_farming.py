@@ -118,6 +118,9 @@ def _client(snapshot: Envelope | None = None) -> MagicMock:
 
 def test_native_action_parameter_contract() -> None:
     assert set(NATIVE_ACTION_SKILLS) == {
+        "inspect-machines", "inspect-production", "eat-food", "cut-grass",
+        "inspect-planting", "inspect-route", "inspect-livestock", "inspect-shop",
+        "inspect-building-services", "build-building", "upgrade-building", "purchase-animal",
         "inspect-location",
         "inspect-map-image",
         "inspect-crafting",
@@ -144,6 +147,18 @@ def test_native_action_parameter_contract() -> None:
         validate_native_action_parameters("clear-debris", {"locationId": "Farm", "tiles": [], "script": "x"})
     with pytest.raises(ProtocolError, match="locationId"):
         validate_native_action_parameters("clear-debris", {"tiles": []})
+
+
+@pytest.mark.parametrize("skill,parameters", [
+    ("inspect-route", {"locationId": "Farm", "tile": {"x": 12, "y": 8}}),
+    ("inspect-planting", {"locationId": "Farm", "region": {"x": 1, "y": 1, "width": 2, "height": 2}}),
+    ("inspect-livestock", {"locationId": "Coop"}),
+    ("inspect-shop", {"locationId": "SeedShop", "shopId": "SeedShop"}),
+])
+def test_native_inspection_parameter_allowlist(skill, parameters):
+    validate_native_action_parameters(skill, parameters)
+    with pytest.raises(ProtocolError, match="unsupported parameter"):
+        validate_native_action_parameters(skill, {**parameters, "dispatch": True})
 
 
 def test_create_execute_native_action_envelope_shape() -> None:
@@ -255,6 +270,28 @@ def test_scheduler_chop_tree_rejects_empty_tiles() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("operation", ["pickup_items", "cut_grass"])
+def test_scheduler_clearing_dispatch_preserves_route_order(
+    native_compatible_run_dir, operation: str
+) -> None:
+    import asyncio
+
+    async def run():
+        client = _client()
+        scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+        # The inner target must be visited after its blocking entry tile is removed.
+        tiles = [{"x": 6, "y": 7}, {"x": 6, "y": 6}, {"x": 6, "y": 7},
+                 {"x": 3, "y": 6}]
+        original = [dict(tile) for tile in tiles]
+        await getattr(scheduler, operation)(tiles=tiles, location_id="Farm")
+        sent = client.execute_native_action.await_args.kwargs
+        assert sent["skill_id"] == operation.replace("_", "-")
+        assert sent["parameters"]["tiles"] == [tiles[0], tiles[1], tiles[3]]
+        assert tiles == original
+
+    asyncio.run(run())
+
+
 def test_scheduler_refill_uses_snapshot_refill_tiles(native_compatible_run_dir) -> None:
     import asyncio
 
@@ -275,6 +312,7 @@ def test_scheduler_refill_without_observation_is_an_actionable_error() -> None:
 
     async def run():
         scheduler = CompanionScheduler(client=_client(_snapshot_env()))
+        scheduler.query_production = AsyncMock(return_value={"waterRefillTiles": [], "waterRefillMapComplete": True})
         with pytest.raises(SchedulerError, match="no native watering-can refill tile|farming"):
             await scheduler.refill_watering_can(location_id="Farm", max_tiles=2)
 
@@ -405,10 +443,17 @@ def test_scheduler_query_machines_and_livestock_projections() -> None:
             }
         )
         scheduler = CompanionScheduler(client=_client(snapshot))
-        machines = await scheduler.query_machines(location_id="Farm")
+        scheduler._execute_native_action = AsyncMock(return_value={"details": {"machines": {
+            **snapshot.payload["machines"], "locationId": "Shed"}}})
+        machines = await scheduler.query_machines(location_id="Shed")
+        scheduler._execute_native_action.assert_awaited_once_with("inspect-machines", {"locationId": "Shed"}, tiles=[])
+        assert machines["locationId"] == "Shed"
         assert machines["count"] == 2
         assert machines["readyCount"] == 1
+        scheduler._execute_native_action = AsyncMock(return_value={"details": {"livestock": {
+            **snapshot.payload["livestock"], "locationId": "Farm", "capturedRevision": 7}}})
         livestock = await scheduler.query_livestock()
+        scheduler._execute_native_action.assert_awaited_once_with("inspect-livestock", {"locationId": "Farm"}, tiles=[])
         assert livestock["buildingCount"] == 1
         assert livestock["animalCount"] == 1
         assert livestock["buildings"][0]["doorTile"] == {"x": 11, "y": 6}
@@ -421,7 +466,8 @@ def test_scheduler_query_machines_missing_section_is_explicit() -> None:
 
     async def run():
         scheduler = CompanionScheduler(client=_client(_snapshot_env()))
-        with pytest.raises(SchedulerError, match="machines"):
+        scheduler._execute_native_action = AsyncMock(return_value={"details": {"machines": {"locationId": "Shed", "items": []}}})
+        with pytest.raises(SchedulerError, match="requested map"):
             await scheduler.query_machines(location_id="Farm")
         with pytest.raises(SchedulerError, match="livestock"):
             await scheduler.query_livestock()
@@ -487,6 +533,25 @@ def test_plan_operation_allowlist_covers_native_actions_only() -> None:
         {"tiles", "fertilizer_item_id", "location_id"}
     )
     assert "script" not in _PLAN_OPERATION_CALLS["clear_debris"][1]
+
+
+def test_plan_animal_door_resolves_building_and_keeps_command_identity() -> None:
+    import asyncio
+    scheduler = CompanionScheduler(client=_client())
+    scheduler.query_livestock = AsyncMock(return_value={"buildings": [
+        {"indoorsName": "Coop_42", "buildingType": "Coop", "doorTile": {"x": 42, "y": 36}},
+    ]})
+    scheduler._execute_native_action = AsyncMock(return_value={"status": "executed"})
+    asyncio.run(scheduler.toggle_animal_door(building_name="Coop_42", command_id="door-command-1"))
+    args = scheduler._execute_native_action.call_args
+    assert args.args == ("toggle-animal-door", {"locationId": "Farm", "tiles": [{"x": 42, "y": 36}]})
+    assert args.kwargs["command_id"] == "door-command-1"
+    scheduler.query_livestock.return_value["buildings"].append(
+        {"indoorsName": "Coop_43", "buildingType": "Coop", "doorTile": {"x": 52, "y": 36}}
+    )
+    with pytest.raises(PolicyViolationError, match="one observed animal building"):
+        asyncio.run(scheduler.toggle_animal_door(building_name="Coop"))
+    assert scheduler._execute_native_action.call_count == 1
 
 
 def test_discover_capabilities_exposes_memory_write_schema(tmp_path: Path) -> None:

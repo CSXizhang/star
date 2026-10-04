@@ -24,10 +24,17 @@ def load_chat_backend_config(path: Path | None = None) -> dict[str, str]:
     target = path or config_path()
     try:
         raw: Any = json.loads(target.read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and raw.get("backend") in {"agy", "kimi", "codex"}:
-            defaults = {"kimi": DEFAULT_MODEL, "agy": "gemini-3.8-flash", "codex": ""}
+        if isinstance(raw, dict) and raw.get("backend") in {"agy", "kimi", "codex", "dsh", "mcode"}:
+            defaults = {"kimi": DEFAULT_MODEL, "agy": "gemini-3.8-flash", "codex": "", "dsh": "deepseek-flash",
+                        "mcode": ""}
             config = {"backend": str(raw["backend"]), "model": str(raw.get("model") or defaults[raw["backend"]])}
-            if raw.get("effort") in {"default", "low", "medium", "high"}:
+            if raw["backend"] in {"codex", "dsh", "mcode"}:
+                config["effort"] = "low"
+            allowed_efforts = ({"default", "off", "low", "high", "max"} if raw["backend"] == "dsh"
+                               else {"default", "low", "medium", "high", "xhigh", "max"} if raw["backend"] == "mcode"
+                               else {"default", "low", "medium", "high", "xhigh"} if raw["backend"] == "codex"
+                               else {"default", "low", "medium", "high"})
+            if raw.get("effort") in allowed_efforts:
                 config["effort"] = str(raw["effort"])
             if raw.get("agent"):
                 config["agent"] = str(raw["agent"])

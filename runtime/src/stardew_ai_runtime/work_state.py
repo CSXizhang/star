@@ -24,7 +24,7 @@ import os
 import time as _time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,13 @@ OUTCOMES = frozenset({"completed", "partial", "unknown", "cancelled", "failed"})
 # Plan steps may only reference these existing MCP operations. No shell, no code.
 ALLOWED_OPERATIONS = frozenset(
     {
+        "observe_building_services",
+        "observe_production",
+        "eat_food",
+        "cut_grass",
+        "build_building",
+        "upgrade_building",
+        "purchase_animal",
         "observe_farming_helpers",
         "observe_crafting",
         "observe_farm_space",
@@ -69,9 +76,11 @@ ALLOWED_OPERATIONS = frozenset(
         "query_inventory",
         "query_chests",
         "query_planting_options",
+        "query_route",
         "query_shop",
         "query_wiki",
         "water_zone",
+        "water_tiles",
         "water_auto",
         "harvest_auto",
         "deposit_to_chest",
@@ -82,7 +91,6 @@ ALLOWED_OPERATIONS = frozenset(
         "ship_items",
         "purchase_items",
         "navigate_to",
-        "plant_crop_workflow",
         "pause_task",
         "resume_task",
         "cancel_task",
@@ -90,6 +98,8 @@ ALLOWED_OPERATIONS = frozenset(
 )
 READ_ONLY_OPERATIONS = frozenset(
     {
+        "observe_building_services",
+        "observe_production",
         "observe_farming_helpers",
         "observe_crafting",
         "observe_farm_space",
@@ -112,6 +122,14 @@ TERMINAL_STEP_STATUSES = frozenset({"completed", "partial", "cancelled", "failed
 
 class WorkStateError(ValueError):
     """Invalid work-state mutation (validation failure)."""
+
+
+PLANT_WORKFLOW_PLAN_ERROR = json.dumps({
+    "errorCode": "COMPOSITE_STEP_UNSUPPORTED", "saved": False,
+    "execution": "not_started", "operation": "plant_crop_workflow",
+    "recommendedAction": "submit_plan",
+    "message": "未执行、未保存作业。plant_crop_workflow 是旧多阶段兼容接口，不能作为一个可对账的持久化步骤。请按已观察的种子、箱子和地块，拆成独立 withdraw_from_chest / hoe_tiles / plant_seeds / water_tiles 步骤；需要时在同一任务中加入导航。不同类型、地图和数量的合法原子操作仍可组合。",
+}, ensure_ascii=False)
 
 
 # Supported explicit waiting conditions. A waiting step is only re-claimable when
@@ -264,6 +282,7 @@ class Step:
     outcome: str | None = None
     reason_code: str | None = None
     effects: list[dict[str, Any]] = field(default_factory=list)
+    feedback: dict[str, Any] = field(default_factory=dict)
     lease_owner: str | None = None
     lease_until: float = 0.0
     attempts: int = 0
@@ -284,6 +303,7 @@ class Task:
     steps: list[Step] = field(default_factory=list)
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
+    decision_token: str | None = None
 
 
 @dataclass
@@ -324,6 +344,8 @@ class ExecutionEntry:
     snapshot_revision: int | None = None
     game_date: str | None = None
     at: str = field(default_factory=_now_iso)
+    location_id: str | None = None
+    game_time: int | None = None
 
 
 @dataclass
@@ -343,6 +365,49 @@ class SaveWorkState:
     last_settled_day: str | None = None
     # Completed/cancelled task facts archived by the day rollover. Bounded.
     archive: list[dict[str, Any]] = field(default_factory=list)
+    branch_failures: list[dict[str, Any]] = field(default_factory=list)
+
+
+# Retired engine allowance fields never become model instructions again. Player
+# prose and one-time reservedFunds remain untouched; archives keep source history.
+def _current_constraints(value: Any) -> Any:
+    retired = {"purchaseBudget", "dailyPurchaseBudget", "perPurchaseLimit", "daily_budget", "per_purchase_max"}
+    if isinstance(value, dict):
+        return {key: _current_constraints(item) for key, item in value.items() if key not in retired}
+    if isinstance(value, list):
+        return [_current_constraints(item) for item in value]
+    return value
+
+
+def bind_execution_scope_params(operation: str, params: dict[str, Any],
+                                goal_constraints: dict[str, Any] | None) -> dict[str, Any]:
+    """Project an accepted exact scope into auto selection without mutating a plan."""
+    result = dict(params)
+    if operation not in {"water_auto", "harvest_auto"}:
+        return result
+    objective = (goal_constraints or {}).get("objectiveScope")
+    scope = objective.get("executionScope") if isinstance(objective, dict) else None
+    if not isinstance(scope, dict):
+        return result
+    location = scope.get("locationId")
+    if not isinstance(location, str) or not location.strip():
+        raise WorkStateError("Saved executionScope requires an observed locationId")
+
+    def coordinates(value: Any) -> list[dict[str, int]]:
+        if not isinstance(value, list) or any(
+            not isinstance(tile, dict) or any(type(tile.get(key)) is not int or tile[key] < 0
+                                             for key in ("x", "y")) for tile in value
+        ):
+            raise WorkStateError("executionScope target tiles require non-negative integer x/y coordinates")
+        return [{"x": x, "y": y} for x, y in sorted({(tile["x"], tile["y"]) for tile in value})]
+
+    tiles = coordinates(scope.get("tiles"))
+    if result.get("target_tiles") is not None:
+        requested = {(tile["x"], tile["y"]) for tile in coordinates(result["target_tiles"])}
+        tiles = [tile for tile in tiles if (tile["x"], tile["y"]) in requested]
+    result["target_tiles"] = tiles
+    result["location_id"] = location
+    return result
 
 
 class WorkStore:
@@ -369,7 +434,8 @@ class WorkStore:
                 if not isinstance(value, dict):
                     continue
                 states[save_id] = SaveWorkState(
-                    goals=[Goal(**g) for g in value.get("goals", []) if isinstance(g, dict)],
+                    goals=[Goal(**{**g, "constraints": _current_constraints(g.get("constraints") or {})})
+                           for g in value.get("goals", []) if isinstance(g, dict)],
                     tasks=[
                         Task(
                             **{
@@ -401,6 +467,7 @@ class WorkStore:
                         else None
                     ),
                     archive=[a for a in value.get("archive", []) if isinstance(a, dict)],
+                    branch_failures=[b for b in value.get("branchFailures", []) if isinstance(b, dict)],
                 )
         except (TypeError, ValueError):
             states = {}
@@ -440,7 +507,7 @@ class WorkStore:
                 "tasks": [asdict(t) for t in state.tasks],
                 "todos": [asdict(t) for t in state.todos],
                 "executions": [asdict(e) for e in state.executions],
-                "notices": state.notices[-20:],
+                "notices": state.notices,
                 "paused": state.paused,
                 "schedulerEpoch": state.scheduler_epoch,
                 "decision": state.decision,
@@ -448,9 +515,17 @@ class WorkStore:
                 "lastSettledDay": state.last_settled_day,
                 # Bound the archived fact log so it never grows without limit.
                 "archive": state.archive[-200:],
+                "branchFailures": state.branch_failures[-60:],
             }
         temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(self.state_path)
+        for attempt in range(4):
+            try:
+                temp.replace(self.state_path)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                _time.sleep(0.05 * (attempt + 1))
 
     def _mutate(self, save_id: str, mutate: Callable[[SaveWorkState], Any]) -> Any:
         if not save_id:
@@ -465,6 +540,11 @@ class WorkStore:
                 result = mutate(state)
                 self._write_unlocked()
                 return result
+            except Exception:
+                # A rejected mutation or failed replacement is not persisted
+                # work. Discard its prepared in-memory goals/todos as well.
+                self._load()
+                raise
             finally:
                 self._unlock(lock)
 
@@ -481,17 +561,52 @@ class WorkStore:
             raise WorkStateError("Player decision message must contain 1..1000 characters")
         def mutate(state: SaveWorkState) -> dict[str, Any]:
             self._find_goal(state, goal_id)
-            previous = next((n for n in state.notices if n["goalId"] == goal_id and n["message"] == text), None)
+            previous = next((n for n in state.notices if n["goalId"] == goal_id and n["message"] == text and not n.get("answeredAt")), None)
             if previous:
                 return dict(previous)
             notice = {"id": _new_id("notice"), "goalId": goal_id, "message": text, "delivered": False}
-            state.notices = (state.notices + [notice])[-20:]
+            state.notices.append(notice)
+            # Both pending questions and answered receipts are durable. A client
+            # may miss the confirmation and reconnect much later; pruning its
+            # answer would leave that client's persisted question pending forever.
             return dict(notice)
         return self._mutate(save_id, mutate)
 
     def pending_player_notice(self, save_id: str) -> dict[str, Any] | None:
-        notice = next((n for n in self.state(save_id).notices if not n.get("delivered")), None)
+        notice = next((n for n in self.state(save_id).notices if not n.get("delivered") and not n.get("answeredAt") and not n.get("dismissedAt")), None)
         return dict(notice) if notice else None
+
+    def unresolved_player_notices(self, save_id: str) -> list[dict[str, Any]]:
+        return [dict(n) for n in self.state(save_id).notices if not n.get("answeredAt") and not n.get("dismissedAt")]
+
+    def set_notice_visibility(self, save_id: str, notice_ids: list[str], dismissed: bool) -> None:
+        """Player-owned tombstones; hiding a question grants no execution authority."""
+        def mutate(state: SaveWorkState) -> None:
+            notices = [next((n for n in state.notices if n.get("id") == identifier), None) for identifier in notice_ids]
+            if any(n is None for n in notices):
+                raise WorkStateError("Player decision is missing")
+            for notice in notices:
+                if notice.get("answeredAt"):
+                    continue
+                if dismissed:
+                    notice.setdefault("dismissedAt", _now_iso())
+                    notice["delivered"] = True
+                else:
+                    notice.pop("dismissedAt", None)
+                    notice["delivered"] = False
+        self._mutate(save_id, mutate)
+
+    def answer_player_notice(self, save_id: str, notice_id: str, text: str, request_id: str) -> None:
+        def mutate(state: SaveWorkState) -> None:
+            notice = next((n for n in state.notices if n.get("id") == notice_id), None)
+            if notice is None:
+                raise WorkStateError("Player decision is missing")
+            if notice.get("dismissedAt"):
+                raise WorkStateError("Player decision is dismissed")
+            if notice.get("answeredAt"):
+                return
+            notice.update(answer=text, answerRequestId=request_id, answeredAt=_now_iso())
+        self._mutate(save_id, mutate)
 
     def acknowledge_player_notice(self, save_id: str, notice_id: str) -> None:
         def mutate(state: SaveWorkState) -> None:
@@ -551,9 +666,10 @@ class WorkStore:
             if constraints is not None:
                 goal.constraints = dict(constraints)
             if project is not None:
-                if len(json.dumps(project, ensure_ascii=False)) > 24000:
+                merged = {**goal.project, **project}
+                if len(json.dumps(merged, ensure_ascii=False)) > 24000:
                     raise WorkStateError("project notes must fit within 24000 characters")
-                goal.project = dict(project)
+                goal.project = merged
             if status is not None:
                 if status not in GOAL_STATUSES:
                     raise WorkStateError(f"invalid goal status '{status}'")
@@ -571,11 +687,15 @@ class WorkStore:
         self, save_id: str, milestone_id: str, *, text: str,
         constraints: dict[str, Any], todos: list[dict[str, Any]], active: bool,
         existing_goal_id: str | None = None,
+        before_write: Callable[[str, dict[str, str]], None] | None = None,
     ) -> tuple[str, dict[str, str]]:
         """Atomically reconcile a milestone's authorization, including retry recovery.
 
         Stable milestone identity prevents duplicate goals after a failed milestone
         file write. Changed terms invalidate old child plans before replacement.
+        When supplied, before_write persists the canonical milestone and its
+        prepared links while this work lock is held, before any work-file write.
+        It also runs for an unchanged retry; its failure leaves work untouched.
         """
         def mutate(state: SaveWorkState) -> tuple[str, dict[str, str]]:
             goal = next((g for g in state.goals
@@ -588,10 +708,13 @@ class WorkStore:
                 state.goals.append(goal)
             unchanged = goal.constraints.get("milestoneSpec") == signature
             if unchanged and goal.status == ("active" if active else "paused"):
-                return goal.id, {
+                ids = {
                     t.intent.split("：", 1)[0]: t.id for t in state.todos
                     if t.goal_id == goal.id and t.status in {"pending", "due", "done"}
                 }
+                if before_write is not None:
+                    before_write(goal.id, dict(ids))
+                return goal.id, ids
             self._cancel_goal_children(state, goal.id)
             goal.text = text
             goal.constraints = {**desired, "milestoneSpec": signature}
@@ -607,6 +730,8 @@ class WorkStore:
                                 expiry=dict(spec["expiry"]) if spec.get("expiry") else None)
                     state.todos.append(todo)
                     ids[spec["key"]] = todo.id
+            if before_write is not None:
+                before_write(goal.id, dict(ids))
             return goal.id, ids
 
         return self._mutate(save_id, mutate)
@@ -648,7 +773,13 @@ class WorkStore:
                 task.updated_at = _now_iso()
                 for step in task.steps:
                     if step.status in {"pending", "running", "unknown"}:
-                        step.status = "cancelled"
+                        # Cancelling intent cannot confirm an already dispatched
+                        # native command. Keep it reconcilable, never replay it.
+                        if step.command_id and step.status in {"running", "unknown"}:
+                            step.status = "unknown"
+                            step.reason_code = step.reason_code or "UNCONFIRMED_AFTER_CANCEL"
+                        else:
+                            step.status = "cancelled"
                         step.lease_owner = None
                         step.lease_until = 0.0
         for todo in state.todos:
@@ -704,6 +835,8 @@ class WorkStore:
                 if not isinstance(raw_step, dict):
                     raise WorkStateError("each step must be an object")
                 operation = str(raw_step.get("operation") or "")
+                if operation == "plant_crop_workflow":
+                    raise WorkStateError(PLANT_WORKFLOW_PLAN_ERROR)
                 if operation not in ALLOWED_OPERATIONS:
                     raise WorkStateError(
                         f"operation '{operation}' is not an allowed plan operation"
@@ -838,35 +971,26 @@ class WorkStore:
             state.last_job["decisionId"] = state.decision.get("token")
             if task_id:
                 state.last_job["taskId"] = task_id
+                task = next((t for t in state.tasks if t.id == task_id), None)
+                if task:
+                    state.last_job["taskTitle"] = task.title
+                    state.last_job["goalId"] = task.goal_id
             state.decision["finished"] = True
         self._mutate(save_id, mutate)
 
     @staticmethod
     def validate_short_job(tasks: list[dict[str, Any]]) -> None:
+        """Select one serial job; native operations validate their own prerequisites."""
         if len(tasks) != 1:
-            raise WorkStateError('ONE_SHORT_JOB_REQUIRED: nothing selected. Submit exactly one task without dependencies, e.g. tasks=[{"title":"浇水","steps":[{"operation":"water_auto","params":{"max_tiles":10}}]}]. Record remaining business with remember_intent; select it in the next decision.')
+            raise WorkStateError("ONE_SHORT_JOB_REQUIRED: submit exactly one task with sequential steps")
         task = tasks[0]
         steps = task.get("steps") or []
         if not 1 <= len(steps) <= 32 or task.get("dependencies"):
-            raise WorkStateError("Short job requires 1..32 bounded steps and no business dependencies")
+            raise WorkStateError("Job requires 1..32 sequential steps and no task dependencies")
         if any(s.get("wait") for s in steps):
             raise WorkStateError("FUTURE_WAIT_IS_INTENT: select a job only when its prerequisites hold")
-        operations = {s.get("operation") for s in steps} - {"navigate_to", "get_status", "query_inventory"}
-        if len(operations) > 1 or operations & {"plant_crop_workflow", "purchase_and_plant"}:
-            raise WorkStateError("MULTIPLE_BUSINESSES: navigation may accompany one native business kind only")
-        units = 0
-        for step in steps:
-            if step.get("operation") not in operations:
-                continue
-            params = step.get("params") or {}
-            units += max(1, len(params.get("tiles") or params.get("target_tiles") or []), int(params.get("max_tiles") or params.get("count") or 1))
-            if int(params.get("radius") or 0) > 3:
-                raise WorkStateError("Short job area exceeds bounded radius")
-        if units > 64:
-            raise WorkStateError("Short job exceeds 64 native targets")
-        locations = {s.get("params", {}).get("location_id") for s in steps if s.get("operation") in operations}
-        if len(locations) > 1:
-            raise WorkStateError("Short business job must stay within one location")
+        if any(s.get("operation") == "plant_crop_workflow" for s in steps):
+            raise WorkStateError(PLANT_WORKFLOW_PLAN_ERROR)
 
     def submit_plan(
         self,
@@ -936,6 +1060,19 @@ class WorkStore:
                 if goal.status != "active":
                     raise WorkStateError(f"Bound goal '{bound_goal_id}' is no longer active; supply an active goal_id or goal_text. Nothing selected.")
 
+            for spec in tasks:
+                for candidate in spec.get("steps", []):
+                    operation = candidate.get("operation")
+                    target = self._branch_target(candidate.get("params") or {})
+                    blocked = next((b for b in state.branch_failures if b.get("blocked")
+                        and b.get("goalId") == goal.id and b.get("operation") == operation
+                        and b.get("target") == target), None)
+                    if blocked:
+                        raise WorkStateError("BRANCH_BLOCKED: " + str(blocked.get("reasonCode"))
+                            + "; " + str(blocked.get("recoveryCondition") or
+                                "修复该原因并取得对应对象或路线的新原生可执行证据")
+                            + "; choose another branch")
+
             if replace:
                 for existing in state.tasks:
                     if existing.goal_id != goal.id:
@@ -957,6 +1094,8 @@ class WorkStore:
                     superseded.append(existing.id)
 
             created.extend(self._append_plan(state, goal.id, tasks))
+            for task in created:
+                task.decision_token = decision_token
             state.scheduler_epoch += 1
             state.decision.update(selected=True, taskId=created[0].id, epoch=state.scheduler_epoch)
             resolved_goal_id = goal.id
@@ -1083,27 +1222,163 @@ class WorkStore:
                   "failed": "未完成", "cancelled": "已取消"}
         seen: set[str] = set()
         rows: list[dict[str, Any]] = []
-        for entry in reversed(state.executions):
+        # The panel reports a semantic job, while the ledger retains each native
+        # command. Group confirmed commands by job and native date for display.
+        commands = {entry.command_id or f"{entry.task_id}:{entry.step_id}": entry for entry in state.executions}
+        grouped: dict[tuple[str, str | None], ExecutionEntry] = {}
+        severity = {"completed": 0, "cancelled": 1, "failed": 2, "partial": 3, "unknown": 4}
+        for entry in commands.values():
+            if entry.operation in READ_ONLY_OPERATIONS:
+                continue
+            key = (entry.task_id, entry.game_date)
+            previous = grouped.get(key)
+            outcome = entry.outcome if previous is None or severity.get(entry.outcome, 4) >= severity.get(previous.outcome, 4) else previous.outcome
+            grouped[key] = replace(entry, effects=(previous.effects if previous else []) + entry.effects, outcome=outcome)
+        for entry in reversed(list(grouped.values())):
             if entry.operation in READ_ONLY_OPERATIONS:
                 continue
             identity = entry.command_id or f"{entry.task_id}:{entry.step_id}"
             if identity in seen:
                 continue
             seen.add(identity)
-            label = labels.get(entry.outcome, "结果待核实")
             task = tasks.get(entry.task_id)
-            if entry.outcome == "completed" and task and task.status in {"pending", "running", "waiting"}:
+            # A confirmed navigation step cannot complete a job whose later
+            # native command remains unconfirmed after restart.
+            projected_outcome = "unknown" if task and task.status == "unknown" else entry.outcome
+            label = labels.get(projected_outcome, "结果待核实")
+            if projected_outcome == "completed" and task and task.status in {"pending", "running", "waiting"}:
                 label = "步骤完成，任务继续中"
             summary = label
             if entry.effects:
-                summary += f"；记录 {len(entry.effects)} 项实际变化"
-            if entry.reason_code and entry.outcome != "completed":
-                summary += "；" + entry.reason_code[:80]
-            rows.append({"commandId": identity, "taskTitle": str(titles.get(entry.task_id) or entry.operation)[:80],
-                         "gameDate": entry.game_date, "outcome": entry.outcome, "summary": summary[:180]})
+                summary += "；" + self.effect_summary(entry.effects)
+            reason = None
+            if entry.reason_code:
+                reason = self.reason_summary(entry.reason_code)
+                if entry.outcome != "completed":
+                    summary += "；" + reason
+            rows.append({"commandId": identity, "taskTitle": str(titles.get(entry.task_id) or "任务名称未记录")[:80],
+                         "gameDate": entry.game_date, "gameTime": entry.game_time, "recordedAt": entry.at,
+                         "outcome": projected_outcome, "summary": summary[:180],
+                         "reasonCode": entry.reason_code, "reason": reason})
             if len(rows) >= max(1, min(int(limit), 8)):
                 break
         return list(reversed(rows))
+
+    @staticmethod
+    def reason_summary(reason_code: str | None, message: str | None = None) -> str:
+        """Translate recorded classifications without guessing a missing cause."""
+        code = str(reason_code or "").strip()
+        known = {
+            "OUT_OF_SEEDS": "没有可用种子，剩余地块尚未播种",
+            "NO_SEEDS": "没有可用种子，尚未开始播种",
+            "OUT_OF_WATER": "水壶没水了，需要补水后继续",
+            "NEEDS_WATER_CAN": "还没有可用的水壶",
+            "STAMINA_EXHAUSTED": "体力不足",
+            "INSUFFICIENT_STAMINA": "体力不足",
+            "STEP_PARTIAL": "还有未完成的地块",
+            "REMAINING_WORK": "还有后续工作",
+            "WATER_INCOMPLETE": "还有作物待浇水",
+            "BUDGET_EXCEEDED": "本次作业时间已用完",
+            "WAITING_TIMEOUT": "等待条件超过时限",
+            "PATH_BLOCKED": "通路受阻，暂时无法到达目标",
+            "NO_PATH": "没有找到可到达目标的路线",
+            "TARGET_BLOCKED": "目标位置被占用，暂时无法操作",
+            "TARGET_NOT_FOUND": "没有找到指定目标",
+            "LOCATION_MISMATCH": "当前位置与任务要求不一致",
+            "INVENTORY_FULL": "背包已满，需要先腾出空间",
+            "INSUFFICIENT_FUNDS": "可用金币不足",
+            "SHOP_CLOSED": "商店尚未营业",
+            "NATIVE_TERMINAL_UNCONFIRMED": "连接中断，尚未确认实际动作结果",
+            "STEP_DISPATCH_REJECTED": "游戏未接受这次动作",
+            "NO_WORK": "没有找到当前可执行的目标",
+            "CANCELLED": "工作已取消",
+            "BEDTIME": "临近就寝，剩余工作留待醒后继续",
+        }
+        if code in known:
+            return known[code]
+        detail = str(message or "").strip()
+        if code:
+            # An unfamiliar exact classification remains visible, not replaced
+            # with a made-up explanation or the unhelpful 'reason recorded'.
+            return f"原因类别：{code[:100]}（暂未提供详细说明）"
+        if detail:
+            return detail[:180]
+        return "尚未收到具体失败原因，需要核实实际结果"
+
+    @staticmethod
+    def effect_summary(effects: list[dict[str, Any]]) -> str:
+        """Describe every confirmed native category, without using the job title."""
+        excluded = {"skipped", "unknown", "failed", "rejected"}
+        navigation = [e for e in effects if isinstance(e, dict) and (
+            e.get("state") in {"navigated", "arrived"} or
+            (e.get("state") is None and isinstance(e.get("location"), str)
+             and type(e.get("pathLength")) is int and e["pathLength"] >= 0))]
+        effects = [e for e in effects if isinstance(e, dict)
+                   and e.get("state") is not None and e.get("state") not in excluded]
+        if not effects and not navigation:
+            return "未确认实际变化"
+        states = [e.get("state") for e in effects]
+        summaries = []
+        handled = {"navigated", "arrived"}
+
+        def tiles(kinds: tuple[str, ...], label: str) -> None:
+            handled.update(kinds)
+            count = sum(states.count(kind) for kind in kinds)
+            if count:
+                summaries.append(f"{label} {count} 格")
+
+        def items(state: str, label: str, unit: str = "件", default: int = 1) -> None:
+            handled.add(state)
+            count = sum(int(e.get("stack", e.get("count", default)))
+                        for e in effects if e.get("state") == state)
+            if count:
+                summaries.append(f"{label} {count} {unit}")
+
+        if navigation:
+            summaries.append(f"已记录 {len(navigation)} 段行程")
+        handled.add("refilled")
+        if "refilled" in states:
+            count = states.count("refilled")
+            summaries.append("水壶已补满" + (f" {count} 次" if count > 1 else ""))
+        handled.add("ate-food")
+        count = sum(int(e.get("stack", 1)) for e in effects if e.get("state") == "ate-food")
+        if count:
+            summaries.append(f"已吃 {count} 份食物恢复体力")
+        tiles(("cleared-weeds", "cleared-stone", "cleared-twig", "cleared-dead-crop", "clump-cleared", "cut-grass"), "已清理")
+        tiles(("tree-felled",), "已砍倒")
+        tiles(("hoed", "tilled"), "已开垦")
+        tiles(("planted",), "已种下")
+        tiles(("watered",), "已浇水")
+        tiles(("fertilized",), "已施肥")
+        tiles(("harvested",), "已收获")
+        tiles(("placed",), "已放置")
+        for state, label in (("withdrawn", "已取出"), ("deposited", "已入箱"),
+                             ("inserted", "已投入原料"), ("collected", "已收取"),
+                             ("picked-up", "已拾取"), ("crafted", "已制作"),
+                             ("removed-and-recovered", "已回收")):
+            items(state, label)
+        handled.add("purchased")
+        purchases = [e for e in effects if e.get("state") == "purchased"]
+        count = sum(int(e.get("count", e.get("stack", 0))) for e in purchases)
+        cost = sum(int(e.get("subtotal", 0)) for e in purchases)
+        if count:
+            summaries.append(f"已买入 {count} 件" + (f"，花费 {cost} 金" if cost else ""))
+        items("animal-purchased", "已买入", "只动物")
+        handled.add("petted")
+        if "petted" in states:
+            summaries.append(f"已抚摸 {states.count('petted')} 只动物")
+        items("fed", "已放入", "份饲料", default=0)
+        for state, label in (("building-construction-ordered", "建造已下单，等待施工"),
+                             ("building-upgrade-ordered", "扩建已下单，等待施工"),
+                             ("building-moved", "建筑已移动"), ("door-opened", "动物门已打开"),
+                             ("door-closed", "动物门已关闭")):
+            handled.add(state)
+            if state in states:
+                summaries.append(label)
+        other = sum(state not in handled for state in states)
+        if other:
+            summaries.append(f"记录 {other} 项实际变化")
+        return "，".join(summaries) if summaries else f"记录 {len(effects)} 项实际变化"
 
     # ----------------------------------------------------------- claiming
     @staticmethod
@@ -1135,7 +1410,7 @@ class WorkStore:
             d = state.decision
             if d.get("taskId") != task.id or d.get("finished") or d.get("expires", 0) <= _time.time():
                 continue
-            if task.status in {"completed", "cancelled", "unknown", "partial", "running"}:
+            if task.status in {"completed", "cancelled", "failed", "unknown", "partial", "running"}:
                 continue
             goal = next((g for g in state.goals if g.id == task.goal_id), None)
             if goal is None or goal.status != "active":
@@ -1371,6 +1646,73 @@ class WorkStore:
             task.updated_at = _now_iso()
         self._mutate(save_id, mutate)
 
+    @staticmethod
+    def _step_location(operation: str, params: dict[str, Any]) -> str | None:
+        """Normalize verified dispatch defaults, not coordinate-based guesses.
+
+        Legacy package-r6 execute_plant_seeds defaults location_id to Farm;
+        execute_water_zone always dispatches execute_tiles on Farm. water_auto
+        instead uses its observed companion map, so has no inferred default here.
+        """
+        for name in ("location_id", "locationId"):
+            if name in params:
+                value = params[name]
+                return value if isinstance(value, str) and value else None
+        return "Farm" if operation in {"plant_seeds", "water_zone", "water_tiles"} else None
+
+    @staticmethod
+    def _execution_location(state: SaveWorkState, task: Task, step: Step,
+                            outcome: str, effects: list[dict[str, Any]],
+                            game_day: str | None = None) -> str | None:
+        """Retain native map provenance before bounded task archives are pruned."""
+        if outcome == "unknown":
+            return None
+        maps = {e["locationId"] for e in effects if isinstance(e, dict)
+                and isinstance(e.get("locationId"), str) and e["locationId"]}
+        if len(maps) == 1:
+            return next(iter(maps))
+        if len(maps) > 1:
+            return None  # Each effect keeps its own map; no shared entry map.
+        if step.operation == "navigate_to":
+            location = effects[-1].get("location") if outcome == "completed" and effects else None
+            return location if isinstance(location, str) and location else None
+        location = WorkStore._step_location(step.operation, step.params)
+        if isinstance(location, str) and location:
+            return location
+        for previous in reversed(state.executions):
+            if game_day and previous.game_date != game_day:
+                break
+            if previous.operation == "navigate_to" and previous.outcome != "completed":
+                break
+            if previous.operation == "navigate_to" and previous.task_id != task.id:
+                break  # A newer task's navigation invalidates older task-map evidence.
+            if previous.task_id != task.id:
+                continue
+            if previous.outcome == "unknown":
+                return None
+            if previous.operation == "navigate_to":
+                if previous.outcome != "completed" or not previous.effects:
+                    return None
+                location = previous.effects[-1].get("location")
+                return location if isinstance(location, str) and location else previous.location_id
+            if (previous.outcome == "completed" and previous.location_id
+                    and any(isinstance(e, dict) and e.get("state") not in {None, "skipped"}
+                            for e in previous.effects)):
+                return previous.location_id
+        # Legacy mapless protocols may use the latest actual actor navigation,
+        # but only on the same explicitly recorded native day, never a default map.
+        if game_day:
+            for previous in reversed(state.executions):
+                if previous.game_date != game_day:
+                    break
+                if previous.operation != "navigate_to":
+                    continue
+                if previous.outcome != "completed" or not previous.effects:
+                    break
+                location = previous.effects[-1].get("location")
+                return location if isinstance(location, str) and location else previous.location_id
+        return None
+
     def commit_step_result(
         self,
         save_id: str,
@@ -1379,6 +1721,7 @@ class WorkStore:
         step_id: str,
         outcome: str,
         effects: list[dict[str, Any]] | None = None,
+        feedback: dict[str, Any] | None = None,
         reason_code: str | None = None,
         snapshot_revision: int | None = None,
         command_id: str | None = None,
@@ -1399,6 +1742,8 @@ class WorkStore:
                 raise WorkStateError(
                     "cannot mark a step completed before its command id is persisted"
                 )
+            if command_id and step.command_id and command_id != step.command_id:
+                raise WorkStateError("Result command id does not match the persisted step command")
             if command_id and not step.command_id:
                 step.command_id = command_id
 
@@ -1406,6 +1751,7 @@ class WorkStore:
             step.outcome = outcome
             step.reason_code = reason_code
             step.effects = list(effects or [])
+            step.feedback = dict(feedback or {})
             step.lease_owner = None
             step.lease_until = 0.0
             state.executions.append(
@@ -1420,8 +1766,15 @@ class WorkStore:
                     snapshot_revision=snapshot_revision,
                     game_date=(_day_key(game_date.get("year"), game_date.get("season"), game_date.get("day"))
                                if isinstance(game_date, dict) else None),
+                    game_time=game_date.get("timeOfDay") if isinstance(game_date, dict) else None,
+                    location_id=self._execution_location(
+                        state, task, step, outcome, effects or [],
+                        _day_key(game_date.get("year"), game_date.get("season"), game_date.get("day"))
+                        if isinstance(game_date, dict) else None),
                 )
             )
+            self._record_branch_result(state, task, step, outcome, reason_code,
+                                       command_id or step.command_id or "")
 
             if outcome in {"completed", "cancelled"}:
                 remaining = [s for s in task.steps if s.status not in TERMINAL_STEP_STATUSES]
@@ -1431,6 +1784,8 @@ class WorkStore:
                     task.status = "pending"
             elif outcome == "partial":
                 task.status = "partial"
+            elif outcome in {"failed", "rejected"}:
+                task.status = "failed"
             else:
                 task.status = "unknown"
             task.updated_at = _now_iso()
@@ -1444,6 +1799,99 @@ class WorkStore:
 
         return self._mutate(save_id, mutate)
 
+    @staticmethod
+    def _branch_target(params: dict[str, Any]) -> dict[str, Any]:
+        aliases = {"locationId": "location_id", "shopId": "shop_id", "itemId": "item_id"}
+        normalized = {aliases.get(k, k): v for k, v in params.items()}
+        if "machine_x" in params and "machine_y" in params:
+            normalized["tile"] = {"x": params["machine_x"], "y": params["machine_y"]}
+        if isinstance(normalized.get("tiles"), list) and len(normalized["tiles"]) == 1:
+            normalized["tile"] = normalized.pop("tiles")[0]
+        return {k: normalized[k] for k in ("location_id", "shop_id", "tile", "tiles",
+                                          "item_id", "seed_item_id", "animal_id", "animal_name",
+                                          "building_name", "chest_x", "chest_y",
+                                          "center_x", "center_y", "radius", "landmark")
+                if k in normalized}
+
+    def _record_branch_result(self, state, task, step, outcome, reason, command_id):
+        if outcome == "partial" and reason and not any(
+            e.get("state") not in {None, "skipped", "unknown", "failed", "rejected"}
+            for e in step.effects if isinstance(e, dict)):
+            outcome = "failed"  # Known terminal with no productive effects.
+        if outcome not in {"completed", "failed", "rejected"} or not command_id:
+            return  # Unknown/partial outcomes require reconciliation, not retry counting.
+        target = self._branch_target(step.params)
+        same_target = [b for b in state.branch_failures if b.get("goalId") == task.goal_id
+                       and b.get("operation") == step.operation and b.get("target") == target]
+        if outcome == "completed":
+            state.branch_failures = [b for b in state.branch_failures if b not in same_target]
+            for b in state.branch_failures:
+                cause = str(b.get("reasonCode") or "").lower()
+                if any(code in cause for code in ("unknown", "unconfirmed", "in_progress")):
+                    continue
+                if ((step.operation == "eat_food" and any(s in cause for s in ("stamina", "exhaust", "energy")))
+                        or (step.operation == "refill_watering_can" and "water" in cause)):
+                    b.update(blocked=False, failures=0, recoveryEvidence=command_id)
+            return
+        # One native command remains one attempt even if reconciliation later
+        # changes its reason bucket. Executions persist beyond the three-item
+        # per-branch display window and survive process restarts.
+        def counted(entry):
+            return entry.outcome in {"completed", "failed", "rejected"} or (
+                entry.outcome == "partial" and entry.reason_code and not any(
+                    e.get("state") not in {None, "skipped", "unknown", "failed", "rejected"}
+                    for e in entry.effects if isinstance(e, dict)))
+        if any(command_id in b.get("commands", []) for b in state.branch_failures) or any(
+                entry.command_id == command_id and counted(entry)
+                for entry in state.executions[:-1]):
+            return
+        branch = next((b for b in same_target if b.get("reasonCode") == reason), None)
+        if branch is None:
+            branch = {"goalId": task.goal_id, "operation": step.operation, "target": target,
+                      "reasonCode": reason, "failures": 0, "commands": [], "attempts": [],
+                      "recoveryCondition": "修复该原因并取得对应对象或路线的新原生可执行证据"}
+            state.branch_failures.append(branch)
+        if command_id in branch["commands"]:
+            return
+        branch["commands"].append(command_id)
+        branch["attempts"].append({"commandId": command_id, "params": step.params, "reasonCode": reason})
+        branch["commands"] = branch["commands"][-3:]
+        branch["attempts"] = branch["attempts"][-3:]
+        branch["failures"] += 1
+        branch["blocked"] = branch["failures"] >= 3
+        branch["updatedAt"] = _now_iso()
+
+    def observe_branch_recovery(self, save_id: str, *, operation: str,
+                                target: dict[str, Any], evidence: dict[str, Any]) -> None:
+        """Harness-only: a successful native inspection of this exact target."""
+        if operation != "navigate_to" or evidence.get("reachable") is not True:
+            return
+        def mutate(state):
+            for branch in state.branch_failures:
+                reason = str(branch.get("reasonCode") or "").lower()
+                if (branch.get("operation") == operation
+                        and branch.get("target") == self._branch_target(target)
+                        and not any(code in reason for code in ("unknown", "unconfirmed", "in_progress"))
+                        and any(code in reason for code in ("path", "route", "unreachable", "obstacle", "entrance", "warp"))):
+                    branch.update(blocked=False, failures=0, recoveryEvidence=evidence)
+        self._mutate(save_id, mutate)
+
+    def observe_machine_recovery(self, save_id: str, location_id: str, machines: list[dict]) -> None:
+        def mutate(state):
+            for branch in state.branch_failures:
+                reason = str(branch.get("reasonCode") or "").lower()
+                if any(code in reason for code in ("unknown", "unconfirmed", "in_progress")):
+                    continue
+                if branch.get("operation") != "collect_machine" or not any(s in reason for s in ("ready", "output", "processing")):
+                    continue
+                target = branch.get("target") or {}
+                if target.get("location_id", "Farm") != location_id:
+                    continue
+                tiles = target.get("tiles") or ([target["tile"]] if "tile" in target else [])
+                if tiles and all(any(m.get("tile") == tile and m.get("isReady") is True for m in machines) for tile in tiles):
+                    branch.update(blocked=False, failures=0, recoveryEvidence={"machinesReady": tiles})
+        self._mutate(save_id, mutate)
+
     def recover(self, save_id: str, *, now: float | None = None) -> list[dict[str, Any]]:
         """Resolve leased steps after a restart without replaying completed work."""
         self.clean_stale_waiting_tasks(save_id)
@@ -1454,7 +1902,9 @@ class WorkStore:
             logged = {entry.command_id: entry for entry in state.executions if entry.command_id}
             for task in state.tasks:
                 for step in task.steps:
-                    if step.status != "running" or step.lease_until > current:
+                    legacy_cancelled_command = (step.status == "cancelled" and step.command_id
+                                                and step.outcome not in TERMINAL_STEP_STATUSES)
+                    if not legacy_cancelled_command and (step.status != "running" or step.lease_until > current):
                         continue
                     entry = logged.get(step.command_id or "")
                     if entry is not None:
@@ -1467,6 +1917,7 @@ class WorkStore:
                         continue
                     # Cannot confirm: keep unknown, request a decision once, never re-charge.
                     step.status = "unknown"
+                    step.reason_code = "UNCONFIRMED_AFTER_RESTART"
                     step.lease_owner = None
                     step.lease_until = 0.0
                     if task.status == "running":
@@ -1622,6 +2073,9 @@ class WorkStore:
             'allowed trigger types: "calendar" {"type","year","season","day"}, '
             '"inventory" {"type","itemId","minCount"}, '
             '"crop" {"type","cropId","state"}. '
+            '"gameTime" {"type","year","season","day","timeOfDay"}, '
+            '"resource" {"type","resource":"stamina"|"water","minAmount"}, '
+            '"machineReady" {"type","locationId","tile":{"x","y"}}. '
             'Examples: {"type":"calendar","year":2,"season":"spring","day":3}; '
             '{"type":"inventory","itemId":"(O)368","minCount":5}; '
             '{"type":"crop","cropId":"(O)24","state":"mature"}. '
@@ -1629,12 +2083,25 @@ class WorkStore:
         )
 
         kind = trigger.get("type")
-        if kind in {"calendar", "gameDay"}:
+        if kind in {"calendar", "gameDay", "gameTime"}:
             if _calendar_key(trigger.get("year"), trigger.get("season"), trigger.get("day")) is None:
                 raise WorkStateError(
                     "calendar trigger requires year (integer), season "
                     "(spring|summer|fall|winter) and day (1..28). " + allowed
                 )
+            if kind == "gameTime":
+                time_of_day = trigger.get("timeOfDay")
+                if type(time_of_day) is not int or not 600 <= time_of_day <= 2600 or time_of_day % 100 >= 60:
+                    raise WorkStateError("gameTime requires native timeOfDay HHMM (600..2600). " + allowed)
+        elif kind == "resource":
+            amount = trigger.get("minAmount")
+            if trigger.get("resource") not in {"stamina", "water"} or type(amount) not in {int, float} or not 0 < amount <= 10000:
+                raise WorkStateError("resource requires stamina|water and positive minAmount. " + allowed)
+        elif kind == "machineReady":
+            tile = trigger.get("tile")
+            if (not isinstance(trigger.get("locationId"), str) or not trigger["locationId"].strip()
+                    or not isinstance(tile, dict) or any(type(tile.get(k)) is not int or tile[k] < 0 for k in ("x", "y"))):
+                raise WorkStateError("machineReady requires observed locationId and tile x/y. " + allowed)
         elif kind == "inventory":
             if not trigger.get("itemId") or not isinstance(trigger.get("minCount", 1), int):
                 raise WorkStateError(
@@ -1700,12 +2167,31 @@ class WorkStore:
         snapshot: dict[str, Any] | None,
         current_key: tuple[int, int, int] | None,
     ) -> bool:
+        payload = (snapshot or {}).get("payload")
+        if not isinstance(payload, dict):
+            payload = snapshot or {}
+        world = payload.get("world") if isinstance(payload.get("world"), dict) else {}
         kind = trigger.get("type")
         if kind in {"calendar", "gameDay"}:
             trigger_key = _calendar_key(trigger.get("year"), trigger.get("season"), trigger.get("day"))
             return bool(trigger_key and current_key and current_key >= trigger_key)
-        world = (snapshot or {}).get("world") if isinstance((snapshot or {}).get("world"), dict) else {}
-        payload = (snapshot or {}).get("payload") if isinstance((snapshot or {}).get("payload"), dict) else {}
+        if kind == "gameTime":
+            day = _calendar_key(trigger.get("year"), trigger.get("season"), trigger.get("day"))
+            time_of_day = world.get("timeOfDay")
+            return bool(day and current_key and (current_key > day or
+                        (current_key == day and type(time_of_day) is int and time_of_day >= trigger["timeOfDay"])))
+        if kind == "resource":
+            companion = payload.get("companion") or {}
+            field = "stamina" if trigger.get("resource") == "stamina" else "waterCanLevel"
+            amount = companion.get(field)
+            return type(amount) in {int, float} and amount >= trigger["minAmount"]
+        if kind == "machineReady":
+            # Native cross-map readiness facts; never infer readiness from a
+            # countdown, stale tool result, or the absence of an observed machine.
+            signals = payload.get("productionSignals") or []
+            return any(isinstance(m, dict) and m.get("locationId") == trigger["locationId"]
+                       and m.get("tile") == trigger["tile"] and m.get("isReady") is True
+                       for m in signals if isinstance(signals, list))
         if kind == "inventory":
             inventory = payload.get("inventory") or world.get("inventory") or {}
             slots = inventory.get("slots", []) if isinstance(inventory, dict) else []
@@ -1923,6 +2409,132 @@ class WorkStore:
         self._mutate(save_id, mutate)
         return expired
 
+    @staticmethod
+    def _planting_evidence(state: SaveWorkState) -> dict[str, Any]:
+        """Project confirmed pairs and remaining batches without changing goals.
+
+        Ledger insertion order is native result order. Task/archive params only
+        supply the map and seed identity; coordinates always come from effects.
+        Legacy mapless actions use a verified operation default or confirmed
+        navigation on the same native day; unproven map identities stay unknown.
+        """
+        tasks = {a["task"]["id"]: a["task"] for a in state.archive
+                 if isinstance(a.get("task"), dict) and a["task"].get("id")}
+        tasks.update({task.id: asdict(task) for task in state.tasks})
+        steps = {(task_id, step["id"]): step for task_id, task in tasks.items()
+                 for step in task.get("steps", []) if isinstance(step, dict) and step.get("id")}
+        task_maps: dict[str, str] = {}
+        pending: dict[tuple[str, int, int], tuple[str, str, str]] = {}
+        batch_counts: dict[tuple[str, str, str], dict[str, int]] = {}
+        recent_batches: dict[tuple[str, str, str], None] = {}
+        actor_map: str | None = None
+        actor_day: str | None = None
+        seen = set()
+        for entry in state.executions:
+            if entry.game_date != actor_day:
+                actor_map = None
+                task_maps.clear()
+                actor_day = entry.game_date
+            if entry.outcome == "unknown":
+                task_maps.pop(entry.task_id, None)
+                if entry.operation == "navigate_to":
+                    actor_map = None
+                    task_maps.clear()
+                continue
+            if not entry.command_id or entry.outcome not in {"completed", "partial", "failed", "cancelled"}:
+                continue
+            identity = (entry.task_id, entry.step_id, entry.command_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            step = steps.get((entry.task_id, entry.step_id), {})
+            params = step.get("params") or {}
+            if entry.operation == "navigate_to":
+                actor_map = None
+                task_maps.clear()
+                if entry.outcome == "completed" and entry.effects:
+                    location = entry.effects[-1].get("location")
+                    if isinstance(location, str) and location:
+                        task_maps[entry.task_id] = location
+                        if entry.game_date:
+                            actor_map = location
+                continue
+            seen_effects = set()
+            for effect in entry.effects:
+                if not isinstance(effect, dict):
+                    continue
+                kind = effect.get("state")
+                if kind not in {"planted", "watered", "harvested", "cleared-dead-crop"}:
+                    continue
+                tile = effect.get("tile")
+                if not isinstance(tile, dict) or any(
+                    not isinstance(tile.get(axis), int) or isinstance(tile.get(axis), bool)
+                    for axis in ("x", "y")
+                ):
+                    continue
+                location = (effect.get("locationId") or entry.location_id
+                            or (WorkStore._step_location(entry.operation, params) if step else None)
+                            or task_maps.get(entry.task_id)
+                            or actor_map)
+                if not isinstance(location, str) or not location:
+                    continue  # No map evidence: never match coordinates across maps.
+                task_maps[entry.task_id] = location
+                key = (location, tile["x"], tile["y"])
+                effect_identity = (kind, key)
+                if effect_identity in seen_effects:
+                    continue
+                seen_effects.add(effect_identity)
+                if kind == "planted":
+                    seed = effect.get("itemId") or params.get("seed_item_id")
+                    if isinstance(seed, str) and seed:
+                        batch = (entry.task_id, seed, location)
+                        counts = batch_counts.setdefault(batch, {
+                            "originalPlantedCount": 0, "confirmedWateredCount": 0,
+                            "removedBeforeWaterCount": 0,
+                        })
+                        counts["originalPlantedCount"] += 1
+                        recent_batches.pop(batch, None)
+                        recent_batches[batch] = None
+                        pending.pop(key, None)
+                        pending[key] = batch
+                else:
+                    batch = pending.pop(key, None)
+                    if batch is not None:
+                        counter = ("confirmedWateredCount" if kind == "watered"
+                                   else "removedBeforeWaterCount")
+                        batch_counts[batch][counter] += 1
+                        recent_batches.pop(batch, None)
+                        recent_batches[batch] = None
+        grouped: dict[tuple[str, str, str], list[dict[str, int]]] = {}
+        # Newest batches first; keep the whole outstanding count even when the
+        # compact coordinate budget cannot fit all historic unmatched plants.
+        for (_location, x, y), batch in reversed(list(pending.items())):
+            grouped.setdefault(batch, []).append({"x": x, "y": y})
+        remaining = 64
+        batches = []
+        for (task_id, seed, location), tiles in grouped.items():
+            if remaining == 0:
+                break
+            shown = tiles[:remaining]
+            batches.append({"taskId": task_id, "seedItemId": seed, "locationId": location,
+                            **batch_counts[(task_id, seed, location)],
+                            "pendingCount": len(tiles), "tiles": shown,
+                            "truncated": len(shown) < len(tiles)})
+            remaining -= len(shown)
+        recent = [
+            {"taskId": task_id, "seedItemId": seed, "locationId": location,
+             **batch_counts[(task_id, seed, location)],
+             "pendingCount": len(grouped.get((task_id, seed, location), []))}
+            for task_id, seed, location in reversed(list(recent_batches))
+        ][:8]
+        return {"pendingCount": len(pending), "batchCount": len(grouped), "batches": batches,
+                "confirmedWateredCount": sum(c["confirmedWateredCount"] for c in batch_counts.values()),
+                "countProvenance": "ledgerConfirmed; not automatic goal completion",
+                "countScope": "all retained same-map planted-then-watered pairs, including historical completed batches; total, not a new delta",
+                "recentBatches": recent, "recentBatchesTruncated": len(recent_batches) > 8,
+                "truncated": len(pending) > 64,
+                "basis": "confirmed planted effects without later same-map watered/harvested/cleared-dead-crop effects"}
+
     def overview(
         self,
         save_id: str,
@@ -1958,19 +2570,31 @@ class WorkStore:
                 "operation": ready_step.operation,
                 "params": ready_step.params,
             }
-        anomalies = [
-            {
-                "taskId": t.id,
-                "stepId": s.id,
-                "status": s.status,
-                "reasonCode": s.reason_code,
-                "outcome": s.outcome,
-                "commandId": s.command_id,
-            }
-            for t in state.tasks
-            for s in t.steps
-            if s.status in {"unknown", "partial", "failed"}
-        ]
+        logged = {(e.task_id, e.step_id, e.command_id): e for e in state.executions}
+        current_ids = {state.decision.get("taskId"), state.last_job.get("taskId")}
+        ranked_anomalies = []
+        for task in state.tasks:
+            for step in task.steps:
+                entry = logged.get((task.id, step.id, step.command_id))
+                confirmed = ((entry.outcome if entry else step.outcome) in TERMINAL_STEP_STATUSES)
+                uncertain = step.status == "unknown" or (
+                    task.status in {"cancelled", "completed"} and step.command_id and not confirmed)
+                if not uncertain and (task.status in {"cancelled", "completed"}
+                                      or step.status not in {"partial", "failed"}):
+                    continue
+                # Actual native result time wins over later edits/cancellation
+                # timestamps. No ledger entries or historic outcomes are removed.
+                at = _parse_iso_epoch(entry.at if entry else task.created_at)
+                rank = (bool(uncertain), task.id in current_ids, at)
+                ranked_anomalies.append((rank, {
+                    "taskId": task.id, "stepId": step.id,
+                    "status": "unknown" if uncertain else step.status,
+                    "reasonCode": step.reason_code or (
+                        "UNCONFIRMED_AFTER_CANCEL" if uncertain and task.status == "cancelled"
+                        else "UNCONFIRMED_NATIVE_RESULT" if uncertain else None),
+                    "outcome": step.outcome, "commandId": step.command_id,
+                }))
+        anomalies = [row for _, row in sorted(ranked_anomalies, key=lambda pair: pair[0], reverse=True)]
         return {
             "saveId": save_id,
             "paused": state.paused,
@@ -1983,7 +2607,11 @@ class WorkStore:
             "nextStep": next_step,
             "anomalies": anomalies[:5],
             "blockedDependencies": self.blocked_dependencies(save_id)[:5],
+            "blockedBranches": [{k: b.get(k) for k in ("goalId", "operation", "target", "reasonCode",
+                "failures", "blocked", "recoveryCondition")} for b in state.branch_failures
+                if b.get("failures", 0) > 0][-5:],
             "recentExecutions": self.execution_log(save_id, limit=5),
+            "plantingEvidence": self._planting_evidence(state),
             "waitingConditions": self.wait_conditions(save_id),
             "hasExecutableWork": next_step is not None,
             "lastJob": state.last_job,

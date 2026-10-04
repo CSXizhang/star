@@ -20,7 +20,8 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
     private const long MaxMonotonicTicks = 3600;
-    private const int ActionDurationTicks = 8; // Tool action duration
+    private const int ActionDurationTicks = 18;
+    private const int MaxToolAnimationTicks = 90;
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -215,6 +216,11 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
         {
             if (!IsExecuting) return;
 
+            if (IsPaused && _cancelRequested)
+            {
+                FinishExecution(ExecutionState.Cancelled, _cancelReason ?? "Cancelled by request.", "CANCELLED");
+                return;
+            }
             if (IsPaused) return;
 
             if (_pauseRequested && CurrentState is ExecutionState.Navigating or ExecutionState.Facing or ExecutionState.Preparing)
@@ -380,22 +386,22 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
         _actionTicks = 0;
         _actionEffectExecuted = false;
         _lastHoeResult = null;
-        _actor.BeginUsingTool();
+        _actor.BeginUsingTool("Hoe");
         CurrentState = ExecutionState.Acting;
     }
 
     private void HandleActing(GameTime? time, long tickCount)
     {
         _actionTicks++;
-        _actor.UpdateToolAnimation(time, tickCount);
+        var phase = _actor.UpdateToolAnimation(time, tickCount);
 
-        if (!_actionEffectExecuted && _actionTicks >= ActionDurationTicks / 2)
+        if (!_actionEffectExecuted && (phase is ToolAnimationPhase.EffectPoint or ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks / 2))
         {
             _actionEffectExecuted = true;
             _lastHoeResult = _adapter.HoeTile(_actor, _currentRequest!.LocationId, _currentTargetTile);
         }
 
-        if (_actionTicks >= ActionDurationTicks)
+        if (_actionTicks >= ActionDurationTicks && (phase == ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks))
         {
             _actor.EndUsingTool();
             CurrentState = ExecutionState.Verifying;

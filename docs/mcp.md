@@ -36,7 +36,21 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -
 
 首次使用 Kimi 时，在仓库根目录交互运行 `kimi`，核对项目信任提示中的 MCP 启动命令和 Mod 路径后确认信任。输入 `/mcp`，确认 `stardew-companion` 已连接，再启动下文的聊天服务；已打开的 Kimi 会话需重新启动才能加载新注册的工具。
 
-`-Agent` 支持 `kimi`、`agy`、`claude`、`codex`、`dsh` 和 `all`。省略 `-Install` 时输出配置供你检查；不同客户端的注册方式和可用程度可能不同。
+`-Agent` 支持 `kimi`、`agy`、`claude`、`codex`、`dsh`、`mcode` 和 `all`。省略 `-Install` 时输出配置供你检查；不同客户端的注册方式和可用程度可能不同。
+
+MiniMax Code 的 MCP 服务保存在数据目录的 `mcp.json`（`MINIMAX_DATA_DIR`，默认 `%USERPROFILE%\.minimax`），桌面端与 CLI 共用同一份。`-Agent mcode -Install` 会合并写入该文件、保留其他服务；如果已存在不是本脚本写入的同名条目，则停止并说明冲突，不改任何文件。
+
+## MiniMax Code 的工具绑定方式
+
+`mcode` 后端用 `mcode exec` 执行一轮无头任务，每轮只把游戏工具绑到这一轮：
+
+- 它把本轮的 `.mcp.json` 写进 `<run-dir>\data\mcode\`，并用 `mcode exec --cwd` 指向该目录。**工作区里的同名条目会盖住你共享配置里的同名服务**（已实测：profile 注册的服务不再生效），所以伙伴一定连到当前这次游戏运行。
+- 该文件的 `env` 承载本轮授权（`STARDEW_DECISION_TOKEN`、surface、life 模式字段）。`--config` 里的 `mcpServers` **不生效**，工具只来自工作区文件与数据目录的 `mcp.json`。
+- 不传 `--config`，因此本机 `~/.minimax` 下的模型选择、登录态与凭据都原样沿用，不读也不改。留空 `model` 即用本机默认模型；默认 `--effort low`，可选 `default/low/medium/high/xhigh/max`，档位必须被所选模型支持，否则 CLI 在本轮开始前就以退出码 2 报错。
+- CLI 从 PATH 解析；PowerShell 执行策略拦下 npm 的 `.ps1` 垫片时，后端自动改用同名 `.cmd`。会话用 `--session` 续跑，恢复失败会改开一个新会话，不会把农场流程卡死。
+- 注意：工作区条目是**追加**的，你共享配置里其他 MCP 服务在这一轮仍然可见；`--permission full` 也不拦终端与文件工具，行为与 Codex 后端的 `danger-full-access` 一致，靠运行时指令约束模型只用游戏工具。
+
+在向导中选择 `mcode` 即可（需先装好并登录 MiniMax Code CLI）。同一台机器上也可以用 `register-mcp.ps1 -Agent mcode` 把游戏工具注册给 MiniMax Code 自己作为外部客户端；两者互不影响。
 
 手动配置支持 stdio 的 MCP 客户端时，可以直接使用 `uv run --project <仓库根目录>/runtime python`（与 `register-mcp.ps1 -Install` 生成的配置一致），参数为：
 
@@ -48,7 +62,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/register-mcp.ps1 -
 
 ## 游戏内聊天
 
-复制 `config/chat-backend.example.json` 为 `config/chat-backend.json`，设置 `backend` 和 `model`。当前聊天后端支持 `kimi`、`agy` 和 `codex`。使用本机已登录的 Codex CLI 时，设置 `"backend": "codex"`；省略 `model` 会沿用本机 Codex 配置的模型。每次调用只临时绑定当前游戏的 MCP，不修改全局配置。
+复制 `config/chat-backend.example.json` 为 `config/chat-backend.json`，设置 `backend` 和 `model`。当前聊天后端支持 `kimi`、`agy`、`codex`、`dsh` 和 `mcode`。使用本机已登录的 Codex CLI 时，设置 `"backend": "codex"`；省略 `model` 会沿用本机 Codex 配置的模型。每次调用只临时绑定当前游戏的 MCP，不修改全局配置。
 
 ```powershell
 uv run --project runtime python -m stardew_ai_runtime.chat_bridge --run-dir "C:\你的游戏目录\Mods\StardewAI.Companion.Mod" --backend kimi

@@ -9,6 +9,7 @@ namespace StardewAI.Companion.Mod.Tests;
 public sealed class SimulatedWorldObserver : IWorldObserver
 {
     private readonly Dictionary<TileCoordinate, bool> _passability = new();
+    private readonly Dictionary<string, Dictionary<TileCoordinate, bool>> _locationPassability = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<TileCoordinate, TileDirtState> _dirtMap = new();
     private PlayerResourceSnapshot _playerSnapshot = new(270f, 40, 10);
     private int _worldRevision = 1;
@@ -29,6 +30,13 @@ public sealed class SimulatedWorldObserver : IWorldObserver
     private readonly HashSet<TileCoordinate> _warpOrDoorTiles = new();
 
     public void SetPassable(TileCoordinate tile, bool passable) => _passability[tile] = passable;
+    public void SetPassable(string location, TileCoordinate tile, bool passable)
+    {
+        if (!_locationPassability.TryGetValue(location, out var map))
+            _locationPassability[location] = map = new();
+        map[tile] = passable;
+        KnownLocations.Add(location);
+    }
 
     public void SetWarpOrDoor(TileCoordinate tile, bool isWarpOrDoor)
     {
@@ -46,10 +54,16 @@ public sealed class SimulatedWorldObserver : IWorldObserver
 
     public bool IsTilePassable(string locationName, TileCoordinate tile)
     {
+        TilePassabilityChecks++;
+        if (_locationPassability.TryGetValue(locationName, out var map))
+            return map.TryGetValue(tile, out bool value) && value;
         if (!string.Equals(CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
             return false;
         return _passability.TryGetValue(tile, out bool passable) ? passable : true;
     }
+
+    public int TilePassabilityChecks { get; private set; }
+    public Exception? FarmWorkScanFailure { get; set; }
 
     public bool IsWarpOrDoorTile(string locationName, TileCoordinate tile)
     {
@@ -65,6 +79,7 @@ public sealed class SimulatedWorldObserver : IWorldObserver
 
     public IReadOnlyList<FarmDirtWorkItem> ScanFarmWork(string locationName)
     {
+        if (FarmWorkScanFailure is not null) throw FarmWorkScanFailure;
         if (!string.Equals(CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
             return Array.Empty<FarmDirtWorkItem>();
 

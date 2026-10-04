@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [string]$GameDir = '', [string]$TargetModDir = '',
-    [ValidateSet('kimi', 'agy', 'codex', 'none')][string]$Agent = 'kimi',
+    [ValidateSet('kimi', 'agy', 'codex', 'dsh', 'mcode', 'none')][string]$Agent = 'kimi',
     [string]$Model = '', [switch]$AutoInstall, [switch]$DryRun, [switch]$CheckOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -68,20 +68,20 @@ if (-not $AutoInstall -and -not $DryRun) {
     $form.Controls.Add($browse)
     $backendBox = New-Object Windows.Forms.ComboBox
     $backendBox.DropDownStyle = 'DropDownList'
-    [void]$backendBox.Items.AddRange(@('kimi', 'agy', 'codex'))
-    $backendBox.SelectedItem = if ($Agent -in @('agy', 'codex')) { $Agent } else { 'kimi' }
+    [void]$backendBox.Items.AddRange(@('kimi', 'agy', 'codex', 'dsh', 'mcode'))
+    $backendBox.SelectedItem = if ($Agent -in @('agy', 'codex', 'dsh', 'mcode')) { $Agent } else { 'kimi' }
     $backendBox.SetBounds(20, 105, 150, 28)
     $form.Controls.Add($backendBox)
     $modelBox = New-Object Windows.Forms.TextBox
-    $modelBox.Text = if ($Model) { $Model } elseif ($Agent -eq 'agy') { 'gemini-3.8-flash' } elseif ($Agent -eq 'codex') { '' } else { 'kimi-code/k3' }
+    $modelBox.Text = if ($Model) { $Model } elseif ($Agent -eq 'agy') { 'gemini-3.8-flash' } elseif ($Agent -in @('codex', 'mcode')) { '' } elseif ($Agent -eq 'dsh') { 'deepseek-flash' } else { 'kimi-code/k3' }
     $modelBox.SetBounds(190, 105, 410, 28)
     $form.Controls.Add($modelBox)
     $backendBox.Add_SelectedIndexChanged({
-        $modelBox.Text = if ($backendBox.SelectedItem -eq 'agy') { 'gemini-3.8-flash' } elseif ($backendBox.SelectedItem -eq 'codex') { '' } else { 'kimi-code/k3' }
+        $modelBox.Text = if ($backendBox.SelectedItem -eq 'agy') { 'gemini-3.8-flash' } elseif ($backendBox.SelectedItem -in @('codex', 'mcode')) { '' } elseif ($backendBox.SelectedItem -eq 'dsh') { 'deepseek-flash' } else { 'kimi-code/k3' }
     })
     $loadSettings = {
         $saved = Read-BackendSettings $pathBox.Text.Trim()
-        if ($saved -and $saved.backend -in @('kimi', 'agy', 'codex')) {
+        if ($saved -and $saved.backend -in @('kimi', 'agy', 'codex', 'dsh', 'mcode')) {
             if (-not $agentSpecified) { $backendBox.SelectedItem = $saved.backend }
             if (-not $modelSpecified -and $saved.model -and (-not $agentSpecified -or $Agent -eq $saved.backend)) { $modelBox.Text = $saved.model }
         }
@@ -89,7 +89,7 @@ if (-not $AutoInstall -and -not $DryRun) {
     $pathBox.Add_TextChanged($loadSettings)
     & $loadSettings
     $note = New-Object Windows.Forms.Label
-    $note.Text = "左侧选择 AI 客户端，右侧填写该账号可用的模型标识；Codex 留空则沿用本机设置。`nKimi 写入项目 MCP；agy 注册客户端 MCP；Codex 每轮临时绑定游戏 MCP。`n请自行安装并登录所选 CLI。此向导不会安装 CLI，也不会复制账号凭据。`n更新保留玩家 data、已有设置与存档；请先退出游戏和伙伴服务。"
+    $note.Text = "左侧选择 AI 客户端，右侧填写模型；Codex、MiniMax Code（mcode）留空沿用本机设置。`nKimi 写入项目 MCP；agy 注册客户端 MCP；Codex 和 mcode 每轮临时绑定游戏 MCP。`nmcode 默认 low 推理；dsh 使用 deepseek-flash（low），读取本机凭据或 DEEPSEEK_API_KEY。`n请自行安装并登录所选 CLI。此向导不会安装 CLI，也不会复制账号凭据。`n更新保留玩家 data、已有设置与存档；请先退出游戏和伙伴服务。"
     $note.SetBounds(20, 145, 580, 95)
     $form.Controls.Add($note)
     $ok = New-Object Windows.Forms.Button
@@ -121,7 +121,7 @@ $gamePath = [IO.Path]::GetFullPath($GameDir)
 $destination = Join-Path $gamePath 'Mods\StardewAI.Companion.Mod'
 $previousSettings = Read-BackendSettings $gamePath
 if ($previousSettings) {
-    if (-not $agentSpecified -and $previousSettings.backend -in @('kimi', 'agy', 'codex')) { $Agent = $previousSettings.backend }
+    if (-not $agentSpecified -and $previousSettings.backend -in @('kimi', 'agy', 'codex', 'dsh', 'mcode')) { $Agent = $previousSettings.backend }
     if (-not $modelSpecified -and $previousSettings.model -and (-not $agentSpecified -or $Agent -eq $previousSettings.backend)) { $Model = $previousSettings.model }
 }
 if ($TargetModDir -and [IO.Path]::GetFullPath($TargetModDir).TrimEnd('\') -ne $destination.TrimEnd('\')) { throw 'Release installs only into the selected game Mods/StardewAI.Companion.Mod directory.' }
@@ -130,7 +130,7 @@ if ($DryRun) {
     exit 0
 }
 if (Get-Process -Name 'StardewModdingAPI', 'Stardew Valley' -ErrorAction SilentlyContinue) { throw 'Close Stardew Valley and SMAPI before installing. No process will be stopped.' }
-if (-not $Model) { $Model = if ($Agent -eq 'agy') { 'gemini-3.8-flash' } elseif ($Agent -eq 'codex') { '' } else { 'kimi-code/k3' } }
+if (-not $Model) { $Model = if ($Agent -eq 'agy') { 'gemini-3.8-flash' } elseif ($Agent -in @('codex', 'mcode')) { '' } elseif ($Agent -eq 'dsh') { 'deepseek-flash' } else { 'kimi-code/k3' } }
 
 if ($destination.TrimEnd('\') -ne $releaseRoot.TrimEnd('\')) {
     # Preflight every destination before any copying; never follow directory links.
@@ -179,16 +179,22 @@ if ($Agent -ne 'none') {
         foreach ($property in $previousSettings.PSObject.Properties) { $merged[$property.Name] = $property.Value }
     }
     $merged.backend = $Agent
-    $merged.model = $Model
+    $merged.model = if ($Agent -eq 'dsh' -and -not $Model) { 'deepseek-flash' } else { $Model }
+    if ($Agent -eq 'dsh') { $merged.effort = 'low' }
+    if ($Agent -eq 'mcode' -and (-not $previousSettings -or $previousSettings.backend -ne 'mcode' -or -not $merged.effort)) { $merged.effort = 'low' }
     [IO.File]::WriteAllText($configFile, ($merged | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
     if ($Agent -eq 'codex') {
         Write-Host 'Codex will bind the game MCP for each turn; global MCP settings were not changed.'
+    } elseif ($Agent -eq 'dsh') {
+        Write-Host 'dsh uses its SDK protocol and game-only MCP; uses your saved DeepSeek credential or DEEPSEEK_API_KEY environment variable.'
+    } elseif ($Agent -eq 'mcode') {
+        Write-Host 'MiniMax Code will bind the game MCP for each turn; global MCP settings were not changed.'
     } elseif ($Agent -eq 'kimi' -or (Get-Command agy.exe -ErrorAction SilentlyContinue)) {
         & (Join-Path $destination 'tools/register-mcp.ps1') -RunDir $destination -Agent $Agent -Install
     } else {
         Write-Warning 'agy CLI is missing. Install and sign in to agy, then rerun setup to register MCP.'
     }
-    if (-not (Get-Command ($Agent + '.exe') -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command $Agent -ErrorAction SilentlyContinue)) {
         Write-Warning "Install and sign in to $Agent CLI. Setup does not install third-party clients or accounts."
     }
 }

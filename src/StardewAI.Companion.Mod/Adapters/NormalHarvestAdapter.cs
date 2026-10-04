@@ -10,7 +10,7 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// <summary>
 /// Production hand-harvest adapter executing crop.harvest through normal game mechanics.
 /// Enforces:
-/// 1. Main-thread and current-map execution only.
+/// 1. Main-thread execution on the companion's loaded map.
 /// 2. Maturity via HoeDirt.readyForHarvest() only; scythe crops rejected.
 /// 3. Conservative inventory capacity precheck (one empty slot required).
 /// 4. Game1.player is temporarily swapped to the companion Farmer for the duration of
@@ -64,11 +64,15 @@ public sealed class NormalHarvestAdapter : IHarvestAdapter
             return HarvestTileResult.Failed("Harvest operation rejected: must execute on the game main thread.");
         }
 
-        // 2. Current map invariant
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        // 2. The companion's map is independent of the human player's active map.
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return HarvestTileResult.Failed(
-                $"Harvest target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Harvest target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return HarvestTileResult.Failed($"Harvest target map '{locationName}' is not loaded or does not exist.");
         }
 
         // 3. Precheck adjacency
@@ -104,7 +108,7 @@ public sealed class NormalHarvestAdapter : IHarvestAdapter
         }
 
         // 6. Resolve the actual HoeDirt and crop
-        var location = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+        var location = Game1.getLocationFromName(locationName);
         if (location is null)
         {
             return HarvestTileResult.Failed($"Game location '{locationName}' not found.");

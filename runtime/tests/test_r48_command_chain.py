@@ -78,7 +78,7 @@ def test_job_completion_triggers_command_chain(tmp_path: Path, monkeypatch: pyte
 
         assert turn_count == 2
         assert request_ids[1].startswith("chain-")
-        assert "始终用中文回复玩家" in prompts[0]
+        assert "主动汇报阶段成果、实质取舍和阻塞，每次不超过三句" in prompts[0]
         assert "chat-continuation" in prompts[1]
         assert "这是对玩家指令『种植胡萝卜』的继续" in prompts[1]
         assert "始终用中文回复玩家" in prompts[1]
@@ -212,7 +212,10 @@ def test_command_chain_broken_by_pause_cancel_new_command(tmp_path: Path, monkey
         await bridge.wait_for_chains()
         assert turn_count == 1
 
-        bridge._work_store.set_paused("Save1", False)
+        resume_env = Envelope.create_autonomy_control(bridge.instance_id, "r1", "Save1", "resume")
+        await bridge._handle_autonomy_control(mock_ws, resume_env, "Save1")
+        assert not bridge._autonomy.state("Save1").paused
+        assert not bridge._work_store.state("Save1").paused
         await bridge.handle_chat_submit(mock_ws, "req-2", "任务2", "Save1")
         assert "Save1" in bridge._command_chains
         assert turn_count == 2

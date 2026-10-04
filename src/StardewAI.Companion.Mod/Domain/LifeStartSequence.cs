@@ -142,11 +142,11 @@ public sealed class LifeStartSequence
     /// </summary>
     public static string MapGoal(string playStyle) => playStyle switch
     {
-        "earn" => "优先赚钱：收获出货、按需补种，遵守每日购买上限",
+        "earn" => "优先赚钱：收获出货、按需补种",
         "workhorse" => "任劳任怨：浇水除草收获、喂动物、收机器成品等日常杂务",
         "community" => "社区中心献祭（规划中）",
         "decor" => "农场装修（规划中）",
-        _ => "优先赚钱：收获出货、按需补种，遵守每日购买上限",
+        _ => "优先赚钱：收获出货、按需补种",
     };
 
     private void Finish()

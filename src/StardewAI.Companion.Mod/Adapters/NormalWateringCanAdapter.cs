@@ -11,7 +11,7 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// <summary>
 /// Normal Watering Can Adapter implementing production tool execution.
 /// Enforces:
-/// 1. Main-thread and current-map execution only.
+/// 1. Main-thread execution on the companion's loaded map.
 /// 2. Precheck empty can before invoking tool logic (prevents accessing Game1.player empty-can path).
 /// 3. Human player resources are verified unchanged before and after tool use.
 /// 4. Game1.player is never swapped.
@@ -47,12 +47,17 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
             return WaterTileResult.Failed("Watering can operation rejected: must execute on the game main thread.");
         }
 
-        // 2. Target map must be loaded. The companion works on its own logical map,
+        // 2. Target map must be the companion's loaded map. It works independently
         // which may differ from the player's active map (e.g. the morning after a
         // pass-out the player wakes in the FarmHouse while the companion is on the Farm).
         if (!_observer.LocationExists(locationName))
         {
             return WaterTileResult.Failed($"Watering target map '{locationName}' is not loaded or does not exist.");
+        }
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        {
+            return WaterTileResult.Failed(
+                $"Watering target map '{locationName}' does not match companion map '{actor.LocationName}'.");
         }
 
         // 3. Precheck empty can (CRITICAL: prevent invoking game empty-can path which touches Game1.player)
@@ -82,6 +87,8 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         {
             return WaterTileResult.PreconditionError($"Tile {targetTile} does not contain tilled soil.");
         }
+        if (dirtState.IsDead)
+            return WaterTileResult.PreconditionError($"Tile {targetTile} contains a dead crop; clear it before planting.");
         if (dirtState.IsWatered)
         {
             return WaterTileResult.PreconditionError($"Tile {targetTile} is already watered.");

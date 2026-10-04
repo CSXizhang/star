@@ -7,6 +7,53 @@ namespace StardewAI.Companion.Mod.Tests;
 public class WorldMapGraphTests
 {
     [Fact]
+    public void NativeBuildingEntranceAtTopRowClampsArrivalToNonNegativeTile()
+    {
+        var farm = new StardewValley.GameLocation();
+        farm.name.Value = "Farm";
+        var indoors = new StardewValley.GameLocation();
+        indoors.name.Value = "Coop";
+        indoors.uniqueName.Value = "Coop-top-row";
+        indoors.warps.Add(new StardewValley.Warp(3, 0, "Farm", 42, 36, false));
+        var building = new StardewValley.Buildings.Building();
+        var oldWorld = StardewValley.Game1.netWorldState;
+        try
+        {
+            StardewValley.Game1.netWorldState = new Netcode.NetRoot<StardewValley.Network.NetWorldState>(new StardewValley.Network.NetWorldState());
+            farm.buildings.Add(building);
+        }
+        finally { StardewValley.Game1.netWorldState = oldWorld; }
+        building.indoors.Value = indoors;
+        var graph = new WorldMapGraph(() => new[] { farm, indoors });
+        var edge = Assert.Single(graph.GetEdges("Farm", "Coop-top-row"));
+        Assert.Equal(new TileCoordinate(3, 0), edge.TargetTile);
+    }
+    [Fact]
+    public void BuildingWithoutNativeEntranceWarp_DoesNotInventArrival()
+    {
+        var farm = new StardewValley.GameLocation();
+        farm.name.Value = "Farm";
+        var indoors = new StardewValley.GameLocation();
+        indoors.name.Value = "Coop";
+        indoors.uniqueName.Value = "Coop-no-warp";
+        var building = new StardewValley.Buildings.Building();
+        var oldWorld = StardewValley.Game1.netWorldState;
+        try
+        {
+            StardewValley.Game1.netWorldState = new Netcode.NetRoot<StardewValley.Network.NetWorldState>(new StardewValley.Network.NetWorldState());
+            farm.buildings.Add(building);
+        }
+        finally { StardewValley.Game1.netWorldState = oldWorld; }
+        building.indoors.Value = indoors;
+        var graph = new WorldMapGraph(() => new[] { farm, indoors });
+        Assert.Empty(graph.GetEdges("Farm", "Coop-no-warp"));
+        indoors.warps.Add(new StardewValley.Warp(3, 14, "Farm", 42, 36, false));
+        graph.InvalidateCache();
+        var edge = Assert.Single(graph.GetEdges("Farm", "Coop-no-warp"));
+        Assert.Equal(new TileCoordinate(3, 13), edge.TargetTile);
+    }
+
+    [Fact]
     public void FindLocationRoute_SameLocation_ReturnsSingleLocationRoute()
     {
         var graph = new WorldMapGraph();

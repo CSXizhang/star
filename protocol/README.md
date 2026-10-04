@@ -16,6 +16,8 @@ Wire compatibility rules:
 - All timestamps use RFC 3339 UTC strings.
 - `worldRevision` starts at zero during handshake.
 
+Production observations, resource recovery and building services are described in [Native production chain](production-chain.md).
+
 ## F8 command and control correlation
 
 The chat channel distinguishes a model turn from the whole player instruction.
@@ -58,6 +60,8 @@ Direction: **C#→Py** means the Companion Mod sends the message to the Runtime.
 | `mode` | str | `"chat"` (casual talk) or `"plan"` (read-only plan discussion; never dispatches) |
 | `text` | str | 1..500 chars |
 | `source` | str | always `"life-menu"` |
+| `replyToNoticeId` | str? | optional save-scoped pending decision identity; blank/unknown/already answered IDs are rejected |
+| `resolveNotice` | bool? | default false: a linked follow-up keeps the decision pending; true requires the player explicitly submitting their choice |
 
 ### `life.chat.reply` (Py→C#, §1.2)
 
@@ -71,6 +75,7 @@ Direction: **C#→Py** means the Companion Mod sends the message to the Runtime.
 | `error` | str? | present on `failed` |
 | `profileRevision` | int | for optimistic-lock tracking |
 | `memoryRevision` | int | for optimistic-lock tracking |
+| `answeredNoticeId` | str? | only after successfully accepting a linked decision reply; a failed exchange leaves the question pending |
 
 Never carries token/usage/session fields.
 
@@ -111,7 +116,6 @@ Never carries token/usage/session fields.
 | `mode` | str | `"free"` \| `"command"` |
 | `paused` | bool | |
 | `goal` | str? | |
-| `dailySpendLimit` | int? | real semantics: per-day purchase cap (not "reserved funds") |
 | `boxPreference` | str? | |
 | `dailySpend` | int? | |
 | `hasExecutableWork` | bool | |

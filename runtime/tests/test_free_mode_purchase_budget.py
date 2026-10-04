@@ -1,16 +1,14 @@
-"""Free-mode daily purchase budget must be enforced on the real plan dispatch path.
+"""Goal-driven purchasing has no daily allowance.
 
-The model-facing ``purchase_items`` tool only *selects* a short job
-(``protect_job`` interception); the actual purchase runs through the shared
-plan worker: ``run_next_step`` -> ``PlanExecutor`` -> ``execute_plan_operation``
--> ``CompanionScheduler.execute_purchase_items`` -> native client. These tests
-drive that whole chain with a fake transport client and assert the daily
-budget is a program guarantee, not a prompt hint.
+Drive the actual short-job dispatch chain and verify legacy allowances are
+ignored, while unknown results, replay protection and actual cost accounting
+continue through the existing native command ledger.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,7 +133,7 @@ def _make_client(results: list, cached: dict | None = None) -> MagicMock:
     cache: dict[str, object] = dict(cached or {})
     client.get_cached_result = MagicMock(side_effect=lambda command_id: cache.get(command_id))
     client.cache_result = lambda command_id, payload: cache.__setitem__(
-        command_id, SimpleNamespace(payload=payload)
+        command_id, SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=payload)
     )
     return client
 
@@ -152,7 +150,10 @@ def _free_mode(run_dir: Path, budget: int | None) -> None:
     ctl = _autonomy(run_dir)
     ctl.set_mode(SAVE, "free")
     if budget is not None:
-        ctl.set_preferences(SAVE, budget_limit=budget)
+        # Reproduce existing player sidecars without rewriting their world.
+        raw = json.loads(ctl.state_path.read_text(encoding="utf-8"))
+        raw[SAVE]["budget_limit"] = budget
+        ctl.state_path.write_text(json.dumps(raw), encoding="utf-8")
 
 
 async def _run_purchase_plan(
@@ -169,34 +170,51 @@ async def _run_purchase_plan(
     return execution
 
 
-def test_single_purchase_cannot_exceed_remaining_daily_budget(native_compatible_run_dir) -> None:
-    """One purchase whose native quote exceeds the daily budget is rejected
-    before dispatch, even when the model authorized a far larger budget_limit."""
+def test_purchase_ignores_legacy_daily_allowance(native_compatible_run_dir) -> None:
     _free_mode(native_compatible_run_dir, budget=100)
-    client = _make_client([SimpleNamespace(payload=_purchase_result("x", "succeeded", 120))])
+    client = _make_client([SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("x", "succeeded", 120))])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
     server = create_mcp_server(scheduler=scheduler, full=True)
-    store = _work_store(native_compatible_run_dir)
-
-    execution = asyncio.run(
-        _run_purchase_plan(server, store, [{"itemId": MID, "count": 3}], 500, "decision-1")
-    )
-
-    client.execute_purchase_items.assert_not_called()
-    assert execution["outcome"] == "partial"
-    assert execution["reasonCode"] == "AUTONOMY_BUDGET_EXHAUSTED"
+    execution = asyncio.run(_run_purchase_plan(server, _work_store(native_compatible_run_dir),
+        [{"itemId": MID, "count": 3}], 500, "decision-1"))
+    assert execution["outcome"] == "completed"
+    assert client.execute_purchase_items.call_args.kwargs["budget_limit"] == 500
     state = _autonomy(native_compatible_run_dir).state(SAVE)
-    assert state.daily_spend == 0
-    assert state.spend_reservations == {}
+    assert state.daily_spend == 120 and state.spend_reservations == {}
+    assert "budget_limit" not in state.__dict__
 
 
-def test_cumulative_purchases_cannot_exceed_daily_budget(native_compatible_run_dir) -> None:
-    """Two 40-cost purchases drain a budget of 100; the third is rejected by
-    the program, not merely advised against."""
+def test_animal_and_building_service_have_no_daily_allowance(native_compatible_run_dir):
+    _free_mode(native_compatible_run_dir, budget=0)
+    client = _make_client([
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("animal-1", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("seed-3", "succeeded", 80)),
+    ])
+    client.execute_native_action = AsyncMock(side_effect=lambda **kwargs: kwargs["command_id"])
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+    async def run():
+        result = await scheduler.purchase_animal("house-guid", "White Chicken", "Hen", 500, command_id="animal-1")
+        assert result["terminalState"] == "succeeded"
+        assert client.execute_native_action.call_args.kwargs["parameters"]["budget_limit"] == 500
+        await scheduler.purchase_animal("house-guid", "White Chicken", "Hen", 500, command_id="animal-1")
+        assert client.execute_native_action.await_count == 1
+        guard = await scheduler._guard_free_mode_purchase(items=[], budget_limit=500,
+            shop_id="ScienceHouse", command_id="build-2", reserve_allowance=True)
+        assert guard.effective_budget == 500 and guard.early_response is None
+        seeds = await scheduler.execute_purchase_items([{"itemId": MID, "count": 2}], 500, command_id="seed-3")
+        assert seeds["terminalState"] == "succeeded"
+        state = _autonomy(native_compatible_run_dir).state(SAVE)
+        assert state.daily_spend == 120 and state.spend_reservations == {}
+    asyncio.run(run())
+
+
+def test_cumulative_purchases_are_not_limited_by_legacy_allowance(native_compatible_run_dir) -> None:
+    """Three confirmed purchases can exceed the old daily allowance."""
     _free_mode(native_compatible_run_dir, budget=100)
     client = _make_client([
-        SimpleNamespace(payload=_purchase_result("x", "succeeded", 40)),
-        SimpleNamespace(payload=_purchase_result("x", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("x", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("x", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("x", "succeeded", 40)),
     ])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
     server = create_mcp_server(scheduler=scheduler, full=True)
@@ -209,11 +227,10 @@ def test_cumulative_purchases_cannot_exceed_daily_budget(native_compatible_run_d
 
     assert first["outcome"] == "completed"
     assert second["outcome"] == "completed"
-    assert third["outcome"] == "partial"
-    assert third["reasonCode"] == "AUTONOMY_BUDGET_EXHAUSTED"
-    assert client.execute_purchase_items.await_count == 2
+    assert third["outcome"] == "completed"
+    assert client.execute_purchase_items.await_count == 3
     state = _autonomy(native_compatible_run_dir).state(SAVE)
-    assert state.daily_spend == 80
+    assert state.daily_spend == 120
     assert state.spend_reservations == {}
 
 
@@ -223,7 +240,7 @@ def test_same_command_id_retry_is_idempotent_and_settles_once(native_compatible_
     _free_mode(native_compatible_run_dir, budget=100)
     client = _make_client([
         TimeoutError(),
-        SimpleNamespace(payload=_purchase_result("native-cmd-x", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("native-cmd-x", "succeeded", 40)),
     ])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
 
@@ -268,12 +285,21 @@ def test_unknown_result_keeps_reservation_and_settles_once_on_reconcile(
     it and settles exactly once before its own dispatch."""
     _free_mode(native_compatible_run_dir, budget=100)
     monkeypatch.setenv("STARDEW_NATIVE_RECONCILE_TIMEOUT_SECONDS", "1")
-    client = _make_client([
-        TimeoutError(),
-        TimeoutError(),
-        TimeoutError(),
-        SimpleNamespace(payload=_purchase_result("native-2", "succeeded", 10)),
-    ])
+    client = _make_client([])
+    pending_command_id = None
+
+    async def result_for_command(command_id, **kwargs):
+        nonlocal pending_command_id
+        if pending_command_id is None:
+            pending_command_id = command_id
+        if command_id == pending_command_id:
+            raise TimeoutError()
+        return SimpleNamespace(save_id=SAVE, game_session_id="session-a",
+            payload=_purchase_result(command_id, "succeeded", 10))
+
+    # Keep the first command unknown regardless of the poll count. A fixed
+    # sequence can accidentally deliver the second command before the deadline.
+    client.wait_for_result.side_effect = result_for_command
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
     server = create_mcp_server(scheduler=scheduler, full=True)
     store = _work_store(native_compatible_run_dir)
@@ -309,9 +335,9 @@ def test_terminal_results_settle_confirmed_cost_and_failure_refunds(
     reservation instead of blocking every later purchase."""
     _free_mode(native_compatible_run_dir, budget=100)
     client = _make_client([
-        SimpleNamespace(payload=_purchase_result("c1", "succeeded", 40)),
-        SimpleNamespace(payload=_purchase_result("c2", "failed", 0)),
-        SimpleNamespace(payload=_purchase_result("c3", "partially-succeeded", 10)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("c1", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("c2", "failed", 0)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("c3", "partially-succeeded", 10)),
     ])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
 
@@ -339,20 +365,20 @@ def test_terminal_results_settle_confirmed_cost_and_failure_refunds(
     asyncio.run(run())
 
 
-def test_new_day_resets_budget_and_carries_unsettled_reservation(
+def test_new_day_resets_spend_and_carries_unsettled_purchase(
     native_compatible_run_dir, monkeypatch,
 ) -> None:
-    """Day rollover (autonomy.on_day_started via next_candidate) zeroes the
-    spend but keeps the unsettled reservation; it is settled once when the next
-    purchase reconciles it, and the new day's budget is enforced on top."""
+    """Day rollover preserves unknown purchases and records actual costs;
+    neither earlier spending nor old allowances limit the next command."""
     _free_mode(native_compatible_run_dir, budget=100)
     monkeypatch.setenv("STARDEW_NATIVE_RECONCILE_TIMEOUT_SECONDS", "1")
     client = _make_client([
-        SimpleNamespace(payload=_purchase_result("native-x1", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("native-x1", "succeeded", 40)),
         TimeoutError(),
         TimeoutError(),
         TimeoutError(),
-        SimpleNamespace(payload=_purchase_result("native-z", "succeeded", 50)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("native-z", "succeeded", 70)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("native-w", "succeeded", 50)),
     ])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
     server = create_mcp_server(scheduler=scheduler, full=True)
@@ -377,33 +403,30 @@ def test_new_day_resets_budget_and_carries_unsettled_reservation(
     assert state.daily_spend == 0
     assert list(state.spend_reservations.values()) == [40]  # not lost across the day boundary
 
-    # Without the reset only 100-40(spent)-40(reserved)=20 would remain, so a
-    # 70-quote purchase is rejected on the fresh day after the pending one is
-    # settled once (remaining 100-40=60).
-    rejected = asyncio.run(
+    # Both new purchases are allowed after reconciling the prior command.
+    third = asyncio.run(
         _run_purchase_plan(server, store, [{"itemId": MID, "count": 1}, {"itemId": CHEAP, "count": 3}], 70, "decision-3")
     )
-    assert rejected["outcome"] == "partial"
-    assert rejected["reasonCode"] == "AUTONOMY_BUDGET_EXHAUSTED"
-    assert client.execute_purchase_items.await_count == 2
+    assert third["outcome"] == "completed"
+    assert client.execute_purchase_items.await_count == 3
 
-    # A 50-quote purchase fits the remaining 60 and completes the day at 90.
+    # Confirmed costs remain visible, without imposing a spending ceiling.
     ok = asyncio.run(
         _run_purchase_plan(server, store, [{"itemId": MID, "count": 1}, {"itemId": CHEAP, "count": 1}], 50, "decision-4")
     )
     assert ok["outcome"] == "completed"
-    assert client.execute_purchase_items.await_count == 3
+    assert client.execute_purchase_items.await_count == 4
     state = _autonomy(native_compatible_run_dir).state(SAVE)
-    assert state.daily_spend == 90
+    assert state.daily_spend == 160
     assert state.spend_reservations == {}
     assert sorted(state.settled_spend_commands) == sorted(
-        [day1a["commandId"], pending_id, ok["commandId"]]
+        [day1a["commandId"], pending_id, third["commandId"], ok["commandId"]]
     )
 
 
 def test_command_mode_purchase_is_not_budget_gated(native_compatible_run_dir) -> None:
     """指令(命令)模式 keeps the pre-existing behavior: no daily-budget gate."""
-    client = _make_client([SimpleNamespace(payload=_purchase_result("x", "succeeded", 10))])
+    client = _make_client([SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("x", "succeeded", 10))])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
     server = create_mcp_server(scheduler=scheduler, full=True)
     store = _work_store(native_compatible_run_dir)
@@ -419,30 +442,27 @@ def test_command_mode_purchase_is_not_budget_gated(native_compatible_run_dir) ->
     assert state.spend_reservations == {}
 
 
-def test_free_mode_without_configured_budget_rejects_purchases(native_compatible_run_dir) -> None:
-    """Zero budget (free mode, no preference set) rejects every purchase."""
-    _free_mode(native_compatible_run_dir, budget=None)
-    client = _make_client([SimpleNamespace(payload=_purchase_result("x", "succeeded", 10))])
+@pytest.mark.parametrize("legacy_budget", [None, 0, 1])
+def test_free_mode_needs_no_purchase_allowance(native_compatible_run_dir, legacy_budget) -> None:
+    _free_mode(native_compatible_run_dir, budget=legacy_budget)
+    client = _make_client([SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("x", "succeeded", 10))])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
     server = create_mcp_server(scheduler=scheduler, full=True)
-    store = _work_store(native_compatible_run_dir)
+    execution = asyncio.run(_run_purchase_plan(server, _work_store(native_compatible_run_dir),
+        [{"itemId": CHEAP, "count": 1}], 10, "decision-1"))
+    assert execution["outcome"] == "completed"
+    assert client.execute_purchase_items.await_count == 1
 
-    execution = asyncio.run(
-        _run_purchase_plan(server, store, [{"itemId": CHEAP, "count": 1}], 10, "decision-1")
-    )
 
+def test_native_quote_check_is_still_per_command(native_compatible_run_dir):
+    _free_mode(native_compatible_run_dir, budget=None)
+    client = _make_client([])
+    scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
+    result = asyncio.run(scheduler.execute_purchase_items(
+        [{"itemId": MID, "count": 3}], 100, command_id="bad-quote"))
+    assert result["error"]["code"] == "PURCHASE_QUOTE_EXCEEDS_LIMIT"
     client.execute_purchase_items.assert_not_called()
-    assert execution["reasonCode"] == "AUTONOMY_BUDGET_EXHAUSTED"
-
-
-
-# ---------------------------------------------------------------------------
-# Defect 1: terminalState="partially-succeeded" is a real native purchase
-# terminal (PurchaseStateMachine: PartiallySucceeded => partially-succeeded,
-# always carrying a confirmed non-negative totalCost) but the ledger only
-# accepted succeeded/failed/cancelled, so partial spends never settled and
-# every later purchase stayed blocked on AUTONOMY_PENDING_RECONCILIATION.
-# ---------------------------------------------------------------------------
+    assert _autonomy(native_compatible_run_dir).state(SAVE).spend_reservations == {}
 
 
 def test_partially_succeeded_settles_confirmed_cost_and_unblocks_next_purchase(
@@ -450,8 +470,8 @@ def test_partially_succeeded_settles_confirmed_cost_and_unblocks_next_purchase(
 ) -> None:
     _free_mode(native_compatible_run_dir, budget=100)
     client = _make_client([
-        SimpleNamespace(payload=_purchase_result("c1", "partially-succeeded", 10)),
-        SimpleNamespace(payload=_purchase_result("c2", "succeeded", 40)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("c1", "partially-succeeded", 10)),
+        SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("c2", "succeeded", 40)),
     ])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
 
@@ -549,7 +569,7 @@ def test_terminal_boundary_settles_confirmed_cost_or_keeps_reservation(
     result = _purchase_result("c1", terminal, total_cost if total_cost is not None else 0)
     if total_cost is None:
         result["details"].pop("totalCost")
-    client = _make_client([SimpleNamespace(payload=result)])
+    client = _make_client([SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=result)])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
 
     async def run() -> None:
@@ -582,7 +602,7 @@ def test_compatibility_rejection_leaves_no_reservation_and_recovers(
     run_dir = tmp_path / "mods" / "StardewAI.Companion.Mod"
     run_dir.mkdir(parents=True)
     _free_mode(run_dir, budget=40)
-    client = _make_client([SimpleNamespace(payload=_purchase_result("c1", "succeeded", 40))])
+    client = _make_client([SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("c1", "succeeded", 40))])
     scheduler = CompanionScheduler(client=client, run_dir=run_dir)
 
     async def attempt() -> dict:
@@ -620,13 +640,13 @@ def test_concurrent_task_rejection_leaves_no_purchase_reservation(
     async def wait_side_effect(command_id: str, timeout: float = 10.0):
         if command_id == "cmd-water":
             await gate["event"].wait()
-            return SimpleNamespace(payload={
+            return SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload={
                 "commandId": "cmd-water", "terminalState": "succeeded",
                 "completedCount": 1, "skippedCount": 0, "failedCount": 0,
                 "effects": [], "details": {},
             })
         if command_id == "cmd-buy":
-            return SimpleNamespace(payload=_purchase_result("cmd-buy", "succeeded", 40))
+            return SimpleNamespace(save_id=SAVE, game_session_id="session-a", payload=_purchase_result("cmd-buy", "succeeded", 40))
         raise AssertionError(f"unexpected wait_for_result({command_id})")
 
     client = MagicMock()

@@ -272,7 +272,7 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
             // 3. Game-level pause, open menus, saving, world not ready
             try
             {
-                if (Game1.paused || Game1.activeClickableMenu != null || !Context.IsWorldReady)
+                if (Game1.paused || StardewAI.Companion.Mod.Menus.CompanionMenuClock.HasBlockingMenu || !Context.IsWorldReady)
                 {
                     _actor.Halt();
                     return;

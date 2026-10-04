@@ -16,11 +16,23 @@ class ProtocolError(ValueError):
 # here, schedule, transport, MCP schema and the C# handler all validate the same
 # contract, and an unknown skill/parameter is rejected instead of being forwarded.
 NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
+    "cut-grass": frozenset({"locationId", "tiles"}),
+    "inspect-building-services": frozenset({"locationId"}),
+    "build-building": frozenset({"locationId", "buildingType", "tile", "budget_limit"}),
+    "upgrade-building": frozenset({"locationId", "buildingName", "buildingType", "budget_limit"}),
+    "purchase-animal": frozenset({"locationId", "buildingName", "animalType", "animalName", "budget_limit"}),
+    "inspect-machines": frozenset({"locationId"}),
+    "inspect-production": frozenset({"locationId"}),
+    "eat-food": frozenset({"locationId", "itemId"}),
     "inspect-crafting": frozenset({"locationId"}),
     "craft-items": frozenset({"locationId", "recipeName", "itemCount"}),
     "move-building": frozenset({"locationId", "buildingName", "tile"}),
     "inspect-map-image": frozenset({"locationId"}),
     "inspect-location": frozenset({"locationId", "region"}),
+    "inspect-planting": frozenset({"locationId", "region"}),
+    "inspect-route": frozenset({"locationId", "tile"}),
+    "inspect-livestock": frozenset({"locationId"}),
+    "inspect-shop": frozenset({"locationId", "shopId"}),
     "place-items": frozenset({"locationId", "tiles", "itemId"}),
     "remove-items": frozenset({"locationId", "tiles", "itemId"}),
     "refill-watering-can": frozenset({"locationId", "tiles"}),
@@ -30,10 +42,10 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "chop-tree": frozenset({"locationId", "tiles"}),
     "insert-machine": frozenset({"locationId", "tile", "itemId", "itemCount"}),
     "collect-machine": frozenset({"locationId", "tiles"}),
-    "pet-animal": frozenset({"locationId", "tiles", "animalName"}),
+    "pet-animal": frozenset({"locationId", "tiles", "animalName", "animalId"}),
     "feed-animals": frozenset({"locationId", "buildingName"}),
     "toggle-animal-door": frozenset({"locationId", "tiles"}),
-    "collect-animal-produce": frozenset({"locationId", "tiles", "animalName"}),
+    "collect-animal-produce": frozenset({"locationId", "tiles", "animalName", "animalId"}),
 }
 
 NATIVE_ACTION_TASK_PREFIXES: dict[str, str] = {
@@ -249,6 +261,7 @@ class Envelope:
         max_water: int = 20,
         cancel_policy: str = "safe-point",
         policy_decision_id: str = "policy-allow",
+        include_empty_tiles: bool | None = None,
     ) -> Envelope:
         return cls(
             protocol_version="0.1",
@@ -271,6 +284,7 @@ class Envelope:
                 "parameters": {
                     "locationId": location_id,
                     "tiles": tiles,
+                    "includeEmptyTiles": include_empty_tiles is True,
                 },
                 "budgets": {
                     "maxGameMinutes": max_game_minutes,
@@ -1026,6 +1040,7 @@ class Envelope:
         proposal_ready: bool | None = None,
         proposal_node_id: str | None = None,
         activity: Mapping[str, Any] | None = None,
+        answered_notice_id: str | None = None,
     ) -> Envelope:
         """life.chat.reply: no token/session fields (contract §1.2)."""
         payload: dict[str, Any] = {
@@ -1047,6 +1062,8 @@ class Envelope:
             payload["proposalNodeId"] = proposal_node_id
         if activity is not None:
             payload["activity"] = dict(activity)
+        if answered_notice_id is not None:
+            payload["answeredNoticeId"] = answered_notice_id
         return cls(
             protocol_version="0.1", message_type="life.chat.reply",
             message_id=f"msg-life-reply-{uuid.uuid4().hex[:8]}",
@@ -1314,6 +1331,10 @@ class LifeChatSubmitPayload:
     text: str
     source: str = "life-menu"
     accepted_node_id: str | None = None
+    reply_to_notice_id: str | None = None
+    resolve_notice: bool = False
+    notice_action: str | None = None
+    notice_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatSubmitPayload:
@@ -1333,8 +1354,25 @@ class LifeChatSubmitPayload:
         accepted = value.get("acceptedNodeId")
         if accepted is not None and (mode != "plan" or not isinstance(accepted, str) or not accepted.strip()):
             raise ProtocolError("acceptedNodeId requires plan mode and a non-empty proposal id")
+        notice = value.get("replyToNoticeId")
+        if notice is not None and (not isinstance(notice, str) or not notice.strip()):
+            raise ProtocolError("replyToNoticeId requires a non-empty notice id")
+        resolve = value.get("resolveNotice", False)
+        if not isinstance(resolve, bool) or resolve and not notice:
+            raise ProtocolError("resolveNotice requires boolean and a pending notice id")
+        notice_action = value.get("noticeAction")
+        notice_ids = value.get("noticeIds", [])
+        if not isinstance(notice_ids, list):
+            raise ProtocolError("noticeIds must be an array")
+        if notice_action is not None and (notice_action not in {"dismiss", "restore"} or
+                not isinstance(notice_ids, list) or not 1 <= len(notice_ids) <= 200 or
+                any(not isinstance(i, str) or not i.strip() for i in notice_ids) or notice or accepted or resolve):
+            raise ProtocolError("Invalid notice visibility action")
+        if notice_action is None and notice_ids:
+            raise ProtocolError("noticeIds requires noticeAction")
         return cls(request_id=request_id, save_id=save_id, mode=mode, text=text, source=source,
-                   accepted_node_id=accepted)
+                   accepted_node_id=accepted, reply_to_notice_id=notice, resolve_notice=resolve,
+                   notice_action=notice_action, notice_ids=tuple(notice_ids))
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -1344,6 +1382,9 @@ class LifeChatSubmitPayload:
             "text": self.text,
             "source": self.source,
             **({"acceptedNodeId": self.accepted_node_id} if self.accepted_node_id else {}),
+            **({"replyToNoticeId": self.reply_to_notice_id} if self.reply_to_notice_id else {}),
+            **({"resolveNotice": True} if self.resolve_notice else {}),
+            **({"noticeAction": self.notice_action, "noticeIds": list(self.notice_ids)} if self.notice_action else {}),
         }
 
 
@@ -1362,6 +1403,7 @@ class LifeChatReplyPayload:
     proposal_ready: bool | None = None
     proposal_node_id: str | None = None
     activity: dict[str, Any] | None = None
+    answered_notice_id: str | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatReplyPayload:
@@ -1377,6 +1419,7 @@ class LifeChatReplyPayload:
             proposal_ready=value.get("proposalReady"),
             proposal_node_id=value.get("proposalNodeId"),
             activity=value.get("activity"),
+            answered_notice_id=value.get("answeredNoticeId"),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -1399,6 +1442,8 @@ class LifeChatReplyPayload:
             res["proposalNodeId"] = self.proposal_node_id
         if self.activity is not None:
             res["activity"] = dict(self.activity)
+        if self.answered_notice_id is not None:
+            res["answeredNoticeId"] = self.answered_notice_id
         return res
 
 
@@ -1452,6 +1497,13 @@ class LifeProfileSetPayload:
             raise ProtocolError(f"life.profile.set: invalid personality '{patch['personality']}'")
         if "careFrequency" in patch and patch["careFrequency"] not in _LIFE_CARE_FREQUENCIES:
             raise ProtocolError(f"life.profile.set: invalid careFrequency '{patch['careFrequency']}'")
+        if "bedtime" in patch:
+            bedtime = patch["bedtime"]
+            if isinstance(bedtime, bool) or not isinstance(bedtime, int):
+                raise ProtocolError("life.profile.set: bedtime must be a game HHMM integer")
+            bedtime = bedtime + 2400 if 0 <= bedtime <= 100 else bedtime
+            if not 1800 <= bedtime <= 2500 or bedtime % 100 >= 60 or bedtime % 10:
+                raise ProtocolError("life.profile.set: bedtime must be 18:00..01:00 in ten-minute steps")
         if "companionName" in patch:
             name = str(patch["companionName"]).strip()
             if not (1 <= len(name) <= 12):

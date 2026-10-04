@@ -53,6 +53,7 @@ public interface IFarmerActor
     ToolAnimationPhase AnimationPhase { get; }
 
     void BeginUsingTool();
+    void BeginUsingTool(string toolName) => BeginUsingTool();
     ToolAnimationPhase UpdateToolAnimation(GameTime? time, long tickCount);
     void EndUsingTool();
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import sqlite3
@@ -15,12 +16,14 @@ import pytest
 from stardew_ai_runtime.chat_bridge import (
     ActiveChatTask,
     ChatBridge,
+    InternalMcpPlanClient,
     configure_chat_bridge_file_logging,
     get_command_usage_delta,
     get_max_gen_idx,
     main,
     remove_chat_bridge_file_logging,
 )
+from stardew_ai_runtime.decision_policy import decision_policy
 from stardew_ai_runtime.protocol import (
     ChatCancelPayload,
     ChatReplyPayload,
@@ -29,6 +32,58 @@ from stardew_ai_runtime.protocol import (
 )
 from stardew_ai_runtime.scheduler import DiscoveryError
 
+
+def _mock_agy_stream(proc, stdout: str, stderr: str) -> None:
+    """Bridge parser tests use the native result event; transport has its own tests."""
+    output = ""
+    if stdout:
+        start, end = stdout.find("{"), stdout.rfind("}") + 1
+        output = stdout[:start] + json.dumps({"event": "result", "result": json.loads(stdout[start:end])}) + "\n"
+    proc.stdin = io.StringIO()
+    proc.stdout = io.StringIO(output)
+    proc.stderr = io.StringIO(stderr)
+    proc.poll.return_value = proc.returncode
+    proc.wait.return_value = proc.returncode
+
+
+def test_internal_client_close_releases_inflight_and_queued_calls(tmp_path: Path) -> None:
+    async def scenario():
+        started = asyncio.Event()
+        calls = []
+
+        async def native_call(name, arguments):
+            calls.append(name)
+            started.set()
+            await asyncio.Event().wait()
+
+        session = MagicMock()
+        session.initialize = AsyncMock()
+        session.call_tool = native_call
+        session.__aenter__ = AsyncMock(return_value=session)
+        streams = MagicMock()
+        streams.__aenter__ = AsyncMock(return_value=(None, None))
+        real_wait_for = asyncio.wait_for
+
+        async def short_close_wait(awaitable, timeout):
+            return await real_wait_for(awaitable, 0.01 if timeout == 5.0 else timeout)
+
+        client = InternalMcpPlanClient(tmp_path)
+        with patch("mcp.client.stdio.stdio_client", return_value=streams), patch(
+            "mcp.ClientSession", return_value=session
+        ), patch("stardew_ai_runtime.chat_bridge.asyncio.wait_for", side_effect=short_close_wait):
+            await client.open()
+            current = asyncio.create_task(client.call_tool("eat_food", {}))
+            await started.wait()
+            queued = asyncio.create_task(client.call_tool("get_status", {}))
+            await asyncio.sleep(0)
+            await client.close()
+            results = await real_wait_for(asyncio.gather(current, queued, return_exceptions=True), 1)
+        assert all(isinstance(result, RuntimeError) for result in results)
+        assert all("unknown" in str(result) for result in results)
+        assert calls == ["eat_food"]
+        assert client._task is None
+
+    asyncio.run(scenario())
 
 def test_chat_submit_payload_roundtrip() -> None:
     submit = ChatSubmitPayload(
@@ -141,7 +196,8 @@ def test_format_agent_prompt() -> None:
     assert "收割所有成熟作物" in prompt
     assert "stardew-companion" in prompt
     assert "MCP" in prompt
-    assert "始终用中文回复玩家" in prompt
+    assert decision_policy() in prompt
+    assert "主动汇报阶段成果、实质取舍和阻塞，每次不超过三句" in prompt
 
 
 def test_format_chain_prompt_contains_chinese_reply_instruction() -> None:
@@ -167,7 +223,7 @@ def test_execute_agy_turn_success_parsing() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -195,7 +251,7 @@ def test_execute_agy_turn_empty_response_not_falsified() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -217,7 +273,7 @@ def test_execute_agy_turn_effort_and_model_rules() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (json.dumps({"status": "SUCCESS", "response": "ok"}), "")
+        _mock_agy_stream(mock_proc, json.dumps({"status": "SUCCESS", "response": "ok"}), "")
         mock_popen.return_value = mock_proc
 
         # 1. New conversation: --model AND --effort should be present
@@ -232,6 +288,7 @@ def test_execute_agy_turn_effort_and_model_rules() -> None:
 
         # 2. Resumed conversation retains the explicitly configured model.
         task2 = ActiveChatTask(request_id="r2", save_id="s1")
+        _mock_agy_stream(mock_proc, json.dumps({"status": "SUCCESS", "response": "ok"}), "")
         bridge._execute_agy_turn(task2, conversation_id="existing-cid-999", prompt="test prompt")
         cmd_resume = mock_popen.call_args[0][0]
         assert "--conversation" in cmd_resume
@@ -250,7 +307,7 @@ def test_execute_agy_turn_quota_exhaustion() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = ("", "Error: RESOURCE_EXHAUSTED: quota exceeded for model")
+        _mock_agy_stream(mock_proc, "", "Error: RESOURCE_EXHAUSTED: quota exceeded for model")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -273,7 +330,7 @@ def test_execute_agy_turn_rate_limit_notifies_and_is_not_quota() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = ("", "429 Too Many Requests: rate limit exceeded")
+        _mock_agy_stream(mock_proc, "", "429 Too Many Requests: rate limit exceeded")
         mock_popen.return_value = mock_proc
 
         res = bridge._execute_agy_turn(
@@ -411,7 +468,7 @@ def test_old_stdout_error_ignored_on_successful_turn() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -426,7 +483,7 @@ def test_rate_limit_distinguished_from_quota() -> None:
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = ("", "Error 429: rate limit exceeded. Please retry later.")
+        _mock_agy_stream(mock_proc, "", "Error 429: rate limit exceeded. Please retry later.")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(request_id="r1", save_id="s1")
@@ -453,7 +510,9 @@ def test_cancel_race_pre_and_post_spawn() -> None:
     task_post = ActiveChatTask(request_id="r_post", save_id="s1")
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
-        mock_proc.pid = 9999
+        mock_proc.returncode = -9
+        _mock_agy_stream(mock_proc, "", "")
+        mock_proc.poll.return_value = None
 
         def popen_side_effect(*args, **kwargs):
             # Simulate cancel arriving right as process spawns
@@ -614,7 +673,7 @@ def test_resume_ignores_old_cumulative_quota_error(tmp_path: Path) -> None:
          patch("stardew_ai_runtime.chat_bridge.get_conversation_db_path", return_value=db_path):
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(
@@ -653,7 +712,7 @@ def test_resume_detects_genuine_new_step17_quota_error(tmp_path: Path) -> None:
          patch("stardew_ai_runtime.chat_bridge.get_conversation_db_path", return_value=db_path):
         mock_proc = MagicMock()
         mock_proc.returncode = 1
-        mock_proc.communicate.return_value = (mock_stdout, "")
+        _mock_agy_stream(mock_proc, mock_stdout, "")
         mock_popen.return_value = mock_proc
 
         task = ActiveChatTask(
@@ -734,7 +793,7 @@ def test_autonomy_chat_channel_lifecycle_replays_initial_snapshot_and_enable(tmp
     """Native snapshots use /chat, so enable-after-connect works without a second socket."""
     bridge = ChatBridge(run_dir=tmp_path)
     bridge._autonomy.set_enabled("save-1", False)
-    bridge._autonomy.set_preferences("save-1", goal="种植", budget_limit=75, box_preference="作物入箱")
+    bridge._autonomy.set_preferences("save-1", goal="种植", box_preference="作物入箱")
     enabled = False
     sent: list[str] = []
     stop_event = asyncio.Event()
@@ -765,33 +824,46 @@ def test_autonomy_chat_channel_lifecycle_replays_initial_snapshot_and_enable(tmp
             await bridge._receive_loop(FakeSocket(), "save-1", stop_event)
             submit.assert_awaited_once()
             assert submit.await_args.args[0].__class__.__name__ == "FakeSocket"
-            assert "75" in submit.await_args.args[2]
+            assert "remainingBudget" not in submit.await_args.args[2]
             assert "作物入箱" in submit.await_args.args[2]
-            assert "始终用中文回复玩家" in submit.await_args.args[2]
+            # Core instructions are added by handle_chat_submit, not the scheduler.
+            assert "实时上下文" in submit.await_args.args[2]
             await bridge._send_reply(
                 submit.await_args.args[0],
                 Envelope.create_chat_reply(bridge.instance_id, "autonomy-reply", "completed", "已完成", save_id="save-1"),
             )
 
     asyncio.run(exercise())
-    assert len(bridge._autonomy_requests) == 1
-    assert sent == []  # Routine autonomous completion stays in the log.
+    assert not bridge._autonomy_requests  # finished dispatch reservations are released
+    # Native profile synchronization is allowed; routine completion sends no chat reply.
+    families = [json.loads(message)["messageType"] for message in sent]
+    assert "chat.reply" not in families
+    assert set(families) <= {"life.profile.state", "autonomy.state"}
+    assert "autonomy.state" in families, "terminal usage telemetry remains visible"
 
 
-def test_autonomy_cancel_disables_future_work(tmp_path: Path) -> None:
+def test_autonomy_cancel_stops_arrangement_preserves_free_mode(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path)
     bridge._autonomy.set_enabled("save-1", True)
-    bridge._active_task = ActiveChatTask("autonomy-1", "save-1", "auto")
+    task = ActiveChatTask("autonomy-1", "save-1", "auto")
+    bridge._active_task = task
+    goal = bridge._work_store.add_goal("save-1", "照料动物", source="user")
+    bridge._autonomy.set_goal_scope("save-1", goal.id)
 
     class ReplySocket:
         async def send_text(self, _text: str) -> None:
             return None
 
     asyncio.run(bridge.handle_chat_cancel(ReplySocket(), "autonomy-1", "player cancelled", "save-1"))
-    assert bridge._autonomy.state("save-1").enabled is False
+    assert task.cancelled
+    assert bridge._active_task is None
+    assert bridge._autonomy.state("save-1").enabled is True
+    assert bridge._autonomy.state("save-1").mode == "free"
+    assert bridge._autonomy.state("save-1").goal_scope is None
+    assert bridge._work_store.state("save-1").goals[0].status == "cancelled"
 
 
-def test_any_player_chat_cancel_disables_autonomy_even_when_idle(tmp_path: Path) -> None:
+def test_idle_player_cancel_preserves_autonomy_mode(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path)
     bridge._autonomy.set_enabled("save-1", True)
 
@@ -800,7 +872,9 @@ def test_any_player_chat_cancel_disables_autonomy_even_when_idle(tmp_path: Path)
             return None
 
     asyncio.run(bridge.handle_chat_cancel(ReplySocket(), None, "player stopped autonomy", "save-1"))
-    assert bridge._autonomy.state("save-1").enabled is False
+    assert bridge._autonomy.state("save-1").enabled is True
+    assert bridge._autonomy.state("save-1").mode == "free"
+    assert bridge._autonomy.state("save-1").pending == []
 
 
 def test_external_disable_is_applied_on_event_without_timeout(tmp_path: Path) -> None:
@@ -1118,6 +1192,49 @@ def test_codex_keeps_session_across_day_and_generic_context_limits(tmp_path: Pat
     asyncio.run(run())
 
 
+def test_receive_loop_releases_completed_tasks_without_receive_timeout(tmp_path, monkeypatch):
+    async def scenario():
+        bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        stop_event = asyncio.Event()
+        tracked = None
+
+        async def capture_tracking(_envelope, _save_id, tracked_tasks, _ws):
+            nonlocal tracked
+            if tracked is not None:
+                assert tracked is tracked_tasks
+            tracked = tracked_tasks
+
+        monkeypatch.setattr(bridge, "_maybe_schedule_autonomy", capture_tracking)
+        for name in ("_snapshot_care_hooks", "_handle_life_message", "handle_chat_submit",
+                     "_push_work_state", "_stop_autonomy_if_disabled"):
+            monkeypatch.setattr(bridge, name, AsyncMock())
+        messages = [json.dumps({
+            "protocolVersion": "0.1", "messageType": kind, "messageId": str(i),
+            "senderInstanceId": "mod", "sequenceNumber": i, "worldRevision": 1,
+            "sentAt": "2026-10-03T00:00:00Z", "saveId": "save-1", "gameSessionId": "g1",
+            "payload": {"requestId": str(i), "text": "hello", "saveId": "save-1", "world": {}},
+        }) for i, kind in enumerate(["world.snapshot", "life.chat.submit", "chat.submit"] * 12)]
+
+        class FakeSocket:
+            async def receive_text(self, timeout):
+                # Let the previous task and its done callbacks run between messages.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                if tracked is not None:
+                    assert not tracked
+                if messages:
+                    return messages.pop(0)
+                stop_event.set()
+                return '{}'  # End the loop without ever raising a receive timeout.
+
+        await bridge._receive_loop(FakeSocket(), "save-1", stop_event)
+        assert tracked is not None and not tracked
+        for name in ("_snapshot_care_hooks", "_handle_life_message", "handle_chat_submit"):
+            assert getattr(bridge, name).await_count == 12
+
+    asyncio.run(scenario())
+
+
 def test_receive_loop_settles_only_a_real_day_change(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path)
     stop_event = asyncio.Event()
@@ -1189,7 +1306,7 @@ def test_injected_context_and_f8_expose_persisted_wait_condition(tmp_path: Path)
     in (1) the compact decision context auto-injected into every prompt and (2)
     the F8 autonomy state payload — no extra model tool query required.
     """
-    from stardew_ai_runtime.decision_context import render_decision_context
+    from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
     from stardew_ai_runtime.work_state import WorkStore
 
     bridge = ChatBridge(run_dir=tmp_path)
@@ -1242,6 +1359,13 @@ def test_injected_context_and_f8_expose_persisted_wait_condition(tmp_path: Path)
     rendered = render_decision_context(context)
     assert "\n" not in rendered and "wait-task" in rendered
 
+    # Autonomous and continuation prompts use the compact _work_context path,
+    # unlike _decision_context's full overview. Both must carry the same wait.
+    compact_context = build_decision_context(
+        {"payload": bridge._latest_snapshot_payload}, work=bridge._work_context(save_id), origin="free-mode"
+    )
+    assert compact_context["currentTask"]["waitingFor"] == context["currentTask"]["waitingFor"]
+
     # (2) F8 autonomy payload (what the settings UI shows).
     payload = bridge._autonomy_state_payload(save_id, bridge._autonomy.state(save_id))
     rows = [row for row in payload["waitingConditions"] if row.get("taskId") == "wait-task"]
@@ -1250,6 +1374,43 @@ def test_injected_context_and_f8_expose_persisted_wait_condition(tmp_path: Path)
     assert rows[0]["stepId"] == "wait-step"
     # The farm view is deliberately not asked to carry this unrelated memory.
     assert payload["hasExecutableWork"] is False
+
+
+def test_codex_explicit_request_context_uses_engineering_budget(tmp_path: Path) -> None:
+    bridge = ChatBridge(run_dir=tmp_path, backend="codex")
+    bridge._session_token_budget = 100000
+    bridge._session_request_checkpoint = 1
+    bridge.record_conversation_id("save-1", "codex-1")
+    # Billing can span many requests and includes cached input; never infer
+    # context or trigger the unmeasured request-count fallback from it.
+    for latest in (None, True, -1, "100000"):
+        usage = bridge._codex_turn_usage({
+            "usage": {"input_tokens": 700000, "cache_read_input_tokens": 690000},
+            "usage_request_count": 1, "usage_latest_request_input_context": latest,
+        })
+        assert bridge._note_session_context("save-1", usage) is None
+    assert bridge._session_context_state["save-1"]["measured"] is False
+    # Two explicit sub-budget readings stay below the budget, regardless of
+    # accumulated billing or request count.
+    for _ in range(2):
+        usage = bridge._codex_turn_usage({
+            "usage": {"input_tokens": 700000},
+            "usage_latest_request_input_context": 99999,
+        })
+        assert usage["latestRequestInputContext"] == 99999
+        assert bridge._note_session_context("save-1", usage) is None
+    # A real request measurement is usable even if turn billing is unknown.
+    usage = bridge._codex_turn_usage({
+        "usage": None, "usage_status": "unknown",
+        "usage_latest_request_input_context": 100000,
+    })
+    reason = bridge._note_session_context("save-1", usage)
+    assert reason == "SESSION_CONTEXT_BUDGET"
+    assert bridge._session_context_state["save-1"]["latestInputContext"] == 100000
+    bridge._rotate_provider_session("save-1", reason=reason)
+    assert bridge.get_conversation_id("save-1") is None
+    assert bridge._session_history["codex:save-1"] == ["codex-1"]
+    assert bridge._codex_turn_usage({"usage": None}) is None
 
 
 def test_session_context_budget_rotates_on_latest_request_not_sum(tmp_path: Path) -> None:
@@ -1509,7 +1670,7 @@ def test_provider_default_effort_omits_unsupported_cli_option(conversation_id):
     with patch("subprocess.Popen") as popen:
         process = MagicMock()
         process.returncode = 0
-        process.communicate.return_value = (json.dumps({"status": "SUCCESS", "response": "ok"}), "")
+        _mock_agy_stream(process, json.dumps({"status": "SUCCESS", "response": "ok"}), "")
         popen.return_value = process
         result = bridge._execute_agy_turn(
             ActiveChatTask(request_id="effort-default", save_id="s1"),

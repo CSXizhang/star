@@ -57,6 +57,11 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                 NativeActionKind.ClearDebris => ClearDebris(actor, request, target),
                 NativeActionKind.PickupItems => PickupItems(actor, request, target),
                 NativeActionKind.InsertMachine => InsertMachine(actor, request, target),
+                NativeActionKind.CutGrass => CutGrass(actor, request, target),
+                NativeActionKind.EatFood => EatFood(actor, request, target),
+                NativeActionKind.BuildBuilding => BuildBuilding(actor, request, target),
+                NativeActionKind.UpgradeBuilding => UpgradeBuilding(actor, request, target),
+                NativeActionKind.PurchaseAnimal => PurchaseAnimal(actor, request, target),
                 NativeActionKind.CollectMachine => CollectMachine(actor, request, target),
                 NativeActionKind.PetAnimal => PetAnimal(actor, request, target),
                 NativeActionKind.FeedAnimals => FeedAnimals(actor, request, target),
@@ -119,7 +124,26 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             int before = actor.WaterLeft;
             int pixelX = target.Tile.X * 64 + 32;
             int pixelY = target.Tile.Y * 64 + 32;
-            can.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
+            // Vanilla WateringCan.DoFunction checks Game1.currentLocation for the
+            // refill tile, even though it receives `loc` explicitly. The human
+            // player may be indoors while the companion refills on the farm.
+            // Set the backing field only for this synchronous native call: the
+            // public setter emits location-change events for the human player.
+            var game1Field = typeof(Game1).GetField("game1", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+            var currentLocationField = typeof(Game1).GetField("instanceGameLocation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+            var game = game1Field?.GetValue(null);
+            if (game is null || currentLocationField is null)
+                return NativeActionStepResult.Failed("Cannot access native watering-can location context.");
+            var previousLocation = currentLocationField.GetValue(game);
+            try
+            {
+                currentLocationField.SetValue(game, loc);
+                can.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
+            }
+            finally
+            {
+                currentLocationField.SetValue(game, previousLocation);
+            }
             int after = actor.WaterLeft;
             if (after <= before)
                 return NativeActionStepResult.Failed(
@@ -392,7 +416,9 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             // later game tick, so this batch then stops and asks the state machine
             // for another tick window instead of burning stamina on a falling tree.
             bool dealtDamage = false;
-            for (int swing = 0; swing < 8; swing++)
+            // One real swing per visible animation cycle. The state machine keeps
+            // this target until it falls, instead of hiding eight hits in one frame.
+            for (int swing = 0; swing < 1; swing++)
             {
                 if (tree is not null)
                 {
@@ -424,9 +450,15 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                         staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
 
                 float healthBefore = tree is not null ? tree.health?.Value ?? 0f : clump!.health?.Value ?? 0f;
+                bool stumpBefore = tree?.stump?.Value == true;
                 axe.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
                 float healthAfter = tree is not null ? tree.health?.Value ?? 0f : clump!.health?.Value ?? 0f;
-                if (healthAfter < healthBefore)
+                // Native felling resets health from 1 to the stump's 5. That
+                // phase change is progress even though the numeric health rises.
+                bool phaseChanged = tree != null && (!stumpBefore && tree.stump?.Value == true || tree.falling?.Value == true);
+                bool removed = tree != null ? !loc.terrainFeatures.TryGetValue(v, out var remaining) || !ReferenceEquals(remaining, tree)
+                    : !loc.resourceClumps.Contains(clump!);
+                if (healthAfter < healthBefore || phaseChanged || removed)
                     dealtDamage = true;
                 else if (!dealtDamage)
                     return NativeActionStepResult.Failed(
@@ -656,6 +688,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     $"heldObject={(held is null ? "null" : held.QualifiedItemId)}, " +
                     $"minutesUntilReady={machine.MinutesUntilReady}).");
 
+            _observer.TrackProductionMachine(request.LocationId, target.Tile);
             return NativeActionStepResult.Succeeded("inserted", itemId: input.QualifiedItemId, itemCount: consumed);
         });
     }
@@ -776,6 +809,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     $"Machine at {target.Tile} was cleared but companion inventory did not gain '{outputId}' (expected {expectedStack}, gained 0).");
             }
 
+            _observer.TrackProductionMachine(request.LocationId, target.Tile);
             return NativeActionStepResult.Succeeded("collected", itemId: outputId, itemCount: gained);
         });
     }
@@ -809,6 +843,12 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
         if (animal.wasPet?.Value == true)
             return NativeActionStepResult.Precondition($"Animal '{animal.Name}' was already petted today.", "already-petted");
 
+        // FarmAnimal.pet would open the human player's TryingToSleep dialogue
+        // and return without petting. Recheck live facts before the native call.
+        if (AnimalPettingConditions.SleepingBlocksPetting(Game1.timeOfDay, animal.isMoving()))
+            return NativeActionStepResult.Precondition(
+                $"Animal '{animal.Name}' is trying to sleep; arrange petting next day.", "animal-sleeping");
+
         return InvokeIsolated(actor, "pet-animal", () =>
         {
             int happinessBefore = animal.happiness?.Value ?? 0;
@@ -838,12 +878,16 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
     /// </summary>
     private NativeActionStepResult FeedAnimals(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
-        string indoorsName = target.TargetId ?? request.LocationId;
-        var loc = ResolveLocation(indoorsName);
-        if (loc is not AnimalHouse house)
+        string requestedName = target.TargetId ?? request.LocationId;
+        var house = ResolveAnimalHouseForFeed(requestedName, out bool ambiguous);
+        if (house is null)
             return NativeActionStepResult.Precondition(
-                $"Location '{indoorsName}' is not an animal building interior.",
-                "not-animal-house");
+                ambiguous
+                    ? $"Animal building '{requestedName}' is ambiguous; use its observed unique interior name."
+                    : $"Animal building '{requestedName}' was not found; use its observed unique interior name.",
+                ambiguous ? "ambiguous-animal-house" : "not-animal-house");
+
+        string indoorsName = house.NameOrUniqueName;
 
         string companionLocation = !string.IsNullOrWhiteSpace(actor.GameFarmer?.currentLocation?.NameOrUniqueName)
             ? actor.GameFarmer.currentLocation.NameOrUniqueName
@@ -851,7 +895,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                 ? actor.GameFarmer.currentLocation.Name
                 : actor.LocationName);
 
-        if (!string.Equals(companionLocation, indoorsName, StringComparison.OrdinalIgnoreCase))
+        if (!IsCurrentFeedAnimalHouse(house, actor.GameFarmer?.currentLocation))
             return NativeActionStepResult.Precondition(
                 $"Companion is on '{companionLocation}', not inside '{indoorsName}'.",
                 "wrong-map");
@@ -861,11 +905,10 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
 
         return InvokeIsolated(actor, "feed-animals", () =>
         {
-            List<FarmAnimal> animals;
-            try { animals = house.getAllFarmAnimals(); }
-            catch { animals = new List<FarmAnimal>(); }
-            if (animals.Count == 0)
-                return NativeActionStepResult.Precondition($"'{indoorsName}' has no animals.", "no-animals");
+            // Residents remain assigned to this house while grazing outside. The
+            // current interior animal collection is not the building's feed demand.
+            if (house.animalsThatLiveHere.Count == 0)
+                return NativeActionStepResult.Precondition($"'{indoorsName}' has no resident animals.", "no-animals");
 
             var troughTiles = FindTroughTiles(house);
             if (troughTiles.Count == 0)
@@ -877,14 +920,20 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             int siloBefore = SiloHayTotal(house);
             int invBefore = actor.GetItemCount(HayItemId);
 
-            int animalLimit = 0;
-            try { animalLimit = house.animalLimit?.Value ?? 0; } catch { animalLimit = 0; }
-            int fillLimit = animalLimit > 0 ? Math.Min(animalLimit, troughTiles.Count) : troughTiles.Count;
+            int fillLimit = GetAnimalFeedTargetCount(house, troughTiles.Count);
+            if (fillLimit <= 0)
+                return NativeActionStepResult.Precondition(
+                    $"'{indoorsName}' has no valid animal feeding capacity.", "no-trough");
+            if (troughBefore >= fillLimit)
+                return NativeActionStepResult.Precondition(
+                    $"'{indoorsName}' troughs already supply its residents ({troughBefore}/{fillLimit}).",
+                    "already-full");
+            int hayNeeded = fillLimit - troughBefore;
 
             int filled = 0;
             foreach (var tile in troughTiles)
             {
-                if (filled >= fillLimit)
+                if (filled >= hayNeeded)
                     break;
                 bool occupied;
                 try { occupied = house.objects.ContainsKey(tile); }
@@ -931,7 +980,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     playerActionRequired: true);
             }
 
-            if (siloSpent <= 0 || !conserved)
+            if (!conserved)
                 return NativeActionStepResult.Failed(
                     $"'{indoorsName}' feeding did not conserve hay " +
                     $"(trough +{added}, silo {siloBefore}->{siloAfter}, inventory {invBefore}->{invAfter}).");
@@ -941,6 +990,52 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
     }
 
     private const string HayItemId = "(O)178";
+
+    private static AnimalHouse? ResolveAnimalHouseForFeed(string requestedName, out bool ambiguous)
+    {
+        var candidates = new List<(AnimalHouse House, string? BuildingType)>();
+        var seen = new HashSet<GameLocation>();
+        void Visit(GameLocation location, string? buildingType = null)
+        {
+            if (location is AnimalHouse house) candidates.Add((house, buildingType));
+            if (!seen.Add(location)) return;
+            foreach (var building in location.buildings)
+                if (building.GetIndoors() is { } indoors)
+                    Visit(indoors, building.buildingType?.Value);
+        }
+        foreach (var location in Game1.locations) Visit(location);
+        return SelectFeedAnimalHouse(requestedName, candidates, out ambiguous);
+    }
+
+    private static AnimalHouse? SelectFeedAnimalHouse(string requestedName,
+        IEnumerable<(AnimalHouse House, string? BuildingType)> candidates, out bool ambiguous)
+    {
+        ambiguous = false;
+        if (string.IsNullOrWhiteSpace(requestedName)) return null;
+        var entries = candidates.ToList();
+        bool Matches(string? name) => !string.IsNullOrWhiteSpace(name)
+            && string.Equals(name, requestedName, StringComparison.OrdinalIgnoreCase);
+        // A real interior identity wins over friendly names. Aliases must resolve
+        // uniquely across all houses, never to the first house or the player's map.
+        var matches = entries.Where(c => Matches(c.House.NameOrUniqueName))
+            .Select(c => c.House).Distinct().ToList();
+        if (matches.Count == 0)
+            matches = entries.Where(c => Matches(c.House.Name) || Matches(c.BuildingType))
+                .Select(c => c.House).Distinct().ToList();
+        ambiguous = matches.Count > 1;
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
+    private static bool IsCurrentFeedAnimalHouse(AnimalHouse house, GameLocation? companionLocation) =>
+        ReferenceEquals(house, companionLocation)
+        && string.Equals(house.NameOrUniqueName, companionLocation?.NameOrUniqueName, StringComparison.OrdinalIgnoreCase);
+
+    private static int GetAnimalFeedTargetCount(AnimalHouse house, int troughTileCount)
+    {
+        int residents = house.animalsThatLiveHere.Distinct().Count();
+        int animalLimit = Math.Max(0, house.animalLimit?.Value ?? 0);
+        return Math.Min(residents, Math.Min(animalLimit, Math.Max(0, troughTileCount)));
+    }
 
     /// <summary>Native trough tiles: the <c>Trough/Back</c> map property the game uses.</summary>
     private static List<Vector2> FindTroughTiles(AnimalHouse house)
@@ -1546,6 +1641,8 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
         try
         {
             var targetLoc = ResolveLocation(locationName);
+            if (name.StartsWith("id:",StringComparison.Ordinal) && long.TryParse(name[3..],out long animalId))
+                return targetLoc?.getAllFarmAnimals().FirstOrDefault(a=>a.myID.Value==animalId && ReferenceEquals(a.currentLocation,targetLoc));
             if (targetLoc != null)
             {
                 var locAnimals = targetLoc.getAllFarmAnimals()

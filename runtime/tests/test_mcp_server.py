@@ -573,7 +573,27 @@ def test_mcp_server_tool_registration(mock_scheduler):
         assert "toggle_animal_door" in tool_names
         assert "chop_tree" in tool_names
         assert {"observe_farm_space", "place_items", "remove_items"} <= set(tool_names)
-        assert len(tools) == 60
+        assert {"observe_production", "eat_food"} <= set(tool_names)
+        assert {"cut_grass", "observe_building_services", "build_building", "upgrade_building", "purchase_animal"} <= set(tool_names)
+        assert {"query_route", "read_guidance"} <= set(tool_names)
+        assert len(tool_names) == len(set(tool_names))
+        assert set(tool_names) == set("""
+            read_reload_history
+            apply_fertilizer autonomy_status build_building call_capability cancel_task
+            chop_tree clear_debris collect_animal_produce collect_machine craft_items
+            cut_grass deposit_to_chest discover_capabilities dispatch_plan_operation
+            eat_food feed_animals get_status get_work_overview harvest_and_store harvest_auto
+            hoe_tiles insert_machine manage_goal manage_milestones manage_companion manage_plan manage_todo
+            move_building navigate_to observe_building_services observe_crafting
+            observe_farm_space observe_farming_helpers observe_livestock observe_machines
+            observe_map_image observe_production organize_chest pause_task pet_animal
+            pickup_items place_items plant_crop_workflow plant_seeds purchase_animal
+            purchase_items query_chests query_farm_work query_inventory query_planting_options
+            query_route query_shop query_wiki read_guidance reconcile_plan_command
+            refill_watering_can remember_intent remove_items request_player_decision
+            resume_task run_next_step set_autonomy ship_items submit_plan toggle_animal_door
+            upgrade_building water_auto water_zone water_tiles withdraw_from_chest work_plan_overview
+        """.split())
         assert "autonomy_status" in tool_names
         assert "set_autonomy" in tool_names
         assert "query_wiki" in tool_names
@@ -864,7 +884,7 @@ def test_mcp_server_call_deposit_to_chest(mock_scheduler, tmp_path):
         mock_scheduler.deposit_to_chest.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "deposit_to_chest"
-        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "detail": False}
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "detail": False, "location_id": "Farm"}
 
     asyncio.run(run())
 
@@ -881,7 +901,7 @@ def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler, tmp_p
         mock_scheduler.deposit_to_chest.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "deposit_to_chest"
-        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": None, "detail": False}
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": None, "detail": False, "location_id": "Farm"}
 
     asyncio.run(run())
 
@@ -932,10 +952,37 @@ def test_mcp_server_call_query_planting_options(mock_scheduler):
         assert data["season"] == "spring"
         assert data["companionHasHoe"] is True
         assert data["candidateTiles"]["tilledEmptyCount"] == 6
-        mock_scheduler.query_planting_options.assert_awaited_once_with(detail=False)
+        mock_scheduler.query_planting_options.assert_awaited_once_with(detail=False, location_id="Farm", region=None)
 
         await server.call_tool("query_planting_options", {"detail": True})
-        mock_scheduler.query_planting_options.assert_awaited_with(detail=True)
+        mock_scheduler.query_planting_options.assert_awaited_with(detail=True, location_id="Farm", region=None)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("tool,scheduler_method", [
+    ("query_planting_options", "query_planting_options"),
+    ("observe_farm_space", "query_farm_space"),
+])
+@pytest.mark.parametrize("through_gateway", [False, True])
+def test_saved_farm_region_survives_typed_and_gateway_calls(mock_scheduler, tool, scheduler_method, through_gateway):
+    """The real gateway supplies a dict, while direct MCP calls create SpatialRegion."""
+    async def run():
+        region = {"x": 41, "y": 22, "width": 12, "height": 8}
+        method = AsyncMock(return_value={"region": region, "capacity": 95})
+        setattr(mock_scheduler, scheduler_method, method)
+        server = create_mcp_server(scheduler=mock_scheduler)
+        params = {"location_id": "Farm", "region": region}
+        if through_gateway:
+            _, data = await server.call_tool("call_capability", {"tool": tool, "params": params})
+            data = data["result"]
+        else:
+            _, data = await server.call_tool(tool, params)
+        assert data["region"] == region
+        expected = {"location_id": "Farm", "region": region}
+        if tool == "query_planting_options":
+            expected["detail"] = False
+        method.assert_awaited_once_with(**expected)
 
     asyncio.run(run())
 
@@ -1045,8 +1092,7 @@ def test_mcp_server_call_navigate_to(mock_scheduler, tmp_path):
         mock_scheduler.execute_navigate_to.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Town", "tile_x": 43, "tile_y": 58,
-                               "x": None, "y": None, "tile": None, "landmark": None,
+        assert step.params == {"location_id": "Town", "tile": {"x": 43, "y": 58}, "landmark": None,
                                "detail": False}
 
     asyncio.run(run())
@@ -1267,8 +1313,8 @@ def test_mcp_server_error_handling(mock_scheduler, tmp_path):
 
 
 def test_mcp_server_new_tools_error_mapping(mock_scheduler, tmp_path):
-    """Two-layer validation: short-job budget rules reject at selection time;
-    execution-time parameter validation defers to plan dispatch."""
+    """Schema and short-job budgets reject before selection;
+    game-dependent policy violations still defer to plan dispatch."""
     async def run():
         from stardew_ai_runtime.scheduler import SchedulerError
 
@@ -1276,16 +1322,20 @@ def test_mcp_server_new_tools_error_mapping(mock_scheduler, tmp_path):
         store = _grant_decision(tmp_path, mock_scheduler)
         env = {"STARDEW_DECISION_TOKEN": "decision-1"}
 
-        # Selection-time budget violation surfaces the guard's ToolError.
-        with pytest.raises(ToolError, match="Short job exceeds 64 native targets"):
-            await server.call_tool("harvest_auto", {"max_tiles": 100})
+        # Large spatial batches select normally; only the worker dispatches.
+        with patch.dict(os.environ, env):
+            _, result = await server.call_tool("harvest_auto", {"max_tiles": 100})
+        assert result["status"] == "job-selected"
+        store.begin_decision("mock-save-123", "decision-1")
 
-        # Execution-time policy violations pass selection and become a selected job.
+        with pytest.raises(ToolError, match="chest_x"):
+            await server.call_tool("deposit_to_chest", {"chest_x": -1, "chest_y": 12})
+        assert not store.state("mock-save-123").decision["selected"]
+
+        # Other policy violations still pass selection and become a selected job.
         for tool_name, args in [
-            ("deposit_to_chest", {"chest_x": -1, "chest_y": 12}),
             ("withdraw_from_chest", {"chest_x": 70, "chest_y": 12}),
             ("organize_chest", {"chest_x": 70, "chest_y": 12}),
-            ("hoe_tiles", {"tiles": []}),
             ("plant_seeds", {"seed_item_id": "", "tiles": [{"x": 64, "y": 15}]}),
             ("ship_items", {"items": []}),
         ]:
@@ -1414,37 +1464,38 @@ def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path):
     asyncio.run(run())
 
 
-def test_mcp_server_call_plant_crop_workflow(mock_scheduler):
-    """Composite planting workflows are rejected on the model surface: one short
-    job may contain a single business kind only."""
+def test_mcp_server_call_plant_crop_workflow(mock_scheduler, tmp_path):
+    """The legacy name gives repair guidance without dispatching a composite step."""
     async def run():
+        store = _grant_decision(tmp_path, mock_scheduler)
         server = create_mcp_server(scheduler=mock_scheduler)
-        with pytest.raises(ToolError, match="MULTIPLE_BUSINESSES"):
-            await server.call_tool(
-                "plant_crop_workflow",
-                {"crop_name_or_id": "Parsnip", "count": 3},
-            )
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            with pytest.raises(ToolError, match="COMPOSITE_STEP_UNSUPPORTED") as error:
+                await server.call_tool("plant_crop_workflow", {"crop_name_or_id": "Parsnip", "count": 100})
+        assert '"saved": false' in str(error.value)
+        assert "water_tiles" in str(error.value)
+        assert store.state("mock-save-123").tasks == []
+        assert not store.state("mock-save-123").decision["selected"]
         mock_scheduler.plant_crop_workflow.assert_not_called()
-
     asyncio.run(run())
 
 
-def test_mcp_server_call_navigate_to_with_landmark(mock_scheduler, tmp_path):
+def test_mcp_server_call_navigate_to_resolves_observed_shop_landmark(mock_scheduler, tmp_path):
+    mock_scheduler.latest_snapshot = {"payload": {"shop": {"locationId": "SeedShop", "interactionTile": {"x": 4, "y": 5}}}}
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         store = _grant_decision(tmp_path, mock_scheduler)
         with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
             _, data = await server.call_tool(
                 "navigate_to",
-                {"location_id": "Farm", "landmark": "shipping_bin"},
+                {"location_id": "SeedShop", "landmark": "counter"},
             )
         assert data["status"] == "job-selected"
         mock_scheduler.execute_navigate_to.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Farm", "landmark": "shipping_bin",
-                               "tile_x": None, "tile_y": None, "x": None, "y": None,
-                               "tile": None, "detail": False}
+        assert step.params == {"location_id": "SeedShop", "landmark": "counter",
+                               "tile": {"x": 4, "y": 5}, "detail": False}
 
     asyncio.run(run())
 
@@ -1551,8 +1602,7 @@ def test_mcp_server_navigate_to_xy_and_executing_status(mock_scheduler, tmp_path
         mock_scheduler.execute_navigate_to.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Farm", "x": 61, "y": 17,
-                               "tile_x": None, "tile_y": None, "tile": None,
+        assert step.params == {"location_id": "Farm", "tile": {"x": 61, "y": 17},
                                "landmark": None, "detail": False}
 
     asyncio.run(run())
@@ -1784,7 +1834,8 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
 
         assert "call_capability" in light_names
         assert "discover_capabilities" in light_names
-        assert "plant_crop_workflow" in light_names
+        assert "plant_crop_workflow" not in light_names  # Composite legacy jobs are rejected.
+        assert {"plant_seeds", "eat_food"} <= light_names
         # Common actions are exposed directly on the game surface.
         assert "water_auto" in light_names
         assert "harvest_auto" in light_names
@@ -1837,7 +1888,7 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
         # call_capability passes params through without schema default injection.
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "navigate_to"
-        assert step.params == {"location_id": "Farm", "x": 61, "y": 17}
+        assert step.params == {"location_id": "Farm", "tile": {"x": 61, "y": 17}}
 
         with pytest.raises(ToolError):
             await light_server.call_tool("call_capability", {"tool": "not_a_tool", "params": {}})
@@ -2031,6 +2082,51 @@ def test_internal_dispatch_plan_operation_forwards_stable_command_id(mock_schedu
     asyncio.run(run())
 
 
+def test_short_job_rejects_misspelled_navigation_parameters_before_saving(mock_scheduler, tmp_path, monkeypatch):
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("mock-save-123", "navigation-decision")
+    monkeypatch.setenv("STARDEW_DECISION_TOKEN", "navigation-decision")
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+
+    async def run():
+        with pytest.raises(ToolError, match="INVALID_JOB_PARAMETERS"):
+            await server.call_tool("submit_plan", {"goal_text": "打开鸡舍门", "tasks": [
+                {"title": "走到鸡舍门前", "steps": [{"operation": "navigate_to",
+                                                       "params": {"location_id": "Farm", "tile_x": 42, "tile_y": 36}}]},
+            ]})
+        assert not store.state("mock-save-123").tasks
+        assert not store.state("mock-save-123").decision.get("selected")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["build_building", "upgrade_building", "purchase_animal"])
+def test_service_target_map_is_checked_before_navigation_or_selection(mock_scheduler, tmp_path, monkeypatch, operation):
+    store = _grant_decision(tmp_path, mock_scheduler, token="service-decision")
+    monkeypatch.setenv("STARDEW_DECISION_TOKEN", "service-decision")
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+
+    async def run():
+        service_params = {
+            "build_building": {"building_type": "Coop", "tile": {"x": 40, "y": 20}},
+            "upgrade_building": {"building_name": "CoopA", "building_type": "Big Coop"},
+            "purchase_animal": {"building_name": "CoopA", "animal_type": "Chicken", "animal_name": "小鸡"},
+        }[operation]
+        steps = [{"operation": "navigate_to", "params": {"location_id": "AnimalShop", "tile": {"x": 12, "y": 16}}},
+                 {"operation": operation, "params": {**service_params, "location_id": "AnimalShop", "budget_limit": 800}}]
+        with pytest.raises(ToolError, match="target building"):
+            await server.call_tool("submit_plan", {"goal_text": "养鸡", "tasks": [{"title": "购鸡", "steps": steps}]})
+        assert not store.state("mock-save-123").tasks
+        assert not store.state("mock-save-123").decision.get("selected")
+        steps[1]["params"]["location_id"] = "Farm"
+        _, data = await server.call_tool("submit_plan", {"goal_text": "养鸡", "tasks": [{"title": "购鸡", "steps": steps}]})
+        assert data["executionScope"] == "one_short_job"
+        assert len(store.state("mock-save-123").tasks) == 1
+        assert store.state("mock-save-123").decision["selected"] is True
+
+    asyncio.run(run())
+
+
 def test_get_status_detail_keeps_real_native_sections(mock_scheduler):
     """detail=True must not drop the real inventory/weather/wallet sections."""
     mock_scheduler.run_dir = None
@@ -2109,29 +2205,29 @@ def test_manage_milestones_aliases_missing_and_conflicting_ids(mock_scheduler, t
             assert any(p["support"] == "manual" for p in saved["node"]["prepItems"])
             if todo_ids is None:
                 todo_ids = saved["todoIds"]
-        with pytest.raises(ToolError, match="unknown"):
-            await server.call_tool("manage_milestones", {"action": "adopt", "id": "not-a-node"})
-        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
-        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+        _, failed = await server.call_tool("manage_milestones", {"action": "adopt", "id": "not-a-node"})
+        assert failed["saved"] is False and "unknown" in failed["error"]
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "outside-player-conversation")
+        with pytest.raises(ToolError, match="LIFE_CONVERSATION_REQUIRED"):
             await server.call_tool("manage_milestones", {"action": "adopt", "id": "spring-egg-festival-strawberry:y1"})
     asyncio.run(run())
 
 
-def test_manage_milestones_write_actions_require_plan_mode(mock_scheduler, monkeypatch):
+def test_manage_milestones_write_actions_require_life_conversation(mock_scheduler, monkeypatch):
     async def run():
         server = create_mcp_server(scheduler=mock_scheduler)
         monkeypatch.delenv("STARDEW_LIFE_MODE", raising=False)
-        # list is always allowed, even in casual chat.
+        # list is allowed even outside a life conversation.
         _, result = await server.call_tool("manage_milestones", {"action": "list"})
         assert result["saveId"] == "mock-save-123"
         assert result["nodes"] == []
-        # adopt without plan mode is rejected with guidance to the plan mode.
-        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+        # Writes require a life conversation; neither chat nor plan grants approval.
+        with pytest.raises(ToolError, match="LIFE_CONVERSATION_REQUIRED"):
             await server.call_tool(
                 "manage_milestones",
                 {"action": "adopt", "node_id": "spring-egg-festival-strawberry:y1"},
             )
-        with pytest.raises(ToolError, match="PLAN_MODE_REQUIRED"):
+        with pytest.raises(ToolError, match="LIFE_CONVERSATION_REQUIRED"):
             await server.call_tool(
                 "manage_milestones",
                 {"action": "propose", "title": "自定义", "target_date": "1:spring:13"},
@@ -2142,8 +2238,44 @@ def test_manage_milestones_write_actions_require_plan_mode(mock_scheduler, monke
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("mode", ["chat", "plan"])
+def test_manage_milestones_conversation_can_propose_then_adopt_same_turn(
+    mock_scheduler, tmp_path, monkeypatch, mode
+):
+    async def run():
+        mock_scheduler.run_dir = None
+        mock_scheduler.latest_snapshot = {
+            "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
+        }
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
+        monkeypatch.setenv("STARDEW_LIFE_MODE", mode)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        description = tools["manage_milestones"].description
+        assert "chat or plan" in description
+        assert "Neither mode grants" in description
+        assert 'A clear instruction or "you decide" authorizes propose and adopt in the SAME turn' in description
+        assert "a question or preference alone does not" in description
+        _, proposed = await server.call_tool("manage_milestones", {
+            "action": "propose", "title": "照料今天的作物", "preparation": ["water"],
+        })
+        assert proposed["node"]["status"] == "suggested"
+        work = WorkStore(tmp_path / "data" / "work-state.json")
+        assert work.list_goals("mock-save-123") == []
+        # The model must establish agreement before this call; this offline test
+        # verifies the tool contract, not natural-language consent recognition.
+        _, adopted = await server.call_tool("manage_milestones", {
+            "action": "adopt", "node_id": proposed["node"]["id"],
+        })
+        assert adopted["node"]["status"] == "adopted"
+        assert adopted["goalId"] and adopted["todoIds"]
+        assert adopted["execution"] == "not_started_by_this_tool"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["chat", "plan"])
 def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
-    mock_scheduler, tmp_path, monkeypatch
+    mock_scheduler, tmp_path, monkeypatch, mode
 ):
     from stardew_ai_runtime.autonomy import AutonomyController
 
@@ -2153,12 +2285,12 @@ def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
     }
     autonomy = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     autonomy.set_preferences(
-        "mock-save-123", goal="优先赚钱", budget_limit=500, box_preference="shipping"
+        "mock-save-123", goal="优先赚钱", box_preference="shipping"
     )
 
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler)
-        monkeypatch.setenv("STARDEW_LIFE_MODE", "plan")
+        monkeypatch.setenv("STARDEW_LIFE_MODE", mode)
         _, result = await server.call_tool("manage_milestones", {
             "action": "adopt",
             "node_id": "spring-egg-festival-strawberry:y1",
@@ -2187,7 +2319,7 @@ def test_manage_milestones_adopt_wires_goal_todo_without_touching_budget(
 
         # The one-time reservation never becomes a per-day purchase budget.
         state = autonomy.state("mock-save-123")
-        assert state.budget_limit == 500
+        assert "budget_limit" not in state.__dict__
         assert state.daily_spend == 0
         # No decision/plan machinery was involved.
         assert store.state("mock-save-123").decision == {}
@@ -2233,6 +2365,13 @@ def test_manage_milestones_on_life_surface_is_not_job_wrapped(
     mock_scheduler.latest_snapshot = {
         "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 11}}
     }
+
+    import json
+    import time
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "life-snapshot.json").write_text(json.dumps({
+        "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot,
+    }), encoding="utf-8")
 
     async def run():
         monkeypatch.setenv("STARDEW_MCP_SURFACE", "life")
@@ -2326,4 +2465,219 @@ def test_internal_work_overview_keeps_full_contract_and_compact_unknown_has_reas
         assert compact["paused"] is True
         assert compact["tasks"][0]["stepStates"][0]["reason_code"] == "NATIVE_TERMINAL_UNCONFIRMED"
         assert compact["anomalies"] == unknown["anomalies"]
+    asyncio.run(run())
+
+
+
+def test_water_tiles_internal_dispatch_preserves_exact_batch_and_command(mock_scheduler, tmp_path):
+    async def run():
+        tiles = [{"x": 69, "y": 18}, {"x": 64, "y": 23}]
+        captured = {}
+        async def native(tiles, location_id="Farm", include_empty_tiles=False, command_id=None):
+            captured.update(tiles=tiles, location_id=location_id, command_id=command_id)
+            return {"terminalState": "succeeded", "completedCount": 2, "effects": [{"tile": t, "state": "watered"} for t in tiles]}
+        mock_scheduler.execute_tiles = native
+        mock_scheduler.run_dir = None
+        store = WorkStore(tmp_path / "data/work-state.json")
+        store.begin_decision("mock-save-123", "choice")
+        store.submit_plan("mock-save-123", goal_text="种浇", decision_token="choice", tasks=[
+            {"id": "t", "title": "浇指定散点", "steps": [{"id": "s", "operation": "water_tiles", "params": {"tiles": tiles}}]}])
+        store.claim_next_step("mock-save-123", "worker")
+        store.assign_command_id("mock-save-123", "t", "s", "stable-native-id")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="internal")
+        _, result = await server.call_tool("dispatch_plan_operation", {"operation": "water_tiles", "params": {"tiles": tiles}, "command_id": "stable-native-id"})
+        assert captured == {"tiles": tiles, "location_id": "Farm", "command_id": "stable-native-id"}
+        assert result["completedCount"] == 2
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("tiles", [[], [{"x": True, "y": 1}], [{"x": -1, "y": 1}], [{"x": 1}], [{"x": 1.5, "y": 1}]])
+def test_invalid_spatial_parameters_are_rejected_before_selection(mock_scheduler, tmp_path, tiles):
+    async def run():
+        store = _grant_decision(tmp_path, mock_scheduler)
+        server = create_mcp_server(scheduler=mock_scheduler)
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            with pytest.raises(ToolError):
+                await server.call_tool("submit_plan", {"goal_text": "farm", "tasks": [{"title": "water", "steps": [{"operation": "water_tiles", "params": {"tiles": tiles}}]}]})
+        assert not store.state("mock-save-123").decision["selected"]
+        assert not store.state("mock-save-123").tasks
+    asyncio.run(run())
+
+
+def test_compact_overview_prioritizes_current_work_and_defers_coordinates():
+    import json
+
+    from stardew_ai_runtime.mcp_server import compact_work_overview
+    coordinates = [{"x": i, "y": 5} for i in range(500)]
+    overview = {"decision": {"goalId": "g9", "taskId": "t9"},
+        "goals": [{"id": f"g{i}", "text": "plant", "status": "active", "constraints": {"milestoneSpec": {"tiles": coordinates}}} for i in range(10)],
+        "tasks": [{"id": f"t{i}", "status": "running" if i == 9 else "completed", "steps": [{"operation": "plant_seeds", "params": {"tiles": coordinates}, "effects": []}]} for i in range(10)],
+        "recentExecutions": [], "lastJob": {"actualSummary": "播种2格", "completedCount": 2, "skippedCount": 17, "effects": coordinates}}
+    compact = compact_work_overview(overview)
+    assert compact["goals"][0]["id"] == "g9"
+    assert compact["currentTask"]["id"] == "t9"
+    assert compact["goalCount"] == compact["taskCount"] == 10
+    assert compact["lastJob"]["skippedCount"] == 17
+    assert "effects" not in compact["lastJob"]
+    assert len(json.dumps(compact)) < len(json.dumps(overview)) / 10
+
+
+
+def test_milestone_failed_adopt_returns_revise_fields_and_correction_saves(mock_scheduler, tmp_path, monkeypatch):
+    async def run():
+        mock_scheduler.run_dir = None
+        mock_scheduler.latest_snapshot = {"payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 16}}}
+        import json
+        import time
+        (tmp_path / "data").mkdir(exist_ok=True)
+        (tmp_path / "data/life-snapshot.json").write_text(json.dumps({
+            "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot}), encoding="utf-8")
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="life")
+        _, proposed = await server.call_tool("manage_milestones", {"action": "propose", "title": "补种土豆", "summary": "19格", "preparation": ["plant"]})
+        node_id = proposed["node"]["id"]
+        await server.call_tool("manage_milestones", {"action": "adopt", "node_id": node_id})
+        _, failed = await server.call_tool("manage_milestones", {"action": "adopt", "node_id": node_id})
+        assert failed["saved"] is False
+        assert failed["currentStatus"] == "adopted"
+        assert failed["recommendedAction"] == "revise"
+        assert {"node_id", "summary", "preparation", "execution_scope"}.issubset(failed["acceptedFields"])
+        _, saved = await server.call_tool("manage_milestones", {"action": failed["recommendedAction"], "node_id": node_id, "summary": "全部种完，地不够就开垦"})
+        assert saved["saved"] is True
+        assert saved["node"]["summary"] == "全部种完，地不够就开垦"
+    asyncio.run(run())
+
+
+def test_milestone_revise_passes_preparation_and_preserves_omitted_items(mock_scheduler, tmp_path, monkeypatch):
+    async def run():
+        import time
+
+        mock_scheduler.run_dir = None
+        mock_scheduler.latest_snapshot = {"payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 16}}}
+        (tmp_path / "data").mkdir(exist_ok=True)
+        (tmp_path / "data/life-snapshot.json").write_text(json.dumps({
+            "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot}), encoding="utf-8")
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="life")
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        preparation_schema = tools["manage_milestones"].inputSchema["properties"]["preparation"]
+        assert "omitted/null keeps current preparation" in preparation_schema["description"]
+        assert "[] clears it" in preparation_schema["description"]
+
+        _, proposed = await server.call_tool("manage_milestones", {
+            "action": "propose", "title": "浇水80格", "summary": "浇完80格", "preparation": ["water"],
+        })
+        node_id = proposed["node"]["id"]
+        await server.call_tool("manage_milestones", {"action": "adopt", "node_id": node_id, "terms_note": "仅浇水"})
+        _, revised = await server.call_tool("manage_milestones", {
+            "action": "revise", "node_id": node_id, "title": "种19格土豆",
+            "summary": "把19颗土豆种下，地不够就开垦，再浇水", "terms_note": "种完后浇水",
+            "preparation": ["plant", "water", "plant"],
+        })
+        assert revised["saved"] is True
+        assert [item["key"] for item in revised["node"]["prepItems"]] == ["plant", "water"]
+        assert revised["node"]["title"] == "种19格土豆"
+        assert revised["node"]["termsNote"] == "种完后浇水"
+
+        _, preserved = await server.call_tool("manage_milestones", {
+            "action": "revise", "node_id": node_id, "summary": "继续同一批播种浇水",
+        })
+        assert [item["key"] for item in preserved["node"]["prepItems"]] == ["plant", "water"]
+        _, cleared = await server.call_tool("manage_milestones", {
+            "action": "revise", "node_id": node_id, "preparation": [],
+        })
+        assert cleared["saved"] is True and cleared["node"]["prepItems"] == []
+
+    asyncio.run(run())
+
+
+def test_milestone_exact_scope_roundtrip_and_full_single_node_read(mock_scheduler, tmp_path, monkeypatch):
+    async def run():
+        import time
+
+        mock_scheduler.run_dir = None
+        mock_scheduler.latest_snapshot = {"payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 16}}}
+        (tmp_path / "data").mkdir(exist_ok=True)
+        (tmp_path / "data/life-snapshot.json").write_text(json.dumps({
+            "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot}), encoding="utf-8")
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="life")
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        schema = tools["manage_milestones"].inputSchema["properties"]["execution_scope"]
+        assert "Candidate tile count is independent" in schema["description"]
+        assert {"locationId", "tiles"} == set(schema["anyOf"][2]["required"])
+        tiles = [{"x": x, "y": 10} for x in range(200)]
+        exact_scope = {"locationId": "Farm", "tiles": tiles}
+        _, proposed = await server.call_tool("manage_milestones", {
+            "action": "propose", "title": "候选区域", "summary": "固定区域种19颗种子",
+            "target_date": "1:summer:1", "preparation": ["plant"],
+            "execution_scope": {"locationId": "Farm", "tiles": [*tiles, [0, 10]]},
+        })
+        node_id = proposed["node"]["id"]
+        assert proposed["node"]["executionScope"] == exact_scope
+        for n in range(13):
+            await server.call_tool("manage_milestones", {
+                "action": "propose", "title": f"临近安排{n}", "target_date": "1:spring:17",
+            })
+        _, ordinary = await server.call_tool("manage_milestones", {"action": "list"})
+        assert node_id not in {node["id"] for node in ordinary["nodes"]}
+        _, detailed = await server.call_tool("manage_milestones", {"action": "list", "node_id": node_id})
+        assert len(detailed["nodes"]) == 1
+        assert detailed["nodes"][0]["executionScope"] == exact_scope
+
+        _, adopted = await server.call_tool("manage_milestones", {
+            "action": "adopt", "node_id": node_id, "planned_count": 19,
+        })
+        assert adopted["node"]["plannedCount"] == 19
+        assert len(adopted["node"]["executionScope"]["tiles"]) == 200
+        _, unchanged = await server.call_tool("manage_milestones", {
+            "action": "revise", "node_id": node_id, "summary": "仍在固定候选区域内种19颗",
+        })
+        assert unchanged["node"]["executionScope"] == exact_scope
+        _, explicit_empty = await server.call_tool("manage_milestones", {
+            "action": "revise", "node_id": node_id,
+            "execution_scope": {"locationId": "Farm", "tiles": []},
+        })
+        assert explicit_empty["node"]["executionScope"] == {"locationId": "Farm", "tiles": []}
+        _, cleared = await server.call_tool("manage_milestones", {
+            "action": "revise", "node_id": node_id, "execution_scope": {},
+        })
+        assert cleared["saved"] is True and "executionScope" not in cleared["node"]
+
+    asyncio.run(run())
+
+
+def test_milestone_work_write_failure_reports_saved_node_and_unsynced_execution(mock_scheduler, tmp_path, monkeypatch):
+    async def run():
+        import time
+
+        from stardew_ai_runtime.companion_milestones import CompanionMilestoneStore
+
+        mock_scheduler.run_dir = None
+        mock_scheduler.latest_snapshot = {"payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 16}}}
+        (tmp_path / "data").mkdir(exist_ok=True)
+        (tmp_path / "data/life-snapshot.json").write_text(json.dumps({
+            "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot}), encoding="utf-8")
+        monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="life")
+        _, proposed = await server.call_tool("manage_milestones", {
+            "action": "propose", "title": "旧安排", "summary": "只浇水", "preparation": ["water"],
+        })
+        node_id = proposed["node"]["id"]
+        await server.call_tool("manage_milestones", {"action": "adopt", "node_id": node_id})
+        work_path = tmp_path / "data/work-state.json"
+        before = work_path.read_bytes()
+        with patch.object(WorkStore, "_write_unlocked", side_effect=OSError("work write refused")):
+            _, result = await server.call_tool("manage_milestones", {
+                "action": "revise", "node_id": node_id, "title": "新安排", "summary": "种19颗",
+                "preparation": ["plant"], "execution_scope": {"locationId": "Farm", "tiles": [{"x": 1, "y": 2}]},
+            })
+        assert result["saved"] is True and result["nodeSaved"] is True
+        assert result["executionSynced"] is False
+        assert "work write refused" in result["error"]
+        assert work_path.read_bytes() == before
+        node = next(node for node in CompanionMilestoneStore(tmp_path / "data/companion-milestones.json").list_nodes("mock-save-123")
+                    if node["id"] == node_id)
+        assert node["summary"] == "种19颗" and node["prepItems"][0]["key"] == "plant"
+
     asyncio.run(run())

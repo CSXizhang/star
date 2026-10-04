@@ -24,6 +24,9 @@ def package_at(root):
         files["tools/" + name] = (ROOT / "tools" / name).read_bytes()
     skill = "agent-skills/stardew-companion/SKILL.md"
     files[skill] = (ROOT / skill).read_bytes()
+    from stardew_ai_runtime.agent_instructions import INSTRUCTION_FILES
+    for path in INSTRUCTION_FILES:
+        files[path.as_posix()] = (ROOT / path).read_bytes()
     for relative, content in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,3 +167,43 @@ def test_builder_allowlists_production_inputs():
     spec.loader.exec_module(module)
     assert set(module.MOD_FILES) == {"manifest.json", "StardewAI.Companion.Mod.dll", "StardewAI.Companion.Mod.deps.json"}
     assert "pip" not in module.TOOL_FILES
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows installer")
+@pytest.mark.parametrize("previous", [None, {"backend": "mcode", "model": "", "effort": "high"},
+                                     {"backend": "dsh", "model": "deepseek-flash", "effort": "max"}])
+def test_mcode_release_install_defaults_and_preserves_existing_choices(tmp_path, previous):
+    import os
+
+    root = tmp_path / "新包 空格"
+    package_at(root)
+    game = tmp_path / "游戏 空格"
+    destination = game / "Mods/StardewAI.Companion.Mod"
+    (destination / "config").mkdir(parents=True)
+    (destination / "data").mkdir()
+    (game / "StardewModdingAPI.exe").write_bytes(b"fixture-only")
+    memory = destination / "data/player-memory.json"
+    memory.write_bytes(b'{"keep":true}')
+    config = destination / "config/chat-backend.json"
+    if previous:
+        config.write_text(json.dumps({**previous, "custom": {"keep": True}}), encoding="utf-8")
+    global_mcp = tmp_path / "minimax-account/mcp.json"
+    global_mcp.parent.mkdir()
+    original = b'{"mcpServers":{"other":{"command":"keep.exe"}}}'
+    global_mcp.write_bytes(original)
+    env = dict(os.environ, MINIMAX_DATA_DIR=str(global_mcp.parent), MAVIS_DATA_DIR=str(global_mcp.parent))
+    command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+               str(root / "tools/setup-companion.ps1"), "-AutoInstall", "-GameDir", str(game)]
+    if not previous or previous["backend"] != "mcode":
+        command += ["-Agent", "mcode"]
+    result = subprocess.run(command, env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = json.loads(config.read_text(encoding="utf-8-sig"))
+    assert saved["backend"] == "mcode" and saved["model"] == ""
+    assert saved["effort"] == ("high" if previous and previous["backend"] == "mcode" else "low")
+    if previous:
+        assert saved["custom"] == {"keep": True}
+    assert memory.read_bytes() == b'{"keep":true}'
+    assert global_mcp.read_bytes() == original
+    assert "global MCP settings were not changed" in result.stdout
+    verify_release(destination)

@@ -83,7 +83,6 @@ def test_schema_and_discovery_expose_one_nested_task(tmp_path):
     {"title": "water", "steps": [{"operation": "water_auto"}], "operation": "harvest_auto"},
     {"title": "water", "operation": "water_auto", "type": "harvest_auto"},
     {"title": "water", "operation": "water_auto", "params": {"maxTiles": 10, "max_tiles": 1}},
-    {"title": "water", "operation": "water_auto", "params": {"maxTiles": 65}},
     {"title": "water", "steps": [{"operation": "water_auto", "wait": {"type": "gameDay"}}]},
 ])
 def test_ambiguous_or_unsafe_inputs_select_nothing(tmp_path, monkeypatch, task):
@@ -95,6 +94,17 @@ def test_ambiguous_or_unsafe_inputs_select_nothing(tmp_path, monkeypatch, task):
     assert not store.state("save").decision["selected"]
     assert not store.list_tasks("save")
     assert not store.list_goals("save")
+
+
+def test_more_than_64_targets_preserves_legacy_max_tiles_alias(tmp_path, monkeypatch):
+    store = WorkStore(tmp_path / "data" / "work-state.json")
+    store.begin_decision("save", "decision")
+    monkeypatch.setenv("STARDEW_DECISION_TOKEN", "decision")
+    asyncio.run(setup_server(tmp_path).call_tool("submit_plan", {"goal_text": "care", "tasks": [{
+        "title": "water", "operation": "water_auto", "params": {"maxTiles": 100},
+    }]}))
+    step = store.state("save").tasks[0].steps[0]
+    assert step.operation == "water_auto" and step.params == {"max_tiles": 100}
 
 
 def test_multi_business_can_be_repaired_once_without_consuming_decision(tmp_path, monkeypatch):

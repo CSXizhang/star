@@ -9,7 +9,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$RunDir,
-    [ValidateSet('agy', 'kimi', 'claude', 'codex', 'dsh', 'all')][string]$Agent = 'all',
+    [ValidateSet('agy', 'kimi', 'claude', 'codex', 'dsh', 'mcode', 'all')][string]$Agent = 'all',
     [switch]$Install,
     [string]$ProjectDir
 )
@@ -134,6 +134,46 @@ function Show-Dsh {
     Write-Host "按该客户端的 MCP stdio server 配置格式填入即可。"
 }
 
+function Get-McodeConfig {
+    $doc = @{ mcpServers = @{ $serverName = @{ command = $mcpCommand; args = $uvArgs } } }
+    return ($doc | ConvertTo-Json -Depth 5)
+}
+
+function Show-Mcode {
+    Write-Host "`n=== MiniMax Code (mcode) ==="
+    Write-Host "MiniMax Code 的 MCP 服务保存在数据目录 mcp.json（默认 %USERPROFILE%\.minimax\mcp.json），"
+    Write-Host "供桌面端与 CLI 共用；这份配置只影响外部客户端的对话，不影响游戏内聊天后端。"
+    Write-Host "也可直接在 MiniMax Code 中用内置 MCP 工具注册 stdio 服务，参数如下："
+    Write-Host (Get-McodeConfig)
+}
+
+function Install-Mcode {
+    $mcodeHome = if ($env:MINIMAX_DATA_DIR) { $env:MINIMAX_DATA_DIR } elseif ($env:MAVIS_DATA_DIR) { $env:MAVIS_DATA_DIR } else { Join-Path $env:USERPROFILE ".minimax" }
+    $mcpFile = Join-Path $mcodeHome "mcp.json"
+    $serverMap = @{}
+    if (Test-Path -LiteralPath $mcpFile) {
+        try {
+            $raw = Get-Content -LiteralPath $mcpFile -Raw -Encoding utf8
+            $parsed = ConvertFrom-Json -InputObject $raw
+            if ($parsed.mcpServers) {
+                foreach ($prop in $parsed.mcpServers.PSObject.Properties) {
+                    $serverMap[$prop.Name] = $prop.Value
+                }
+            }
+            if ($serverMap.ContainsKey($serverName)) {
+                throw "Existing $serverName entry in $mcpFile was not created by this script; review it before installing. No files changed."
+            }
+        } catch {
+            throw "Could not read or safely merge $mcpFile ($_). No files changed."
+        }
+    }
+    $serverMap[$serverName] = @{ command = $mcpCommand; args = $uvArgs }
+    New-Item -ItemType Directory -Path $mcodeHome -Force | Out-Null
+    $config = @{ mcpServers = $serverMap }
+    [System.IO.File]::WriteAllText($mcpFile, ($config | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host ">>> 已写入 $mcpFile（重启 MiniMax Code 或新会话生效）"
+}
+
 function Install-Agy {
     Write-Host ">>> 注册进 agy..."
     $configured = & agy mcp list 2>&1 | Out-String
@@ -177,5 +217,6 @@ switch ($Agent) {
     'claude' { Show-Claude; if ($Install) { Write-Warning "Claude Desktop 请将上述 JSON 片段合并至 claude_desktop_config.json" } }
     'codex'  { Show-Codex;  if ($Install) { Install-Codex } }
     'dsh'    { Show-Dsh;    if ($Install) { Write-Warning "dsh 请按其文档填入 command 与 args" } }
-    'all'    { Show-Agy; Show-Kimi; Show-Claude; Show-Codex; Show-Dsh }
+    'mcode'  { Show-Mcode;  if ($Install) { Install-Mcode } }
+    'all'    { Show-Agy; Show-Kimi; Show-Claude; Show-Codex; Show-Dsh; Show-Mcode }
 }

@@ -71,6 +71,8 @@ public sealed class WebSocketTransportServer : ITransportServer
     private readonly Queue<LifeMilestonesStatePayload> _pendingLifeMilestonesStates = new();
     private readonly object _chatLock = new();
     private readonly SemaphoreSlim _chatSendLock = new(1, 1);
+    private readonly Queue<(long Generation, string Reason, bool SendFailure)> _pendingChatProblems = new();
+    private long _chatSendFailureGeneration = -1;
     private WorldSnapshotPayload? _lastSnapshot;
     private long _lastSnapshotRevision;
 
@@ -716,6 +718,19 @@ public sealed class WebSocketTransportServer : ITransportServer
     /// </summary>
     public void Update()
     {
+        // Only the current chat generation may report an asynchronous send failure.
+        // Prefer its concrete send reason over the resulting generic receive exit.
+        lock (_chatLock)
+        {
+            var problems = _pendingChatProblems.Where(p => p.Generation == _chatSocketGeneration).ToList();
+            _pendingChatProblems.Clear();
+            if (problems.Count > 0)
+            {
+                var problem = problems.FirstOrDefault(p => p.SendFailure);
+                if (!problem.SendFailure) problem = problems[0];
+                OnChatChannelProblem?.Invoke(null, null, problem.Reason);
+            }
+        }
         // 1. Process and deliver pending disconnect callbacks on the main game thread.
         // This MUST be delivered before processing any new incoming commands or snapshots
         // to ensure active tasks from the previous generation are cancelled first.
@@ -1145,7 +1160,7 @@ public sealed class WebSocketTransportServer : ITransportServer
             error = "Construction requires itemId and 1-64 explicit tiles.";
             return false;
         }
-        bool isNativeTiled = skillId is "place-items" or "remove-items" or "chop-tree" || string.Equals(skillId, "refill-watering-can", StringComparison.OrdinalIgnoreCase) ||
+        bool isNativeTiled = skillId is "place-items" or "remove-items" or "chop-tree" or "cut-grass" || string.Equals(skillId, "refill-watering-can", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(skillId, "apply-fertilizer", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(skillId, "clear-debris", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(skillId, "pickup-items", StringComparison.OrdinalIgnoreCase) ||
@@ -1177,7 +1192,7 @@ public sealed class WebSocketTransportServer : ITransportServer
 
             if ((string.Equals(skillId, "pet-animal", StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(skillId, "collect-animal-produce", StringComparison.OrdinalIgnoreCase)) &&
-                string.IsNullOrWhiteSpace(payload.Parameters.AnimalName))
+                string.IsNullOrWhiteSpace(payload.Parameters.AnimalName) && string.IsNullOrWhiteSpace(payload.Parameters.AnimalId))
             {
                 error = $"AnimalName is required for {skillId}.";
                 return false;
@@ -1360,29 +1375,23 @@ public sealed class WebSocketTransportServer : ITransportServer
             _lastSnapshot = snapshot;
             _lastSnapshotRevision = worldRevision;
         }
-        var payloadNode = JsonSerializer.SerializeToNode(snapshot, JsonOptions)!.AsObject();
-        var envelope = CreateEnvelope("world.snapshot", payloadNode, correlationId: null, worldRevision: worldRevision);
-        EnqueueOutbound(envelope, isCritical: true, _socketGeneration);
-        _ = SendChatSnapshotAsync(snapshot, worldRevision);
-        return Task.CompletedTask;
+        // Keep the latest snapshot for the next handshake, but an idle command
+        // socket has no sender. Queuing every TimeChanged snapshot after it closes
+        // would fill the critical queue and report a false backpressure failure.
+        if (IsClientConnected)
+        {
+            var payloadNode = JsonSerializer.SerializeToNode(snapshot, JsonOptions)!.AsObject();
+            var envelope = CreateEnvelope("world.snapshot", payloadNode, correlationId: null, worldRevision: worldRevision);
+            EnqueueOutbound(envelope, isCritical: true, _socketGeneration);
+        }
+        return SendChatSnapshotAsync(snapshot, worldRevision);
     }
 
     private async Task<bool> SendChatSnapshotAsync(WorldSnapshotPayload snapshot, long worldRevision)
     {
-        WebSocket? socket;
-        lock (_chatLock) { socket = _chatSocket; }
-        if (socket == null || socket.State != WebSocketState.Open) return false;
+        if (!IsChatConnected) return false;
         var envelope = CreateEnvelope("world.snapshot", JsonSerializer.SerializeToNode(snapshot, JsonOptions)!.AsObject(), worldRevision: worldRevision);
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOptions));
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await _chatSendLock.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
-        try
-        {
-            if (socket.State != WebSocketState.Open) return false;
-            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeoutCts.Token).ConfigureAwait(false);
-            return true;
-        }
-        finally { _chatSendLock.Release(); }
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
     }
 
     public Task SendSkillResultAsync(SkillResultPayload result, string correlationId, string? idempotencyKey = null)
@@ -1420,7 +1429,7 @@ public sealed class WebSocketTransportServer : ITransportServer
         return Task.CompletedTask;
     }
 
-    private static bool IsObservationSkill(string? skillId) => skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting";
+    private static bool IsObservationSkill(string? skillId) => skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting" or "inspect-machines" or "inspect-production" or "inspect-building-services" or "inspect-planting" or "inspect-route" or "inspect-livestock" or "inspect-shop";
 
     public Task SendProtocolErrorAsync(string code, string message, string? correlationId = null)
     {
@@ -1633,7 +1642,8 @@ public sealed class WebSocketTransportServer : ITransportServer
                 if (_chatSocket == socket)
                 {
                     _chatSocket = null;
-                    OnChatChannelProblem?.Invoke(null, null, "伙伴连接已断开，请恢复服务后重试；动作结果未确认。");
+                    if (_chatSendFailureGeneration != gen)
+                        _pendingChatProblems.Enqueue((gen, "伙伴连接已断开，请恢复服务后重试；动作结果未确认。", false));
                 }
             }
         }
@@ -1665,17 +1675,7 @@ public sealed class WebSocketTransportServer : ITransportServer
             GameSessionId: _gameSessionId
         );
 
-        var json = JsonSerializer.Serialize(envelope, JsonOptions);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await _chatSendLock.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
-        try
-        {
-            if (socket.State != WebSocketState.Open) return false;
-            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeoutCts.Token).ConfigureAwait(false);
-            return true;
-        }
-        finally { _chatSendLock.Release(); }
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
     }
 
     public async Task<bool> SendAutonomyControlAsync(AutonomyControlPayload payload)
@@ -1688,16 +1688,7 @@ public sealed class WebSocketTransportServer : ITransportServer
             _senderInstanceId, 0, 0, DateTimeOffset.UtcNow,
             JsonSerializer.SerializeToNode(payload, JsonOptions)!.AsObject(),
             SaveId: payload.SaveId, GameSessionId: _gameSessionId);
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOptions));
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await _chatSendLock.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
-        try
-        {
-            if (socket.State != WebSocketState.Open) return false;
-            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeoutCts.Token).ConfigureAwait(false);
-            return true;
-        }
-        finally { _chatSendLock.Release(); }
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
     }
 
     public async Task<bool> SendChatCancelAsync(ChatCancelPayload payload)
@@ -1726,17 +1717,7 @@ public sealed class WebSocketTransportServer : ITransportServer
             GameSessionId: _gameSessionId
         );
 
-        var json = JsonSerializer.Serialize(envelope, JsonOptions);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await _chatSendLock.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
-        try
-        {
-            if (socket.State != WebSocketState.Open) return false;
-            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeoutCts.Token).ConfigureAwait(false);
-            return true;
-        }
-        finally { _chatSendLock.Release(); }
+        return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
     }
 
     public void Dispose()
@@ -1907,18 +1888,56 @@ public sealed class WebSocketTransportServer : ITransportServer
     private async Task<bool> SendChatEnvelopeAsync(EnvelopeDto envelope)
     {
         WebSocket? socket;
-        lock (_chatLock) { socket = _chatSocket; }
+        long generation;
+        lock (_chatLock) { socket = _chatSocket; generation = _chatSocketGeneration; }
         if (socket == null || socket.State != WebSocketState.Open) return false;
 
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOptions));
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await _chatSendLock.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+        bool acquired = false;
         try
         {
-            if (socket.State != WebSocketState.Open) return false;
+            await _chatSendLock.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            acquired = true;
+            lock (_chatLock)
+                if (_chatSocket != socket || _chatSocketGeneration != generation || socket.State != WebSocketState.Open)
+                    return false;
             await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeoutCts.Token).ConfigureAwait(false);
             return true;
         }
-        finally { _chatSendLock.Release(); }
+        catch (OperationCanceledException)
+        {
+            ReportChatSendFailure(generation, envelope.MessageType, acquired
+                ? "发送超时（5秒），伙伴后台未及时读取游戏消息。连接可能已中断，请恢复连接后核对结果。"
+                : "等待发送超时（5秒），伙伴消息发送通道正忙。请恢复连接后核对结果。", "timeout");
+            return false;
+        }
+        catch (WebSocketException)
+        {
+            ReportChatSendFailure(generation, envelope.MessageType,
+                "发送失败，伙伴聊天连接已发生异常。请恢复连接后核对结果。", "WebSocket failure");
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            ReportChatSendFailure(generation, envelope.MessageType,
+                "发送失败，伙伴聊天连接已关闭。请恢复连接后核对结果。", "closed socket");
+            return false;
+        }
+        finally { if (acquired) _chatSendLock.Release(); }
+    }
+
+    private void ReportChatSendFailure(long generation, string messageType, string detail, string category)
+    {
+        lock (_chatLock)
+        {
+            if (_serverCts?.IsCancellationRequested == true || generation != _chatSocketGeneration ||
+                _chatSendFailureGeneration == generation) return;
+            _chatSendFailureGeneration = generation;
+            string subject = messageType == "world.snapshot" ? "游戏状态快照" : "伙伴消息";
+            _pendingChatProblems.Enqueue((generation, subject + detail, true));
+            // Protocol metadata only: no envelope payload, credentials or CLI output.
+            _logger?.Invoke($"Chat send {category}: {messageType}, generation {generation}.", "Warn");
+        }
     }
 }

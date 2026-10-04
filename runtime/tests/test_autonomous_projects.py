@@ -66,17 +66,18 @@ def test_layout_dispatch_keeps_partial_native_result_and_command_identity():
     asyncio.run(run())
 
 
-def test_layout_adoption_is_cross_day_authorization(tmp_path):
+@pytest.mark.parametrize("preparation", ["layout", "production"])
+def test_layout_adoption_is_cross_day_authorization(tmp_path, preparation):
     from stardew_ai_runtime.companion_milestones import CompanionMilestoneStore
     store = CompanionMilestoneStore(tmp_path / "milestones.json")
     work = WorkStore(tmp_path / "work.json")
     date = {"year": 1, "season": "spring", "day": 2}
-    node = store.propose("a", title="Whole farm", summary="Keep orchard", target_date="1:spring:2", preparation=["layout"], game_date=date)
+    node = store.propose("a", title="Whole farm", summary="Keep orchard", target_date="1:spring:2", preparation=[preparation], game_date=date)
     adopted = store.adopt("a", node["id"], work_store=work, game_date=date)
     work.settle_game_day("a", year=1, season="spring", day=2)
     work.settle_game_day("a", year=1, season="spring", day=3)
     due = work.evaluate_todos("a", snapshot={}, game_date={"year": 1, "season": "spring", "day": 3})
-    assert due[0]["id"] == adopted["todoIds"]["layout"]
+    assert due[0]["id"] == adopted["todoIds"][preparation]
     assert due[0]["expiry"] is None
     goal = work.state("a").goals[0]
     assert goal.source == "user" and goal.project["phase"] == "observe"
@@ -110,14 +111,16 @@ def test_map_image_is_mcp_content_and_rejects_arbitrary_file(tmp_path, monkeypat
     scheduler = MagicMock()
     scheduler.query_map_image = AsyncMock(return_value={"path": str(image_path)})
     async def run():
-        server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="life")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="full")
         result = await server.call_tool("observe_map_image", {})
         assert result[0].type == "image" and result[0].mimeType == "image/png"
         scheduler.query_map_image.return_value = {"path": str(tmp_path / "private.png")}
         with pytest.raises(ToolError, match="controlled image directory"):
             await server.call_tool("observe_map_image", {})
         names = {tool.name for tool in await server.list_tools()}
-        assert "place_items" not in names and "remove_items" not in names
+        assert "observe_map_image" in names
+        life = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="life")
+        assert "observe_map_image" not in {tool.name for tool in await life.list_tools()}
     asyncio.run(run())
 
 
@@ -179,7 +182,9 @@ def test_space_region_preserves_absolute_coordinates_and_full_map_default():
         native = {"width": 4, "height": 3, "offset": {"x": 10, "y": 20},
                   "mapWidth": 80, "mapHeight": 65, "occupants": [{"x": 11, "y": 21}]}
         sched._execute_native_action = AsyncMock(return_value={"details": {"farmSpace": native}})
-        assert await sched.query_farm_space(region=region) == native
+        expected = {**native, "occupantCount": 1, "occupantCounts": {"unknown": 1},
+                    "occupantsTruncated": False, "occupantDetailsComplete": True}
+        assert await sched.query_farm_space(region=region) == expected
         assert sched._execute_native_action.call_args.args[1]["region"] == region
         await sched.query_farm_space()
         assert "region" not in sched._execute_native_action.call_args.args[1]
@@ -189,7 +194,7 @@ def test_space_region_preserves_absolute_coordinates_and_full_map_default():
         wrapper.query_farm_space = AsyncMock(side_effect=sched.query_farm_space)
         server = create_mcp_server(scheduler=wrapper, surface="light")
         _, result = await server.call_tool("observe_farm_space", {"region": region})
-        assert result == native
+        assert result == expected
         with pytest.raises(ToolError):
             await server.call_tool("observe_farm_space", {"region": {**region, "x": True}})
     asyncio.run(run())
@@ -203,10 +208,10 @@ def test_player_work_log_projects_bounded_native_records_into_wire(tmp_path):
     bridge = ChatBridge(run_dir=tmp_path)
     store = bridge._work_store
     def seed(state):
-        state.tasks.append(Task(id="task", goal_id="g", title="铺设东侧道路"))
         for i in range(10):
-            state.executions.append(ExecutionEntry(command_id=f"c{i}", task_id="task", step_id=f"s{i}",
-                operation="place_items", outcome="completed", effects=[{"x": i, "y": 2}],
+            state.tasks.append(Task(id=f"task-{i}", goal_id="g", title="铺设东侧道路"))
+            state.executions.append(ExecutionEntry(command_id=f"c{i}", task_id=f"task-{i}", step_id=f"s{i}",
+                operation="place_items", outcome="completed", effects=[{"state": "placed", "x": i, "y": 2}],
                 game_date="1:spring:3" if i else None))
         state.executions.append(state.executions[-1])
     store._mutate("a", seed)
@@ -217,6 +222,7 @@ def test_player_work_log_projects_bounded_native_records_into_wire(tmp_path):
     assert rows[-1]["taskTitle"] == "铺设东侧道路"
     assert rows[-1]["gameDate"] == "1:spring:3"
     assert "任务继续中" in rows[-1]["summary"]
+    assert "已放置 1 格" in rows[-1]["summary"]
     assert len(rows[-1]["summary"]) <= 180
     assert bridge._life_work_projection("another-save")["recentExecutions"] == []
     envelope = Envelope.create_life_profile_state(bridge.instance_id, "request", "a", {}, 0, work=work)
@@ -264,6 +270,9 @@ def test_standby_project_notes_do_not_wake_loop_but_changed_goal_does(tmp_path):
         await bridge._maybe_schedule_autonomy(snapshot, "a", tracked, None, force=True)
         await asyncio.gather(*tracked)
         assert bridge.handle_chat_submit.await_count == 1
+        prompt = bridge.handle_chat_submit.call_args.args[2]
+        # This mock observes the scheduler request before shared core injection.
+        assert "Layout" in prompt
         bridge._work_store.revise_goal("a", goal.id, project={"phase": "waiting", "summary": "Need materials"})
         await bridge._maybe_schedule_autonomy(snapshot, "a", tracked, None, force=True)
         await asyncio.gather(*tracked)

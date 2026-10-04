@@ -161,10 +161,14 @@ public sealed class NormalShippingAdapter : IShippingAdapter
                 $"Shipping rejected: destination map must be 'Farm', got '{locationName}'.", skipReason: "invalid-location");
         }
 
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return ShippingItemResult.Failed(
-                $"Shipping target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Shipping target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return ShippingItemResult.Failed($"Shipping target map '{locationName}' is not loaded or does not exist.");
         }
 
         // 3. Companion check

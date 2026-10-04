@@ -2,7 +2,8 @@
 
 The companion proposes data-driven milestone nodes (Egg Festival strawberry
 run, Spring Crops bundle retention) based on the real game date and the
-player's play style; the player adopts/revises/defers them in plan mode, and
+player's play style; the player adopts/revises/defers them in life conversations
+(chat or plan), with explicit agreement to adopt or change accepted work, and
 adopted capability prep items enter the existing WorkStore goal/todo system.
 Completion is decided only by verifiable state on day settlement.
 
@@ -169,12 +170,13 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
 
 
 _PREPARATION_LABELS = {
+    "production": "持续负责玩家交付的种植与畜牧，按实际资金安排种子、工具、饲料、畜舍建造和购动物等必要前置，分批生产、照料和收取产物；跨日继续",
     "layout": "按认可的整体范围设计与分批施工，原生观察布局、放置或回收真实物品；保留保护区与通道，跨日继续",
     "water": "照料当前缺水作物，按实际体力和水量完成一小段浇水",
     "harvest": "收取眼前成熟作物；不自动出售或处理献祭保留品",
     "clear": "清理农场眼前少量杂物，保留资源并遵守体力保护",
-    "plant": "用现有可用种子小规模补种并浇水；不因此自动买种子",
-    "animals": "照料现有动物的日常喂食和抚摸，不购买动物",
+    "plant": "按本次明确种植范围安排播种与浇水，必要种子按实际资金准备",
+    "animals": "照料当前动物的日常喂食和抚摸；持续养殖目标用production",
     "machines": "收取现有机器成品，不自动出售或追加采购",
     "store": "把玩家指定保留的物品整理进获准使用的箱子，不出售",
     "ship": "仅出货玩家已明确认可可出售的物品，保留献祭和其他约定保留品",
@@ -184,6 +186,46 @@ _PREPARATION_LABELS = {
 
 class MilestoneError(ValueError):
     """Invalid milestone mutation (validation / state-machine failure)."""
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = {"saved": False, **(details or {})}
+
+
+def _custom_preparation_items(preparation: list[str]) -> list[dict[str, Any]]:
+    if not isinstance(preparation, list) or any(
+        not isinstance(key, str) or key not in _PREPARATION_LABELS for key in preparation
+    ):
+        raise MilestoneError("preparation must use " + "|".join(_PREPARATION_LABELS))
+    return [{"key": key, "label": _PREPARATION_LABELS[key],
+             "support": "capability", "status": "pending", "leadDays": 0,
+             "note": "按实际观察执行；采纳是安排，完成需真实结果"}
+            for key in dict.fromkeys(preparation)]
+
+
+def _normalise_execution_scope(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Canonical explicit candidate set; an empty object removes a prior scope."""
+    if not isinstance(value, dict):
+        raise MilestoneError("execution_scope must be an object with locationId and tiles")
+    if not value:
+        return None
+    location = value.get("locationId")
+    rows = value.get("tiles")
+    if not isinstance(location, str) or not location.strip() or not isinstance(rows, list):
+        raise MilestoneError("execution_scope requires locationId and a tiles list")
+    coordinates: set[tuple[int, int]] = set()
+    for row in rows:
+        if isinstance(row, dict):
+            pair = (row.get("x"), row.get("y"))
+        elif isinstance(row, (list, tuple)) and len(row) == 2:
+            pair = tuple(row)
+        else:
+            raise MilestoneError("execution_scope tiles must be integer {x,y} objects or [x,y] pairs")
+        if any(not isinstance(axis, int) or isinstance(axis, bool) for axis in pair):
+            raise MilestoneError("execution_scope tile coordinates must be integers")
+        coordinates.add(pair)
+    return {"locationId": location.strip(),
+            "tiles": [{"x": x, "y": y} for x, y in sorted(coordinates)]}
 
 
 # --------------------------------------------------------------------------- dates
@@ -385,6 +427,7 @@ def wire_node(node: dict[str, Any]) -> dict[str, Any]:
         "plannedCount": node.get("plannedCount"),
         "termsNote": node.get("termsNote"),
         "updatedAt": node.get("updatedAt"),
+        **({"executionScope": node["executionScope"]} if isinstance(node.get("executionScope"), dict) else {}),
     }
 
 
@@ -438,7 +481,7 @@ class CompanionMilestoneStore:
         )
         temp.replace(self.state_path)
 
-    def _mutate(self, save_id: str, fn: Any) -> Any:
+    def _mutate(self, save_id: str, fn: Any, *, sync_work: WorkStore | None = None) -> Any:
         if not save_id:
             raise MilestoneError("save_id is required")
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -448,8 +491,30 @@ class CompanionMilestoneStore:
             try:
                 self._load()
                 record = self._data.setdefault(save_id, self._default_record())
+                original_statuses = {node_id: node.get("status") for node_id, node in record["nodes"].items()}
                 result = fn(record)
-                self._write_unlocked()
+                node_saved = False
+
+                def save_before_work(goal_id: str, todo_ids: dict[str, str]) -> None:
+                    nonlocal node_saved
+                    result["goalId"], result["todoIds"] = goal_id, todo_ids
+                    self._write_unlocked()
+                    node_saved = True
+
+                if sync_work is not None and result.get("status") == "adopted":
+                    try:
+                        self._wire_work_items(result, sync_work, save_id, before_write=save_before_work)
+                    except (MilestoneError, OSError) as ex:
+                        if node_saved:
+                            raise MilestoneError(f"arrangement saved but work synchronization failed: {ex}", details={
+                                "saved": True, "nodeSaved": True, "executionSynced": False,
+                                "nodeId": result.get("id"), "currentStatus": result.get("status"),
+                            }) from ex
+                        if isinstance(ex, MilestoneError):
+                            ex.details["currentStatus"] = original_statuses.get(result.get("id"), "suggested")
+                        raise
+                if not node_saved:
+                    self._write_unlocked()
                 return result
             finally:
                 self._unlock(lock)
@@ -528,6 +593,7 @@ class CompanionMilestoneStore:
         summary: str | None = None,
         source_url: str | None = None,
         preparation: list[str] | None = None,
+        execution_scope: dict[str, Any] | None = None,
         game_date: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Model-proposed custom node during plan discussion (must carry a target date)."""
@@ -536,9 +602,9 @@ class CompanionMilestoneStore:
             raise MilestoneError("propose: title is required")
         if len(clean) > 60:
             raise MilestoneError("propose: title must be at most 60 chars")
-        preparation = list(dict.fromkeys(preparation or []))
-        if any(key not in _PREPARATION_LABELS for key in preparation):
-            raise MilestoneError("preparation must use " + "|".join(_PREPARATION_LABELS))
+        prep_items = _custom_preparation_items(preparation or [])
+        preparation = [prep["key"] for prep in prep_items]
+        explicit_scope = _normalise_execution_scope(execution_scope) if execution_scope is not None else None
         target = _parse_target_date(target_date)
         current_key = _game_date_key(game_date)
         now = time.time()
@@ -553,10 +619,7 @@ class CompanionMilestoneStore:
             "daysUntil": _days_until(current_key, target),
             "summary": (summary or "").strip() or None,
             "sourceUrl": (source_url or "").strip() or None,
-            "prepItems": [{"key": key, "label": _PREPARATION_LABELS[key],
-                           "support": "capability", "status": "pending", "leadDays": 0,
-                           "note": "按实际观察执行；采纳是安排，完成需真实结果"}
-                          for key in preparation],
+            "prepItems": prep_items,
             "reservedFunds": None,
             "plannedCount": None,
             "termsNote": None,
@@ -565,9 +628,17 @@ class CompanionMilestoneStore:
             "todoIds": {},
             "createdAt": now,
             "updatedAt": now,
+            **({"executionScope": explicit_scope} if explicit_scope is not None else {}),
         }
 
         def mutate(record: dict[str, Any]) -> dict[str, Any]:
+            for existing in record["nodes"].values():
+                if (existing.get("status") == "suggested" and not existing.get("templateId")
+                        and existing.get("title") == node["title"] and existing.get("summary") == node["summary"]
+                        and existing.get("targetDate") == node["targetDate"]
+                        and existing.get("executionScope") == node.get("executionScope")
+                        and [prep.get("key") for prep in existing.get("prepItems", [])] == preparation):
+                    return existing
             record["nodes"][node["id"]] = node
             self._bump(record, node["targetDate"], "propose", node["title"])
             return node
@@ -591,9 +662,17 @@ class CompanionMilestoneStore:
         allowed = _TRANSITIONS[action]
         status = str(node.get("status") or "")
         if status not in allowed:
+            details = {"nodeId": node.get("id"), "currentStatus": status}
+            correction = ""
+            if action == "adopt" and status == "adopted":
+                details.update(recommendedAction="revise", acceptedFields=[
+                    "node_id", "title", "summary", "target_date", "reserved_funds",
+                    "planned_count", "terms_note", "preparation", "execution_scope",
+                ])
+                correction = "; update the existing arrangement with revise(node_id, summary, ...)"
             raise MilestoneError(
                 f"cannot {action} node '{node.get('id')}' from status '{status}' "
-                f"(allowed from: {sorted(allowed)})"
+                f"(allowed from: {sorted(allowed)}){correction}", details=details,
             )
 
     def adopt(
@@ -627,15 +706,13 @@ class CompanionMilestoneStore:
                 node["plannedCount"] = int(planned_count)
             if terms_note is not None:
                 node["termsNote"] = str(terms_note).strip() or None
-            if work_store is not None:
-                self._wire_work_items(node, work_store, save_id)
             node["status"] = "adopted"
             node["daysUntil"] = _days_until(current_key, node["target"])
             node["updatedAt"] = time.time()
             self._bump(record, node.get("targetDate"), "adopt", node.get("title"))
             return node
 
-        return self._mutate(save_id, mutate)
+        return self._mutate(save_id, mutate, sync_work=work_store)
 
     def revise(
         self,
@@ -647,6 +724,8 @@ class CompanionMilestoneStore:
         reserved_funds: int | None = None,
         planned_count: int | None = None,
         terms_note: str | None = None,
+        preparation: list[str] | None = None,
+        execution_scope: dict[str, Any] | None = None,
         work_store: WorkStore | None = None,
         target_date: str | None = None,
         game_date: dict[str, Any] | None = None,
@@ -656,6 +735,16 @@ class CompanionMilestoneStore:
         def mutate(record: dict[str, Any]) -> dict[str, Any]:
             node = self._resolve_for_write(record, node_id, current_key)
             self._check_transition("revise", node)
+            if execution_scope is not None:
+                explicit_scope = _normalise_execution_scope(execution_scope)
+                if explicit_scope is None:
+                    node.pop("executionScope", None)
+                else:
+                    node["executionScope"] = explicit_scope
+            if preparation is not None:
+                if node.get("templateId"):
+                    raise MilestoneError("preparation can only be revised on a custom node; catalogue preparation is fixed")
+                node["prepItems"] = _custom_preparation_items(preparation)
             if target_date is not None:
                 target = _parse_target_date(target_date)
                 if node.get("templateId") and target != node["target"]:
@@ -679,14 +768,12 @@ class CompanionMilestoneStore:
                 node["plannedCount"] = int(planned_count)
             if terms_note is not None:
                 node["termsNote"] = str(terms_note).strip() or None
-            if work_store is not None and node.get("status") == "adopted":
-                self._wire_work_items(node, work_store, save_id)
             node["daysUntil"] = _days_until(current_key, node["target"])
             node["updatedAt"] = time.time()
             self._bump(record, node.get("targetDate"), "revise", node.get("title"))
             return node
 
-        return self._mutate(save_id, mutate)
+        return self._mutate(save_id, mutate, sync_work=work_store)
 
     def defer(
         self,
@@ -737,16 +824,24 @@ class CompanionMilestoneStore:
 
     # ------------------------------------------------------------- work wiring
     @staticmethod
-    def _wire_work_items(node: dict[str, Any], work_store: WorkStore, save_id: str) -> None:
+    def _wire_work_items(node: dict[str, Any], work_store: WorkStore, save_id: str, *, before_write: Any = None) -> None:
         capability_items = [p for p in node.get("prepItems", [])
                             if p.get("support") == "capability"]
-        if not capability_items:
+        if not capability_items and not node.get("goalId"):
             return
         constraints = {
             "reservedFunds": node.get("reservedFunds"),
             "reservedFundsNote": "计划保留金额（非每日预算，仅提醒，不冻结资金）",
             "plannedCount": node.get("plannedCount"),
             "termsNote": node.get("termsNote"),
+            "objectiveScope": {
+                "summary": node.get("summary"),
+                "targetDate": node.get("targetDate"),
+                "plannedCount": node.get("plannedCount"),
+                "termsNote": node.get("termsNote"),
+                "preparation": [prep["key"] for prep in capability_items],
+                **({"executionScope": node["executionScope"]} if isinstance(node.get("executionScope"), dict) else {}),
+            },
         }
         target = node["target"]
         specs = []
@@ -759,22 +854,25 @@ class CompanionMilestoneStore:
                           f'范围={node.get("summary") or "仅当前可确认范围，不扩大到其他工作"}；'
                           f'计划数量={node.get("plannedCount") or "待商量"}；'
                           f'约定={node.get("termsNote") or "无"}',
-                "trigger": {"type": "calendar", **trigger}, "expiry": None if prep["key"] == "layout" else dict(target),
+                "trigger": {"type": "calendar", **trigger}, "expiry": None if not node.get("templateId") or prep["key"] in {"layout", "production"} else dict(target),
             })
         try:
             goal_id, todo_ids = work_store.sync_milestone_work(
-                save_id, node["id"], text=(f'持续项目：{node["title"]}' if any(p["key"] == "layout" for p in capability_items)
+                save_id, node["id"], text=(f'持续项目：{node["title"]}' if any(p["key"] in {"layout", "production"} for p in capability_items)
                                           else f'节点准备：{node["title"]}（{node["targetDate"]}）'),
                 constraints=constraints, todos=specs, active=True,
                 existing_goal_id=node.get("goalId"),
+                before_write=before_write,
             )
             node["goalId"], node["todoIds"] = goal_id, todo_ids
-            if any(p["key"] == "layout" for p in capability_items):
+            if any(p["key"] in {"layout", "production"} for p in capability_items):
                 goal = next(g for g in work_store.state(save_id).goals if g.id == goal_id)
                 if not goal.project:
                     work_store.revise_goal(save_id, goal_id, project={"phase": "observe", "summary": node.get("summary") or node["title"], "openQuestions": []})
         except WorkStateError as ex:
-            raise MilestoneError(f"work system rejected milestone: {ex}") from None
+            raise MilestoneError(f"work system rejected milestone: {ex}", details={
+                "nodeId": node.get("id"), "currentStatus": node.get("status"),
+            }) from None
 
     @staticmethod
     def _unwire_work_items(node: dict[str, Any], work_store: WorkStore, save_id: str) -> None:

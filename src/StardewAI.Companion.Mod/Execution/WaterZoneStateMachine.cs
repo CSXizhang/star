@@ -211,6 +211,14 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 {
                     _skippedTiles.Add(new SkippedTileInfo(tile, "NotTilled"));
                 }
+                else if (dirt.IsDead)
+                {
+                    _skippedTiles.Add(new SkippedTileInfo(tile, "DeadCrop"));
+                }
+                else if (!request.IncludeEmptyTiles && !dirt.HasCrop)
+                {
+                    _skippedTiles.Add(new SkippedTileInfo(tile, "NoCrop"));
+                }
                 else if (dirt.IsWatered)
                 {
                     _skippedTiles.Add(new SkippedTileInfo(tile, "AlreadyWatered"));
@@ -259,16 +267,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             {
                 _cancelRequested = false;
 
-                // Safe in-progress swing resolution:
-                // If the tool effect already executed on the current tile, verify it before halting
-                if (CurrentState == ExecutionState.Watering && _toolEffectExecuted && !_wateredTiles.Contains(_currentTargetTile))
-                {
-                    var dirt = _observer.GetDirtState(_currentRequest.LocationId, _currentTargetTile);
-                    if (dirt.IsWatered)
-                    {
-                        _wateredTiles.Add(_currentTargetTile);
-                    }
-                }
+                VerifyExecutedEffectBeforeTermination();
 
                 _actor.Halt();
                 _actor.EndUsingTool();
@@ -294,9 +293,11 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             // 3. Game-level pause, open menus, saving, world not ready
             try
             {
-                if (Game1.paused || Game1.activeClickableMenu != null || !Context.IsWorldReady)
+                if (Game1.paused || StardewAI.Companion.Mod.Menus.CompanionMenuClock.HasBlockingMenu || !Context.IsWorldReady)
                 {
-                    _actor.Halt();
+                    // Halt ends the native tool lifecycle. Freeze an in-flight
+                    // swing in place so it can resume after the menu closes.
+                    if (!_actor.IsUsingTool) _actor.Halt();
                     return;
                 }
             }
@@ -314,6 +315,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             int gameMinutesElapsed = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
             if (gameMinutesElapsed > _currentRequest.MaxGameMinutes)
             {
+                VerifyExecutedEffectBeforeTermination();
                 _actor.Halt();
                 _actor.EndUsingTool();
                 _avatar?.SetAnimation("idle");
@@ -325,6 +327,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             // 5. Monotonic timeout guard
             if (_elapsedTicks > MaxMonotonicTicks)
             {
+                VerifyExecutedEffectBeforeTermination();
                 _actor.Halt();
                 _actor.EndUsingTool();
                 _avatar?.SetAnimation("idle");
@@ -550,6 +553,12 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
 
         // Pre-tool re-observation: check if tile was watered concurrently
         var dirt = _observer.GetDirtState(_currentRequest!.LocationId, _currentTargetTile);
+        if (!_currentRequest.IncludeEmptyTiles && (!dirt.HasCrop || dirt.IsDead))
+        {
+            _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, dirt.IsDead ? "DeadCrop" : "NoCrop"));
+            AdvanceToNextTarget();
+            return;
+        }
         if (dirt.IsWatered)
         {
             _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "ConcurrentlyWatered"));
@@ -622,6 +631,17 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
 
             CurrentState = ExecutionState.Verifying;
         }
+    }
+
+    private void VerifyExecutedEffectBeforeTermination()
+    {
+        // A clock/cancel boundary can arrive after the native effect and before
+        // the animation's final verification tick. Preserve only observed dirt
+        // changes; never repeat the tool action to settle that pending result.
+        if (CurrentState is not (ExecutionState.Watering or ExecutionState.Verifying) ||
+            !_toolEffectExecuted || _currentRequest is null || _wateredTiles.Contains(_currentTargetTile)) return;
+        if (_observer.GetDirtState(_currentRequest.LocationId, _currentTargetTile).IsWatered)
+            _wateredTiles.Add(_currentTargetTile);
     }
 
     private void TickVerifying()

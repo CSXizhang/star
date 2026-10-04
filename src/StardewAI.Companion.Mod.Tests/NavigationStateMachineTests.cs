@@ -7,6 +7,207 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class NavigationStateMachineTests
 {
+    [Fact]
+    public void AlreadyAtDestinationVerifiesWithoutSearchingOrMoving()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm" };
+        var observer = new SimulatedWorldObserver();
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph());
+        var original = actor.Tile;
+        Assert.True(machine.Start(new NavigationRequest("arrived", "task", "Farm", original, 120), out _));
+        for (int tick = 1; tick < 10 && machine.IsExecuting; tick++) machine.Update(null, tick);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Equal(original, actor.Tile);
+        Assert.Equal(0, observer.TilePassabilityChecks);
+    }
+
+    [Theory]
+    [InlineData("pause")]
+    [InlineData("cancel")]
+    [InlineData("clear")]
+    [InlineData("blocked")]
+    public void DynamicObstructionBacksOffWithoutRepeatingRouteSearchAndHonorsControls(string action)
+    {
+        var actor = new StubFarmerActor();
+        actor.SetLocation("Farm", new(0, 1));
+        var observer = new SimulatedWorldObserver();
+        for (int x = 0; x <= 10; x++) observer.SetPassable("Farm", new(x, 1), true);
+        var logs = new List<string>();
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph(),
+            log: (text, _) => logs.Add(text));
+        Assert.True(machine.Start(new NavigationRequest("blocked", "task", "Farm", new(10, 1), 120), out _));
+        machine.Update(null, 1);
+        observer.PlayerTile = new(1, 1);
+        for (int tick = 2; tick <= 3; tick++) machine.Update(null, tick);
+        Assert.Equal(ExecutionState.Preparing, machine.CurrentState);
+        int before = observer.TilePassabilityChecks;
+        var original = actor.Tile;
+        for (int tick = 4; tick <= 10; tick++) machine.Update(null, tick);
+        Assert.Equal(before, observer.TilePassabilityChecks);
+        Assert.Equal(original, actor.Tile);
+        if (action == "pause")
+        {
+            machine.RequestPause();
+            machine.Update(null, 11);
+            Assert.True(machine.IsPaused);
+        }
+        else if (action == "cancel")
+        {
+            machine.RequestCancel();
+            machine.Update(null, 11);
+            Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        }
+        else
+        {
+            if (action == "clear") observer.PlayerTile = null;
+            for (int tick = 11; tick < 600 && machine.IsExecuting; tick++) machine.Update(null, tick);
+            Assert.False(machine.IsExecuting);
+            Assert.Equal(action == "clear" ? ExecutionState.Succeeded : ExecutionState.Failed, machine.FinalResult!.FinalState);
+            if (action == "blocked") Assert.Equal("DESTINATION_UNREACHABLE", machine.FinalResult.ErrorCode);
+        }
+        Assert.Single(logs.Where(line => line.Contains("route resolved")));
+    }
+
+    [Fact]
+    public void FinalLegBecomingUnreachableReturnsActualReasonWithinBoundedReplans()
+    {
+        var actor = new StubFarmerActor();
+        actor.SetLocation("Farm", new(0, 1));
+        var observer = new SimulatedWorldObserver();
+        for (int x = 0; x <= 10; x++) observer.SetPassable("Farm", new(x, 1), true);
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph());
+        Assert.True(machine.Start(new NavigationRequest("no-path", "task", "Farm", new(10, 1), 120), out _));
+        machine.Update(null, 1);
+        for (int x = 1; x <= 10; x++) observer.SetPassable("Farm", new(x, 1), false);
+        for (int tick = 2; tick < 300 && machine.IsExecuting; tick++) machine.Update(null, tick);
+        Assert.False(machine.IsExecuting);
+        Assert.Equal("DESTINATION_UNREACHABLE", machine.FinalResult!.ErrorCode);
+        Assert.Contains("unreachable", machine.FinalResult.ErrorMessage);
+    }
+
+    [Fact]
+    public void PauseBeforeNativeArrivalBlocksMovementUntilExplicitResume()
+    {
+        var ui = new StardewAI.Companion.Mod.Menus.ChatCommandUiState();
+        ui.NoteLocalPauseRequested();
+        ui.BeginControl("pause", "pause");
+        Assert.False(ui.ApplyNativePauseGate(null));
+        ui.ApplyControlAck("pause", true, true);
+        var actor = new StubFarmerActor { LocationName = "Farm" };
+        var observer = new SimulatedWorldObserver();
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph());
+        var original = actor.Tile;
+        Assert.True(machine.Start(new NavigationRequest("late-nav", "task", "Farm", new(12, 12), 120), out _));
+        Assert.True(ui.ApplyNativePauseGate(machine));
+        for (int tick = 1; tick < 10; tick++) machine.Update(null, tick);
+        Assert.True(machine.IsPaused);
+        Assert.Equal(original, actor.Tile);
+        ui.BeginControl("resume", "resume");
+        Assert.True(ui.ApplyNativePauseGate(machine)); // resume waits for its ACK
+        machine.Resume();
+        ui.ApplyControlAck("resume", false, false);
+        Assert.True(ui.ApplyNativePauseGate(machine));
+        machine.Update(null, 10);
+        Assert.True(machine.IsPaused);
+        ui.BeginControl("resume2", "resume");
+        ui.ApplyControlAck("resume2", true, false);
+        ui.NoteLocalResumed();
+        machine.Resume();
+        Assert.False(ui.ApplyNativePauseGate(machine));
+        for (int tick = 11; tick < 200 && machine.IsExecuting; tick++) machine.Update(null, tick);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Equal(new TileCoordinate(12, 12), actor.Tile);
+    }
+
+    [Fact]
+    public void PausedCancelSettlesWithoutMoving()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm" };
+        var observer = new SimulatedWorldObserver();
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph());
+        var original = actor.Tile;
+        Assert.True(machine.Start(new NavigationRequest("pause-nav", "task", "Farm", new(12, 12), 120), out _));
+        machine.RequestPause();
+        machine.Update(null, 1);
+        Assert.True(machine.IsPaused);
+        machine.RequestCancel("cancel paused route");
+        machine.Update(null, 2);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Empty(machine.FinalResult.HopRecords);
+        Assert.Equal(original, actor.Tile);
+    }
+
+    [Fact]
+    public void CancelTakesPriorityOverPauseBeforeAnyRouteSearch()
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm" };
+        var observer = new SimulatedWorldObserver();
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph());
+        Assert.True(machine.Start(new NavigationRequest("cancel-first", "task", "Farm", new(12, 12), 120), out _));
+        machine.RequestPause();
+        machine.RequestCancel();
+        machine.Update(null, 1);
+        Assert.Equal(ExecutionState.Cancelled, machine.FinalResult!.FinalState);
+        Assert.Equal(0, observer.TilePassabilityChecks);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void FailedRoute_ReportsOnlyReachableDestinationDoor(bool destinationDoor, bool entranceReachable)
+    {
+        var observer = new SimulatedWorldObserver();
+        for (int x = 0; x <= 4; x++)
+            observer.SetPassable("Town", new(x, 1), x != 2 || entranceReachable);
+        var graph = new WorldMapGraph();
+        graph.AddEdge(new MapEdge("Town", "JojaMart", new(1, 1), new(1, 1),
+            MapEdgeKind.LockedDoorWarp, 900, 2300));
+        if (destinationDoor)
+            graph.AddEdge(new MapEdge("Town", "AnimalShop", new(4, 1), new(1, 1),
+                MapEdgeKind.LockedDoorWarp, 900, 1800));
+        var planner = new ReachableRoutePlanner(observer, new SameMapNavigator(observer), graph);
+        Assert.Null(planner.Find("Town", new(0, 1), "AnimalShop", new(1, 1), 810, null, out var reason));
+        Assert.NotNull(reason);
+        Assert.DoesNotContain("JojaMart", reason);
+        if (destinationDoor && entranceReachable)
+        {
+            Assert.Contains("AnimalShop", reason);
+            Assert.Contains("locked", reason);
+        }
+        else
+            Assert.Contains("No route found with passable entrance paths", reason);
+    }
+
+    [Theory]
+    [InlineData("Forest", 1, 2)]
+    [InlineData("Farm", 1, 3)]
+    public void BlockedFarmEntrance_SelectsReachableDetourIncludingSameMapLoop(string startLocation, int startX, int hops)
+    {
+        var observer = new SimulatedWorldObserver();
+        foreach (string location in new[] { "Farm", "Forest", "BusStop" })
+            for (int x = 0; x <= 10; x++)
+                observer.SetPassable(location, new TileCoordinate(x, 1), location != "Farm" || x <= 2 || x >= 8);
+        var graph = new WorldMapGraph();
+        graph.AddEdge(new MapEdge("Forest", "Farm", new(2, 1), new(1, 1), MapEdgeKind.Warp));
+        graph.AddEdge(new MapEdge("Farm", "Forest", new(0, 1), new(1, 1), MapEdgeKind.Warp));
+        graph.AddEdge(new MapEdge("Forest", "BusStop", new(3, 1), new(1, 1), MapEdgeKind.Warp));
+        graph.AddEdge(new MapEdge("BusStop", "Farm", new(3, 1), new(9, 1), MapEdgeKind.Warp));
+        var navigator = new SameMapNavigator(observer);
+        var route = new ReachableRoutePlanner(observer, navigator, graph).Find(startLocation, new(startX, 1), "Farm", new(10, 1), 600, null, out _);
+        Assert.NotNull(route);
+        Assert.Equal(hops, route.Edges.Count);
+        Assert.Equal("BusStop", route.Edges[^2].TargetLocation);
+        var actor = new StubFarmerActor();
+        actor.SetLocation(startLocation, new(startX, 1));
+        var machine = new NavigationStateMachine(actor, observer, navigator, graph);
+        Assert.True(machine.Start(new("cmd-detour", "task-detour", "Farm", new(10, 1), 120), out _));
+        for (int tick = 1; tick < 600 && machine.IsExecuting; tick++) machine.Update(null, tick);
+        Assert.Equal(ExecutionState.Succeeded, machine.CurrentState);
+        Assert.Equal(new TileCoordinate(10, 1), actor.Tile);
+        Assert.Equal(hops, machine.FinalResult!.HopRecords.Count - 1);
+    }
+
     private sealed class StubFarmerActor : IFarmerActor
     {
         public string CompanionId => "companion-test";

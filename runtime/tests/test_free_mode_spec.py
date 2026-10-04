@@ -36,7 +36,7 @@ def test_old_enabled_save_migrates_to_free_without_spend_permission(tmp_path: Pa
     path = tmp_path / "autonomy.json"
     path.write_text(json.dumps({"save-a": {"enabled": True, "budget_limit": None}}), encoding="utf-8")
     state = AutonomyController(path).state("save-a")
-    assert state.mode == "free" and state.daily_spend == 0 and state.budget_limit is None
+    assert state.mode == "free" and state.daily_spend == 0 and "budget_limit" not in state.__dict__
 
 
 def test_first_day_and_new_day_each_allow_one_planning_wakeup(tmp_path: Path) -> None:
@@ -87,11 +87,20 @@ def test_fingerprint_uses_real_world_snapshot_fixture_and_tolerates_missing_shap
 def test_pause_cancel_and_save_switch_do_not_resume_old_autonomy(tmp_path: Path) -> None:
     ctl = AutonomyController(tmp_path / "state.json")
     ctl.set_mode("save-a", "free")
+    ctl.set_goal_scope("save-a", "cancelled-arrangement")
     ctl.control("save-a", "pause")
     assert ctl.next_candidate("save-a", _snapshot()) is None
     ctl.control("save-a", "cancel")
-    assert ctl.state("save-a").mode == "command"
+    assert ctl.state("save-a").mode == "free"
+    assert ctl.state("save-a").enabled
+    assert ctl.state("save-a").goal_scope is None
+    assert ctl.state("save-a").paused
+    assert ctl.next_candidate("save-a", _snapshot()) is None
     assert ctl.state("save-b").mode == "command"
+    # Reload/switch saves must preserve the old pause, while the other save is independent.
+    restarted = AutonomyController(tmp_path / "state.json")
+    assert restarted.state("save-a").paused
+    assert restarted.next_candidate("save-a", _snapshot()) is None
 
 
 def test_player_request_preempts_autonomy_generation(tmp_path: Path) -> None:
@@ -122,6 +131,26 @@ def test_quota_failure_pauses_free_mode_and_explains_reason(tmp_path: Path) -> N
     asyncio.run(run())
 
 
+def test_approval_refusal_is_visible_and_stays_paused_across_next_day(tmp_path):
+    async def run():
+        bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        bridge._autonomy.set_mode("save-a", "free")
+        ws = AsyncMock()
+        with patch.object(bridge, "_execute_turn", return_value={
+            "success": False, "response": "", "error": "TOOL_APPROVAL_REQUIRED",
+            "conversation_id": None, "duration": 0.1,
+        }):
+            await bridge.handle_chat_submit(ws, "autonomy-denied", "浇水", "save-a")
+        final = json.loads(ws.send_text.call_args_list[-1].args[0])["payload"]
+        assert final["status"] == "failed" and "审批策略拒绝" in final["replyText"]
+        restarted = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        assert restarted._autonomy.state("save-a").paused
+        assert restarted._work_store.state("save-a").paused
+        restarted._autonomy.on_day_started("save-a", 12, game_date="1:spring:12")
+        assert restarted._autonomy.next_candidate("save-a", {"farmWork": {"cropUnwateredTiles": [{"x": 1, "y": 2}]}}) is None
+    asyncio.run(run())
+
+
 def test_backend_tool_progress_is_forwarded_as_processing_reply() -> None:
     async def run() -> None:
         bridge = ChatBridge(backend="kimi")
@@ -139,7 +168,7 @@ def test_backend_tool_progress_is_forwarded_as_processing_reply() -> None:
 def test_budget_and_box_defaults_preserve_free_labor(tmp_path: Path) -> None:
     ctl = AutonomyController(tmp_path / "state.json")
     state = ctl.state("save-a")
-    assert state.budget_limit is None or state.budget_limit == 0
+    assert "budget_limit" not in state.__dict__
     assert state.box_preference == "none"
     ctl.set_preferences("save-a", box_preference="any")
     assert ctl.state("save-a").box_preference == "any"  # explicit legacy preference remains valid
@@ -149,7 +178,7 @@ def test_budget_and_box_defaults_preserve_free_labor(tmp_path: Path) -> None:
 def test_purchase_accounting_covers_cumulative_replay_and_unknown_result(tmp_path: Path) -> None:
     ctl = AutonomyController(tmp_path / "state.json")
     ctl.set_mode("save-a", "free")
-    ctl.set_preferences("save-a", budget_limit=10)
+    ctl.set_preferences("save-a")
     ctl.reserve_spend("save-a", "a", 4)
     ctl.settle_spend("save-a", "a", 3)
     ctl.reserve_spend("save-a", "b", 4)
@@ -174,7 +203,7 @@ def test_free_purchase_entry_selects_short_job_and_preserves_command_id(tmp_path
     })
     ctl = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     ctl.set_mode("save-a", "free")
-    ctl.set_preferences("save-a", budget_limit=6)
+    ctl.set_preferences("save-a")
     store = WorkStore(tmp_path / "data" / "work-state.json")
     store.begin_decision("save-a", "decision-fp")
 
@@ -201,8 +230,7 @@ def test_free_purchase_entry_selects_short_job_and_preserves_command_id(tmp_path
 
 
 def test_free_purchase_selection_does_not_consume_budget(tmp_path: Path) -> None:
-    """Repeated purchase selections are never rejected by the daily budget: budget
-    enforcement lives in the harness/prompt layer, not the selection guard."""
+    """Selecting a short job does not dispatch or record actual spending."""
     scheduler = MagicMock()
     scheduler.run_dir = tmp_path
     scheduler.latest_world_revision = 1
@@ -215,7 +243,7 @@ def test_free_purchase_selection_does_not_consume_budget(tmp_path: Path) -> None
     ])
     ctl = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     ctl.set_mode("save-a", "free")
-    ctl.set_preferences("save-a", budget_limit=100)
+    ctl.set_preferences("save-a")
     store = WorkStore(tmp_path / "data" / "work-state.json")
     server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, full=True)
 
@@ -247,7 +275,7 @@ def test_free_purchase_selection_keeps_reservations_untouched(tmp_path: Path) ->
     scheduler.execute_purchase_items = AsyncMock(return_value={"terminalState": "unknown", "details": {}})
     ctl = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     ctl.set_mode("save-a", "free")
-    ctl.set_preferences("save-a", budget_limit=100)
+    ctl.set_preferences("save-a")
     store = WorkStore(tmp_path / "data" / "work-state.json")
     store.begin_decision("save-a", "decision-fp")
 
@@ -278,7 +306,7 @@ def test_pending_purchase_reconnect_does_not_blind_redispatch(tmp_path: Path) ->
     scheduler.execute_purchase_items = AsyncMock()
     ctl = AutonomyController(tmp_path / "data" / "autonomy-state.json")
     ctl.set_mode("save-a", "free")
-    ctl.set_preferences("save-a", budget_limit=100)
+    ctl.set_preferences("save-a")
     ctl.reserve_spend("save-a", "cmd-pending", 40)
     store = WorkStore(tmp_path / "data" / "work-state.json")
     store.begin_decision("save-a", "decision-fp")
@@ -307,7 +335,7 @@ def test_purchase_command_retry_reuses_task_and_idempotency_without_dispatch(tmp
     client.execute_purchase_items = AsyncMock(return_value="cmd-real")
     client.wait_for_result = AsyncMock(side_effect=[
         TimeoutError(),
-        SimpleNamespace(payload={"terminalState": "succeeded", "details": {"totalCost": 0}}),
+        SimpleNamespace(save_id="save-a", game_session_id="session-a", payload={"terminalState": "succeeded", "details": {"totalCost": 0}}),
     ])
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
 

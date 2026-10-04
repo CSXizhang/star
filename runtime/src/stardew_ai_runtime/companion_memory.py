@@ -61,6 +61,7 @@ class CompanionMemoryStore:
                     if isinstance(v, dict):
                         self._data[str(k)] = {
                             "memoryRevision": int(v.get("memoryRevision", 0)),
+                            "instructionRevision": int(v.get("instructionRevision", v.get("memoryRevision", 0))),
                             "entries": list(v.get("entries", [])) if isinstance(v.get("entries"), list) else [],
                         }
         except (FileNotFoundError, OSError, ValueError, TypeError):
@@ -103,7 +104,7 @@ class CompanionMemoryStore:
             self._lock(lock)
             try:
                 self._load()
-                record = self._data.setdefault(save_id, {"memoryRevision": 0, "entries": []})
+                record = self._data.setdefault(save_id, {"memoryRevision": 0, "instructionRevision": 0, "entries": []})
                 fn(record)
                 self._write_unlocked()
                 return dict(record)
@@ -120,6 +121,16 @@ class CompanionMemoryStore:
         return f"mem-{uuid.uuid4().hex[:12]}"
 
     # ---------------------------------------------------------------- public API
+    def instruction_revision(self, save_id: str) -> int:
+        """Revision of agreements/preferences only, for provider session rotation.
+
+        Routine completion events still change the wire memoryRevision, but do
+        not invalidate the work session. Legacy records start from their known
+        memory revision so subsequent user corrections remain distinguishable.
+        """
+        self._load()
+        return int(self._data.get(save_id, {}).get("instructionRevision", 0))
+
     def list(self, save_id: str) -> dict[str, Any]:
         """Return {memoryRevision, entries} for save_id (wire shape, §1.5).
 
@@ -215,6 +226,8 @@ class CompanionMemoryStore:
                 new_entry["commandId"] = command_id
             entries.append(new_entry)
             record["memoryRevision"] = current_rev + 1
+            if kind != "event":
+                record["instructionRevision"] = int(record.get("instructionRevision", current_rev)) + 1
             result["memoryRevision"] = record["memoryRevision"]
             result["entry"] = dict(new_entry)
 
@@ -249,6 +262,7 @@ class CompanionMemoryStore:
                         return
                     e["text"] = str(text)[:200]
                     record["memoryRevision"] = current_rev + 1
+                    record["instructionRevision"] = int(record.get("instructionRevision", current_rev)) + 1
                     result["memoryRevision"] = record["memoryRevision"]
                     result["entry"] = dict(e)
                     return
@@ -281,6 +295,8 @@ class CompanionMemoryStore:
                 if isinstance(e, dict) and e.get("id") == entry_id:
                     entries.pop(i)
                     record["memoryRevision"] = current_rev + 1
+                    if e.get("kind") != "event":
+                        record["instructionRevision"] = int(record.get("instructionRevision", current_rev)) + 1
                     result["memoryRevision"] = record["memoryRevision"]
                     return
             status_holder[0] = "rejected"
@@ -299,6 +315,13 @@ class CompanionMemoryStore:
         self._load()
         record = self._data.get(save_id, {"memoryRevision": 0, "entries": []})
         entries: list[dict[str, Any]] = record.get("entries", [])
+        # Do not rewrite player agreements or historical events. Only retired
+        # engine-generated allowance rules are excluded from current context.
+        entries = [entry for entry in entries if not (
+            isinstance(entry, dict) and entry.get("source") == "system"
+            and entry.get("kind") in {"preference", "agreement"}
+            and any(marker in str(entry.get("text", "")) for marker in
+                    ("每日购买额度", "每日采购额度", "purchaseBudget", "dailyPurchaseBudget")))]
 
         agreements = [e for e in entries if isinstance(e, dict) and e.get("kind") == "agreement"]
         preferences = [e for e in entries if isinstance(e, dict) and e.get("kind") == "preference"]

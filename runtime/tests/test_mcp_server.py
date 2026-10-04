@@ -2505,8 +2505,9 @@ def test_invalid_spatial_parameters_are_rejected_before_selection(mock_scheduler
 
 
 def test_compact_overview_prioritizes_current_work_and_defers_coordinates():
-    from stardew_ai_runtime.mcp_server import compact_work_overview
     import json
+
+    from stardew_ai_runtime.mcp_server import compact_work_overview
     coordinates = [{"x": i, "y": 5} for i in range(500)]
     overview = {"decision": {"goalId": "g9", "taskId": "t9"},
         "goals": [{"id": f"g{i}", "text": "plant", "status": "active", "constraints": {"milestoneSpec": {"tiles": coordinates}}} for i in range(10)],
@@ -2649,6 +2650,7 @@ def test_milestone_exact_scope_roundtrip_and_full_single_node_read(mock_schedule
 def test_milestone_work_write_failure_reports_saved_node_and_unsynced_execution(mock_scheduler, tmp_path, monkeypatch):
     async def run():
         import time
+
         from stardew_ai_runtime.companion_milestones import CompanionMilestoneStore
 
         mock_scheduler.run_dir = None

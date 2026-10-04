@@ -13,8 +13,8 @@ from stardew_ai_runtime.companion_milestones import (
     MilestoneError,
     wire_node,
 )
-from stardew_ai_runtime.work_state import WorkStore, WorkStateError
 from stardew_ai_runtime.decision_context import build_decision_context, objective_scope
+from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 SAVE = "Save1"
 DATE_11 = {"year": 1, "season": "spring", "day": 11}  # 2 days before Egg Festival

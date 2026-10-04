@@ -61,7 +61,7 @@ from stardew_ai_runtime.decision_context import (
     objective_scope,
     render_decision_context,
 )
-from stardew_ai_runtime.decision_policy import decision_policy, project_context
+from stardew_ai_runtime.decision_policy import decision_policy
 from stardew_ai_runtime.job_feedback import compact_job_feedback, compact_task_feedback
 from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
 from stardew_ai_runtime.life_chat import LifeChatService

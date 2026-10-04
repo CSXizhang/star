@@ -358,6 +358,7 @@ def test_step_feedback_roundtrip_and_legacy_load(tmp_path):
 
 def test_replace_retries_only_transient_permission_errors(tmp_path, monkeypatch):
     from pathlib import Path
+
     import stardew_ai_runtime.work_state as module
     original = Path.replace
     attempts = []
@@ -379,6 +380,7 @@ def test_replace_retries_only_transient_permission_errors(tmp_path, monkeypatch)
 @pytest.mark.parametrize("error, expected_attempts", [(PermissionError, 4), (OSError, 1)])
 def test_replace_does_not_swallow_final_or_other_errors(tmp_path, monkeypatch, error, expected_attempts):
     from pathlib import Path
+
     import stardew_ai_runtime.work_state as module
     attempts = []
     def replace(path, target):

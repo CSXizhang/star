@@ -54,7 +54,12 @@ from stardew_ai_runtime.scheduler import (
     validate_action_tiles,
 )
 from stardew_ai_runtime.wiki import WikiLookup
-from stardew_ai_runtime.work_state import PLANT_WORKFLOW_PLAN_ERROR, WorkStateError, WorkStore, bind_execution_scope_params
+from stardew_ai_runtime.work_state import (
+    PLANT_WORKFLOW_PLAN_ERROR,
+    WorkStateError,
+    WorkStore,
+    bind_execution_scope_params,
+)
 
 
 def _compact_plan_task(task: dict[str, Any]) -> dict[str, Any]:

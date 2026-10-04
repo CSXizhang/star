@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
 from stardew_ai_runtime.agy_process import AgyProcessOutcome
+from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
 from stardew_ai_runtime.decision_context import build_decision_context
 from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore

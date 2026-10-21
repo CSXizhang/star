@@ -10,12 +10,14 @@ function Get-ReleasePath([string]$Root, [string]$Relative) {
     $base = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     if ([IO.Path]::IsPathRooted($Relative) -or $Relative -match '(^|[\\/])\.\.([\\/]|$)|:') { throw "Unsafe release path: $Relative" }
     if ($Relative -match '^(?i)(data|config|\.kimi-code|\.env|\.env.local)([\\/]|$)') { throw 'Release manifest cannot own player data or settings.' }
-    $path = [IO.Path]::GetFullPath((Join-Path $base $Relative))
+    $path = [IO.Path]::GetFullPath([IO.Path]::Combine($base, $Relative))
     if (-not $path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { throw 'Release path escapes package.' }
-    $probe = Split-Path -Parent $path
+    $probe = [IO.Path]::GetDirectoryName($path)
     while ($probe.Length -ge $base.TrimEnd('\').Length) {
-        if ((Test-Path -LiteralPath $probe) -and ((Get-Item -LiteralPath $probe -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Linked release directory not allowed: $probe" }
-        $probe = Split-Path -Parent $probe
+        # This runs for every parent of every bundled file. Native path/attribute
+        # calls preserve the link checks without thousands of provider lookups.
+        if ([IO.Directory]::Exists($probe) -and ([IO.File]::GetAttributes($probe) -band [IO.FileAttributes]::ReparsePoint)) { throw "Linked release directory not allowed: $probe" }
+        $probe = [IO.Path]::GetDirectoryName($probe)
     }
     return $path
 }

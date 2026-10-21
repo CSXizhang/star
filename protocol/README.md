@@ -18,6 +18,21 @@ Wire compatibility rules:
 
 Production observations, resource recovery and building services are described in [Native production chain](production-chain.md).
 
+## Runtime restart reconciliation
+
+`mod.welcome.payload.commandResultQuery: true` advertises the optional read-only
+`skill.result.query` extension. A query carries the current `saveId`,
+`gameSessionId`, and `payload.commandId`. It returns one original cached
+`skill.result`, correlated with the query message, or `skill.result.status`
+with `status: "unknown" | "in-flight"`. It never dispatches or retries an action.
+Missing or mismatched save/session identities are rejected. Unknown is not a
+successful completion; the runtime must stop unconfirmed continuation.
+
+The cache lives only in the current native game session and retains the existing
+bounded idempotency history. This recovers a terminal receipt across a runtime
+restart, not across a native game/save reload. Older Mods without the capability
+retain the existing received-result reconciliation behavior.
+
 ## F8 command and control correlation
 
 The chat channel distinguishes a model turn from the whole player instruction.
@@ -292,6 +307,13 @@ The optional snapshot fields `world.playerMoney`, `world.playerStamina`, and
 `companion.availableMoney` and companion stamina; missing fields mean unknown,
 not zero or a shared wallet. Plan dialogue receives both resource views and
 compact current farm counts without requiring the player to re-enter them.
+
+The optional payload field `observedAt` records UTC Unix seconds at the native
+game observation. A player dialogue submission sends a new native snapshot
+before its request. Tool-start progress publishes another observation on the
+game thread when a long model turn reads state. Cached retransmission and runtime cache writes preserve the
+observation time; they do not renew freshness. Older snapshots without this
+field use their envelope timestamp when received.
 
 A plan turn that explicitly adopts/re-adopts or materially revises current due
 preparation may hand one short job to the existing work command path. It never

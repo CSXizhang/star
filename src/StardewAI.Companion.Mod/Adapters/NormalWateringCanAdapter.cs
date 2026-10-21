@@ -39,6 +39,11 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         string locationName,
         TileCoordinate targetTile)
     {
+        if (actor is PlayerActor player) {
+            var observed=_observer.GetDirtState(locationName,targetTile);
+            return observed.IsWatered ? WaterTileResult.Succeeded(Math.Max(0,player.ToolStartStamina-player.Stamina),Math.Max(0,player.ToolStartWater-player.WaterLeft)) : WaterTileResult.Failed("Native tool lifecycle completed without watering the target.");
+        }
+
         ArgumentNullException.ThrowIfNull(actor);
 
         // 1. Thread safety invariant
@@ -95,8 +100,15 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         }
 
         // 7. Verify human player baseline isolation BEFORE tool use
-        var playerBefore = _observer.GetPlayerSnapshot();
-        var originalPlayerRef = Game1.player;
+        // (skipped entirely in player mode: the actor IS Game1.player).
+        bool playerBound = ActorGuards.IsPlayerBound(actor);
+        PlayerResourceSnapshot? playerBefore = null;
+        Farmer? originalPlayerRef = null;
+        if (!playerBound)
+        {
+            playerBefore = _observer.GetPlayerSnapshot();
+            originalPlayerRef = Game1.player;
+        }
 
         try
         {
@@ -135,19 +147,23 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         }
         finally
         {
-            // 9. Strict Invariant Checks:
-            // - Game1.player was NOT swapped
-            if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+            // 9. Strict Invariant Checks (companion mode only; skipped for player-bound
+            // actors, where the stamina/water spend above is the intended effect):
+            if (!playerBound)
             {
-                throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified!");
-            }
+                // - Game1.player was NOT swapped
+                if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+                {
+                    throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified!");
+                }
 
-            // - Game1.player resources were NOT drained or modified
-            var playerAfter = _observer.GetPlayerSnapshot();
-            if (!playerBefore.EqualsPlayerResources(playerAfter))
-            {
-                throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion tool action! Before: {playerBefore}, After: {playerAfter}");
+                // - Game1.player resources were NOT drained or modified
+                var playerAfter = _observer.GetPlayerSnapshot();
+                if (!playerBefore!.EqualsPlayerResources(playerAfter))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion tool action! Before: {playerBefore}, After: {playerAfter}");
+                }
             }
         }
     }

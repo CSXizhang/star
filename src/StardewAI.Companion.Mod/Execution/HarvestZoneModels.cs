@@ -23,7 +23,10 @@ public sealed record HarvestedTileInfo(
     string? ItemName,
     int Stack,
     int Quality
-);
+)
+{
+    public string HarvestMethod { get; init; } = "hand";
+}
 
 public sealed class HarvestZoneResult
 {
@@ -42,6 +45,8 @@ public sealed class HarvestZoneResult
     public string? ErrorCode { get; }
     public bool RetryRecommended { get; }
     public bool PlayerActionRequired { get; }
+    public IReadOnlyList<Dictionary<string, object>>? InventoryDelta { get; }
+    public bool NativeScytheUsed { get; }
 
     public HarvestZoneResult(
         string commandId,
@@ -58,7 +63,9 @@ public sealed class HarvestZoneResult
         string? errorMessage = null,
         string? errorCode = null,
         bool retryRecommended = false,
-        bool playerActionRequired = false)
+        bool playerActionRequired = false,
+        IReadOnlyList<Dictionary<string, object>>? inventoryDelta = null,
+        bool nativeScytheUsed = false)
     {
         CommandId = commandId;
         TaskId = taskId;
@@ -75,6 +82,8 @@ public sealed class HarvestZoneResult
         ErrorCode = errorCode;
         RetryRecommended = retryRecommended;
         PlayerActionRequired = playerActionRequired;
+        InventoryDelta = inventoryDelta;
+        NativeScytheUsed = nativeScytheUsed;
     }
 
     /// <summary>
@@ -102,7 +111,8 @@ public sealed class HarvestZoneResult
                 ["itemId"] = harvested.ItemId ?? "",
                 ["itemName"] = harvested.ItemName ?? "",
                 ["stack"] = harvested.Stack,
-                ["quality"] = harvested.Quality
+                ["quality"] = harvested.Quality,
+                ["harvestMethod"] = harvested.HarvestMethod
             });
         }
         foreach (var skipped in SkippedTiles)
@@ -114,14 +124,34 @@ public sealed class HarvestZoneResult
                 ["reason"] = skipped.Reason
             });
         }
+        foreach (var failed in FailedTiles)
+        {
+            effects.Add(new Dictionary<string, object>
+            {
+                ["tile"] = new Dictionary<string, object> { ["x"] = failed.Tile.X, ["y"] = failed.Tile.Y },
+                ["state"] = "failed",
+                ["reason"] = failed.Reason
+            });
+        }
 
         SkillResultResources? resources = new(StaminaUsed, WaterUsed, GameMinutesElapsed);
         SkillResultError? error = ErrorMessage is not null
             ? new(ErrorCode ?? "EXECUTION_ERROR", ErrorMessage, null, RetryRecommended)
             : null;
-        Dictionary<string, object>? details = InventoryFull
-            ? new Dictionary<string, object> { ["inventoryFull"] = true }
-            : null;
+        Dictionary<string, object>? details = InventoryFull || InventoryDelta is not null
+            ? new Dictionary<string, object>() : null;
+        if (InventoryFull) details!["inventoryFull"] = true;
+        if (InventoryDelta is not null)
+        {
+            details!["inventoryDelta"] = InventoryDelta;
+            details["inventoryDeltaObserved"] = true;
+            details["inventoryDeltaEntryCount"] = InventoryDelta.Count;
+            details["inventoryDeltaTiming"] = "command-completion; later native proximity collection belongs to subsequent snapshots";
+            details["inventoryDeltaScope"] = "bound-native-player-command-interval";
+            details["nativeScytheUsed"] = NativeScytheUsed;
+            if (NativeScytheUsed)
+                details["quantityNote"] = "Scythe tile effects confirm harvested crops, not backpack quantity. inventoryDelta is the measured whole-job backpack change; native drops may still be on the ground.";
+        }
 
         return new SkillResultPayload(
             CommandId: CommandId,

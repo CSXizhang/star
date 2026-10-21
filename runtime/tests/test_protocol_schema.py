@@ -17,6 +17,20 @@ def test_protocol_schema_is_valid() -> None:
     Draft202012Validator.check_schema(schema)
 
 
+def test_native_work_delivery_receipt_matches_schema():
+    from stardew_ai_runtime.protocol import Envelope
+    schema = json.loads(SCHEMA_PATH.read_text(encoding='utf-8'))
+    validator = Draft202012Validator(schema)
+    envelope = Envelope.create_chat_reply('bridge', 'delivery', 'completed', '实际取消了。', save_id='farm').to_mapping()
+    envelope['payload']['deliveryOutboxIds'] = ['obx-1']
+    assert not list(validator.iter_errors(envelope))
+    receipt = {**envelope, 'messageType': 'chat.delivery.ack',
+               'payload': {'requestId': 'delivery', 'saveId': 'farm', 'outboxIds': ['obx-1']}}
+    assert not list(validator.iter_errors(receipt))
+    receipt['payload']['outboxIds'] = []
+    assert list(validator.iter_errors(receipt))
+
+
 def test_protocol_examples_match_schema() -> None:
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     validator = Draft202012Validator(schema, format_checker=FormatChecker())
@@ -52,6 +66,7 @@ def test_production_snapshot_schema_covers_serialized_csharp_record_fields():
         "WorldSnapshotPayload": {"properties": wire},
         "AutonomyStatePayload": defs["autonomyState"]["allOf"][1]["properties"]["payload"],
         "SkillResultPayload": defs["skillResult"]["allOf"][1]["properties"]["payload"],
+        "ModWelcomePayload": defs["modWelcome"]["allOf"][1]["properties"]["payload"],
         "ChatReplyPayload": defs["chatReply"]["allOf"][1]["properties"]["payload"],
         "InventorySlotSnapshot": wire["inventory"]["properties"]["slots"]["items"],
         "CompanionInventorySnapshot": wire["inventory"],
@@ -92,6 +107,25 @@ def test_native_snapshot_contract_remains_strict(path, value):
         target = target[key]
     target[path[-1]] = value
     assert list(Draft202012Validator(schema).iter_errors(instance))
+
+
+@pytest.mark.parametrize("status", ["unknown", "in-flight"])
+def test_result_reconciliation_schema_has_read_only_session_bound_shapes(status):
+    from stardew_ai_runtime.protocol import Envelope
+
+    validator = Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8")))
+    query = Envelope.create_result_query("runtime-restarted", 1, "save", "session", 1, "old-command").to_mapping()
+    assert not list(validator.iter_errors(query))
+    response = deepcopy(query)
+    response.update(messageType="skill.result.status", correlationId=query["messageId"])
+    response["payload"]["status"] = status
+    assert not list(validator.iter_errors(response))
+    for field in ["saveId", "gameSessionId"]:
+        invalid = deepcopy(query)
+        invalid.pop(field)
+        assert list(validator.iter_errors(invalid))
+    response["payload"]["terminalState"] = "succeeded"
+    assert list(validator.iter_errors(response))
 
 
 def test_chat_resume_request_is_optional_boolean():

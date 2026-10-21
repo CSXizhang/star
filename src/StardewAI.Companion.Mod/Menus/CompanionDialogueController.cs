@@ -157,8 +157,7 @@ public sealed class CompanionDialogueController
         _next = null;
         _returnAfterPages = false;
         _afterPages = null;
-        _portrait?.Dispose();
-        _portrait = null;
+        InvalidatePortrait();
         _meetingProfileRequest = _meetingMemoryRequest = _draftName = _meetingChoice = _meetingFeedback = null;
         _helpAfterFeedback = false;
         CompanionMenuClock.OwnedQuestion = null;
@@ -167,8 +166,41 @@ public sealed class CompanionDialogueController
         _f8Active = false;
     }
 
+    public void InvalidatePortrait()
+    {
+        _portrait?.Dispose();
+        _portrait = null;
+    }
+
     public void Update()
     {
+        // Our menus allow the clock to run, but native exhaustion still waits
+        // for dialogue/movement locks to clear. Release only our conversation
+        // at 2 AM; the game owns pass-out, shipping settlement and the new day.
+        if (Game1.timeOfDay >= 2600)
+        {
+            _next = null;
+            _pages = null;
+            _afterPages = null;
+            _returnAfterPages = false;
+            _f8Active = false;
+            var nightMenu = Game1.activeClickableMenu;
+            if (nightMenu != null && CompanionMenuClock.IsConversation(nightMenu))
+            {
+                nightMenu.exitFunction = null;
+                // Runs input cleanup so an unsent message survives the night.
+                nightMenu.exitThisMenu(playSound: false);
+                _ownedMenu = null;
+                CompanionMenuClock.OwnedQuestion = null;
+                if (!Game1.eventUp && Game1.currentLocation?.currentEvent == null)
+                {
+                    Game1.dialogueUp = false;
+                    if (Game1.player != null && !Game1.player.UsingTool) Game1.player.CanMove = true;
+                }
+                RestoreDialogueLanguage();
+            }
+            return;
+        }
         // Native question boxes expose exitThisMenu separately from closeDialogue.
         // Recover only our closed conversation's movement lock, never another event.
         if (CompanionMenuClock.OwnedQuestion != null && Game1.activeClickableMenu == null)
@@ -321,9 +353,13 @@ public sealed class CompanionDialogueController
     private void ShowF8Choices()
     {
         if (Game1.activeClickableMenu != null || Game1.eventUp) return;
+        string caption = _state.IsChatPending
+            ? _state.PendingChatDescription + "，可以继续补充要求。"
+            : "想说什么？";
         Ask("", new[]
         {
             new Response("reply", "直接回复"),
+            new Response("work", "当前工作 · 暂停 / 取消"),
             new Response("history", "历史记录"),
             new Response("memory", "偏好和约定"),
             new Response("settings", "设置和用量"),
@@ -332,11 +368,12 @@ public sealed class CompanionDialogueController
             switch (key)
             {
                 case "reply": (_replyInput ?? _conversation ?? (() => ShowInput("chat")))(); break;
+                case "work": _progress(); OwnF8Child(); break;
                 case "history": (_records ?? _progress)(); OwnF8Child(); break;
                 case "memory": _memory(); OwnF8Child(); break;
                 case "settings": (_hubSettings ?? _settings)(); OwnF8Child(); break;
             }
-        });
+        }, caption);
     }
 
     public void OpenReplyInput(Func<string, string?, bool, bool> submit, string? noticeId = null)
@@ -543,13 +580,13 @@ public sealed class CompanionDialogueController
         _inbox.Receive(requestId, status, text, proposalReady, proposalNodeId);
     }
 
-    private void Ask(string text, Response[] responses, Action<string> answer)
+    private void Ask(string text, Response[] responses, Action<string> answer, string? caption = null)
     {
         void ShowChoices()
         {
             UseReadableDialogueFont();
             // Stardew deliberately uses its separate response layout for choices.
-            Game1.currentLocation.createQuestionDialogue($"{CompanionNpcDialogueBox.LiteralText(DisplayName)}：", responses,
+            Game1.currentLocation.createQuestionDialogue($"{CompanionNpcDialogueBox.LiteralText(DisplayName)}：{caption}", responses,
                 (_, key) => _next = () => answer(key));
             _ownedMenu = Game1.activeClickableMenu;
             CompanionMenuClock.OwnedQuestion = _ownedMenu;

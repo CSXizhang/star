@@ -49,6 +49,7 @@ def test_decision_validation_reasons_and_guidance(tmp_path):
 
     # 2. Token missing / mismatch
     store.set_paused("save", False)
+    store.revoke_decision("save")
     store.begin_decision("save", "tok-2")
     with pytest.raises(WorkStateError) as exc_missing:
         store.select_direct_job("save", "wrong-tok", "water_auto")
@@ -68,6 +69,7 @@ def test_decision_validation_reasons_and_guidance(tmp_path):
     assert guide in str(exc_selected_plan.value)
 
     # 4. Expired token
+    store.revoke_decision("save")
     store.begin_decision("save", "tok-3")
     store._mutate("save", lambda s: s.decision.update(expires=time.time() - 10))
     with pytest.raises(WorkStateError) as exc_expired:

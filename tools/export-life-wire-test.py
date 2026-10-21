@@ -312,6 +312,7 @@ def main() -> None:
                     {"name": "Parsnip", "quantity": 3},
                 ],
             },
+            "actorMode": "companion",
         },
     ))
 

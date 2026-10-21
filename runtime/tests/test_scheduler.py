@@ -2178,6 +2178,54 @@ def test_scheduler_task_timeout_returns_executing_and_retains_active_task(mock_t
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("control", ["pause", "cancel"])
+def test_scheduler_timeout_preserves_control_and_can_resume_paused_native_command(
+    mock_transport_client, native_compatible_run_dir, control,
+):
+    async def run():
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        waiting, expire = asyncio.Event(), asyncio.Event()
+
+        async def delayed_timeout(command_id, timeout=10.0):
+            waiting.set()
+            await expire.wait()
+            raise TimeoutError("Native terminal wait elapsed while controlled")
+
+        mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-controlled-water")
+        mock_transport_client.wait_for_result = AsyncMock(side_effect=delayed_timeout)
+        mock_transport_client.pause_skill = AsyncMock()
+        mock_transport_client.resume_skill = AsyncMock()
+        mock_transport_client.cancel_skill = AsyncMock()
+        execution = asyncio.create_task(scheduler.execute_water_zone(
+            center_x=64, center_y=15, radius=0, task_id="task-controlled-water",
+        ))
+        await waiting.wait()
+        if control == "pause":
+            await scheduler.pause_task()
+            expected = "paused"
+        else:
+            await scheduler.cancel_task(reason="Player cancels before terminal wait expires")
+            expected = "cancelling"
+        expire.set()
+        result = await execution
+        assert scheduler.active_task.status == expected
+        assert scheduler.has_active_task and not scheduler.active_task.is_terminal
+        assert result["terminalState"] == "running"
+        assert result["details"]["status"] == expected
+        if control == "pause":
+            resumed = await scheduler.resume_task()
+            assert resumed["status"] == "resumed"
+            mock_transport_client.resume_skill.assert_awaited_once()
+            assert mock_transport_client.resume_skill.call_args.kwargs["correlation_id"] == "cmd-controlled-water"
+            assert scheduler.active_task.status == "running"
+        else:
+            mock_transport_client.cancel_skill.assert_awaited_once()
+            mock_transport_client.resume_skill.assert_not_awaited()
+        mock_transport_client.execute_water_zone.assert_awaited_once()
+
+    asyncio.run(run())
+
+
 def test_scheduler_get_status_settles_completed_task(mock_transport_client, native_compatible_run_dir):
     """get_status detects background task completion via cached result."""
     async def run():

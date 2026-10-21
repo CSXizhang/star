@@ -9,9 +9,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-CODEX_GAME_TOOL_PROFILE_VERSION = "stardew-game-tools-v2"
+CODEX_GAME_TOOL_PROFILE_VERSION = "stardew-game-tools-v5"
 
-# Supported by the local 0.159.2 CLI and the official configuration schema.
+# Verified with the local 0.162.0-alpha.17.2 CLI and the official configuration schema.
 # Do not use removed apply_patch_freeform/tool_search switches: those do not
 # remove tools. The CLI has no documented general native-tool allowlist.
 _DISABLED_FEATURES = (
@@ -31,6 +31,9 @@ def game_tool_config() -> list[str]:
         # Its code-mode host is transport infrastructure, not a shell surface.
         # Disabling it leaves listed MCP tools unusable (verified in r18).
         "features.code_mode_host=true",
+        # The bundled game MCP takes ~1.2s to import/list on this host. Codex's
+        # default optional-server grace is 1s; never build an empty game catalog.
+        "mcp_optional_startup_grace_ms=0",
         "features.skip_host_skill_discovery=true",
         "skills.bundled.enabled=false",
         "skills.include_instructions=false",

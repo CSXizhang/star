@@ -23,6 +23,7 @@ def test_decision_owns_one_sequence_and_can_combine_operation_kinds(tmp_path):
     choose(store)
     with pytest.raises(WorkStateError, match="NEW_MODEL"):
         store.submit_plan("save", goal_text="store", tasks=tasks("deposit_to_chest"), decision_token="decision-1")
+    store.revoke_decision("save")
     store.begin_decision("save", "second")
     with pytest.raises(WorkStateError, match="ONE_SHORT"):
         store.submit_plan("save", goal_text="many", tasks=tasks()+tasks(), decision_token="second")
@@ -226,11 +227,13 @@ def test_interrupt_at_step_boundary_does_not_advance(tmp_path):
 
 def test_native_cancel_bypasses_work_queue(tmp_path):
     from types import SimpleNamespace
+    from unittest.mock import AsyncMock
 
     from stardew_ai_runtime.chat_bridge import InternalMcpPlanClient
     async def exercise():
         client=InternalMcpPlanClient(tmp_path)
         client._task=asyncio.current_task()
+        client._open_session=AsyncMock()
         calls=[]
         class Session:
             async def call_tool(self,name,args):

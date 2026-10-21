@@ -119,6 +119,42 @@ public class NavigationStateMachineTests
         Assert.Equal(new TileCoordinate(12, 12), actor.Tile);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PausedClockDoesNotSpendWorkBudgetAndResumeDoesNotResetActiveTime(bool exhaustActiveBudget)
+    {
+        var actor = new StubFarmerActor { LocationName = "Farm" };
+        var observer = new SimulatedWorldObserver();
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph());
+        Assert.True(machine.Start(new NavigationRequest("clock-pause", "clock-task", "Farm", new(12, 12), 60), out _));
+        machine.Update(null, 1);
+        observer.TimeOfDay = 610;
+        machine.RequestPause();
+        machine.Update(null, 2);
+        Assert.True(machine.IsPaused);
+        var pausedTile = actor.Tile;
+        observer.TimeOfDay = 800;
+        machine.Update(null, 3);
+        Assert.Equal(pausedTile, actor.Tile);
+        machine.Resume();
+        observer.TimeOfDay = 810;
+        machine.RequestPause();
+        machine.Update(null, 4);
+        Assert.True(machine.IsPaused);
+        observer.TimeOfDay = 1000;
+        machine.Resume();
+        observer.TimeOfDay = exhaustActiveBudget ? 1050 : 1010;
+        machine.Resume();
+        for (int tick = 5; tick < 200 && machine.IsExecuting; tick++) machine.Update(null, tick);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(exhaustActiveBudget ? ExecutionState.PartiallySucceeded : ExecutionState.Succeeded, result.FinalState);
+        Assert.Equal(exhaustActiveBudget ? "BUDGET_EXCEEDED" : null, result.ErrorCode);
+        Assert.Equal(exhaustActiveBudget ? pausedTile : new TileCoordinate(12, 12), actor.Tile);
+        Assert.Equal(exhaustActiveBudget ? 290 : 250, result.GameMinutesElapsed);
+    }
+
     [Fact]
     public void PausedCancelSettlesWithoutMoving()
     {
@@ -169,14 +205,19 @@ public class NavigationStateMachineTests
         var planner = new ReachableRoutePlanner(observer, new SameMapNavigator(observer), graph);
         Assert.Null(planner.Find("Town", new(0, 1), "AnimalShop", new(1, 1), 810, null, out var reason));
         Assert.NotNull(reason);
-        Assert.DoesNotContain("JojaMart", reason);
+        Assert.DoesNotContain("JojaMart", reason.Message);
         if (destinationDoor && entranceReachable)
         {
-            Assert.Contains("AnimalShop", reason);
-            Assert.Contains("locked", reason);
+            Assert.Equal("TARGET_UNAVAILABLE", reason.ReasonCode);
+            Assert.Contains("AnimalShop", reason.Message);
+            Assert.Contains("locked", reason.Message);
+            Assert.Equal("AnimalShop", reason.Details?["targetLocation"] as string);
         }
         else
-            Assert.Contains("No route found with passable entrance paths", reason);
+        {
+            Assert.Equal("NO_ROUTE", reason.ReasonCode);
+            Assert.Contains("No route found with passable entrance paths", reason.Message);
+        }
     }
 
     [Theory]
@@ -336,8 +377,8 @@ public class NavigationStateMachineTests
 
         Assert.Equal(ExecutionState.Failed, machine.CurrentState);
         Assert.NotNull(machine.FinalResult);
-        Assert.Equal("NO_ROUTE", machine.FinalResult.ErrorCode);
-        Assert.Contains("No route found", machine.FinalResult.ErrorMessage);
+        Assert.Equal("NO_EXIT", machine.FinalResult.ErrorCode);
+        Assert.Contains("No usable exit found", machine.FinalResult.ErrorMessage);
     }
 
     [Fact]

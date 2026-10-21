@@ -38,7 +38,10 @@ public sealed record ModWelcomePayload(
     [property: JsonPropertyName("gameVersion")] string GameVersion,
     [property: JsonPropertyName("smapiVersion")] string SmapiVersion,
     [property: JsonPropertyName("lifecycleState")] string LifecycleState,
-    [property: JsonPropertyName("skills")] string[] Skills
+    [property: JsonPropertyName("skills")] string[] Skills,
+    [property: JsonPropertyName("commandResultQuery"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool CommandResultQuery = false,
+    [property: JsonPropertyName("actorMode")] string ActorMode = "companion",
+    [property: JsonPropertyName("actorMultiplayerId")] long? ActorMultiplayerId = null
 );
 
 public sealed record CompanionSnapshot(
@@ -65,7 +68,17 @@ public sealed record CompanionSnapshot(
 public sealed record MatureCropTile(
     [property: JsonPropertyName("x")] int X,
     [property: JsonPropertyName("y")] int Y,
-    [property: JsonPropertyName("cropId")] string CropId
+    [property: JsonPropertyName("cropId")] string CropId,
+    [property: JsonPropertyName("requiresScythe"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? RequiresScythe = null
+);
+
+public sealed record CultivatedPlotSnapshot(
+    [property: JsonPropertyName("x")] int X,
+    [property: JsonPropertyName("y")] int Y,
+    [property: JsonPropertyName("width")] int Width,
+    [property: JsonPropertyName("height")] int Height,
+    [property: JsonPropertyName("soilCount")] int SoilCount,
+    [property: JsonPropertyName("cropCount")] int CropCount
 );
 
 public sealed record FarmWorkSnapshot(
@@ -80,7 +93,12 @@ public sealed record FarmWorkSnapshot(
     [property: JsonPropertyName("cropUnwateredTruncated")] bool CropUnwateredTruncated = false,
     [property: JsonPropertyName("deadCropCount")] int DeadCropCount = 0,
     [property: JsonPropertyName("locationId")] string? LocationId = null,
-    [property: JsonPropertyName("observationStatus")] string ObservationStatus = "unknown"
+    [property: JsonPropertyName("observationStatus")] string ObservationStatus = "unknown",
+    [property: JsonPropertyName("scope")] string Scope = "location",
+    [property: JsonPropertyName("cultivatedPlots")] List<CultivatedPlotSnapshot>? CultivatedPlots = null,
+    [property: JsonPropertyName("cultivatedPlotCount")] int? CultivatedPlotCount = null,
+    [property: JsonPropertyName("cultivatedPlotsTruncated")] bool CultivatedPlotsTruncated = false,
+    [property: JsonPropertyName("totalCropCount")] int? TotalCropCount = null
 )
 {
     [JsonPropertyName("truncated")]
@@ -97,7 +115,10 @@ public sealed record FarmWorkSnapshot(
         CropUnwateredCount: 0,
         CropUnwateredTruncated: false,
         LocationId: locationId,
-        ObservationStatus: observationStatus
+        ObservationStatus: observationStatus,
+        CultivatedPlots: observationStatus == "observed" ? new List<CultivatedPlotSnapshot>() : null,
+        CultivatedPlotCount: observationStatus == "observed" ? 0 : null,
+        TotalCropCount: observationStatus == "observed" ? 0 : null
     );
 }
 
@@ -131,8 +152,9 @@ public sealed record ChestSlotSnapshot(
 public sealed record ChestSnapshot(
     [property: JsonPropertyName("tile")] TileCoord Tile,
     [property: JsonPropertyName("capacity")] int Capacity,
-    [property: JsonPropertyName("freeSlots")] int FreeSlots,
-    [property: JsonPropertyName("contents")] List<ChestSlotSnapshot> Contents
+    [property: JsonPropertyName("freeSlots")] int? FreeSlots,
+    [property: JsonPropertyName("contents")] List<ChestSlotSnapshot> Contents,
+    [property: JsonPropertyName("contentsObserved")] bool ContentsObserved = true
 );
 
 public sealed record ChestsSnapshot(
@@ -168,7 +190,46 @@ public sealed record WorldStateSnapshot(
     [property: JsonPropertyName("playerItems"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<PlayerItemDto>? PlayerItems = null,
     [property: JsonPropertyName("playerMoney"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? PlayerMoney = null,
     [property: JsonPropertyName("playerStamina"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] float? PlayerStamina = null,
-    [property: JsonPropertyName("playerMaxStamina"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? PlayerMaxStamina = null
+    [property: JsonPropertyName("playerMaxStamina"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? PlayerMaxStamina = null,
+    // Native UI/world state (event/cutscene, dialogue, menus, pause). World/player
+    // facts valid in both actor modes; null only when the game state is unreadable.
+    [property: JsonPropertyName("native"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] NativeUiSnapshot? Native = null
+);
+
+/// <summary>
+/// Native UI state snapshot: what is currently on the player's screen (event,
+/// dialogue, question responses, active menu) and whether the player can move or
+/// the clock is paused. Filled in both actor modes; read-only facts only.
+/// </summary>
+public sealed record NativeUiSnapshot(
+    [property: JsonPropertyName("eventUp")] bool EventUp,
+    [property: JsonPropertyName("eventSkippable")] bool EventSkippable,
+    [property: JsonPropertyName("dialogueUp")] bool DialogueUp,
+    [property: JsonPropertyName("dialogueSpeaker")] string? DialogueSpeaker,
+    [property: JsonPropertyName("dialogueText")] string? DialogueText,
+    [property: JsonPropertyName("isQuestionDialogue")] bool IsQuestionDialogue,
+    [property: JsonPropertyName("questionResponses")] string[]? QuestionResponses,
+    [property: JsonPropertyName("activeMenu")] string? ActiveMenu,
+    [property: JsonPropertyName("playerCanMove")] bool PlayerCanMove,
+    [property: JsonPropertyName("isTimePaused")] bool IsTimePaused,
+    [property: JsonPropertyName("endOfNight")] bool EndOfNight,
+    // Structured program hold (protective clock pause): present only while a
+    // failure/unattended hold is active; the runtime dedupes one recovery
+    // decision per holdId and the model sees why the clock is held.
+    [property: JsonPropertyName("programHold"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ProgramHoldSnapshot? ProgramHold = null,
+    [property: JsonPropertyName("clockPauseOwner"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ClockPauseOwner = null,
+    [property: JsonPropertyName("playerActionSupport"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? PlayerActionSupport = null,
+    [property: JsonPropertyName("eventIsFestival")] bool EventIsFestival = false,
+    [property: JsonPropertyName("eventAllowsMovement")] bool EventAllowsMovement = false,
+    [property: JsonPropertyName("namingInput"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyDictionary<string, object>? NamingInput = null
+);
+
+/// <summary>Structured protective-hold state carried in the native UI snapshot.</summary>
+public sealed record ProgramHoldSnapshot(
+    [property: JsonPropertyName("active")] bool Active,
+    [property: JsonPropertyName("reason")] string? Reason,
+    [property: JsonPropertyName("holdId")] string? HoldId,
+    [property: JsonPropertyName("sinceUtc")] string? SinceUtc
 );
 
 public sealed record SeedItemSnapshot(
@@ -202,7 +263,10 @@ public sealed record PlantingSnapshot(
     [property: JsonPropertyName("companionHasHoe")] bool CompanionHasHoe,
     [property: JsonPropertyName("seeds")] List<SeedItemSnapshot> Seeds,
     [property: JsonPropertyName("candidateTiles")] CandidateTilesSnapshot CandidateTiles,
-    [property: JsonPropertyName("searchBounds")] SearchBoundsSnapshot SearchBounds
+    [property: JsonPropertyName("searchBounds")] SearchBoundsSnapshot SearchBounds,
+    [property: JsonPropertyName("observationStatus")] string ObservationStatus = "observed",
+    [property: JsonPropertyName("scope")] string Scope = "search-region",
+    [property: JsonPropertyName("locationId")] string? LocationId = null
 );
 
 public sealed record ShopItemSnapshot(
@@ -249,7 +313,11 @@ public sealed record WorldSnapshotPayload(
     [property: JsonPropertyName("livestock"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] LivestockSnapshot? Livestock = null,
     [property: JsonPropertyName("farming"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] FarmingSnapshot? Farming = null,
     [property: JsonPropertyName("productionSignals"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<ProductionSignal>? ProductionSignals = null,
-    [property: JsonPropertyName("productionSignalsTruncated"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ProductionSignalsTruncated = false
+    [property: JsonPropertyName("productionSignalsTruncated"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ProductionSignalsTruncated = false,
+    [property: JsonPropertyName("observedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? ObservedAt = null,
+    [property: JsonPropertyName("actorMode")] string ActorMode = "companion",
+    [property: JsonPropertyName("controlOwner")] string? ControlOwner = null,
+    [property: JsonPropertyName("actorMultiplayerId")] long? ActorMultiplayerId = null
 );
 
 // ---------------------------------------------------------------------------
@@ -447,6 +515,21 @@ public sealed record WaterZoneParameters(
 
     [JsonIgnore]
     public int? EffectiveBudgetLimit => BudgetLimit ?? BudgetLimitSnakeCase;
+
+    // native-advance argument: allow skipping a skippable native event/cutscene.
+    [JsonPropertyName("allowSkip")]
+    public bool AllowSkip { get; init; }
+
+    // native-answer argument: explicit zero-based index into the question responses.
+    [JsonPropertyName("choiceIndex")]
+    public int? ChoiceIndex { get; init; }
+    // Explicit text for the currently observed native NamingMenu only.
+    [JsonPropertyName("menuText")]
+    public string? MenuText { get; init; }
+    [JsonPropertyName("npcName")]
+    public string? NpcName { get; init; }
+    [JsonPropertyName("facing")]
+    public int? Facing { get; init; }
 }
 
 public sealed record ExecutionBudgets(
@@ -552,7 +635,16 @@ public sealed record ChatReplyPayload(
     [property: JsonPropertyName("commandId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CommandId = null,
     [property: JsonPropertyName("commandComplete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? CommandComplete = null,
     [property: JsonPropertyName("resumeWorkRequested"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? ResumeWorkRequested = null,
-    [property: JsonPropertyName("readOnly"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? ReadOnly = null
+    [property: JsonPropertyName("readOnly"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? ReadOnly = null,
+    [property: JsonPropertyName("deliveryOutboxIds"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? DeliveryOutboxIds = null,
+    // Independent autostart test: the runtime reports the bound goal id so the mod can
+    // track the run lifecycle without a new channel. Null for ordinary chat.
+    [property: JsonPropertyName("presetGoalId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PresetGoalId = null,
+    // Independent autostart test: the ONLY completion authority for a preset run is the
+    // bound WorkStore goal's verified terminal state ("completed"/"cancelled"), sent by
+    // the runtime's terminal notifier or the idempotent resume path. Generic reply
+    // status/commandComplete never settle the run. Null for ordinary chat.
+    [property: JsonPropertyName("presetGoalTerminal"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PresetGoalTerminal = null
 );
 
 public sealed record ChatCancelPayload(
@@ -850,7 +942,7 @@ public sealed record MilestonePrepItemDto(
 public sealed record MilestoneNodeDto(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("title")] string Title,
-    [property: JsonPropertyName("status")] string Status,   // "suggested" | "adopted" | "deferred" | "completed" | "missed"
+    [property: JsonPropertyName("status")] string Status,   // "suggested" | "adopted" | "deferred" | "completed" | "missed" | "cancelled"
     [property: JsonPropertyName("verification"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Verification = null,
     [property: JsonPropertyName("targetDate"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? TargetDate = null,
     [property: JsonPropertyName("daysUntil"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DaysUntil = null,

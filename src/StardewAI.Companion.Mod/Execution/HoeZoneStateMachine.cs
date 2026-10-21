@@ -285,11 +285,33 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
 
         if (_currentTargetIndex >= _pendingTargets.Count)
         {
-            var terminal = _failedTiles.Count > 0
-                ? (_hoedTiles.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed)
-                : (_skippedTiles.Count > 0 && _hoedTiles.Count == 0 ? ExecutionState.Succeeded : ExecutionState.Succeeded);
+            // Terminal classification mirrors the other zone machines: failed tiles
+            // dominate (partial when something was hoed); an all-skipped zone is a
+            // failure, not a success, and reports the skip-reason histogram.
+            ExecutionState terminal;
+            string? errorMessage = null;
+            string? errorCode = null;
+            if (_failedTiles.Count > 0)
+            {
+                terminal = _hoedTiles.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed;
+                errorMessage = $"{_failedTiles.Count} tile(s) failed: {_failedTiles[0].Reason}";
+                errorCode = "TILES_FAILED";
+            }
+            else if (_skippedTiles.Count > 0 && _hoedTiles.Count == 0)
+            {
+                terminal = ExecutionState.Failed;
+                string skipSummary = string.Join(", ", _skippedTiles
+                    .GroupBy(s => s.Reason, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => $"{g.Key}={g.Count()}"));
+                errorMessage = $"{_skippedTiles.Count} tile(s) skipped: {skipSummary}";
+                errorCode = "ALL_TILES_SKIPPED";
+            }
+            else
+            {
+                terminal = ExecutionState.Succeeded;
+            }
 
-            FinishExecution(terminal, null, null);
+            FinishExecution(terminal, errorMessage, errorCode);
             return;
         }
 
@@ -334,7 +356,10 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
 
         var targetStep = _currentPath[_currentPathIndex];
         var targetTile = targetStep.Tile;
-        var targetPixel = new Vector2(targetTile.X * 64, targetTile.Y * 64);
+        if (ActorGuards.HasReachedWalkingTile(_actor, targetTile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
+        var targetPixel = ActorGuards.WalkingTargetPixel(_actor, targetTile);
         var currentPixel = _actor.PixelPosition;
 
         if (_observer.IsPlayerOnTile(_currentRequest!.LocationId, targetTile))
@@ -366,6 +391,11 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
         var diff = targetPixel - currentPixel;
         float dist = diff.Length();
 
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            _actor.MovePixels(diff.X, diff.Y);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             _actor.PixelPosition = targetPixel;

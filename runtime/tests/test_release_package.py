@@ -156,6 +156,23 @@ def test_installer_isolated_upgrade_preserves_configuration_and_uses_bundled_pyt
                              capture_output=True, text=True, errors="replace")
     assert blocked.returncode != 0
     verify_release(destination)
+    # Non-entry files must also be verified before any installed bytes change.
+    (root / "StardewAI.Companion.Mod.dll").write_bytes(b"fixture-dll")
+    optional = root / "runtime/python/optional-fixture.dat"
+    optional.write_bytes(b"expected")
+    manifest = json.loads((root / "release-manifest.json").read_text())
+    manifest["files"].append({"path": "runtime/python/optional-fixture.dat",
+                              "sha256": hashlib.sha256(b"expected").hexdigest()})
+    (root / "release-manifest.json").write_text(json.dumps(manifest))
+    optional.write_bytes(b"corrupted")
+    before = {p.relative_to(destination).as_posix(): p.read_bytes()
+              for p in destination.rglob("*") if p.is_file()}
+    blocked = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                              str(root / "tools/setup-companion.ps1"), "-AutoInstall", "-GameDir", str(game), "-Agent", "none"],
+                             capture_output=True, text=True, errors="replace")
+    assert blocked.returncode != 0
+    assert {p.relative_to(destination).as_posix(): p.read_bytes()
+            for p in destination.rglob("*") if p.is_file()} == before
 
 
 def test_builder_allowlists_production_inputs():
@@ -170,9 +187,10 @@ def test_builder_allowlists_production_inputs():
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer")
+@pytest.mark.parametrize("explicit_effort", [None, "default"])
 @pytest.mark.parametrize("previous", [None, {"backend": "mcode", "model": "", "effort": "high"},
                                      {"backend": "dsh", "model": "deepseek-flash", "effort": "max"}])
-def test_mcode_release_install_defaults_and_preserves_existing_choices(tmp_path, previous):
+def test_mcode_release_install_defaults_and_preserves_existing_choices(tmp_path, previous, explicit_effort):
     import os
 
     root = tmp_path / "新包 空格"
@@ -196,11 +214,13 @@ def test_mcode_release_install_defaults_and_preserves_existing_choices(tmp_path,
                str(root / "tools/setup-companion.ps1"), "-AutoInstall", "-GameDir", str(game)]
     if not previous or previous["backend"] != "mcode":
         command += ["-Agent", "mcode"]
+    if explicit_effort:
+        command += ["-Effort", explicit_effort]
     result = subprocess.run(command, env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     saved = json.loads(config.read_text(encoding="utf-8-sig"))
     assert saved["backend"] == "mcode" and saved["model"] == ""
-    assert saved["effort"] == ("high" if previous and previous["backend"] == "mcode" else "low")
+    assert saved["effort"] == (explicit_effort or ("high" if previous and previous["backend"] == "mcode" else "default"))
     if previous:
         assert saved["custom"] == {"keep": True}
     assert memory.read_bytes() == b'{"keep":true}'

@@ -1,4 +1,4 @@
-using StardewAI.Companion.Mod.Domain;
+﻿using StardewAI.Companion.Mod.Domain;
 using StardewAI.Companion.Mod.Transport;
 
 namespace StardewAI.Companion.Mod.Execution;
@@ -99,6 +99,7 @@ public sealed class NativeActionResult
     public float StaminaUsed { get; }
     public int WaterUsed { get; }
     public int TotalCost { get; }
+    public IReadOnlyList<Dictionary<string, object>>? InventoryDelta { get; }
     public int GameMinutesElapsed { get; }
     public long FinalWorldRevision { get; }
     public string? ErrorMessage { get; }
@@ -125,7 +126,8 @@ public sealed class NativeActionResult
         string? errorCode = null,
         bool retryRecommended = false,
         bool playerActionRequired = false,
-        NativeActionProgress? progress = null, int totalCost = 0)
+        NativeActionProgress? progress = null, int totalCost = 0,
+        IReadOnlyList<Dictionary<string, object>>? inventoryDelta = null)
     {
         CommandId = commandId;
         TaskId = taskId;
@@ -144,6 +146,7 @@ public sealed class NativeActionResult
         PlayerActionRequired = playerActionRequired;
         Progress = progress;
         TotalCost = totalCost;
+        InventoryDelta = inventoryDelta;
     }
 
     public SkillResultPayload ToTransportPayload()
@@ -184,6 +187,15 @@ public sealed class NativeActionResult
             ["skipped"] = Skipped.Select(Describe).ToList(),
             ["failed"] = Failed.Select(Describe).ToList()
         };
+
+        if (InventoryDelta is not null)
+        {
+            details["inventoryDelta"] = InventoryDelta;
+            details["inventoryDeltaObserved"] = true;
+            details["inventoryDeltaEntryCount"] = InventoryDelta.Count;
+            details["inventoryDeltaTiming"] = "command-completion; later native proximity collection belongs to subsequent snapshots";
+            details["inventoryDeltaScope"] = "bound-native-player-command-interval";
+        }
 
         // Structured progress: emitted only when the state machine really tracked a
         // target loop. No data means no percentage is shown upstream.

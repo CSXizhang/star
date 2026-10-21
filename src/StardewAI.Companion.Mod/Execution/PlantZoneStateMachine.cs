@@ -366,7 +366,10 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
 
         var targetStep = _currentPath[_currentPathIndex];
         var targetTile = targetStep.Tile;
-        var targetPixel = new Vector2(targetTile.X * 64, targetTile.Y * 64);
+        if (ActorGuards.HasReachedWalkingTile(_actor, targetTile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
+        var targetPixel = ActorGuards.WalkingTargetPixel(_actor, targetTile);
         var currentPixel = _actor.PixelPosition;
 
         if (_observer.IsPlayerOnTile(_currentRequest!.LocationId, targetTile))
@@ -398,6 +401,11 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
         var diff = targetPixel - currentPixel;
         float dist = diff.Length();
 
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            _actor.MovePixels(diff.X, diff.Y);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             _actor.PixelPosition = targetPixel;

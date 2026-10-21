@@ -54,6 +54,100 @@ def test_raw_receipt_preserves_native_error_revision_and_explicit_remaining():
     assert "skipReasons" not in feedback
 
 
+@pytest.mark.parametrize("expired_index", [0, 1])
+def test_recovered_intermediate_success_keeps_job_open_and_never_replays(tmp_path, expired_index):
+    async def scenario():
+        store = WorkStore(tmp_path / "work.json")
+        operations = ["plant_seeds", "water_tiles", "refill_watering_can"]
+        task_id = _select(store, [
+            {"operation": "plant_seeds", "params": {"seed_item_id": "(O)475", "tiles": _tiles(2)}},
+            {"operation": "water_tiles", "params": {"tiles": _tiles(2)}},
+            {"operation": "refill_watering_can", "params": {}},
+        ])
+        for _ in range(expired_index):
+            prior = store.claim_next_step("farm", "prior-worker")
+            store.assign_command_id("farm", task_id, prior["stepId"], "prior-command")
+            store.commit_step_result("farm", task_id=task_id, step_id=prior["stepId"],
+                                     outcome="completed", command_id="prior-command")
+        expired = store.claim_next_step("farm", "old-worker", now=time.monotonic() - 10, lease_seconds=1)
+        store.assign_command_id("farm", task_id, expired["stepId"], "expired-command")
+        calls, terminals = [], []
+
+        class Client:
+            async def current_save_id(self):
+                return "farm"
+
+            async def reconcile(self, command_id):
+                calls.append(("reconcile", command_id))
+                return {"terminalState": "succeeded", "commandId": command_id,
+                        "effects": [{"state": "planted" if expired_index == 0 else "watered"}]}
+
+            async def call_tool(self, name, arguments):
+                calls.append(("dispatch", arguments["operation"]))
+                return {"terminalState": "succeeded", "commandId": arguments["command_id"]}
+
+        worker = PlanWorker(store, Client())
+        worker.terminal_callback = lambda *args: terminals.append(args)
+        await worker.evaluate()
+        state = WorkStore(store.state_path).state("farm")
+        assert state.tasks[0].status == "pending" and state.tasks[0].steps[expired_index].status == "completed"
+        assert not state.decision.get("finished")
+        assert not state.last_job and not terminals
+        # Reopen the worker/store to verify that continuation survives persistence.
+        worker = PlanWorker(WorkStore(store.state_path), Client())
+        worker.terminal_callback = lambda *args: terminals.append(args)
+        await worker.evaluate()
+        await worker.evaluate()
+        restored = store.state("farm")
+        assert calls == [("reconcile", "expired-command"),
+                         *[("dispatch", op) for op in operations[expired_index + 1:]]]
+        assert len(restored.executions) == 3
+        assert all(step.attempts == 1 for step in restored.tasks[0].steps)
+        assert restored.decision["finished"] and restored.tasks[0].status == "completed"
+        assert len(terminals) == 1 and terminals[0][1].task_status == "completed"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("terminal,outcome", [
+    ("cancelled", "cancelled"), ("failed", "partial"), ("partially-succeeded", "partial"),
+    (None, "unknown"),
+])
+def test_intermediate_recovery_deviation_stops_remaining_steps(tmp_path, terminal, outcome):
+    async def run():
+        store = WorkStore(tmp_path / "work.json")
+        task_id = _select(store, [
+            {"operation": "water_tiles", "params": {"tiles": _tiles(2)}},
+            {"operation": "refill_watering_can", "params": {}},
+        ])
+        claim = store.claim_next_step("farm", "old-worker", now=time.monotonic() - 10, lease_seconds=1)
+        store.assign_command_id("farm", task_id, claim["stepId"], "old-command")
+        calls, terminals = [], []
+
+        class Client:
+            async def current_save_id(self):
+                return "farm"
+
+            async def reconcile(self, command_id):
+                calls.append(command_id)
+                return {"terminalState": terminal, "commandId": command_id} if terminal else None
+
+            async def call_tool(self, *args):
+                raise AssertionError("A cancelled/failed/unconfirmed step cannot unlock remaining work")
+
+        worker = PlanWorker(store, Client())
+        worker.terminal_callback = lambda *args: terminals.append(args)
+        await worker.evaluate()
+        await worker.evaluate()
+        state = store.state("farm")
+        assert state.decision["finished"] and state.tasks[0].steps[0].status == outcome
+        assert state.tasks[0].steps[1].attempts == 0
+        assert calls == ["old-command"] and len(terminals) == 1
+        assert not store.has_ready_step("farm")
+
+    asyncio.run(run())
+
+
 def test_timeout_placeholder_zero_counters_do_not_prove_unprocessed_targets():
     # Scheduler timeout placeholders can outlive a command that actually did work.
     raw = {"commandId": "unconfirmed", "status": "unknown", "terminalState": "unknown",

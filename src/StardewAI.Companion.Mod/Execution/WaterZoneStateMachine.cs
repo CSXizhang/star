@@ -55,6 +55,8 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
     private int _waterUsed;
     private long _elapsedTicks;
     private int _startClock;
+    private int? _pauseStartedClock;
+    private int _pausedGameMinutes;
 
     // Signals
     private volatile bool _cancelRequested;
@@ -120,6 +122,8 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             _toolEffectExecuted = false;
             _avoidTiles.Clear();
             _startClock = _observer.TimeOfDay;
+            _pauseStartedClock = null;
+            _pausedGameMinutes = 0;
             _cancelRequested = false;
             _cancelReason = null;
             _pauseRequested = false;
@@ -283,6 +287,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             {
                 _pauseRequested = false;
                 CurrentState = ExecutionState.Paused;
+                _pauseStartedClock = _observer.TimeOfDay;
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
                 NotifyPlayer("AI Companion: Task paused.");
@@ -312,7 +317,10 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             _elapsedTicks++;
 
             // 4. Actual game clock delta measurement & budget check
-            int gameMinutesElapsed = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
+            // Explicit player pauses do not spend the work budget. Result resources
+            // still report the full observed game-clock duration, including pauses.
+            int gameMinutesElapsed = Math.Max(0,
+                IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay) - _pausedGameMinutes);
             if (gameMinutesElapsed > _currentRequest.MaxGameMinutes)
             {
                 VerifyExecutedEffectBeforeTermination();
@@ -459,6 +467,9 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         }
 
         var step = _currentPath[_currentPathIndex];
+        if (ActorGuards.HasReachedWalkingTile(_actor, step.Tile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
 
         // Dynamic collision check BEFORE stepping towards destination tile.
         // This uses exactly the same obstacle set as SameMapNavigator planning:
@@ -497,14 +508,20 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             return;
         }
 
-        var targetPixelX = step.Tile.X * 64f + 32f;
-        var targetPixelY = step.Tile.Y * 64f + 32f;
+        var walkingTarget = ActorGuards.WalkingTargetPixel(_actor, step.Tile);
 
         var currentPos = _actor.PixelPosition;
-        float dx = targetPixelX - (currentPos.X + 32f);
-        float dy = targetPixelY - (currentPos.Y + 32f);
+        float dx = walkingTarget.X - currentPos.X;
+        float dy = walkingTarget.Y - currentPos.Y;
 
         float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            // The native actor ignores position setters. Keep driving its held
+            // movement until the measured standing center actually reaches the tile.
+            _actor.MovePixels(dx, dy);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             // Arrived at step tile
@@ -540,6 +557,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         {
             _pauseRequested = false;
             CurrentState = ExecutionState.Paused;
+            _pauseStartedClock = _observer.TimeOfDay;
             _actor.Halt();
             _avatar?.SetAnimation("idle");
             return;
@@ -693,6 +711,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         {
             _pauseRequested = false;
             CurrentState = ExecutionState.Paused;
+            _pauseStartedClock = _observer.TimeOfDay;
             _actor.Halt();
             _avatar?.SetAnimation("idle");
             return;
@@ -842,6 +861,9 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         {
             if (IsPaused && _currentRequest != null)
             {
+                if (_pauseStartedClock is { } pauseClock)
+                    _pausedGameMinutes += IWorldObserver.CalculateGameMinutesElapsed(pauseClock, _observer.TimeOfDay);
+                _pauseStartedClock = null;
                 CurrentState = ExecutionState.Navigating;
                 _avoidTiles.Clear();
                 ReorderRemainingTargets();

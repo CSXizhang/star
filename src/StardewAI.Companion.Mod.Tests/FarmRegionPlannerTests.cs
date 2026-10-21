@@ -27,7 +27,8 @@ public class FarmRegionPlannerTests
             cells[new(x, y)] = x >= 18 && x < 26 && y >= 3 && y < 8 ? "deadCrop" : "tillable";
         var paths = FarmRegionPlanner.Distances(cells.Keys.ToHashSet(), new[] { new TileCoordinate(1, 1) });
         var choices = FarmRegionPlanner.Candidates(cells, new(), paths, null);
-        Assert.InRange(choices.Count, 1, 3);
+        // Five field scales expose up to two alternatives each for model choice.
+        Assert.InRange(choices.Count, 1, 10);
         Assert.True(choices[0].Contains(new Point(18, 3)));
         var saved = new Rectangle(18, 3, 8, 5);
         Assert.Equal(new[] { saved }, FarmRegionPlanner.Candidates(cells, new(), paths, saved));

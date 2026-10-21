@@ -52,6 +52,8 @@ MiniMax Code 的 MCP 服务保存在数据目录的 `mcp.json`（`MINIMAX_DATA_D
 
 在向导中选择 `mcode` 即可（需先装好并登录 MiniMax Code CLI）。同一台机器上也可以用 `register-mcp.ps1 -Agent mcode` 把游戏工具注册给 MiniMax Code 自己作为外部客户端；两者互不影响。
 
+游戏内 `mcode` 保留同一个游戏会话，日内发送已确认的状态增量。真实跨日完成原生过夜保存后，在下一次空闲模型回合前，通过 ACP 的原生 `/compact` 压缩当前会话；约10万输入上下文阈值同样触发原地压缩。它们不会按日或按阈值新建会话。压缩后首轮补发一次有界当前状态、约束和已有决策笔记，随后继续增量；完整历史和执行回执保留原处。压缩调用的用量单独记账，不计作游戏成果。只有会话确实不可恢复或模型、工具、用户约定发生不兼容变化时，才沿用原有的新建会话恢复路径。
+
 手动配置支持 stdio 的 MCP 客户端时，可以直接使用 `uv run --project <仓库根目录>/runtime python`（与 `register-mcp.ps1 -Install` 生成的配置一致），参数为：
 
 ```text

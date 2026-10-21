@@ -6,6 +6,7 @@ namespace StardewAI.Companion.Mod.Domain;
 public sealed class CompanionSaveCheckpoint
 {
     public string SaveId { get; set; } = "";
+    public long? NativePlayerId { get; set; }
     public List<CompanionConversationEntry> Conversation { get; set; } = new();
     public CompanionActorState? Actor { get; set; }
     public Dictionary<string, string?> RuntimePartitions { get; set; } = new();

@@ -60,14 +60,15 @@ public sealed class CompanionConversationMenu : IClickableMenu
         int left = _speech.x, top = _speech.y, w = _speech.width;
         xPositionOnScreen = left; yPositionOnScreen = top; width = w; height = _speech.height + 60;
         _input.X = left + 8; _input.Y = top + _speech.height + 12; _input.Height = 44;
-        _input.Width = w - (_replyTo == null ? 16 : 172);
-        if (_replyTo != null)
-            _buttons.Add((new(left + w - 158, _input.Y, 150, 40), "确认选择", () => Send(true), true));
+        _input.Width = w - 340;
+        _buttons.Add((new(left + w - 324, _input.Y, 150, 40), _replyTo == null ? "发送" : "确认选择", () => Send(_replyTo != null), true));
+        _buttons.Add((new(left + w - 170, _input.Y, 78, 40), "记录", OpenRecords, true));
+        _buttons.Add((new(left + w - 88, _input.Y, 80, 40), "关闭", () => exitThisMenu(playSound: false), true));
     }
     private void Send(bool confirm)
     {
         string text = _input.Text.Trim();
-        if (text.Length == 0 || _state.IsChatPending) return;
+        if (text.Length == 0) return;
         if (!_submit(text, _replyTo, confirm)) { _feedback = "消息未发送，请检查连接。"; return; }
         _input.Text = DraftText = ""; _replyTo = DraftDecisionId = null; _feedback = null; _status = LifeChatStatus.Idle; Focus();
     }

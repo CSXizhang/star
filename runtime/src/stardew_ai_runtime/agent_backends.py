@@ -23,6 +23,7 @@ from typing import Any, Protocol
 from .agent_instructions import runtime_instructions
 from .codex_game_profile import game_tool_config, unrelated_mcp_config, write_game_instructions
 from .codex_usage import CodexUsageMeter
+from .provider_diagnostics import record_completed, record_prepared, safe_error
 
 logger = logging.getLogger("stardew_ai_runtime.agent_backends")
 
@@ -123,6 +124,7 @@ class CodexBackend:
         meter = CodexUsageMeter(session_id)
         result = self._run(active_task, session_id, prompt)
         result.update(meter.finish(result.get("conversation_id"), result.get("usage")))
+        record_completed(self.run_dir, active_task.request_id, result)
         return result
 
     def _run(self, active_task: ActiveTaskLike, session_id: str | None, prompt: str) -> dict[str, Any]:
@@ -150,6 +152,8 @@ class CodexBackend:
         # CLI -c overrides only this invocation. Never edit the user's MCP config.
         mcp = [
             "-c", "mcp_servers.stardew-companion.enabled=true",
+            "-c", "mcp_servers.stardew-companion.required=true",
+            "-c", "mcp_servers.stardew-companion.startup_timeout_sec=30",
             "-c", f'mcp_servers.stardew-companion.command={json.dumps(str(python))}',
             "-c", 'mcp_servers.stardew-companion.args=' + json.dumps([
                 "-B", "-m", "stardew_ai_runtime.mcp_server", "--run-dir", str(self.run_dir),
@@ -180,12 +184,20 @@ class CodexBackend:
             # Optional run-local workaround for a proxy which times out on the
             # Responses WebSocket transport. Keep auth, endpoint and approvals.
             cmd.extend(["-c", f"model_providers.{self.http_provider}.supports_websockets=false"])
-        cmd.append(prompt)
+        # Windows limits the entire command line to 32767 UTF-16 characters.
+        # A legitimate compacted full snapshot can exceed that budget. The CLI
+        # accepts '-' to read the identical prompt from stdin on new and resume.
+        cmd.append("-")
+        record_prepared(self.run_dir, active_task.request_id, session_id, prompt, instructions,
+                        model=self.model, effort=self.effort, http_provider=self.http_provider)
         proc: Any = None
         try:
-            proc = subprocess.Popen(cmd, cwd=str(self.run_dir), stdout=subprocess.PIPE,
+            proc = subprocess.Popen(cmd, cwd=str(self.run_dir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
             active_task.process = proc
+            assert proc.stdin is not None
+            proc.stdin.write(prompt)
+            proc.stdin.close()
             if self.progress:
                 self.progress(BackendProgress(self.name, "started", "已启动 GPT"))
             events: queue.Queue[tuple[str, str | None]] = queue.Queue()
@@ -205,6 +217,7 @@ class CodexBackend:
             reply = ""
             usage = None
             errors: list[str] = []
+            terminal_failure: dict[str, Any] | None = None
             deadline = start + self.timeout_seconds
             while len(done) < 2 and time.monotonic() < deadline:
                 if active_task.cancelled:
@@ -220,6 +233,11 @@ class CodexBackend:
                     continue
                 if channel == "stderr":
                     errors.append(line[:500])
+                    # Readiness states are safe operational metadata. The full
+                    # stderr can contain inherited configuration, never log it.
+                    readiness = re.search(r"mcp:\s*stardew-companion\s+(starting|ready|failed)", line)
+                    if readiness:
+                        logger.info("Codex game MCP startup state=%s elapsedSeconds=%.3f", readiness.group(1), time.monotonic() - start)
                     continue
                 try:
                     event = json.loads(line)
@@ -249,6 +267,25 @@ class CodexBackend:
                     usage = event.get("usage")
                 elif kind == "turn.failed":
                     errors.append(str(event.get("error") or "Codex turn failed"))
+                    # Keep provider-origin failure evidence with the owned run.
+                    # Never copy stderr/configuration, prompts or reasoning into
+                    # this diagnostic; external CLI rollouts may disappear.
+                    wire_error = event.get("error")
+                    terminal_error = safe_error(wire_error)
+                    terminal_failure = terminal_error
+                    try:
+                        error_log = self.run_dir / "logs" / "provider-errors.jsonl"
+                        error_log.parent.mkdir(parents=True, exist_ok=True)
+                        with error_log.open("a", encoding="utf-8") as output:
+                            output.write(json.dumps({
+                                "timestampUnix": time.time(), "provider": self.name,
+                                "requestId": active_task.request_id, "conversationId": session_id,
+                                "source": "codex-cli-turn.failed", "error": terminal_error,
+                                "model": self.model, "effort": self.effort,
+                                "httpProviderOverride": self.http_provider,
+                            }, ensure_ascii=False) + "\n")
+                    except OSError:
+                        logger.warning("Could not persist provider terminal error evidence")
             if len(done) < 2:
                 KimiBackend.terminate(proc)
                 return BackendResult(False, "GPT 执行超时，操作已中止。", session_id,
@@ -257,6 +294,28 @@ class CodexBackend:
             proc.wait(timeout=2)
             if proc.returncode != 0 or not reply:
                 detail = "".join(errors)[-500:]
+                info = (terminal_failure or {}).get("codex_error_info")
+                info_code = info.get("type") or info.get("code") if isinstance(info, dict) else info
+                if (str((terminal_failure or {}).get("code") or info_code or "").lower() == "invalid_prompt"
+                        or "flagged as potentially violating our usage policy" in str((terminal_failure or {}).get("message") or "").lower()):
+                    return BackendResult(False,
+                        "模型服务拒绝了本次请求（invalid_prompt）。已暂停自动重试，保留游戏进度。",
+                        session_id, usage, {"code": "CODEX_INVALID_PROMPT", "message": detail},
+                        self.name, time.monotonic() - start).as_dict()
+                if (session_id and proc.returncode != 0
+                        and any(f"no rollout found for thread id {session_id}" in error.lower()
+                                for error in errors)):
+                    return BackendResult(False, "GPT 本地会话文件已不存在，需要重新建立会话。",
+                        session_id, usage, {"code": "CODEX_SESSION_UNAVAILABLE",
+                                            "message": f"no rollout found for thread id {session_id}"},
+                        self.name, time.monotonic() - start).as_dict()
+                if session_id and any(
+                        "context_length_exceeded" in error.lower()
+                        or "ran out of room in the model's context window" in error.lower()
+                        for error in errors):
+                    return BackendResult(False, "GPT 会话上下文已满，需要重新建立会话。",
+                        session_id, usage, {"code": "CODEX_CONTEXT_EXHAUSTED", "message": detail},
+                        self.name, time.monotonic() - start).as_dict()
                 return BackendResult(False, "GPT 请求失败，请稍后重试。", session_id, usage,
                                      {"code": "CODEX_REQUEST_FAILED", "message": detail}, self.name,
                                      time.monotonic() - start).as_dict()
@@ -865,7 +924,7 @@ class McodeBackend:
 
     def __init__(self, run_dir: Path, model: str = "", command: str = "mcode",
                  progress: ProgressCallback | None = None, timeout_seconds: float = 600.0,
-                 effort: str | None = "low"):
+                 effort: str | None = "default"):
         self.run_dir = Path(run_dir)
         self.model = model
         self.command = command
@@ -889,6 +948,10 @@ class McodeBackend:
                 return str(sibling)
         return executable
 
+    def compact_session(self, active_task: ActiveTaskLike, session_id: str) -> dict[str, Any]:
+        from .mcode_compaction import compact_existing_session
+        return compact_existing_session(self, active_task, session_id)
+
     def _write_workspace(self, surface: str) -> Path:
         """Write this turn's game-only MCP file and return its directory."""
         import sys
@@ -899,6 +962,7 @@ class McodeBackend:
             "STARDEW_LIFE_MODE", "STARDEW_LIFE_TURN_ID", "STARDEW_LIFE_SAVE_ID",
             "STARDEW_LIFE_PROPOSAL_ID", "STARDEW_DECISION_TOKEN") if key in os.environ}
         context["STARDEW_MCP_SURFACE"] = surface
+        context["STARDEW_MCP_WIRE_STYLE"] = "mcode"
         context.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[1]))
         workspace = self.run_dir / "data" / "mcode"
         workspace.mkdir(parents=True, exist_ok=True)
@@ -976,6 +1040,40 @@ class McodeBackend:
         return usage
 
     @staticmethod
+    def _latest_request_context(session_id: str | None, not_before_unix: float) -> int | None:
+        """Read only this invocation's latest request counter, never exec totals.
+
+        The local CLI's numeric counters are optional evidence. A missing or
+        changed SQLite schema stays unknown; no billing total is substituted.
+        """
+        if not session_id:
+            return None
+        import sqlite3
+        from contextlib import closing
+        root = Path(os.environ.get("MINIMAX_DATA_DIR") or Path.home() / ".minimax")
+        path = root / "v2/sqlite/runtime-state.sqlite"
+        if not path.is_file():
+            return None
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as connection:
+                row = connection.execute(
+                    "SELECT ts, input_tokens, cache_read_tokens, cache_write_tokens "
+                    "FROM local_runtime_token_usage WHERE session_id=? ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            if row is None or not isinstance(row[0], (int, float)):
+                return None
+            timestamp = row[0] / 1000 if row[0] > 100_000_000_000 else row[0]
+            if timestamp < not_before_unix:
+                return None
+            values = row[1:]
+            if any(type(value) is not int or value < 0 for value in values):
+                return None
+            return sum(values)
+        except (OSError, sqlite3.Error, ValueError):
+            return None
+
+    @staticmethod
     def _tool_label(name: str | None) -> str | None:
         """Drop the mcp__<server>__ prefix so replies show the real tool."""
         if not name:
@@ -990,6 +1088,8 @@ class McodeBackend:
         proc: Any = None
         requested_session = session_id
         started = False
+        invocation_unix = time.time()
+        terminal_error: Any = None
         # A file-backed stdin avoids both Windows command-line limits and a
         # blocking pipe write before the cancellation/deadline loop can start.
         prompt_stream = tempfile.TemporaryFile()
@@ -1018,6 +1118,10 @@ class McodeBackend:
             usage = None
             status = ""
             errors: list[str] = []
+            plan_validation_failed = False
+            game_job_selected = False
+            unregistered_game_tools: set[tuple[str, str | None]] = set()
+            game_mutation_succeeded = False
             deadline = start + self.timeout_seconds
             while len(done) < 2 and time.monotonic() < deadline:
                 if active_task.cancelled:
@@ -1043,26 +1147,84 @@ class McodeBackend:
                 if not isinstance(event, dict):
                     continue
                 kind = event.get("type")
+                # Public provider events only: never persist reasoning items or credentials.
+                public_item = event.get("item") or {}
+                if (kind in {"session.started", "session.resumed", "turn.completed", "turn.failed", "exec.completed"}
+                        or kind == "item.completed" and public_item.get("type") in {"tool_call", "agent_message"}):
+                    def scrub(value):
+                        if isinstance(value, dict):
+                            return {key: ("[redacted]" if key.lower().replace("_", "") in
+                                    {"sessiontoken", "decisiontoken", "accesstoken", "refreshtoken", "authorization", "apikey", "secret"} else scrub(item))
+                                    for key, item in value.items()}
+                        if isinstance(value, list):
+                            return [scrub(item) for item in value]
+                        return value
+                    try:
+                        trace_path = self.run_dir / "data" / "mcode-public-events.jsonl"
+                        with trace_path.open("a", encoding="utf-8") as trace:
+                            trace.write(json.dumps({"capturedAt": time.time(),
+                                "requestId": getattr(active_task, "request_id", ""),
+                                "event": scrub(event)}, ensure_ascii=False) + "\n")
+                    except OSError:
+                        logger.warning("Could not record public mcode event")
                 if kind in {"session.started", "session.resumed", "turn.started", "item.started", "item.completed", "turn.completed"}:
                     started = True
                 if kind in {"session.started", "session.resumed"}:
                     session_id = event.get("sessionId") or session_id
                 elif kind == "turn.completed":
                     usage = self._usage(event.get("usage")) or usage
+                elif kind == "item.started":
+                    item = event.get("item") or {}
+                    if self.progress and item.get("type") == "tool_call":
+                        self.progress(BackendProgress(self.name, "tool_started", "正在使用工具",
+                                                      self._tool_label((item.get("toolCall") or {}).get("name"))))
                 elif kind == "turn.failed":
+                    terminal_error = event.get("error")
                     errors.append(str(event.get("error") or "mcode turn failed"))
                 elif kind == "item.completed":
                     item = event.get("item") or {}
                     if item.get("type") == "agent_message" and item.get("content"):
                         reply = str(item["content"])
-                    elif item.get("type") == "tool_call" and self.progress:
+                    elif item.get("type") == "tool_call":
                         call = item.get("toolCall") or {}
-                        self.progress(BackendProgress(self.name, "tool_started", "正在处理游戏任务",
-                                                      self._tool_label(call.get("name"))))
+                        name = str(call.get("name") or "")
+                        call_input = call.get("input") or {}
+                        action = call_input.get("action") if isinstance(call_input, dict) else None
+                        action = action if isinstance(action, str) else None
+                        output = call.get("output") or {}
+                        content = output.get("content") or []
+                        from .mcp_server import BASE_TOOLS, LIFE_TOOLS
+                        if (name in BASE_TOOLS | LIFE_TOOLS and call.get("status") == 3
+                                and any(part.get("text") == f"Tool {name} not found"
+                                        for part in content if isinstance(part, dict))):
+                            unregistered_game_tools.add((name, action))
+                        if name.startswith(f"mcp__{self.server_name}__") and call.get("status") == 2:
+                            short_name = self._tool_label(name)
+                            # A successful list proves a route exists, but does
+                            # not perform an earlier failed propose/adopt action.
+                            unregistered_game_tools.discard((short_name, action))
+                            readonly = short_name.startswith((
+                                "get_", "query_", "read_", "list_", "observe_", "discover_", "work_plan_overview", "autonomy_status"))
+                            readonly |= short_name == "manage_milestones" and action == "list"
+                            game_mutation_succeeded |= not readonly
+                        if name == "mcp__stardew-companion__submit_plan" and call.get("status") == 3:
+                            content = output.get("content") or []
+                            plan_validation_failed |= any("Validation failed for tool" in str(part.get("text", ""))
+                                                          for part in content if isinstance(part, dict))
+                        if name.startswith("mcp__stardew-companion__") and call.get("status") == 2:
+                            payload = ((output.get("details") or {}).get("mcp") or {}).get("structuredContent") or {}
+                            game_job_selected |= (name == "mcp__stardew-companion__submit_plan"
+                                                  and bool(payload.get("tasks") and not payload.get("error"))) or payload.get("status") == "job-selected"
+                        if self.progress:
+                            self.progress(BackendProgress(self.name, "tool_completed", "正在处理游戏任务",
+                                                          self._tool_label(call.get("name"))))
                 elif kind == "exec.completed":
                     result = event.get("result") or {}
                     session_id = result.get("sessionId") or session_id
                     status = str(result.get("status") or "")
+                    if result.get("error"):
+                        terminal_error = result["error"]
+                        errors.append(str(result["error"]))
                     if result.get("output"):
                         reply = str(result["output"])
                     usage = self._usage(result.get("usage")) or usage
@@ -1076,12 +1238,48 @@ class McodeBackend:
                                      error={"code": "TIMEOUT", "message": "mcode process deadline exceeded"},
                                      provider=self.name, duration=time.monotonic() - start).as_dict()
             proc.wait(timeout=2)
+            if usage is not None:
+                context = self._latest_request_context(session_id, invocation_unix)
+                if context is not None:
+                    usage["latestRequestInputContext"] = context
+                    usage["latest_request_context_source"] = "mcode_local_request_counter"
+            failure_message = (terminal_error.get("message", "") if isinstance(terminal_error, dict)
+                               else str(terminal_error or ""))
+            if isinstance(terminal_error, dict) and terminal_error.get("code") == "CONTENT_REVIEW_BLOCKED":
+                message = "MiniMax Code 的内容审核拒绝了本次请求。已保留游戏实际进度，本轮未获得模型回复。"
+                return BackendResult(False, message, session_id, usage,
+                                     {"code": "CONTENT_REVIEW_BLOCKED", "message": message},
+                                     self.name, time.monotonic() - start).as_dict()
+            if (re.search(r"\b2067\b", failure_message)
+                    and re.search(r"Token Plan|用量上限", failure_message, re.IGNORECASE)):
+                return BackendResult(False, "MiniMax Code 的 Token Plan 用量已耗尽；已停止新请求，保留实际进度。",
+                                     session_id, usage, {"code": "RESOURCE_EXHAUSTED", "message": failure_message},
+                                     self.name, time.monotonic() - start).as_dict()
+            if unregistered_game_tools:
+                message = "游戏工具调用名称失效，本轮未能完成安排。"
+                failed = BackendResult(False, message, session_id, usage,
+                                       {"code": "MCODE_TOOL_BINDING_FAILED", "message": message},
+                                       self.name, time.monotonic() - start).as_dict()
+                failed["retryable_tool_binding"] = not game_mutation_succeeded
+                return failed
+            if plan_validation_failed and not game_job_selected:
+                message = "派工参数未通过校验，本轮没有成功提交游戏作业；请检查参数后再继续。"
+                return BackendResult(False, message, session_id, usage,
+                                     {"code": "MCODE_TOOL_ARGUMENTS_INVALID", "message": message},
+                                     self.name, time.monotonic() - start).as_dict()
             if proc.returncode == 0 and status == "succeeded" and reply:
                 if self.progress:
                     self.progress(BackendProgress(self.name, "completed", "MiniMax Code 已完成回复"))
                 return BackendResult(True, reply, session_id, usage, provider=self.name,
                                      duration=time.monotonic() - start).as_dict()
             detail = "".join(errors)[-500:]
+            if "defaultmodel is not configured" in detail.lower():
+                # A replacement --config can omit the player's selected model.
+                # Repeating the same exec cannot repair this configuration.
+                message = "MiniMax Code 未配置默认模型。请先选择模型；使用临时 --config 时也需保留 defaultModel。"
+                return BackendResult(False, message, session_id, usage,
+                                     {"code": "MCODE_MODEL_NOT_CONFIGURED", "message": message},
+                                     self.name, time.monotonic() - start).as_dict()
             if (requested_session and not started and usage is None
                     and re.search(r"session (?:not found|is archived|workspace does not match)", detail, re.IGNORECASE)):
                 # A rotated or archived session must not strand the game loop.
@@ -1107,6 +1305,13 @@ class McodeBackend:
                     logger.exception("Failed to clean up mcode process")
             active_task.process = None
 
+    def tool_binding_context(self, surface: str) -> str:
+        from .mcp_server import BASE_TOOLS, LIFE_TOOLS
+        registered = LIFE_TOOLS if surface == "life" else BASE_TOOLS
+        return ("【当前工具绑定】规则里的短工具名只是简称；调用必须使用实际注册全名，并按工具 schema 填参。\n"
+                + "\n".join(f"{name} = mcp__{self.server_name}__{name}" for name in sorted(registered))
+                + "\n工具返回未找到时先核对注册名；未成功保存安排不能声称已派工或已经出发。")
+
     def run(self, active_task: ActiveTaskLike, session_id: str | None, prompt: str) -> dict[str, Any]:
         start = time.monotonic()
         try:
@@ -1124,18 +1329,44 @@ class McodeBackend:
                                  error={"code": "MCODE_GAME_PROFILE_FAILED", "message": str(ex)},
                                  provider=self.name, duration=time.monotonic() - start).as_dict()
         try:
-            from .mcp_server import BASE_TOOLS, LIFE_TOOLS
-            registered = LIFE_TOOLS if surface == "life" else BASE_TOOLS
-            prompt = ("【当前工具绑定】规则里的短工具名只是简称；调用必须使用实际注册全名，并按工具 schema 填参。\n"
-                      + "\n".join(f"{name} = mcp__{self.server_name}__{name}" for name in sorted(registered))
-                      + "\n工具返回未找到时先核对注册名；未成功保存安排不能声称已派工或已经出发。\n\n" + prompt)
+            # The bridge includes bindings in its acknowledged context delivery.
+            # Standalone adapter callers still get a complete initial binding.
+            bootstrap = getattr(active_task, "provider_bootstrap_prompt", None)
+            if not isinstance(bootstrap, str) or not bootstrap:
+                bootstrap = None
+            if bootstrap is None:
+                prompt = self.tool_binding_context(surface) + "\n\n" + prompt
             result = self._invoke(active_task, session_id, prompt, executable, workspace, start)
-            if result.get("error_detail", {}).get("code") == "MCODE_SESSION_UNAVAILABLE" and not active_task.cancelled:
-                logger.info("mcode could not resume session %s; starting a fresh one", session_id)
-                # A resumed life prompt can omit the core policy. A fresh
-                # provider session must receive it again before using tools.
-                result = self._invoke(active_task, None, runtime_instructions() + "\n\n" + prompt,
-                                      executable, workspace, start)
+            if (result.get("error") == "MCODE_TOOL_BINDING_FAILED" and result.get("retryable_tool_binding")
+                    and not active_task.cancelled):
+                previous = result
+                correction = (
+                    "当前调用上下文出现了未注册的裸工具名。下面已包含游戏内指导，勿重复加载外部 CLI skill。"
+                    "请仅复制工具表中的完整 mcp__ 注册名称来调用；不要调用简称或自行构造 Compat 名称。"
+                    "前次没有成功修改游戏安排或派工，本次按原玩家要求处理，不能扩大范围。\n"
+                )
+                # A replacement session cannot interpret the old session's delta.
+                result = self._invoke(active_task, None, correction + (bootstrap or prompt), executable, workspace, start)
+                first_usage, second_usage = previous.get("usage"), result.get("usage")
+                if first_usage or second_usage:
+                    combined = {"input_includes_cache": True, "input_context_measured": False,
+                                "source": "mcode_exec_result"}
+                    for key in ("input_tokens", "output_tokens", "cache_read_tokens", "total_tokens"):
+                        if key in (first_usage or {}) and key in (second_usage or {}):
+                            combined[key] = first_usage[key] + second_usage[key]
+                        else:
+                            combined["partial"] = True
+                    if (first_usage or {}).get("partial") or (second_usage or {}).get("partial"):
+                        combined["partial"] = True
+                    result["usage"] = combined
+                result["binding_recovery"] = {"previousSession": previous.get("conversation_id"),
+                                               "newSession": result.get("conversation_id"),
+                                               "reason": "unregistered_game_tool_name"}
+                logger.warning("Recovered mcode tool binding with one fresh invocation; previous=%s new=%s",
+                               previous.get("conversation_id"), result.get("conversation_id"))
+            # MCODE_SESSION_UNAVAILABLE propagates to the bridge, which rotates
+            # the session honestly (old id kept in history) and retries once
+            # with the full instructions.
             return result
         except OSError as ex:
             return BackendResult(False, "MiniMax Code 启动失败，请检查 CLI 和 Node.js 安装。", session_id,

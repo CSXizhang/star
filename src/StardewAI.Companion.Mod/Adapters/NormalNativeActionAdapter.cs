@@ -1,4 +1,4 @@
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewValley;
 using StardewValley.Buildings;
@@ -44,6 +44,24 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
 
         if (!_observer.IsMainThread)
             return NativeActionStepResult.Failed("Native action rejected: must execute on the game main thread.");
+
+        if (actor is PlayerActor choppingPlayer && request.Kind == NativeActionKind.ChopTree)
+            return VerifyPlayerChop(choppingPlayer, request, target);
+
+        if (actor is PlayerActor native && request.Kind is NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass)
+        {
+            var nativeLocation=actor.GameFarmer?.currentLocation;
+            if (nativeLocation == null) return NativeActionStepResult.Failed("Native player binding was lost.");
+            if (request.Kind == NativeActionKind.RefillWateringCan)
+                return native.WaterLeft > native.ToolStartWater
+                    ? NativeActionStepResult.Succeeded("refilled",waterGained:native.WaterLeft-native.ToolStartWater)
+                    : NativeActionStepResult.Precondition("Native refill did not increase water.","not-refilled");
+            bool remains=request.Kind == NativeActionKind.ClearDebris
+                ? nativeLocation.getObjectAtTile(target.Tile.X,target.Tile.Y) != null
+                : nativeLocation.terrainFeatures.TryGetValue(new Vector2(target.Tile.X,target.Tile.Y),out var feature) && feature is StardewValley.TerrainFeatures.Grass;
+            return remains ? NativeActionStepResult.Failed("Native tool completed but the target remains.")
+                : NativeActionStepResult.Succeeded("cleared",staminaCost:Math.Max(0,native.ToolStartStamina-native.Stamina));
+        }
 
         // Feeding happens on the building's interior map, so the location check is
         // applied per-action against the actual target location instead of the
@@ -124,26 +142,37 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             int before = actor.WaterLeft;
             int pixelX = target.Tile.X * 64 + 32;
             int pixelY = target.Tile.Y * 64 + 32;
-            // Vanilla WateringCan.DoFunction checks Game1.currentLocation for the
-            // refill tile, even though it receives `loc` explicitly. The human
-            // player may be indoors while the companion refills on the farm.
-            // Set the backing field only for this synchronous native call: the
-            // public setter emits location-change events for the human player.
-            var game1Field = typeof(Game1).GetField("game1", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-            var currentLocationField = typeof(Game1).GetField("instanceGameLocation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-            var game = game1Field?.GetValue(null);
-            if (game is null || currentLocationField is null)
-                return NativeActionStepResult.Failed("Cannot access native watering-can location context.");
-            var previousLocation = currentLocationField.GetValue(game);
-            try
+
+            if (ActorGuards.IsPlayerBound(actor))
             {
-                currentLocationField.SetValue(game, loc);
+                // Player mode: the actor's location IS Game1.currentLocation, so the
+                // instanceGameLocation reflection poke is unnecessary; call native directly.
                 can.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
             }
-            finally
+            else
             {
-                currentLocationField.SetValue(game, previousLocation);
+                // Vanilla WateringCan.DoFunction checks Game1.currentLocation for the
+                // refill tile, even though it receives `loc` explicitly. The human
+                // player may be indoors while the companion refills on the farm.
+                // Set the backing field only for this synchronous native call: the
+                // public setter emits location-change events for the human player.
+                var game1Field = typeof(Game1).GetField("game1", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+                var currentLocationField = typeof(Game1).GetField("instanceGameLocation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+                var game = game1Field?.GetValue(null);
+                if (game is null || currentLocationField is null)
+                    return NativeActionStepResult.Failed("Cannot access native watering-can location context.");
+                var previousLocation = currentLocationField.GetValue(game);
+                try
+                {
+                    currentLocationField.SetValue(game, loc);
+                    can.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
+                }
+                finally
+                {
+                    currentLocationField.SetValue(game, previousLocation);
+                }
             }
+
             int after = actor.WaterLeft;
             if (after <= before)
                 return NativeActionStepResult.Failed(
@@ -508,8 +537,11 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     int expected = debris.item?.Stack ?? 1;
                     var before = SnapshotInventoryTotals(actor.GameFarmer);
                     bool accepted;
-                    using (new NativeAnimalHarvestInventoryScope(actor.GameFarmer, loc, debris, chunk))
+                    if (ReferenceEquals(actor.GameFarmer, Game1.player))
                         accepted = debris.collect(actor.GameFarmer, chunk);
+                    else
+                        using (new NativeAnimalHarvestInventoryScope(actor.GameFarmer, loc, debris, chunk))
+                            accepted = debris.collect(actor.GameFarmer, chunk);
                     int gained = MeasureGainedStack(before, SnapshotInventoryTotals(actor.GameFarmer), id);
                     if (!accepted)
                         return gained == 0 && collected == 0
@@ -530,7 +562,13 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             // 2. Spawned object on the ground (forage / animal produce dropped by the game).
             if (loc.getObjectAtTile(target.Tile.X, target.Tile.Y) is StardewValley.Object spawned && spawned.CanBeGrabbed)
             {
+                if (spawned.IsWeeds() || spawned.IsBreakableStone() || spawned.IsTwig())
+                    return NativeActionStepResult.Precondition("This is an observed native obstacle, not a loose pickup. Use its native clearing tool.", "requires-clearing-tool");
+                if (spawned is StardewValley.Objects.Chest { giftbox.Value: true })
+                    return NativeActionStepResult.Precondition("This is a native giftbox; use open_chest and inspect its native result.", "requires-open-chest");
                 string spawnedId = spawned.QualifiedItemId ?? spawned.ItemId ?? "";
+                if (spawnedId is "(O)590" or "(O)SeedSpot")
+                    return NativeActionStepResult.Precondition("Native dig spots require Hoe tool interaction; they are not ordinary pickup objects.", "requires-native-hoe");
                 int stack = spawned.Stack;
                 var tileLoc = new xTile.Dimensions.Location(target.Tile.X, target.Tile.Y);
                 var inventoryBefore = SnapshotInventoryTotals(actor.GameFarmer);
@@ -542,7 +580,9 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                 // The native grab path inserts through addItemToInventoryBool, whose
                 // ownership gate rejects detached farmers; scope the exact item so the
                 // pickup lands in the companion backpack, exactly like the egg path.
-                using (groundEgg
+                if (ReferenceEquals(actor.GameFarmer, Game1.player))
+                    loc.checkAction(tileLoc, Game1.viewport, actor.GameFarmer);
+                else using (groundEgg
                            ? new NativeAnimalHarvestInventoryScope(actor.GameFarmer, (AnimalHouse)loc,
                                new Vector2(target.Tile.X, target.Tile.Y), spawned)
                            : new NativeAnimalHarvestInventoryScope(actor.GameFarmer, loc,
@@ -555,9 +595,14 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                 // calls such as FarmAnimal.pet. Clear it explicitly.
                 try
                 {
-                    if (actor.GameFarmer.FarmerSprite is not null)
-                        actor.GameFarmer.FarmerSprite.PauseForSingleAnimation = false;
-                    actor.GameFarmer.completelyStopAnimatingOrDoingAction();
+                    // The local player's ordinary game update owns the native
+                    // hold-item animation; only a detached companion needs this.
+                    if (!ReferenceEquals(actor.GameFarmer, Game1.player))
+                    {
+                        if (actor.GameFarmer.FarmerSprite is not null)
+                            actor.GameFarmer.FarmerSprite.PauseForSingleAnimation = false;
+                        actor.GameFarmer.completelyStopAnimatingOrDoingAction();
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1503,6 +1548,13 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
     /// </summary>
     private NativeActionStepResult InvokeIsolated(IFarmerActor actor, string action, Func<NativeActionStepResult> body)
     {
+        // Player mode: the actor IS Game1.player, so the "human player unchanged"
+        // invariants are skipped by definition; the resource change is the action.
+        if (ActorGuards.IsPlayerBound(actor))
+        {
+            return body();
+        }
+
         var playerBefore = _observer.GetPlayerSnapshot();
         var originalPlayerRef = Game1.player;
         try

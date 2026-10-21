@@ -80,6 +80,11 @@ public sealed class WebSocketTransportServer : ITransportServer
     public event Action<ChatReplyPayload>? OnChatReplyReceived;
     public event Action<AutonomyStatePayload>? OnAutonomyStateReceived;
     public event Action<string?, string?, string>? OnChatChannelProblem;
+    public string ActorMode { get; set; } = "companion";
+    public bool SupportsThinkingPause { get; set; }
+    public long? ActorMultiplayerId { get; set; }
+    public event Action<string, JsonObject>? OnPlayerMessage;
+    public Task<bool> SendPlayerAuthorityAsync(string owner,string reason) => SendChatEnvelopeAsync(CreateEnvelope("player.authority",new JsonObject { ["owner"]=owner,["reason"]=reason,["saveId"]=_saveId }));
     public event Action<LifeChatReplyPayload>? OnLifeChatReplyReceived;
     public event Action<LifeProfileStatePayload>? OnLifeProfileStateReceived;
     public event Action<LifeMemoryStatePayload>? OnLifeMemoryStateReceived;
@@ -102,7 +107,8 @@ public sealed class WebSocketTransportServer : ITransportServer
         string? gameSessionId = null,
         TransportLogger? logger = null,
         int maxNormalOutboundCapacity = 128,
-        int maxCriticalOutboundCapacity = 64)
+        int maxCriticalOutboundCapacity = 64,
+        string? completedArchiveDirectory = null)
     {
         _handler = handler ?? throw new ArgumentNullException(nameof(handler));
         _logger = logger;
@@ -118,7 +124,7 @@ public sealed class WebSocketTransportServer : ITransportServer
             : sessionToken;
 
         _queue = new BoundedMessageQueue(maxNormalCapacity: 64, maxPriorityCapacity: 16);
-        _idempotencyManager = new IdempotencyManager(maxCapacity: 256);
+        _idempotencyManager = new IdempotencyManager(maxCapacity: 256, completedArchiveDirectory: completedArchiveDirectory);
 
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
@@ -130,9 +136,11 @@ public sealed class WebSocketTransportServer : ITransportServer
         ITransportHandler handler,
         string? saveId,
         string? gameSessionId,
-        Action<string>? simpleLogger)
+        Action<string>? simpleLogger,
+        string? completedArchiveDirectory = null)
         : this(port, sessionToken, handler, saveId, gameSessionId,
-            simpleLogger != null ? new TransportLogger((msg, _) => simpleLogger(msg)) : (TransportLogger?)null)
+            simpleLogger != null ? new TransportLogger((msg, _) => simpleLogger(msg)) : (TransportLogger?)null,
+            completedArchiveDirectory: completedArchiveDirectory)
     {
     }
 
@@ -142,9 +150,11 @@ public sealed class WebSocketTransportServer : ITransportServer
         ITransportHandler handler,
         string? saveId,
         string? gameSessionId,
-        Action<string, StardewModdingAPI.LogLevel>? smapiLogger)
+        Action<string, StardewModdingAPI.LogLevel>? smapiLogger,
+        string? completedArchiveDirectory = null)
         : this(port, sessionToken, handler, saveId, gameSessionId,
-            smapiLogger != null ? new TransportLogger((msg, level) => smapiLogger(msg, ParseSmapiLevel(level))) : (TransportLogger?)null)
+            smapiLogger != null ? new TransportLogger((msg, level) => smapiLogger(msg, ParseSmapiLevel(level))) : (TransportLogger?)null,
+            completedArchiveDirectory: completedArchiveDirectory)
     {
     }
 
@@ -496,10 +506,15 @@ public sealed class WebSocketTransportServer : ITransportServer
                 GameVersion: "1.6.15",
                 SmapiVersion: "4.2.1",
                 LifecycleState: "syncing",
-                Skills: new[] { "water-zone", "harvest-zone", "deposit-chest", "organize-chest", "hoe-tiles", "plant-seeds", "ship-items", "withdraw-chest" }
+                Skills: ActorMode == "player"
+                    ? new[] { "navigate-to", "water-zone", "harvest-zone", "open-chest", "open-shop", "deposit-chest", "organize-chest", "withdraw-chest", "hoe-tiles", "plant-seeds", "ship-items", "purchase-items", "sleep", "refill-watering-can", "clear-debris", "cut-grass", "apply-fertilizer", "pickup-items" }
+                    : new[] { "water-zone", "harvest-zone", "deposit-chest", "organize-chest", "hoe-tiles", "plant-seeds", "ship-items", "withdraw-chest" },
+                ActorMode: ActorMode, ActorMultiplayerId: ActorMultiplayerId,
+                CommandResultQuery: true
             );
 
             var welcomeJson = JsonSerializer.SerializeToNode(welcomePayload, JsonOptions)!.AsObject();
+            welcomeJson["supportsThinkingPause"] = ActorMode == "player" && SupportsThinkingPause;
             var welcomeEnvelope = CreateEnvelope("mod.welcome", welcomeJson, helloEnvelope.MessageId);
 
             EnqueueOutbound(welcomeEnvelope, isCritical: true, _socketGeneration);
@@ -864,6 +879,14 @@ public sealed class WebSocketTransportServer : ITransportServer
 
     private void ProcessMainThreadEnvelope(EnvelopeDto envelope)
     {
+        // Read-only reconciliation has a strict session boundary of its own. It
+        // never enters execute/reject paths or changes an idempotency record.
+        if (envelope.MessageType == "skill.result.query")
+        {
+            HandleSkillResultQuery(envelope);
+            return;
+        }
+
         // Fail-closed expiration check
         if (envelope.ExpiresAt.HasValue && envelope.ExpiresAt.Value < DateTimeOffset.UtcNow)
         {
@@ -880,8 +903,15 @@ public sealed class WebSocketTransportServer : ITransportServer
             return;
         }
 
+        if (ActorMode == "player" && (envelope.SaveId != _saveId || envelope.GameSessionId != _gameSessionId)) {
+            _ = SendProtocolErrorAsync("ACTOR_SESSION_MISMATCH","Player actions require the immutable save and session.",envelope.MessageId); return;
+        }
         switch (envelope.MessageType.ToLowerInvariant())
         {
+            case "player.control":
+            case "agent.thinking":
+                OnPlayerMessage?.Invoke(envelope.MessageType,envelope.Payload);
+                break;
             case "skill.execute":
                 HandleSkillExecute(envelope);
                 break;
@@ -902,6 +932,42 @@ public sealed class WebSocketTransportServer : ITransportServer
                 _logger?.Invoke($"Unrecognized message type: {envelope.MessageType}", "Warn");
                 _ = SendProtocolErrorAsync("UNKNOWN_TYPE", $"Unrecognized message type {envelope.MessageType}", envelope.MessageId);
                 break;
+        }
+    }
+
+    private void HandleSkillResultQuery(EnvelopeDto envelope)
+    {
+        if (State != TransportState.Ready)
+        {
+            _ = SendProtocolErrorAsync("NOT_READY", "Transport session is not Ready.", envelope.MessageId);
+            return;
+        }
+        if (string.IsNullOrEmpty(_saveId) || string.IsNullOrEmpty(_gameSessionId)
+            || envelope.SaveId != _saveId || envelope.GameSessionId != _gameSessionId)
+        {
+            _ = SendProtocolErrorAsync("RESULT_SESSION_MISMATCH", "Result query requires the active save and game session.", envelope.MessageId);
+            return;
+        }
+        if (envelope.Payload?["commandId"] is not JsonValue commandValue
+            || !commandValue.TryGetValue<string>(out var commandId) || string.IsNullOrWhiteSpace(commandId) || commandId.Length > 256)
+        {
+            _ = SendProtocolErrorAsync("INVALID_PARAMETERS", "Result query requires a non-empty commandId (max 256 characters).", envelope.MessageId);
+            return;
+        }
+
+        if (_idempotencyManager.TryGetCompletedResult(commandId, out var result))
+        {
+            // Replay one genuine cached receipt directly, without running completion
+            // bookkeeping again, clearing active work, or resending skill.execute.
+            var payload = JsonSerializer.SerializeToNode(result, JsonOptions)!.AsObject();
+            EnqueueOutbound(CreateEnvelope("skill.result", payload, envelope.MessageId,
+                worldRevision: result!.FinalWorldRevision), isCritical: true, _socketGeneration);
+        }
+        else
+        {
+            var payload = new JsonObject { ["commandId"] = commandId,
+                ["status"] = ActiveCommandId == commandId ? "in-flight" : "unknown" };
+            EnqueueOutbound(CreateEnvelope("skill.result.status", payload, envelope.MessageId), isCritical: true, _socketGeneration);
         }
     }
 
@@ -980,6 +1046,10 @@ public sealed class WebSocketTransportServer : ITransportServer
         var check = _idempotencyManager.Check(idempotencyKey, payload.CommandId, semanticFingerprint, out var cachedResult);
         switch (check)
         {
+            case IdempotencyCheck.ReceiptUnavailable:
+                SendTerminalRejection(envelope, "IDEMPOTENCY_RECEIPT_UNAVAILABLE", "Completed command receipts could not be preserved or read; execution is stopped to prevent duplicates.", recordIdempotency: false);
+                return;
+
             case IdempotencyCheck.CapacityExceeded:
                 SendTerminalRejection(envelope, "IDEMPOTENCY_CAPACITY_EXCEEDED", "Idempotency cache capacity reached for this session.", recordIdempotency: false);
                 return;
@@ -1018,7 +1088,9 @@ public sealed class WebSocketTransportServer : ITransportServer
         // Register in-flight
         if (!_idempotencyManager.TryMarkInFlight(idempotencyKey, payload.CommandId, semanticFingerprint))
         {
-            SendTerminalRejection(envelope, "IDEMPOTENCY_CAPACITY_EXCEEDED", "Idempotency capacity full.", recordIdempotency: false);
+            SendTerminalRejection(envelope, _idempotencyManager.ReceiptStorageUnavailable
+                ? "IDEMPOTENCY_RECEIPT_UNAVAILABLE" : "IDEMPOTENCY_CAPACITY_EXCEEDED",
+                "Idempotency receipt storage is unavailable or all hot records remain in flight.", recordIdempotency: false);
             return;
         }
 
@@ -1378,11 +1450,17 @@ public sealed class WebSocketTransportServer : ITransportServer
         // Keep the latest snapshot for the next handshake, but an idle command
         // socket has no sender. Queuing every TimeChanged snapshot after it closes
         // would fill the critical queue and report a false backpressure failure.
-        if (IsClientConnected)
+        lock (_stateLock)
         {
-            var payloadNode = JsonSerializer.SerializeToNode(snapshot, JsonOptions)!.AsObject();
-            var envelope = CreateEnvelope("world.snapshot", payloadNode, correlationId: null, worldRevision: worldRevision);
-            EnqueueOutbound(envelope, isCritical: true, _socketGeneration);
+            // Serialize with HandleRuntimeHello's welcome enqueue. A connected
+            // socket is not yet a negotiated session: an observation must not
+            // reach the command client before mod.welcome.
+            if (IsClientConnected && State is TransportState.Syncing or TransportState.Ready)
+            {
+                var payloadNode = JsonSerializer.SerializeToNode(snapshot, JsonOptions)!.AsObject();
+                var envelope = CreateEnvelope("world.snapshot", payloadNode, correlationId: null, worldRevision: worldRevision);
+                EnqueueOutbound(envelope, isCritical: true, _socketGeneration);
+            }
         }
         return SendChatSnapshotAsync(snapshot, worldRevision);
     }
@@ -1429,7 +1507,7 @@ public sealed class WebSocketTransportServer : ITransportServer
         return Task.CompletedTask;
     }
 
-    private static bool IsObservationSkill(string? skillId) => skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting" or "inspect-machines" or "inspect-production" or "inspect-building-services" or "inspect-planting" or "inspect-route" or "inspect-livestock" or "inspect-shop";
+    private static bool IsObservationSkill(string? skillId) => skillId is "inspect-player-activities" or "inspect-location" or "inspect-map-image" or "inspect-crafting" or "inspect-machines" or "inspect-production" or "inspect-building-services" or "inspect-planting" or "inspect-route" or "inspect-livestock" or "inspect-shop";
 
     public Task SendProtocolErrorAsync(string code, string message, string? correlationId = null)
     {
@@ -1554,6 +1632,14 @@ public sealed class WebSocketTransportServer : ITransportServer
                         using var doc = JsonDocument.Parse(jsonString);
                         var root = doc.RootElement;
                         ChatReplyPayload? reply = null;
+                        var playerType = root.TryGetProperty("messageType",out var pt) ? pt.GetString() : null;
+                        if (playerType is "agent.thinking" or "player.control") {
+                            if (!root.TryGetProperty("saveId",out var sid) || sid.GetString() != _saveId) continue;
+                            if (!root.TryGetProperty("gameSessionId",out var session) || session.GetString() != _gameSessionId) continue;
+                            var data = JsonNode.Parse(root.GetProperty("payload").GetRawText())!.AsObject();
+                            OnPlayerMessage?.Invoke(playerType,data); continue;
+                        }
+
 
                         string? msgType = root.TryGetProperty("messageType", out var mtProp)
                             ? mtProp.GetString()
@@ -1642,6 +1728,7 @@ public sealed class WebSocketTransportServer : ITransportServer
                 if (_chatSocket == socket)
                 {
                     _chatSocket = null;
+                    OnPlayerMessage?.Invoke("disconnected",new JsonObject());
                     if (_chatSendFailureGeneration != gen)
                         _pendingChatProblems.Enqueue((gen, "伙伴连接已断开，请恢复服务后重试；动作结果未确认。", false));
                 }
@@ -1676,6 +1763,12 @@ public sealed class WebSocketTransportServer : ITransportServer
         );
 
         return await SendChatEnvelopeAsync(envelope).ConfigureAwait(false);
+    }
+
+    public Task<bool> SendChatDeliveryAckAsync(string requestId, string saveId, IReadOnlyList<string> outboxIds)
+    {
+        var payload = JsonSerializer.SerializeToNode(new { requestId, saveId, outboxIds }, JsonOptions)!.AsObject();
+        return SendChatEnvelopeAsync(CreateEnvelope("chat.delivery.ack", payload));
     }
 
     public async Task<bool> SendAutonomyControlAsync(AutonomyControlPayload payload)
@@ -1741,11 +1834,23 @@ public sealed class WebSocketTransportServer : ITransportServer
     /// <summary>
     /// §1.1 Sends a life.chat.submit envelope on the /chat channel.
     /// </summary>
-    public async Task<bool> SendLifeChatSubmitAsync(LifeChatSubmitPayload payload)
+    public async Task<bool> SendLifeChatSubmitAsync(LifeChatSubmitPayload payload, WorldSnapshotPayload? observation = null)
     {
         WebSocket? socket;
         lock (_chatLock) { socket = _chatSocket; }
         if (socket == null || socket.State != WebSocketState.Open) return false;
+
+        // Await publication on the same ordered channel before the dialogue
+        // request can build its model input. A failed observation must not dispatch.
+        if (observation != null)
+        {
+            lock (_chatLock)
+            {
+                _lastSnapshot = observation;
+                _lastSnapshotRevision = observation.CapturedRevision;
+            }
+            if (!await SendChatSnapshotAsync(observation, observation.CapturedRevision).ConfigureAwait(false)) return false;
+        }
 
         var envelope = new EnvelopeDto(
             ProtocolVersion: "0.1",

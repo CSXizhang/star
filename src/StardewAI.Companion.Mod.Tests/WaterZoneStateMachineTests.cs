@@ -294,6 +294,43 @@ public class WaterZoneStateMachineTests
         Assert.Single(machine.FinalResult.WateredTiles);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PausedClockDoesNotSpendWorkBudgetAndResumeDoesNotResetActiveTime(bool exhaustActiveBudget)
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var tile = new TileCoordinate(10, 12);
+        observer.SetDirt(tile, TileDirtState.DryDirt());
+        Assert.True(machine.Start(new WaterZoneRequest("clock-pause", "clock-task", "Farm",
+            new[] { tile }, 50, 20, 60), out _));
+        machine.StepTicks(2);
+        observer.TimeOfDay = 610;
+        machine.RequestPause();
+        machine.StepTicks(1);
+        Assert.True(machine.IsPaused);
+        observer.TimeOfDay = 800;
+        machine.StepTicks(5);
+        Assert.Equal(40, actor.WaterLeft);
+        machine.Resume();
+        observer.TimeOfDay = 810;
+        machine.RequestPause();
+        machine.StepTicks(1);
+        Assert.True(machine.IsPaused);
+        observer.TimeOfDay = 1000;
+        machine.Resume();
+        observer.TimeOfDay = exhaustActiveBudget ? 1050 : 1010;
+        machine.Resume(); // An extra resume while running cannot reset the budget.
+        machine.StepTicks(100);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(exhaustActiveBudget ? ExecutionState.Failed : ExecutionState.Succeeded, result.FinalState);
+        Assert.Equal(exhaustActiveBudget ? "BUDGET_EXHAUSTED" : null, result.ErrorCode);
+        Assert.Equal(exhaustActiveBudget ? 0 : 1, result.WateredTiles.Count);
+        Assert.Equal(exhaustActiveBudget ? 40 : 39, actor.WaterLeft);
+        Assert.Equal(exhaustActiveBudget ? 290 : 250, result.GameMinutesElapsed);
+    }
+
     [Fact]
     public void WaterBudgetExhausted_HaltsSafelyWithPartialSuccess()
     {

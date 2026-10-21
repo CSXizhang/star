@@ -28,6 +28,8 @@ public interface IWorldObserver
         throw new NotSupportedException("Map images are unavailable in this observer.");
     Dictionary<string, object> InspectCrafting(IFarmerActor actor) =>
         throw new NotSupportedException("Crafting observation is unavailable in this observer.");
+    IReadOnlyList<Dictionary<string, object>> ScanInteractables(string locationName, int maxItems = 32) =>
+        Array.Empty<Dictionary<string, object>>();
     /// <summary>
     /// Monotonically increasing revision counter incremented when observable world changes.
     /// </summary>

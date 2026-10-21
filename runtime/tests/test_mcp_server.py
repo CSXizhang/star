@@ -37,7 +37,9 @@ import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from stardew_ai_runtime.mcp_server import create_mcp_server
-from stardew_ai_runtime.scheduler import NoActiveTaskError
+from stardew_ai_runtime.plan_executor import PlanExecutor
+from stardew_ai_runtime.protocol import Envelope
+from stardew_ai_runtime.scheduler import CompanionScheduler, NoActiveTaskError
 from stardew_ai_runtime.work_state import WorkStore
 
 # Import MockModTransportServer from test_transport_live
@@ -578,20 +580,21 @@ def test_mcp_server_tool_registration(mock_scheduler):
         assert {"query_route", "read_guidance"} <= set(tool_names)
         assert len(tool_names) == len(set(tool_names))
         assert set(tool_names) == set("""
-            read_reload_history
-            apply_fertilizer autonomy_status build_building call_capability cancel_task
+            read_reload_history record_decision_note
+            observe_player_activities talk_npc interact_tile attack native_menu_select fish
+            apply_fertilizer autonomy_status build_building call_capability cancel_task cancel_plan_command
             chop_tree clear_debris collect_animal_produce collect_machine craft_items
             cut_grass deposit_to_chest discover_capabilities dispatch_plan_operation
             eat_food feed_animals get_status get_work_overview harvest_and_store harvest_auto
             hoe_tiles insert_machine manage_goal manage_milestones manage_companion manage_plan manage_todo
-            move_building navigate_to observe_building_services observe_crafting
+            move_building navigate_to native_advance native_answer observe_building_services observe_crafting
             observe_farm_space observe_farming_helpers observe_livestock observe_machines
-            observe_map_image observe_production organize_chest pause_task pet_animal
-            pickup_items place_items plant_crop_workflow plant_seeds purchase_animal
+            observe_map_image observe_production open_chest open_shop organize_chest pause_task pet_animal
+            pickup_items place_items player_control plant_crop_workflow plant_seeds purchase_animal
             purchase_items query_chests query_farm_work query_inventory query_planting_options
             query_route query_shop query_wiki read_guidance reconcile_plan_command
             refill_watering_can remember_intent remove_items request_player_decision
-            resume_task run_next_step set_autonomy ship_items submit_plan toggle_animal_door
+            resume_task run_next_step set_autonomy ship_items sleep submit_plan toggle_animal_door
             upgrade_building water_auto water_zone water_tiles withdraw_from_chest work_plan_overview
         """.split())
         assert "autonomy_status" in tool_names
@@ -732,12 +735,65 @@ def test_mcp_server_call_get_status(mock_scheduler):
         assert data["companion"]["tileY"] == 15
         assert data["world"]["timeOfDay"] == 600
         assert data["saveId"] == "mock-save-123"
-        assert "locationId" not in data["companion"]
+        assert data["companion"]["locationId"] == "Farm"
 
         # Detailed call
         _, data_det = await server.call_tool("get_status", {"detail": True})
         assert data_det["companion"]["locationId"] == "Farm"
         assert data_det["world"]["season"] == "spring"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("detail", [None, False, True])
+def test_plan_get_status_handles_detail_with_real_scheduler_and_continues(tmp_path, detail):
+    async def run():
+        payload = {
+            "companion": {"locationId": "Farm", "tileX": 64, "tileY": 15, "activity": "idle"},
+            "world": {"currentLocation": "Farm", "timeOfDay": 600},
+            "farmWork": {"locationId": "Farm", "observationStatus": "observed", "matureCropCount": 0},
+            "inventory": {"slots": [{"itemId": "(O)24", "stack": 1}]},
+            "chests": {"items": []}, "planting": {"candidates": []}, "shop": {"isOpen": False},
+        }
+        snapshot = Envelope.from_mapping({
+            "protocolVersion": "0.1", "messageType": "world.snapshot", "messageId": "status-snapshot",
+            "saveId": "mock-save-123", "gameSessionId": "status-session", "senderInstanceId": "mod",
+            "sequenceNumber": 1, "worldRevision": 4, "sentAt": "2026-10-04T06:00:00Z", "payload": payload,
+        })
+        client = MagicMock(is_connected=True, save_id="mock-save-123", game_session_id="status-session", world_revision=4)
+        client.latest_snapshot = snapshot
+        client.wait_for_snapshot = AsyncMock(return_value=snapshot)
+        scheduler = CompanionScheduler(run_dir=tmp_path, client=client)
+        server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="internal")
+        store = WorkStore(tmp_path / "data" / "work-state.json")
+        store.begin_decision("mock-save-123", "status-decision")
+        params = {} if detail is None else {"detail": detail}
+        store.submit_plan("mock-save-123", goal_text="观察后继续", decision_token="status-decision", tasks=[{
+            "id": "status-task", "title": "观察作业", "steps": [
+                {"id": "status-step", "operation": "get_status", "params": params},
+                {"id": "farm-step", "operation": "query_farm_work", "params": {}},
+            ],
+        }])
+        async def dispatch(operation, step_params, command_id):
+            _, data = await server.call_tool("dispatch_plan_operation", {
+                "operation": operation, "params": step_params, "command_id": command_id,
+            })
+            return data
+
+        executor = PlanExecutor(store, dispatch)
+        result = await executor.run_once("mock-save-123", "status-worker")
+        assert result.outcome == "completed" and result.task_status == "pending"
+        returned = store.state("mock-save-123").tasks[0].steps[0]
+        assert returned.outcome == "completed"
+        observation = result.result
+        assert observation["companion"]["tileX"] == 64 and observation["worldRevision"] == 4
+        assert observation["farmWork"]["matureCropCount"] == 0
+        assert ("inventory" in observation) is (detail is True)
+        if detail:
+            assert observation["inventory"] == payload["inventory"]
+            assert observation["shop"] == payload["shop"]
+        following = await executor.run_once("mock-save-123", "status-worker")
+        assert following.outcome == "completed" and following.task_status == "completed"
 
     asyncio.run(run())
 
@@ -884,7 +940,7 @@ def test_mcp_server_call_deposit_to_chest(mock_scheduler, tmp_path):
         mock_scheduler.deposit_to_chest.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "deposit_to_chest"
-        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "detail": False, "location_id": "Farm"}
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": ["(O)24"], "items": None, "detail": False, "location_id": "Farm"}
 
     asyncio.run(run())
 
@@ -901,7 +957,53 @@ def test_mcp_server_call_deposit_to_chest_without_item_ids(mock_scheduler, tmp_p
         mock_scheduler.deposit_to_chest.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "deposit_to_chest"
-        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": None, "detail": False, "location_id": "Farm"}
+        assert step.params == {"chest_x": 70, "chest_y": 12, "item_ids": None, "items": None, "detail": False, "location_id": "Farm"}
+
+    asyncio.run(run())
+
+
+def test_exact_quantity_and_queued_request_owner_survive_plan_worker(mock_scheduler, tmp_path):
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        sid = "mock-save-123"
+        store.record_request(sid, "a", "Harvest only", origin="player")
+        store.record_request(sid, "b", "Deposit two", origin="player-midflight")
+        store.begin_decision(sid, "decision-1", request_id="a", request_ids=["b"])
+        params = {"chest_x": 66, "chest_y": 20, "items": [{"itemId": "(O)24", "count": 2}]}
+        mock_scheduler.deposit_to_chest = AsyncMock(return_value={
+            "status": "executed", "terminalState": "succeeded", "completedCount": 1,
+            "effects": [{"state": "deposited", "itemId": "(O)24", "stack": 2, "quality": 0}],
+            "details": {"requestedQuantity": 2, "actualQuantity": 2, "remainingQuantity": 0}})
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            with pytest.raises(ToolError, match="REQUEST_ID_REQUIRED"):
+                await server.call_tool("call_capability", {"tool": "deposit_to_chest", "params": params})
+            assert not store.state(sid).tasks
+            await server.call_tool("call_capability", {"tool": "deposit_to_chest", "params": params, "request_id": "b"})
+            await server.call_tool("run_next_step", {})
+        assert mock_scheduler.deposit_to_chest.call_args.kwargs["items"] == params["items"]
+        state = store.state(sid)
+        assert state.executions[-1].request_id == "b"
+        assert next(r for r in state.requests if r["id"] == "a")["taskIds"] == []
+        assert next(r for r in state.requests if r["id"] == "b")["taskIds"] == [state.tasks[0].id]
+        assert state.tasks[0].steps[0].feedback["actualQuantity"] == 2
+
+    asyncio.run(run())
+
+
+def test_plan_worker_rejects_unknown_quantity_without_native_dispatch(mock_scheduler, tmp_path):
+    async def run():
+        server = create_mcp_server(scheduler=mock_scheduler)
+        store = _grant_decision(tmp_path, mock_scheduler)
+        store.submit_plan("mock-save-123", goal_text="Exact transfer", decision_token="decision-1",
+                          tasks=[{"title": "transfer", "steps": [{"operation": "deposit_to_chest",
+                                  "params": {"chest_x": 66, "chest_y": 20, "unknown_quantity": 2}}]}])
+        with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
+            await server.call_tool("run_next_step", {})
+        mock_scheduler.deposit_to_chest.assert_not_awaited()
+        step = store.state("mock-save-123").tasks[0].steps[0]
+        assert step.status != "completed"
+        assert step.effects == []
 
     asyncio.run(run())
 
@@ -1053,7 +1155,7 @@ def test_mcp_server_call_ship_items(mock_scheduler, tmp_path):
         mock_scheduler.execute_ship_items.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "ship_items"
-        assert step.params == {"items": [{"itemId": "(O)24", "count": 2}], "detail": False}
+        assert step.params == {"items": [{"itemId": "(O)24", "count": 2}], "detail": False, "max_game_minutes": 180}
 
     asyncio.run(run())
 
@@ -1326,6 +1428,7 @@ def test_mcp_server_new_tools_error_mapping(mock_scheduler, tmp_path):
         with patch.dict(os.environ, env):
             _, result = await server.call_tool("harvest_auto", {"max_tiles": 100})
         assert result["status"] == "job-selected"
+        store.revoke_decision("mock-save-123")
         store.begin_decision("mock-save-123", "decision-1")
 
         with pytest.raises(ToolError, match="chest_x"):
@@ -1339,6 +1442,7 @@ def test_mcp_server_new_tools_error_mapping(mock_scheduler, tmp_path):
             ("plant_seeds", {"seed_item_id": "", "tiles": [{"x": 64, "y": 15}]}),
             ("ship_items", {"items": []}),
         ]:
+            store.revoke_decision("mock-save-123")  # Retire the previous unexecuted case.
             store.begin_decision("mock-save-123", "decision-1")
             with patch.dict(os.environ, env):
                 _, data = await server.call_tool(tool_name, args)
@@ -1641,6 +1745,7 @@ def test_mcp_server_executing_status_propagation(mock_scheduler, tmp_path):
             ("hoe_tiles", {"tiles": [{"x": 60, "y": 20}]}),
             ("plant_seeds", {"seed_item_id": "seed", "tiles": [{"x": 60, "y": 20}]}),
         ]:
+            store.revoke_decision("mock-save-123")  # Independent schema/status cases.
             store.begin_decision("mock-save-123", "decision-1")
             with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
                 _, data = await server.call_tool(tool_name, args)
@@ -1855,10 +1960,11 @@ def test_progressive_disclosure_default_list_is_small_and_callable(mock_schedule
         assert {t.name for t in schema_light_server._tool_manager.list_tools()} == light_names
 
         internal_names = {t.name for t in internal_server._tool_manager.list_tools()}
-        assert internal_names == light_names | {"reconcile_plan_command", "dispatch_plan_operation"}
+        assert internal_names == light_names | {"reconcile_plan_command", "dispatch_plan_operation", "cancel_plan_command"}
         # The worker's write dispatch and reconcile tools are harness-only.
         assert "dispatch_plan_operation" not in light_names
         assert "reconcile_plan_command" not in light_names
+        assert "cancel_plan_command" not in light_names
 
         default_size = len(json.dumps([t.model_dump() for t in default_tools], ensure_ascii=False))
         full_size = len(json.dumps([t.model_dump() for t in full_tools], ensure_ascii=False))
@@ -1954,6 +2060,7 @@ def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_schedul
                 )
 
         # A fresh decision may revise: the still-pending task is superseded.
+        store.revoke_decision("mock-save-123")
         store.begin_decision("mock-save-123", "decision-sp")
         with patch.dict(os.environ, env):
             _, revised = await server.call_tool(
@@ -2489,6 +2596,47 @@ def test_water_tiles_internal_dispatch_preserves_exact_batch_and_command(mock_sc
         assert captured == {"tiles": tiles, "location_id": "Farm", "command_id": "stable-native-id"}
         assert result["completedCount"] == 2
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("surface", ["light", "full"])
+def test_native_retirement_cannot_be_invoked_via_model_capability(mock_scheduler, tmp_path, monkeypatch, surface):
+    monkeypatch.delenv("STARDEW_MCP_FULL", raising=False)
+    mock_scheduler.ensure_connected = AsyncMock()
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface=surface)
+    async def run():
+        with pytest.raises(ToolError, match="HARNESS_ONLY"):
+            await server.call_tool("call_capability", {"tool": "cancel_plan_command", "params": {"command_id": "old"}})
+    asyncio.run(run())
+    mock_scheduler.ensure_connected.assert_not_awaited()
+
+
+@pytest.mark.parametrize("revoked", [False, True])
+def test_native_retirement_requires_revoked_persisted_command(mock_scheduler, tmp_path, revoked):
+    store = _grant_decision(tmp_path, mock_scheduler)
+    store.submit_plan("mock-save-123", goal_text="harvest", decision_token="decision-1", tasks=[{
+        "id": "t", "title": "harvest", "steps": [{"id": "s", "operation": "harvest_auto", "params": {}}]}])
+    store.claim_next_step("mock-save-123", "worker")
+    store.assign_command_id("mock-save-123", "t", "s", "owned-native")
+    if revoked:
+        store.cancel_goal("mock-save-123", store.state("mock-save-123").goals[0].id)
+    client = MagicMock(cancel_skill=AsyncMock())
+    mock_scheduler.ensure_connected = AsyncMock(return_value=client)
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="internal")
+    async def run():
+        with pytest.raises(ToolError, match="COMMAND_NOT_REVOKED"):
+            await server.call_tool("cancel_plan_command", {"command_id": "unrelated-native"})
+        if revoked:
+            _, result = await server.call_tool("cancel_plan_command", {"command_id": "owned-native"})
+            assert result == {"status": "cancellation-requested", "commandId": "owned-native"}
+        else:
+            with pytest.raises(ToolError, match="COMMAND_NOT_REVOKED"):
+                await server.call_tool("cancel_plan_command", {"command_id": "owned-native"})
+    asyncio.run(run())
+    if revoked:
+        assert client.cancel_skill.await_args.kwargs["correlation_id"] == "owned-native"
+        assert client.cancel_skill.await_count == 1
+    else:
+        mock_scheduler.ensure_connected.assert_not_awaited()
 
 
 @pytest.mark.parametrize("tiles", [[], [{"x": True, "y": 1}], [{"x": -1, "y": 1}], [{"x": 1}], [{"x": 1.5, "y": 1}]])

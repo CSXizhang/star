@@ -62,7 +62,10 @@ def test_auto_farm_actions_reject_house_scope_before_no_work_or_coordinate_dispa
         scheduler = CompanionScheduler(client=client)
         scheduler.execute_tiles = AsyncMock()
         scheduler.execute_skill = AsyncMock()
-        with pytest.raises(SchedulerError, match="[Nn]avigate to Farm first"):
+        # An incomplete Farm observation refuses to choose work before any
+        # house-scope navigation or coordinate dispatch is considered.
+        match = "[Nn]avigate to Farm first" if observed else "observation is unavailable"
+        with pytest.raises(SchedulerError, match=match):
             await getattr(scheduler, operation)()
         scheduler.execute_tiles.assert_not_called()
         scheduler.execute_skill.assert_not_called()

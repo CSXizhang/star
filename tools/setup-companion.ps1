@@ -11,6 +11,7 @@ param(
     [string]$TargetModDir = "",
     [ValidateSet('agy', 'kimi', 'codex', 'dsh', 'mcode', 'claude', 'all', 'none')][string]$Agent = 'kimi',
     [string]$Model = "",
+    [ValidateSet('default', 'off', 'low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = '',
     [switch]$AutoInstall,
     [switch]$DryRun,
     [switch]$CheckOnly,
@@ -27,12 +28,13 @@ $repoRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
 if (Test-Path -LiteralPath (Join-Path $repoRoot 'release-manifest.json')) {
     if ($Agent -notin @('kimi', 'agy', 'codex', 'dsh', 'mcode', 'none')) { throw 'Release chat supports kimi, agy, codex, dsh or mcode; use register-mcp.ps1 for other MCP clients.' }
     $releaseArgs = @{}
-    foreach ($key in @('GameDir', 'TargetModDir', 'Agent', 'Model', 'AutoInstall', 'DryRun', 'CheckOnly')) {
+    foreach ($key in @('GameDir', 'TargetModDir', 'Agent', 'Model', 'Effort', 'AutoInstall', 'DryRun', 'CheckOnly')) {
         if ($PSBoundParameters.ContainsKey($key)) { $releaseArgs[$key] = $PSBoundParameters[$key] }
     }
     & (Join-Path $scriptDir 'install-release.ps1') @releaseArgs
     exit 0
 }
+if ($PSBoundParameters.ContainsKey('Effort')) { throw 'Explicit Effort is supported by the verified release installer; use tools/install-release.ps1 from the release package.' }
 $distSourceDir = Join-Path $repoRoot "artifacts\dist\StardewAI.Companion.Mod"
 $runtimeDir = Join-Path $repoRoot "runtime"
 $detectScript = Join-Path $scriptDir "detect-game.ps1"
@@ -391,7 +393,8 @@ function Set-ChatBackendConfig([string]$backendName, [bool]$isDryRun = $false) {
     }
     $model = if ($backendName -eq 'kimi') { 'kimi-code/k3' } elseif ($backendName -eq 'dsh') { 'deepseek-flash' } elseif ($backendName -in @('codex', 'mcode')) { '' } else { 'gemini-3.8-flash' }
     $backendSettings = @{ backend = $backendName; model = $model }
-    if ($backendName -in @('codex', 'dsh', 'mcode')) { $backendSettings.effort = 'low' }
+    if ($backendName -in @('codex', 'dsh')) { $backendSettings.effort = 'low' }
+    if ($backendName -eq 'mcode') { $backendSettings.effort = 'default' }
     $jsonText = $backendSettings | ConvertTo-Json
     [System.IO.File]::WriteAllText($configFile, $jsonText, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "聊天后端已配置为 $backendName / $model"
@@ -537,7 +540,7 @@ $rbDsh.AutoSize = $true
 $grpAgent.Controls.Add($rbDsh)
 
 $rbMcode = New-Object System.Windows.Forms.RadioButton
-$rbMcode.Text = "MiniMax Code（mcode CLI，low）"
+$rbMcode.Text = "MiniMax Code（沿用客户端推理设置）"
 $rbMcode.Location = New-Object System.Drawing.Point(310, 75)
 $rbMcode.AutoSize = $true
 $grpAgent.Controls.Add($rbMcode)

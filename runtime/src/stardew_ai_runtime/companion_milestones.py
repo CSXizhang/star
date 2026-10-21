@@ -46,7 +46,7 @@ _SEASONS = tuple(sorted(SEASON_ORDER, key=SEASON_ORDER.get))  # spring..winter
 MAX_WIRE_NODES = 12
 _HISTORY_LIMIT = 100
 
-NODE_STATUSES = frozenset({"suggested", "adopted", "deferred", "completed", "missed"})
+NODE_STATUSES = frozenset({"suggested", "adopted", "deferred", "completed", "missed", "cancelled"})
 
 # Model-writable transitions only; completed/missed are set exclusively by
 # on_day_settled from verifiable state (contract §0/§3.1).
@@ -170,6 +170,7 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
 
 
 _PREPARATION_LABELS = {
+    "travel": "只沿可通行路线前往玩家指定地图与到达点，到达后报告；不购买、采集或操作物品，途中遵从暂停、继续和取消",
     "production": "持续负责玩家交付的种植与畜牧，按实际资金安排种子、工具、饲料、畜舍建造和购动物等必要前置，分批生产、照料和收取产物；跨日继续",
     "layout": "按认可的整体范围设计与分批施工，原生观察布局、放置或回收真实物品；保留保护区与通道，跨日继续",
     "water": "照料当前缺水作物，按实际体力和水量完成一小段浇水",
@@ -491,6 +492,8 @@ class CompanionMilestoneStore:
             try:
                 self._load()
                 record = self._data.setdefault(save_id, self._default_record())
+                # A game snapshot can restore an empty milestone record.
+                record.setdefault("nodes", {})
                 original_statuses = {node_id: node.get("status") for node_id, node in record["nodes"].items()}
                 result = fn(record)
                 node_saved = False
@@ -549,6 +552,16 @@ class CompanionMilestoneStore:
         nodes = [dict(n) for n in self._record(save_id).get("nodes", {}).values() if isinstance(n, dict)]
         return _sort_nodes(nodes)
 
+    def bind_player_request(self, save_id: str, node_id: str, request_id: str) -> None:
+        """Bridge-owned provenance; it does not adopt or revise an arrangement."""
+        def mutate(record: dict[str, Any]) -> dict[str, Any]:
+            node = record["nodes"].get(node_id)
+            if node is None:
+                raise MilestoneError(f"unknown node '{node_id}'")
+            node["playerRequestId"] = request_id
+            return node
+        self._mutate(save_id, mutate)
+
     def suggest(
         self,
         game_date: dict[str, Any] | None,
@@ -594,6 +607,9 @@ class CompanionMilestoneStore:
         source_url: str | None = None,
         preparation: list[str] | None = None,
         execution_scope: dict[str, Any] | None = None,
+        reserved_funds: int | None = None,
+        planned_count: int | None = None,
+        terms_note: str | None = None,
         game_date: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Model-proposed custom node during plan discussion (must carry a target date)."""
@@ -602,6 +618,16 @@ class CompanionMilestoneStore:
             raise MilestoneError("propose: title is required")
         if len(clean) > 60:
             raise MilestoneError("propose: title must be at most 60 chars")
+        if reserved_funds is not None:
+            if int(reserved_funds) < 0:
+                raise MilestoneError("reserved_funds must be non-negative")
+            reserved_funds = int(reserved_funds)
+        if planned_count is not None:
+            if int(planned_count) <= 0:
+                raise MilestoneError("planned_count must be positive")
+            planned_count = int(planned_count)
+        if terms_note is not None:
+            terms_note = str(terms_note).strip() or None
         prep_items = _custom_preparation_items(preparation or [])
         preparation = [prep["key"] for prep in prep_items]
         explicit_scope = _normalise_execution_scope(execution_scope) if execution_scope is not None else None
@@ -620,9 +646,9 @@ class CompanionMilestoneStore:
             "summary": (summary or "").strip() or None,
             "sourceUrl": (source_url or "").strip() or None,
             "prepItems": prep_items,
-            "reservedFunds": None,
-            "plannedCount": None,
-            "termsNote": None,
+            "reservedFunds": reserved_funds,
+            "plannedCount": planned_count,
+            "termsNote": terms_note,
             "verifyItems": [],
             "goalId": None,
             "todoIds": {},
@@ -638,6 +664,15 @@ class CompanionMilestoneStore:
                         and existing.get("targetDate") == node["targetDate"]
                         and existing.get("executionScope") == node.get("executionScope")
                         and [prep.get("key") for prep in existing.get("prepItems", [])] == preparation):
+                    # Same proposal re-sent: fold any newly provided terms into
+                    # the stored node instead of dropping them.
+                    changed = False
+                    for key in ("reservedFunds", "plannedCount", "termsNote"):
+                        if node[key] is not None and existing.get(key) != node[key]:
+                            existing[key] = node[key]
+                            changed = True
+                    if changed:
+                        existing["updatedAt"] = time.time()
                     return existing
             record["nodes"][node["id"]] = node
             self._bump(record, node["targetDate"], "propose", node["title"])
@@ -774,6 +809,16 @@ class CompanionMilestoneStore:
             return node
 
         return self._mutate(save_id, mutate, sync_work=work_store)
+
+    def withdraw_goals(self, save_id: str, goal_ids: set[str], *, all_arrangements: bool = False) -> None:
+        """Record withdrawn authorization; ordinary resume/revise cannot re-adopt it."""
+        def mutate(record: dict[str, Any]) -> None:
+            for node in record["nodes"].values():
+                if (node.get("goalId") in goal_ids or all_arrangements) and node.get("status") in {"suggested", "adopted", "deferred"}:
+                    node["status"] = "cancelled"
+                    node["updatedAt"] = time.time()
+                    self._bump(record, node.get("targetDate"), "cancel", node.get("title"))
+        self._mutate(save_id, mutate)
 
     def defer(
         self,

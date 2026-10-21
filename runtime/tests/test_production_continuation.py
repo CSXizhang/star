@@ -78,7 +78,8 @@ def test_deposit_keeps_requested_map_at_both_execution_boundaries():
         client.execute_deposit_chest = AsyncMock(return_value="native")
         async def execute(**kwargs):
             assert kwargs["location_id"] == "Shed"
-            await kwargs["dispatch"](client, task_id="t", idempotency_key="i", expires_seconds=30)
+            await kwargs["dispatch"](client, task_id="t", idempotency_key="i", expires_seconds=30,
+                                     command_id=kwargs.get("requested_command_id"))
             return {"terminalState": "succeeded"}
         scheduler.execute_skill = execute
         await scheduler.deposit_to_chest(3, 4, ["(O)306"], location_id="Shed", command_id="stable")

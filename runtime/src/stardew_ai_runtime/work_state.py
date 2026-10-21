@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import threading
 import time as _time
 import uuid
 from collections.abc import Callable
@@ -39,10 +40,12 @@ STEP_STATUSES = frozenset(
 )
 TODO_STATUSES = frozenset({"pending", "due", "done", "cancelled", "expired"})
 OUTCOMES = frozenset({"completed", "partial", "unknown", "cancelled", "failed"})
+REQUEST_ORIGINS = frozenset({"player", "player-midflight", "autonomy"})
 
 # Plan steps may only reference these existing MCP operations. No shell, no code.
 ALLOWED_OPERATIONS = frozenset(
     {
+        "observe_player_activities", "talk_npc", "interact_tile", "fish", "attack", "native_menu_select",
         "observe_building_services",
         "observe_production",
         "eat_food",
@@ -90,6 +93,11 @@ ALLOWED_OPERATIONS = frozenset(
         "plant_seeds",
         "ship_items",
         "purchase_items",
+        "sleep",
+        "open_shop",
+        "open_chest",
+        "native_advance",
+        "native_answer",
         "navigate_to",
         "pause_task",
         "resume_task",
@@ -98,6 +106,7 @@ ALLOWED_OPERATIONS = frozenset(
 )
 READ_ONLY_OPERATIONS = frozenset(
     {
+        "observe_player_activities",
         "observe_building_services",
         "observe_production",
         "observe_farming_helpers",
@@ -112,6 +121,7 @@ READ_ONLY_OPERATIONS = frozenset(
         "query_chests",
         "query_planting_options",
         "query_shop",
+        "query_route",
         "query_wiki",
     }
 )
@@ -316,9 +326,19 @@ class Goal:
     # Advisory design/phase/open questions; execution facts remain in the ledger.
     project: dict[str, Any] = field(default_factory=dict)
     status: str = "active"
+    # Goal hierarchy: exactly one active ``main`` goal per save; ``stage`` and
+    # ``daily`` goals hang off it via ``parent_id``. Day settlement records
+    # progress on the main goal but never closes it.
+    kind: str = "stage"
+    parent_id: str | None = None
     epoch: int = 0
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
+
+
+GOAL_KINDS = frozenset({"main", "stage", "daily"})
+_PROGRESS_LOG_LIMIT = 30
+_PROGRESS_NOTE_LIMIT = 500
 
 
 @dataclass
@@ -346,6 +366,8 @@ class ExecutionEntry:
     at: str = field(default_factory=_now_iso)
     location_id: str | None = None
     game_time: int | None = None
+    request_id: str | None = None
+    goal_id: str | None = None
 
 
 @dataclass
@@ -366,6 +388,12 @@ class SaveWorkState:
     # Completed/cancelled task facts archived by the day rollover. Bounded.
     archive: list[dict[str, Any]] = field(default_factory=list)
     branch_failures: list[dict[str, Any]] = field(default_factory=list)
+    # Original request contracts (text plus selected-task binding). Bounded to
+    # the newest 50; requests still owed a delivery are never trimmed.
+    requests: list[dict[str, Any]] = field(default_factory=list)
+    # Persistent terminal-fact outbox. Undelivered events are never trimmed;
+    # only the newest 100 consumed events are bounded away.
+    outbox: list[dict[str, Any]] = field(default_factory=list)
 
 
 # Retired engine allowance fields never become model instructions again. Player
@@ -410,12 +438,138 @@ def bind_execution_scope_params(operation: str, params: dict[str, Any],
     return result
 
 
+def _outbox_event_from_dict(value: dict[str, Any]) -> dict[str, Any]:
+    """Fill the persistent delivery/notify structure, keeping recorded state."""
+    event = dict(value)
+    delivery = {"state": "pending", "attempts": 0, "sentAt": None, "consumedAt": None}
+    delivery.update(event.get("delivery") or {})
+    event["delivery"] = delivery
+    notify = {
+        "key": f"{event.get('commandId')}:{event.get('outcome')}",
+        "state": "pending",
+        "deliveredAt": None,
+    }
+    notify.update(event.get("notify") or {})
+    event["notify"] = notify
+    return event
+
+
+def _request_is_pending(state: SaveWorkState, request: dict[str, Any]) -> bool:
+    if request.get("origin") == "player-midflight" and not request.get("consumedByDelivery"):
+        return True
+    request_id = request.get("id")
+    if any(g.status == "active" and g.constraints.get("playerRequestId") == request_id
+           for g in state.goals):
+        return True
+    if state.decision.get("requestId") == request_id and not state.decision.get("finished"):
+        return True
+    if any(t.id in request.get("taskIds", []) and t.status in {"pending", "running", "waiting", "unknown"}
+           for t in state.tasks):
+        return True
+    return any(
+        event.get("requestId") == request_id
+        and (event.get("delivery") or {}).get("state") != "consumed"
+        for event in state.outbox
+    )
+
+
+def _request_is_preset_bound(request: dict[str, Any]) -> bool:
+    """Preset autostart requests stay forever: they are the binding source that
+    ``preset_day_boundary`` uses to recover/verify the preset run's goalId, so
+    the 50-request bound must never trim them away."""
+    request_id = str(request.get("id") or "")
+    return request_id.startswith("preset-")
+
+
+def _trim_requests(state: SaveWorkState) -> None:
+    # Only the oldest resolved requests are bounded away; pending contracts and
+    # preset-bound originals stay.
+    while len(state.requests) > 50:
+        stale = next(
+            (i for i, request in enumerate(state.requests)
+             if not _request_is_preset_bound(request)
+             and not _request_is_pending(state, request)),
+            None,
+        )
+        if stale is None:
+            return
+        state.requests.pop(stale)
+
+
+def _bounded_outbox(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def resolved(event):
+        notify = event.get("notify") or {}
+        return ((event.get("delivery") or {}).get("state") == "consumed"
+                and (not notify.get("reply") or notify.get("state") == "delivered"))
+    consumed = sum(1 for event in events if resolved(event))
+    drop = max(0, consumed - 100)
+    if drop == 0:
+        return events
+    kept: list[dict[str, Any]] = []
+    for event in events:
+        if drop and resolved(event):
+            drop -= 1
+            continue
+        kept.append(event)
+    return kept
+
+
+def _append_outbox_event(state: SaveWorkState, event: dict[str, Any]) -> dict[str, Any]:
+    explicit_kind = event.get("kind") or "terminal"
+    command_id = str(event.get("commandId"))
+    kind = explicit_kind
+    unknown_fact = any(
+        e.get("commandId") == command_id and e.get("outcome") == "unknown"
+        for e in state.outbox
+    )
+    if kind == "terminal" and unknown_fact and event.get("outcome") != "unknown":
+        kind = "correction"
+    if kind == "correction":
+        reason = event.get("reasonCode")
+        existing = next(
+            (
+                e
+                for e in state.outbox
+                if e.get("kind") == "correction"
+                and e.get("commandId") == command_id
+                and e.get("outcome") == event.get("outcome")
+                and e.get("reasonCode") == reason
+            ),
+            None,
+        )
+    else:
+        existing = next(
+            (
+                e
+                for e in state.outbox
+                if e.get("kind") == "terminal" and e.get("commandId") == command_id
+            ),
+            None,
+        )
+    if existing is not None and (existing.get("delivery") or {}).get("state") == "consumed":
+        return dict(existing)
+    stored = _outbox_event_from_dict({**event, "kind": kind})
+    if existing is not None:
+        stored["id"] = existing.get("id") or _new_id("obx")
+        stored["delivery"] = existing["delivery"]
+        previous_notify = existing.get("notify") or {}
+        stored["notify"]["state"] = previous_notify.get("state", "pending")
+        stored["notify"]["deliveredAt"] = previous_notify.get("deliveredAt")
+        existing.clear()
+        existing.update(stored)
+        return dict(existing)
+    stored.setdefault("id", _new_id("obx"))
+    state.outbox.append(stored)
+    return dict(stored)
+
+
 class WorkStore:
     """Cross-process, per-save work state store."""
 
     def __init__(self, state_path: Path | str):
         self.state_path = Path(state_path)
         self._states: dict[str, SaveWorkState] = {}
+        self._thread_lock = threading.RLock()
         self._load()
 
     # ------------------------------------------------------------------ IO
@@ -434,8 +588,17 @@ class WorkStore:
                 if not isinstance(value, dict):
                     continue
                 states[save_id] = SaveWorkState(
-                    goals=[Goal(**{**g, "constraints": _current_constraints(g.get("constraints") or {})})
-                           for g in value.get("goals", []) if isinstance(g, dict)],
+                    goals=[
+                        Goal(
+                            **{
+                                **g,
+                                "kind": g.get("kind") or ("main" if g.get("source") == "preset" else "stage"),
+                                "parent_id": g.get("parent_id") if g.get("parent_id") is not None else g.get("parentId"),
+                                "constraints": _current_constraints(g.get("constraints") or {}),
+                            }
+                        )
+                        for g in value.get("goals", []) if isinstance(g, dict)
+                    ],
                     tasks=[
                         Task(
                             **{
@@ -468,13 +631,16 @@ class WorkStore:
                     ),
                     archive=[a for a in value.get("archive", []) if isinstance(a, dict)],
                     branch_failures=[b for b in value.get("branchFailures", []) if isinstance(b, dict)],
+                    requests=[r for r in value.get("requests", []) if isinstance(r, dict)],
+                    outbox=[_outbox_event_from_dict(o) for o in value.get("outbox", []) if isinstance(o, dict)],
                 )
         except (TypeError, ValueError):
             states = {}
         self._states = states
 
     def reload(self) -> None:
-        self._load()
+        with self._thread_lock:
+            self._load()
 
     @staticmethod
     def _lock(lock: Any) -> None:
@@ -516,6 +682,8 @@ class WorkStore:
                 # Bound the archived fact log so it never grows without limit.
                 "archive": state.archive[-200:],
                 "branchFailures": state.branch_failures[-60:],
+                "requests": state.requests,
+                "outbox": _bounded_outbox(state.outbox),
             }
         temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         for attempt in range(4):
@@ -528,6 +696,13 @@ class WorkStore:
                 _time.sleep(0.05 * (attempt + 1))
 
     def _mutate(self, save_id: str, mutate: Callable[[SaveWorkState], Any]) -> Any:
+        # Reads reload this instance's state map. Protect it while another thread
+        # prepares a mutation, or a read can replace the map before commit and
+        # silently write the old decision back despite the cross-process lock.
+        with self._thread_lock:
+            return self._mutate_locked(save_id, mutate)
+
+    def _mutate_locked(self, save_id: str, mutate: Callable[[SaveWorkState], Any]) -> Any:
         if not save_id:
             raise WorkStateError("save_id is required")
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -551,8 +726,9 @@ class WorkStore:
     def state(self, save_id: str) -> SaveWorkState:
         if not save_id:
             raise WorkStateError("save_id is required")
-        self._load()
-        return self._states.setdefault(save_id, SaveWorkState())
+        with self._thread_lock:
+            self._load()
+            return self._states.setdefault(save_id, SaveWorkState())
 
     def request_player_decision(self, save_id: str, goal_id: str, message: str) -> dict[str, Any]:
         """Explicit model signal, separate from routine completion text."""
@@ -616,6 +792,13 @@ class WorkStore:
         self._mutate(save_id, mutate)
 
     # ------------------------------------------------------------- goals
+    @staticmethod
+    def _active_main_goal(state: SaveWorkState) -> Goal | None:
+        return next(
+            (g for g in state.goals if g.status == "active" and g.kind == "main"),
+            None,
+        )
+
     def add_goal(
         self,
         save_id: str,
@@ -623,26 +806,165 @@ class WorkStore:
         source: str = "user",
         priority: int = 0,
         constraints: dict[str, Any] | None = None,
+        *,
+        kind: str | None = None,
+        parent_id: str | None = None,
     ) -> Goal:
         clean = (text or "").strip()
         if not clean:
             raise WorkStateError("goal text cannot be empty")
         if source not in GOAL_SOURCES:
             raise WorkStateError("goal source must be 'user' or 'agent'")
-        goal = Goal(
-            id=_new_id("goal"),
-            text=clean,
-            source=source,
-            priority=int(priority),
-            constraints=dict(constraints or {}),
-        )
+        if kind is not None and kind not in GOAL_KINDS:
+            raise WorkStateError(f"invalid goal kind '{kind}'")
+
+        goal: Goal | None = None
+        resolved_kind: str | None = None
+        resolved_parent: str | None = parent_id
 
         def mutate(state: SaveWorkState) -> None:
+            nonlocal goal, resolved_kind, resolved_parent
+            active_main = self._active_main_goal(state)
+            if kind is None:
+                # Default hierarchy: a preset assignment is always the main
+                # goal; anything else becomes the first main goal when none is
+                # active yet, otherwise a stage hung off the active main.
+                resolved_kind = (
+                    "main"
+                    if source == "preset" or active_main is None
+                    else "stage"
+                )
+            else:
+                resolved_kind = kind
+                if kind == "main" and active_main is not None:
+                    raise WorkStateError(
+                        "MAIN_GOAL_EXISTS: this save already has an active main goal; "
+                        "attach new work as a stage/daily goal or finish the existing "
+                        "main goal before starting another one"
+                    )
+            if resolved_kind in {"stage", "daily"} and resolved_parent is None and active_main is not None:
+                resolved_parent = active_main.id
+            goal = Goal(
+                id=_new_id("goal"),
+                text=clean,
+                source=source,
+                priority=int(priority),
+                constraints=dict(constraints or {}),
+                kind=resolved_kind,
+                parent_id=resolved_parent,
+            )
             state.goals.append(goal)
             state.scheduler_epoch += 1
 
         self._mutate(save_id, mutate)
+        assert goal is not None
         return goal
+
+    def reconcile_verified_preset_history(self, save_id: str, native_day: int | None) -> list[str]:
+        """Restore post-save terminal receipts before accepting a different run.
+
+        Native serialization precedes the sleep callback. Only the durable,
+        exact-save/request/goal boundary with a verified native sleep can close
+        an active goal restored from that older checkpoint. Human pauses and
+        cancellations, unrelated goals and incomplete receipts are untouched.
+        """
+        if type(native_day) is not int:
+            return []
+        from .snapshot_cache import read_cache
+        try:
+            rows = read_cache(self.state_path.parent / "preset-day-boundary.json")
+        except (OSError, ValueError):
+            return []
+        completed = []
+        for request_id, row in rows.items():
+            if not isinstance(row, dict) or row.get("saveId") != save_id or row.get("phase") != "completed":
+                continue
+            receipt = row.get("nativeSleep") or {}
+            start, end, maximum = row.get("startDay"), receipt.get("endDay"), row.get("maxGameDays")
+            if (receipt.get("via") != "native-sleep" or receipt.get("kind") != "day-advanced"
+                    or type(start) is not int or type(end) is not int or type(maximum) is not int
+                    or maximum < 1 or maximum > 28 or receipt.get("startDay") != start
+                    or end < start + maximum or native_day < end
+                    or row.get("requestId") != request_id or row.get("unfinishedTaskIdsAtBoundary")):
+                continue
+            goal = next((g for g in self.state(save_id).goals if g.id == row.get("goalId")), None)
+            if (goal is None or goal.kind != "main" or goal.status != "active"
+                    or goal.constraints.get("presetRequestId") != request_id):
+                continue
+            def restore_terminal(state, goal_id=goal.id, expected_request=request_id, boundary_receipt=receipt):
+                restored = self._find_goal(state, goal_id)
+                if restored.status != "active" or restored.constraints.get("presetRequestId") != expected_request:
+                    return False
+                if any(t.status not in {"completed", "cancelled"} for t in state.tasks if t.goal_id == restored.id):
+                    raise WorkStateError("PROJECT_UNRESOLVED: saved preset still has unreconciled work")
+                # Do not consult the newly configured run's budget here: this
+                # receipt belongs to the exact older request just verified.
+                restored.status = "completed"
+                restored.project = {**restored.project, "phase": "completed",
+                                    "completionAssessment": "restored-verified-native-sleep-boundary",
+                                    "nativeBoundary": boundary_receipt}
+                restored.updated_at = _now_iso()
+                restored.epoch += 1
+                self._retire_child_authorizations(state, restored)
+                state.scheduler_epoch += 1
+                for todo in state.todos:
+                    if todo.goal_id == restored.id and todo.status in {"pending", "due"}:
+                        todo.status = "done"
+                return True
+            if self._mutate(save_id, restore_terminal):
+                completed.append(goal.id)
+        return completed
+
+    def ensure_preset_main_goal(self, save_id: str, request_id: str, authorized_text: str) -> Goal:
+        """Accept a verified isolated preset once, before its first model turn.
+
+        This records only the authorized objective, never selects native work.
+        A model may start by waiting; that must still have a resumable main scope.
+        """
+        def mutate(state: SaveWorkState) -> Goal:
+            for old_parent in state.goals:
+                if old_parent.kind == "main" and old_parent.status in {"completed", "cancelled"}:
+                    self._retire_child_authorizations(state, old_parent)
+            root = next((r for r in state.requests if r.get("id") == request_id), None)
+            if root is None or root.get("origin") != "player" or root.get("text") != authorized_text:
+                raise WorkStateError("PRESET_REQUEST_MISMATCH")
+            if root.get("goalId"):
+                return self._find_goal(state, root["goalId"])
+            if root.get("workStopped"):
+                raise WorkStateError("WORK_STOPPED: cancelled preset cannot be revived")
+            if self._active_main_goal(state) is not None:
+                raise WorkStateError("MAIN_GOAL_EXISTS: preset cannot replace another active objective")
+            goal = Goal(id=_new_id("goal"), text=authorized_text, source="user", kind="main",
+                        constraints={"playerRequestId": request_id, "presetRequestId": request_id})
+            state.goals.append(goal)
+            root["goalId"] = goal.id
+            state.scheduler_epoch += 1
+            return goal
+        return self._mutate(save_id, mutate)
+
+    def bind_preset_main_goal(self, save_id: str, goal_id: str, authorized_text: str | None = None) -> Goal:
+        """Bind the trusted isolated preset to its sole main goal, idempotently."""
+        clean = authorized_text.strip() if authorized_text else None
+        current = self._find_goal(self.state(save_id), goal_id)
+        if current.status != "active" or (current.kind == "main" and (clean is None or current.text == clean)):
+            return current
+        def mutate(state: SaveWorkState) -> Goal:
+            goal = self._find_goal(state, goal_id)
+            if goal.status != "active" or (goal.kind == "main" and (clean is None or goal.text == clean)):
+                return goal
+            other = self._active_main_goal(state)
+            if other is not None and other.id != goal_id:
+                raise WorkStateError("MAIN_GOAL_EXISTS: cannot rebind another active main goal")
+            if clean is not None and goal.text != clean:
+                goal.project.setdefault("reason", goal.text)
+                goal.text = clean
+            goal.kind = "main"
+            goal.parent_id = None
+            goal.epoch += 1
+            goal.updated_at = _now_iso()
+            state.scheduler_epoch += 1
+            return goal
+        return self._mutate(save_id, mutate)
 
     def revise_goal(
         self,
@@ -655,8 +977,15 @@ class WorkStore:
         status: str | None = None,
         project: dict[str, Any] | None = None,
     ) -> Goal:
+        preset_finalize = False
+        if status == "completed":
+            preset_finalize = self._check_preset_completion(save_id, goal_id)
         def mutate(state: SaveWorkState) -> Goal:
             goal = self._find_goal(state, goal_id)
+            if status == "completed":
+                self._assert_main_goal_closable(state, goal, preset_finalize=preset_finalize)
+            if goal.status == "cancelled" and status is not None and status != "cancelled":
+                raise WorkStateError("cancelled goals cannot be resumed; create a new goal for a new assignment")
             if text is not None:
                 if not text.strip():
                     raise WorkStateError("goal text cannot be empty")
@@ -702,6 +1031,8 @@ class WorkStore:
                          if g.constraints.get("milestoneId") == milestone_id
                          or g.id == existing_goal_id), None)
             desired = {**constraints, "milestoneId": milestone_id}
+            if goal is not None and goal.status == "cancelled":
+                raise WorkStateError("ARRANGEMENT_WITHDRAWN: a cancelled arrangement requires a new player assignment")
             signature = {"text": text, "constraints": desired, "todos": todos}
             if goal is None:
                 goal = Goal(id=_new_id("goal"), text=text, source="user", constraints=desired)
@@ -736,12 +1067,54 @@ class WorkStore:
 
         return self._mutate(save_id, mutate)
 
-    def complete_goal(self, save_id: str, goal_id: str) -> Goal:
+    def _check_preset_completion(self, save_id: str, goal_id: str) -> bool:
+        # Only the explicitly opted-in independent preset owns this day budget.
+        # A daily report is not completion of its multi-day parent project.
+        # Returns True exactly when this goal is the preset-bound goal whose
+        # verified day boundary allows completion (the preset finalize path).
+        from .preset_day_boundary import PresetDayBoundary
+        boundary = PresetDayBoundary(self.state_path.parent.parent)
+        if not boundary.enabled:
+            return False
+        row = boundary.record(save_id, self)
+        if not row or row.get("goalId") != goal_id:
+            return False
+        try:
+            snapshot = json.loads((self.state_path.parent / "life-snapshot.json").read_text(encoding="utf-8-sig"))
+            payload = snapshot.get("payload", snapshot)
+        except (OSError, ValueError):
+            payload = None
+        day = boundary.native_day(payload)
+        if row.get("phase") != "completed" and (row.get("startDay") is None or day is None
+                or day < row["startDay"] + row["maxGameDays"]):
+            raise WorkStateError("PRESET_DAY_NOT_FINISHED: this is a multi-day goal; keep it active, record today's progress and plan the next day after native sleep/save")
+        return True
+
+    def _assert_main_goal_closable(self, state: SaveWorkState, goal: Goal, *, preset_finalize: bool) -> None:
+        """The single long-term main goal is never closed by the model.
+
+        A main goal may close only at a verified preset day boundary (the
+        preset finalize path, whose budget check already passed) or by the
+        player (source='user'). Model turns record daily progress instead.
+        """
+        if goal.kind != "main" or goal.status == "completed" or preset_finalize:
+            return
+        if goal.source == "user":
+            return
+        raise WorkStateError(
+            "MAIN_GOAL_LOCKED: the long-term main goal stays active across day "
+            "settlements; record today's progress on it instead, or ask the "
+            "player to close it. Only a verified preset day boundary may end it."
+        )
+
+    def complete_goal(self, save_id: str, goal_id: str, *, verified_native_boundary: dict | None = None) -> Goal:
         """Close the model's project assessment without inventing native effects."""
+        preset_finalize = self._check_preset_completion(save_id, goal_id)
         def mutate(state: SaveWorkState) -> Goal:
             goal = self._find_goal(state, goal_id)
             if goal.status == "completed":
                 return goal
+            self._assert_main_goal_closable(state, goal, preset_finalize=preset_finalize)
             tasks = [t for t in state.tasks if t.goal_id == goal_id]
             if any(t.status not in {"completed", "cancelled"} for t in tasks):
                 raise WorkStateError("PROJECT_UNRESOLVED: finish or reconcile outstanding work before closing the project")
@@ -749,13 +1122,19 @@ class WorkStore:
             completed += [entry["task"]["id"] for entry in state.archive
                           if entry.get("task", {}).get("goal_id") == goal_id
                           and entry["task"].get("status") == "completed"]
-            if not completed:
+            restored = bool(verified_native_boundary and verified_native_boundary.get("via") == "native-sleep"
+                            and verified_native_boundary.get("kind") == "day-advanced"
+                            and isinstance(verified_native_boundary.get("startDay"), int)
+                            and isinstance(verified_native_boundary.get("endDay"), int)
+                            and verified_native_boundary["endDay"] > verified_native_boundary["startDay"])
+            if not completed and not restored:
                 raise WorkStateError("PROJECT_NO_EXECUTION: no completed native task evidence; cancel an unneeded goal instead")
             goal.status = "completed"
             goal.project = {**goal.project, "phase": "completed", "completionAssessment": "model-reviewed",
                             "completedTaskIds": completed[-64:]}
             goal.updated_at = _now_iso()
             goal.epoch += 1
+            self._retire_child_authorizations(state, goal)
             state.scheduler_epoch += 1
             for todo in state.todos:
                 if todo.goal_id == goal_id and todo.status in {"pending", "due"}:
@@ -763,25 +1142,177 @@ class WorkStore:
             return goal
         return self._mutate(save_id, mutate)
 
+    @staticmethod
+    def _retire_child_authorizations(state: SaveWorkState, parent: Goal) -> list[str]:
+        """End a closed project's child authorization, preserving its knowledge.
+
+        A retained independent intent must explicitly declare carryAcrossGoals
+        and a reason. Ordinary design notes are history, not perpetual authority.
+        Never manufacture completed native work or cancel an unresolved command.
+        """
+        retired = []
+        children = [g for g in state.goals if g.parent_id == parent.id and g.status in {"active", "paused"}]
+        for child in children:
+            if child.constraints.get("carryAcrossGoals") is True and isinstance(child.constraints.get("carryReason"), str) and child.constraints["carryReason"].strip():
+                child.status = "paused"
+                child.project = {**child.project, "phase": "retained-intent-awaiting-reacceptance", "closedParentId": parent.id,
+                                 "retirementReason": "Explicit independent intent retained; closed parent cannot authorize further dispatch. Reaccept under an authorized main goal before resuming."}
+                continue
+            tasks = [t for t in state.tasks if t.goal_id == child.id]
+            if any(s.command_id and s.status in {"running", "unknown", "waiting"} and s.operation not in READ_ONLY_OPERATIONS for t in tasks for s in t.steps):
+                child.status = "paused"
+                child.project = {**child.project, "phase": "needs-reconciliation", "closedParentId": parent.id}
+                continue
+            for task in tasks:
+                if task.status not in {"completed", "cancelled"}:
+                    WorkStore._cancel_task_steps(task)
+            child.status = "cancelled"
+            child.project = {**child.project, "phase": "retired-with-parent", "closedParentId": parent.id,
+                             "retirementReason": "Parent authorization ended; facts and design notes remain available as history, not completed work."}
+            child.updated_at = _now_iso()
+            child.epoch += 1
+            for todo in state.todos:
+                if todo.goal_id == child.id and todo.status in {"pending", "due"}:
+                    todo.status = "cancelled"
+            retired.append(child.id)
+        return retired
+
+    def reconcile_closed_goal_children(self, save_id: str) -> list[str]:
+        """Repair historical parent/child scope without inventing task success."""
+        current = self.state(save_id)
+        closed = {g.id for g in current.goals if g.kind == "main" and g.status in {"completed", "cancelled"}}
+        def needs_repair(g):
+            if g.parent_id not in closed or g.kind not in {"stage", "daily"} or g.status not in {"active", "paused"}:
+                return False
+            if g.status == "paused" and g.project.get("closedParentId") == g.parent_id:
+                if (g.project.get("phase") == "retained-intent-awaiting-reacceptance"
+                        and g.constraints.get("carryAcrossGoals") is True
+                        and str(g.constraints.get("carryReason") or "").strip()):
+                    return False
+                if (g.project.get("phase") == "needs-reconciliation"
+                        and any(s.command_id and s.status in {"running", "unknown", "waiting"}
+                                and s.operation not in READ_ONLY_OPERATIONS
+                                for t in current.tasks if t.goal_id == g.id for s in t.steps)):
+                    return False
+            return True
+        if not any(needs_repair(g) for g in current.goals):
+            return []  # A normal overview is a read, not an unnecessary file replacement.
+        def mutate(state):
+            retired = []
+            for parent in state.goals:
+                if parent.kind == "main" and parent.status in {"completed", "cancelled"}:
+                    retired.extend(self._retire_child_authorizations(state, parent))
+            if retired:
+                state.scheduler_epoch += 1
+            return retired
+        return self._mutate(save_id, mutate)
+
+    def add_progress_note(self, save_id: str, goal_id: str, note: str, game_date: str | None = None) -> Goal:
+        """Append one bounded progress note to the goal's project progressLog.
+
+        Day settlement and model summaries record progress here; the log keeps
+        at most 30 notes of 500 characters each, trimming the oldest first.
+        """
+        clean = (note or "").strip()
+        if not clean:
+            raise WorkStateError("progress note cannot be empty")
+
+        def mutate(state: SaveWorkState) -> Goal:
+            goal = self._find_goal(state, goal_id)
+            log = goal.project.get("progressLog")
+            if not isinstance(log, list):
+                log = []
+            log.append({
+                "date": game_date or "unknown",
+                "note": clean[:_PROGRESS_NOTE_LIMIT],
+                "at": _now_iso(),
+            })
+            goal.project = {**goal.project, "progressLog": log[-_PROGRESS_LOG_LIMIT:]}
+            goal.updated_at = _now_iso()
+            goal.epoch += 1
+            return goal
+
+        return self._mutate(save_id, mutate)
+
+    def record_decision_note(self, save_id: str, goal_id: str, note: str, category: str,
+                             location_id: str, basis_command_id: str | None = None) -> dict[str, Any]:
+        """Persist bounded model interpretation/intent without creating authority."""
+        if category not in {"observation", "hypothesis", "intent", "failure"} or not isinstance(note,str) or not note.strip() or len(note)>800:
+            raise WorkStateError("Explicit category and a note of 1..800 characters required")
+        if not isinstance(location_id,str) or not location_id.strip():
+            raise WorkStateError("Explicit observation/intent map scope required")
+        def mutate(state):
+            goal=self._find_goal(state,goal_id)
+            if goal.kind!="main" or goal.status!="active":
+                raise WorkStateError("Decision notes attach to the active long-term main goal, not a new authorizing stage")
+            basis=next((e for e in reversed(state.executions) if e.command_id==basis_command_id),None)
+            if category in {"observation","failure"} and basis is None:
+                raise WorkStateError("A real persisted basis_command_id is required; unverified interpretations belong to hypothesis")
+            if category=="observation" and basis.outcome!="completed":
+                raise WorkStateError("Unknown/failed commands cannot establish observation facts")
+            row={"category":category,"text":note.strip(),"locationId":location_id,"recordedAt":_now_iso(),
+                 "source":"model-interpretation" if category=="observation" else "model",
+                 "basisCommandId":basis_command_id,"basisOperation":basis.operation if basis else None,
+                 "gameDate":basis.game_date if basis else state.last_settled_day,
+                 "rule":"Current native evidence overrides this dated note. Intent is advisory, not additional authorization."}
+            notes=goal.project.get("decisionNotes") or []
+            if not any(n.get("text")==row["text"] and n.get("category")==category for n in notes if isinstance(n,dict)):
+                goal.project={**goal.project,"decisionNotes":[*notes,row][-16:]}
+                goal.updated_at=_now_iso()
+            return row
+        return self._mutate(save_id,mutate)
+
+    def retire_budget_intents(self, save_id: str, goal_id: str) -> list[str]:
+        """Expire unexecuted remainder at a verified native day boundary.
+
+        This closes authorization, never claims failed/partial work succeeded.
+        Dispatched commands lacking a terminal remain a reconciliation barrier.
+        """
+        def mutate(state):
+            tasks = [t for t in state.tasks if t.goal_id == goal_id]
+            if any(s.command_id and s.status in {"running", "unknown", "waiting"}
+                   and s.operation not in READ_ONLY_OPERATIONS
+                   for t in tasks for s in t.steps):
+                raise WorkStateError("BOUNDARY_RECONCILIATION_REQUIRED: dispatched command lacks a terminal")
+            retired = []
+            for task in tasks:
+                if task.status not in {"completed", "cancelled"}:
+                    self._cancel_task_steps(task)
+                    # Unavailable observations performed no native mutation.
+                    # Preserve their unknown execution facts, but retire intent.
+                    for step in task.steps:
+                        if step.operation in READ_ONLY_OPERATIONS and step.status == "unknown":
+                            step.status = "cancelled"
+                    retired.append(task.id)
+            for todo in state.todos:
+                if todo.goal_id == goal_id and todo.status in {"pending", "due"}:
+                    todo.status = "cancelled"
+            state.scheduler_epoch += 1
+            return retired
+        return self._mutate(save_id, mutate)
+
     def cancel_goal(self, save_id: str, goal_id: str) -> Goal:
         return self.revise_goal(save_id, goal_id, status="cancelled")
 
+    @staticmethod
+    def _cancel_task_steps(task: Task) -> None:
+        task.status = "cancelled"
+        task.updated_at = _now_iso()
+        for step in task.steps:
+            if step.status in {"pending", "running", "unknown", "waiting"}:
+                # Retiring intent cannot invent a terminal for a dispatched command.
+                if step.command_id and step.status in {"running", "unknown", "waiting"}:
+                    step.status = "unknown"
+                    step.reason_code = step.reason_code or "UNCONFIRMED_AFTER_CANCEL"
+                else:
+                    step.status = "cancelled"
+                step.lease_owner = None
+                step.lease_until = 0.0
+
     def _cancel_goal_children(self, state: SaveWorkState, goal_id: str) -> None:
         for task in state.tasks:
-            if task.goal_id == goal_id and task.status not in {"completed", "cancelled"}:
-                task.status = "cancelled"
-                task.updated_at = _now_iso()
-                for step in task.steps:
-                    if step.status in {"pending", "running", "unknown"}:
-                        # Cancelling intent cannot confirm an already dispatched
-                        # native command. Keep it reconcilable, never replay it.
-                        if step.command_id and step.status in {"running", "unknown"}:
-                            step.status = "unknown"
-                            step.reason_code = step.reason_code or "UNCONFIRMED_AFTER_CANCEL"
-                        else:
-                            step.status = "cancelled"
-                        step.lease_owner = None
-                        step.lease_until = 0.0
+            if task.goal_id == goal_id and task.status != "completed":
+                self._cancel_task_steps(task)
         for todo in state.todos:
             if todo.goal_id == goal_id and todo.status in {"pending", "due"}:
                 todo.status = "cancelled"
@@ -910,9 +1441,17 @@ class WorkStore:
         state.tasks.extend(plan)
         return plan
 
-    def begin_decision(self, save_id: str, token: str, *, require_idle: bool = False, goal_scope: str | None = None) -> None:
+    def begin_decision(self, save_id: str, token: str, *, require_idle: bool = False,
+                       goal_scope: str | None = None, goal_default: str | None = None,
+                       request_id: str | None = None, request_ids: list[str] | None = None) -> None:
         """A fresh provider invocation, not a goal/todo, may select one short job."""
         def mutate(state: SaveWorkState) -> None:
+            current = state.decision
+            selected_ids = current.get("taskIds") or [current.get("taskId")]
+            if (current.get("selected") and not current.get("finished")
+                    and any(t.id in selected_ids and t.status in {"pending", "running", "waiting", "unknown"}
+                            for t in state.tasks)):
+                raise WorkStateError("GAME_BUSY: the selected native job retains its decision until it settles")
             if require_idle:
                 if state.paused or any(t.status in {"pending", "running", "waiting", "unknown"} for t in state.tasks):
                     raise WorkStateError("GAME_BUSY: resolve or cancel existing work, and resume paused work before starting an external turn")
@@ -924,12 +1463,23 @@ class WorkStore:
             state.scheduler_epoch += 1
             state.decision = {"token": token, "epoch": state.scheduler_epoch,
                               "expires": _time.time() + 1200, "selected": False}
+            known_requests = {r.get("id") for r in state.requests}
+            if request_id in known_requests:
+                state.decision["requestId"] = request_id
+            offered = [r for r in request_ids or [] if r in known_requests]
+            if offered:
+                state.decision["requestIds"] = offered
             active_goals = [goal for goal in state.goals if goal.status == "active"]
             if goal_scope:
                 if not any(g.id == goal_scope for g in active_goals):
                     raise WorkStateError("Scoped project is not active")
                 state.decision["goalId"] = goal_scope
                 state.decision["goalScope"] = goal_scope
+            elif goal_default and any(g.id == goal_default for g in active_goals):
+                # Soft thread continuity (e.g. an outbox delivery turn): an
+                # unqualified submit_plan defaults to the originating goal, while
+                # an explicit different goal_id remains legal new business.
+                state.decision["goalId"] = goal_default
             elif len(active_goals) == 1:
                 state.decision["goalId"] = active_goals[0].id
         self._mutate(save_id, mutate)
@@ -955,6 +1505,16 @@ class WorkStore:
         def mutate(state: SaveWorkState) -> None:
             state.scheduler_epoch += 1
             state.decision = {}
+        self._mutate(save_id, mutate)
+
+    def stop_request(self, save_id: str, request_id: str, *, reason: str) -> None:
+        """Close scheduling intent independently of the native cancellation result."""
+        def mutate(state: SaveWorkState) -> None:
+            request = next((r for r in state.requests if r.get("id") == request_id), None)
+            if request is not None:
+                request.update(workStopped=True, workStoppedReason=reason, workStoppedAt=_now_iso())
+                if request.get("origin") == "player-midflight":
+                    request["consumedByDelivery"] = True
         self._mutate(save_id, mutate)
 
     def select_direct_job(self, save_id: str, token: str | None, operation: str) -> None:
@@ -1002,6 +1562,7 @@ class WorkStore:
         replace: bool = False,
         source: str = "agent",
         decision_token: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Model-facing plan entry point: submit or revise a short plan for a goal.
 
@@ -1026,6 +1587,15 @@ class WorkStore:
         def mutate(state: SaveWorkState) -> None:
             nonlocal resolved_goal_id, resolved_goal_source, created_goal
             self._assert_decision_valid(state, decision_token)
+            owning_request_id = request_id or state.decision.get("requestId")
+            offered = [state.decision.get("requestId"), *state.decision.get("requestIds", [])]
+            if not request_id and len({r for r in offered if r}) > 1:
+                raise WorkStateError("REQUEST_ID_REQUIRED: choose the original instruction from this decision's request IDs using submit_plan(request_id=...) or call_capability(request_id=...). No job selected.")
+            if request_id and request_id not in offered:
+                raise WorkStateError("Request is not part of this decision")
+            owning_request = next((r for r in state.requests if r.get("id") == owning_request_id), None)
+            if owning_request and owning_request.get("workStopped"):
+                raise WorkStateError("WORK_STOPPED: this original request was cancelled by the player; a new player instruction is required before selecting more work for it.")
             scope = state.decision.get("goalScope")
             if scope and goal_id and goal_id != scope:
                 raise WorkStateError("GOAL_SCOPE_MISMATCH: autonomous project cannot dispatch unrelated work")
@@ -1049,7 +1619,12 @@ class WorkStore:
                     None,
                 )
                 if goal is None:
-                    goal = Goal(id=_new_id("goal"), text=text, source=source)
+                    # Model-submitted plans hang a stage goal off the active
+                    # main goal; the plan never opens a second main goal.
+                    parent = self._active_main_goal(state)
+                    goal = Goal(id=_new_id("goal"), text=text, source=source,
+                                kind="stage",
+                                parent_id=parent.id if parent is not None else None)
                     state.goals.append(goal)
                     created_goal = True
             else:
@@ -1063,7 +1638,26 @@ class WorkStore:
             for spec in tasks:
                 for candidate in spec.get("steps", []):
                     operation = candidate.get("operation")
-                    target = self._branch_target(candidate.get("params") or {})
+                    params = candidate.get("params") or {}
+                    scoped = bind_execution_scope_params(operation, params, goal.constraints)
+                    requested = params.get("target_tiles")
+                    # An explicit empty request still means no work. A nonempty
+                    # request erased by a different saved arrangement is a plan
+                    # conflict, not evidence that the crops have disappeared.
+                    if (operation in {"water_auto", "harvest_auto"}
+                            and (requested and scoped.get("target_tiles") == []
+                                 or params.get("location_id") and scoped.get("location_id")
+                                 and params["location_id"] != scoped["location_id"])):
+                        raise WorkStateError(
+                            "EXECUTION_SCOPE_CONFLICT: requested targets do not overlap the accepted "
+                            f"arrangement for goal {goal.id} "
+                            f"(node={goal.constraints.get('milestoneId')}, revision={goal.epoch}). "
+                            "No job selected and no actions dispatched. Revise that existing arrangement "
+                            "to the player's latest instructions before submitting its replacement job; "
+                            "replace=True only replaces short tasks, not the accepted scope. "
+                            "Do not report NO_WORK or continue to shipping."
+                        )
+                    target = self._branch_target(params)
                     blocked = next((b for b in state.branch_failures if b.get("blocked")
                         and b.get("goalId") == goal.id and b.get("operation") == operation
                         and b.get("target") == target), None)
@@ -1096,8 +1690,16 @@ class WorkStore:
             created.extend(self._append_plan(state, goal.id, tasks))
             for task in created:
                 task.decision_token = decision_token
+                if owning_request is not None:
+                    owning_request.setdefault("taskIds", []).append(task.id)
+                    owning_request["goalId"] = goal.id
+                    if owning_request.get("origin") == "player-midflight":
+                        owning_request["consumedByDelivery"] = True
             state.scheduler_epoch += 1
-            state.decision.update(selected=True, taskId=created[0].id, epoch=state.scheduler_epoch)
+            state.decision.update(selected=True, taskId=created[0].id, goalId=goal.id,
+                                  epoch=state.scheduler_epoch)
+            if owning_request is not None:
+                state.decision["requestId"] = owning_request_id
             resolved_goal_id = goal.id
             resolved_goal_source = goal.source
 
@@ -1135,11 +1737,18 @@ class WorkStore:
         if kind == "goal":
             if source not in GOAL_SOURCES:
                 raise WorkStateError("goal source must be 'user' or 'agent'")
-            goal = Goal(
-                id=_new_id("goal"), text=text, source=source, priority=int(priority)
-            )
+            # Long-term intents are recorded as a stage of the current main
+            # goal (or the first main goal when none is active); they never
+            # create a second parallel main goal.
+            goal = Goal(id=_new_id("goal"), text=text, source=source,
+                        priority=int(priority), kind="stage")
 
             def mutate_goal(state: SaveWorkState) -> None:
+                active_main = self._active_main_goal(state)
+                if active_main is None:
+                    goal.kind = "main"
+                else:
+                    goal.parent_id = active_main.id
                 state.goals.append(goal)
                 state.scheduler_epoch += 1
 
@@ -1313,9 +1922,13 @@ class WorkStore:
             e.get("state") in {"navigated", "arrived"} or
             (e.get("state") is None and isinstance(e.get("location"), str)
              and type(e.get("pathLength")) is int and e["pathLength"] >= 0))]
+        native_sleeps = [e for e in effects if isinstance(e, dict)
+                         and e.get("kind") == "day-advanced" and e.get("via") == "native-sleep"
+                         and type(e.get("startDay")) is int and type(e.get("endDay")) is int
+                         and e["endDay"] == e["startDay"] + 1]
         effects = [e for e in effects if isinstance(e, dict)
                    and e.get("state") is not None and e.get("state") not in excluded]
-        if not effects and not navigation:
+        if not effects and not navigation and not native_sleeps:
             return "未确认实际变化"
         states = [e.get("state") for e in effects]
         summaries = []
@@ -1336,6 +1949,8 @@ class WorkStore:
 
         if navigation:
             summaries.append(f"已记录 {len(navigation)} 段行程")
+        if native_sleeps:
+            summaries.append(f"已确认 {len(native_sleeps)} 次原生睡眠保存并进入新一天")
         handled.add("refilled")
         if "refilled" in states:
             count = states.count("refilled")
@@ -1343,8 +1958,8 @@ class WorkStore:
         handled.add("ate-food")
         count = sum(int(e.get("stack", 1)) for e in effects if e.get("state") == "ate-food")
         if count:
-            summaries.append(f"已吃 {count} 份食物恢复体力")
-        tiles(("cleared-weeds", "cleared-stone", "cleared-twig", "cleared-dead-crop", "clump-cleared", "cut-grass"), "已清理")
+            summaries.append(f"已吃 {count} 份食物；恢复量以原生回执为准")
+        tiles(("cleared", "cleared-weeds", "cleared-stone", "cleared-twig", "cleared-dead-crop", "clump-cleared", "cut-grass"), "已清理")
         tiles(("tree-felled",), "已砍倒")
         tiles(("hoed", "tilled"), "已开垦")
         tiles(("planted",), "已种下")
@@ -1352,7 +1967,7 @@ class WorkStore:
         tiles(("fertilized",), "已施肥")
         tiles(("harvested",), "已收获")
         tiles(("placed",), "已放置")
-        for state, label in (("withdrawn", "已取出"), ("deposited", "已入箱"),
+        for state, label in (("withdrawn", "已取出"), ("deposited", "已入箱"), ("shipped", "已出货"),
                              ("inserted", "已投入原料"), ("collected", "已收取"),
                              ("picked-up", "已拾取"), ("crafted", "已制作"),
                              ("removed-and-recovered", "已回收")):
@@ -1399,7 +2014,8 @@ class WorkStore:
 
         Waiting is never "try again on the next snapshot": a waiting step is only
         returned once its own explicit condition is satisfied by the fresh native
-        snapshot (or by the bounded transport backoff).
+        snapshot (or by the bounded transport backoff). Steps in one task run in
+        their declared order: an unresolved earlier step blocks later actions.
         """
         if state.paused:
             return None
@@ -1418,12 +2034,14 @@ class WorkStore:
             if any(dep not in completed for dep in task.dependencies):
                 continue
             for step in task.steps:
+                if step.status == "completed":
+                    continue
                 # Gate on the step's own explicit condition whether the task is
                 # already parked (waiting) or still pending: a freshly submitted
                 # step with a declared condition must never dispatch before the
                 # condition is observable. Waiting is never "retry next snapshot".
                 if step.status not in {"pending", "waiting"}:
-                    continue
+                    return None
                 if step.wait is not None:
                     if step.wait.type == "transportRetry":
                         # Keep the persisted condition in step with the real
@@ -1432,9 +2050,9 @@ class WorkStore:
                     if not WorkStore._wait_satisfied(
                         step.wait, snapshot=snapshot, game_date=game_date, now=wall
                     ):
-                        continue
+                        return None
                 if step.lease_owner and step.lease_until > now:
-                    continue
+                    return None
                 return task, step
         return None
 
@@ -1597,6 +2215,7 @@ class WorkStore:
                 "stepId": step.id,
                 "operation": step.operation,
                 "params": dict(step.params),
+                "feedback": dict(step.feedback),
                 "attempt": step.attempts,
                 "leaseUntil": step.lease_until,
                 "releasedWait": was_waiting,
@@ -1644,6 +2263,19 @@ class WorkStore:
             step.attempts = max(0, step.attempts - 1)
             task.status = "pending"
             task.updated_at = _now_iso()
+        self._mutate(save_id, mutate)
+
+    def record_step_feedback(
+        self, save_id: str, task_id: str, step_id: str, command_id: str,
+        feedback: dict[str, Any],
+    ) -> None:
+        """Keep observed operation scope while its native command is still running."""
+        def mutate(state: SaveWorkState) -> None:
+            step = self._find_step(self._find_task(state, task_id), step_id)
+            if step.command_id != command_id:
+                raise WorkStateError("Feedback command id does not match the persisted step command")
+            if step.status == "running":
+                step.feedback = dict(feedback)
         self._mutate(save_id, mutate)
 
     @staticmethod
@@ -1736,7 +2368,18 @@ class WorkStore:
         def mutate(state: SaveWorkState) -> dict[str, Any]:
             task = self._find_task(state, task_id)
             step = self._find_step(task, step_id)
-            if step.status not in {"running", "unknown"}:
+            revoked = task.status == "cancelled"
+            # The scope-retirement path and the original executor can receive
+            # the same terminal concurrently. Keep its effects exactly once.
+            if (revoked and command_id and command_id == step.command_id
+                    and step.status in TERMINAL_STEP_STATUSES
+                    and step.outcome == outcome and step.reason_code == reason_code
+                    and step.effects == list(effects or [])):
+                if feedback:
+                    step.feedback = dict(feedback)
+                return {"taskId": task.id, "stepId": step.id,
+                        "taskStatus": task.status, "outcome": step.outcome}
+            if step.status not in {"running", "unknown"} and not (revoked and step.status == "waiting" and step.command_id):
                 raise WorkStateError(f"step '{step_id}' is not awaiting a result")
             if outcome == "completed" and not step.command_id:
                 raise WorkStateError(
@@ -1754,6 +2397,7 @@ class WorkStore:
             step.feedback = dict(feedback or {})
             step.lease_owner = None
             step.lease_until = 0.0
+            request = next((r for r in state.requests if task.id in r.get("taskIds", [])), None)
             state.executions.append(
                 ExecutionEntry(
                     command_id=command_id or step.command_id or "",
@@ -1761,6 +2405,8 @@ class WorkStore:
                     step_id=step_id,
                     operation=step.operation,
                     outcome=outcome,
+                    request_id=request.get("id") if request else None,
+                    goal_id=task.goal_id,
                     effects=list(effects or []),
                     reason_code=reason_code,
                     snapshot_revision=snapshot_revision,
@@ -1776,10 +2422,12 @@ class WorkStore:
             self._record_branch_result(state, task, step, outcome, reason_code,
                                        command_id or step.command_id or "")
 
-            if outcome in {"completed", "cancelled"}:
+            if revoked or outcome == "cancelled":
+                self._cancel_task_steps(task)
+            elif outcome == "completed":
                 remaining = [s for s in task.steps if s.status not in TERMINAL_STEP_STATUSES]
                 if not remaining:
-                    task.status = "completed" if outcome == "completed" else "cancelled"
+                    task.status = "completed"
                 else:
                     task.status = "pending"
             elif outcome == "partial":
@@ -1790,6 +2438,8 @@ class WorkStore:
                 task.status = "unknown"
             task.updated_at = _now_iso()
             state.scheduler_epoch += 1
+            if task.status != "pending" or outcome != "completed":
+                self._queue_task_result(state, task, step, outcome=outcome)
             return {
                 "taskId": task.id,
                 "stepId": step.id,
@@ -1800,8 +2450,42 @@ class WorkStore:
         return self._mutate(save_id, mutate)
 
     @staticmethod
+    def _queue_task_result(state: SaveWorkState, task: Task, step: Step,
+                           *, outcome: str | None = None) -> None:
+        """Commit the delivery obligation with the native outcome, before callbacks."""
+        request = next((r for r in state.requests if task.id in r.get("taskIds", [])), None)
+        if not step.command_id:
+            return
+        # job_feedback imports WorkStore for its shared effect summary; import
+        # here after both modules have initialized, rather than create a cycle.
+        from stardew_ai_runtime.job_feedback import compact_task_feedback
+
+        outcome = outcome or step.outcome or step.status
+        feedback = compact_task_feedback(task, {
+            **step.feedback, "commandId": step.command_id,
+            "effects": step.effects, "reasonCode": step.reason_code,
+        }, operation=step.operation, status=outcome)
+        # The latest native result belongs to this terminal transaction, even
+        # when cancellation has already revoked the selected decision.
+        state.last_job = {**feedback, "taskId": task.id, "taskTitle": task.title,
+                          "goalId": task.goal_id, "decisionId": state.decision.get("token")}
+        if request is None or request.get("origin") not in {"player", "player-midflight"}:
+            return
+        entry = next((e for e in reversed(state.executions)
+                      if e.command_id == step.command_id and e.task_id == task.id), None)
+        _append_outbox_event(state, {
+            "kind": "terminal", "commandId": step.command_id,
+            "taskId": task.id, "goalId": task.goal_id, "operation": step.operation,
+            "outcome": outcome, "reasonCode": step.reason_code,
+            "effects": list(step.effects), "feedback": feedback,
+            "snapshotRevision": entry.snapshot_revision if entry else None,
+            "gameDate": entry.game_date if entry else state.last_settled_day,
+            "requestId": request["id"],
+        })
+
+    @staticmethod
     def _branch_target(params: dict[str, Any]) -> dict[str, Any]:
-        aliases = {"locationId": "location_id", "shopId": "shop_id", "itemId": "item_id"}
+        aliases = {"locationId": "location_id", "shopId": "shop_id", "itemId": "item_id", "npcName": "npc_name"}
         normalized = {aliases.get(k, k): v for k, v in params.items()}
         if "machine_x" in params and "machine_y" in params:
             normalized["tile"] = {"x": params["machine_x"], "y": params["machine_y"]}
@@ -1810,7 +2494,7 @@ class WorkStore:
         return {k: normalized[k] for k in ("location_id", "shop_id", "tile", "tiles",
                                           "item_id", "seed_item_id", "animal_id", "animal_name",
                                           "building_name", "chest_x", "chest_y",
-                                          "center_x", "center_y", "radius", "landmark")
+                                          "center_x", "center_y", "radius", "landmark", "npc_name", "facing", "choice_index")
                 if k in normalized}
 
     def _record_branch_result(self, state, task, step, outcome, reason, command_id):
@@ -1825,6 +2509,17 @@ class WorkStore:
                        and b.get("operation") == step.operation and b.get("target") == target]
         if outcome == "completed":
             state.branch_failures = [b for b in state.branch_failures if b not in same_target]
+            if step.operation == "query_route":
+                facts = ((step.feedback or {}).get("observation") or {}).get("facts") or {}
+                if isinstance(facts, dict):
+                    route_target = {"location_id": step.params.get("location_id"),
+                                    "tile": facts.get("resolvedDestinationTile") or step.params.get("tile")}
+                    self._recover_navigation_branches(state, "navigate_to", route_target, facts)
+            if step.operation == "observe_player_activities":
+                facts = ((step.feedback or {}).get("observation") or {}).get("facts") or {}
+                activities = facts.get("activities") or (facts.get("details") or {}).get("activities")
+                if isinstance(activities, dict):
+                    self._recover_native_interaction_branches(state, activities, command_id)
             for b in state.branch_failures:
                 cause = str(b.get("reasonCode") or "").lower()
                 if any(code in cause for code in ("unknown", "unconfirmed", "in_progress")):
@@ -1849,7 +2544,11 @@ class WorkStore:
         if branch is None:
             branch = {"goalId": task.goal_id, "operation": step.operation, "target": target,
                       "reasonCode": reason, "failures": 0, "commands": [], "attempts": [],
-                      "recoveryCondition": "修复该原因并取得对应对象或路线的新原生可执行证据"}
+                      "recoveryCondition": ("原生碰撞不是路线估计可达的证明：需观察阻碍变化或实际原生通行；不得仅重复 query_route 后重试同一段"
+                                            if step.operation == "navigate_to" and str(reason).lower() == "native_collision" else
+                                            "对同一 location_id 和 tile 调用 query_route；新原生结果 reachable=true 后可重新导航（包括商店营业后）"
+                                            if step.operation == "navigate_to" else
+                                            "修复该原因并取得对应对象的新原生可执行证据")}
             state.branch_failures.append(branch)
         if command_id in branch["commands"]:
             return
@@ -1863,17 +2562,116 @@ class WorkStore:
 
     def observe_branch_recovery(self, save_id: str, *, operation: str,
                                 target: dict[str, Any], evidence: dict[str, Any]) -> None:
-        """Harness-only: a successful native inspection of this exact target."""
+        """A fresh native route proof for this exact target, never an unknown receipt."""
+        self._mutate(save_id, lambda state: self._recover_navigation_branches(state, operation, target, evidence))
+
+    def _recover_navigation_branches(self, state, operation, target, evidence) -> None:
         if operation != "navigate_to" or evidence.get("reachable") is not True:
             return
+        for branch in state.branch_failures:
+            reason = str(branch.get("reasonCode") or "").lower()
+            # A geometry preview can still cross a native event/NPC/animated
+            # barrier. It is not evidence that an observed walking collision
+            # disappeared; a successful native navigation clears this branch
+            # through _record_branch_result instead.
+            if reason == "native_collision" and not (evidence.get("nativeCollisionChecked") is True
+                    and evidence.get("nativeUiClear") is True
+                    and evidence.get("collisionEvidenceScope")=="current-location-native-pathfinding-no-effects"):
+                continue
+            geometry = evidence.get("nativeMovementGeometry")
+            repaired_budget = (reason == "budget_exceeded" and geometry == "standing-center-v2"
+                               and branch.get("budgetRecoveryGeometry") != geometry)
+            if (branch.get("operation") == operation
+                    and branch.get("target") == self._branch_target(target)
+                    and not any(code in reason for code in ("unknown", "unconfirmed", "in_progress"))
+                    and (repaired_budget or reason == "target_unavailable"
+                         or (reason == "native_ui_active" and evidence.get("nativeUiClear") is True)
+                         or any(code in reason for code in ("path", "route", "unreachable", "obstacle", "collision", "entrance", "warp")))):
+                branch.update(blocked=False, failures=0, recoveryEvidence=evidence)
+                if repaired_budget:
+                    branch["budgetRecoveryGeometry"] = geometry
+
+    @staticmethod
+    def _recover_native_interaction_branches(state, activities: dict[str, Any], command_id: str | None = None) -> None:
+        """Fresh exact adjacency repairs NOT_ADJACENT only, never other native failures."""
+        location = activities.get("locationId")
+        player = activities.get("playerTile")
+        revision = activities.get("worldRevision")
+        if not isinstance(location, str) or not isinstance(player, dict) or type(revision) is not int:
+            return
+        if any(type(player.get(k)) is not int for k in ("x", "y")):
+            return
+        def adjacent(tile):
+            return (isinstance(tile, dict) and all(type(tile.get(k)) is int for k in ("x", "y"))
+                    and abs(tile["x"] - player["x"]) + abs(tile["y"] - player["y"]) <= 1)
+        for branch in state.branch_failures:
+            target = branch.get("target") or {}
+            if str(branch.get("reasonCode") or "").upper() != "NOT_ADJACENT" or target.get("location_id") != location:
+                continue
+            failed_revisions = [entry.snapshot_revision for entry in state.executions
+                if entry.command_id in branch.get("commands", []) and type(entry.snapshot_revision) is int]
+            if failed_revisions and revision < max(failed_revisions):
+                continue
+            operation = branch.get("operation")
+            ready = False
+            if operation == "talk_npc":
+                name = target.get("npc_name")
+                if not name:
+                    # Narrow old name-less records only when every saved attempt identifies one NPC.
+                    names = {(a.get("params") or {}).get("npc_name") for a in branch.get("attempts", [])}
+                    if len(names) == 1 and None not in names:
+                        name = next(iter(names))
+                        branch["target"] = {**target, "npc_name": name}
+                ready = bool(name) and any(isinstance(n, dict) and n.get("name") == name
+                    and n.get("canInitiateConversation") is True and adjacent(n.get("tile"))
+                    for n in activities.get("npcs", []))
+            elif operation == "interact_tile":
+                ready = any(isinstance(a, dict) and a.get("tile") == target.get("tile")
+                    and a.get("canInteractNow") is True and adjacent(a.get("tile"))
+                    for a in activities.get("interactions", []) + [f for f in activities.get("fixtures", [])
+                        if isinstance(f, dict) and f.get("operation") == "interact_tile"])
+            if ready:
+                branch.update(blocked=False, failures=0, recoveryEvidence={"commandId": command_id,
+                    "worldRevision": revision, "locationId": location, "playerTile": player,
+                    "basis": "fresh-native-current-interaction-adjacency"})
+
+    def observe_interaction_recovery(self, save_id: str, activities: dict[str, Any]) -> None:
+        self._mutate(save_id, lambda state: self._recover_native_interaction_branches(state, activities))
+
+    def observe_native_ui_recovery(self, save_id: str, native: dict[str, Any], *,
+                                   world_revision: int, game_session_id: str) -> None:
+        """A live native snapshot can retire the specific festival advance guard.
+
+        Called only from the connected snapshot reader, never from stored prompt
+        context. Ending a festival is not proof that other UI failures recovered.
+        Failed command identities/receipts and provider retry holds are retained.
+        """
+        if (not isinstance(native, dict) or type(world_revision) is not int or not game_session_id):
+            return
+        festival_ended = native.get("eventUp") is False and native.get("eventIsFestival") is False
+        dialogue_ready = (native.get("activeMenu") == "DialogueBox"
+                          and native.get("dialogueUp") is True and native.get("isQuestionDialogue") is False)
+        if not festival_ended and not dialogue_ready:
+            return
+
+        def applicable(branch):
+            return (branch.get("operation") == "native_advance"
+                    and branch.get("reasonCode") == "FESTIVAL_FREE_ROAM"
+                    and (branch.get("blocked") or branch.get("failures", 0) > 0))
+
+        if not any(applicable(branch) for branch in self.state(save_id).branch_failures):
+            return
+
         def mutate(state):
             for branch in state.branch_failures:
-                reason = str(branch.get("reasonCode") or "").lower()
-                if (branch.get("operation") == operation
-                        and branch.get("target") == self._branch_target(target)
-                        and not any(code in reason for code in ("unknown", "unconfirmed", "in_progress"))
-                        and any(code in reason for code in ("path", "route", "unreachable", "obstacle", "entrance", "warp"))):
+                if applicable(branch):
+                    evidence = {"basis": "live-native-festival-ended" if festival_ended else "live-native-dialogue-can-advance",
+                                "gameSessionId": game_session_id, "worldRevision": world_revision,
+                                "eventUp": native.get("eventUp"), "eventIsFestival": native.get("eventIsFestival")}
+                    if dialogue_ready and not festival_ended:
+                        evidence.update(activeMenu="DialogueBox", dialogueUp=True, isQuestionDialogue=False)
                     branch.update(blocked=False, failures=0, recoveryEvidence=evidence)
+
         self._mutate(save_id, mutate)
 
     def observe_machine_recovery(self, save_id: str, location_id: str, machines: list[dict]) -> None:
@@ -1933,6 +2731,21 @@ class WorkStore:
                                 "reasonCode": "UNCONFIRMED_AFTER_RESTART",
                             }
                         )
+                    self._queue_task_result(state, task, step, outcome="unknown")
+
+            # A process may have stopped after committing the native outcome,
+            # before releasing its client and publishing finish_job. Its durable
+            # fact is enough to settle that decision on the next owned boundary.
+            selected = next((t for t in state.tasks if t.id == state.decision.get("taskId")), None)
+            event = next((e for e in reversed(state.outbox)
+                          if selected is not None and e.get("taskId") == selected.id), None)
+            if (selected is not None and event is not None
+                    and not any(s.status == "running" for s in selected.steps)
+                    and not state.decision.get("finished")):
+                state.last_job = {**event.get("feedback", {}), "taskId": selected.id,
+                                  "taskTitle": selected.title, "goalId": selected.goal_id,
+                                  "decisionId": state.decision.get("token")}
+                state.decision["finished"] = True
 
         self._mutate(save_id, mutate)
         return decisions
@@ -1975,6 +2788,10 @@ class WorkStore:
             if not parked:
                 raise WorkStateError(f"task '{task_id}' has no step to park")
             state.scheduler_epoch += 1
+            if wait.type != "transportRetry":
+                for step in task.steps:
+                    if step.id in parked:
+                        self._queue_task_result(state, task, step, outcome="waiting")
             return {
                 "taskId": task.id,
                 "status": task.status,
@@ -2210,7 +3027,7 @@ class WorkStore:
 
     # ----------------------------------------------------- day rollover
     def settle_game_day(
-        self, save_id: str, *, year: Any, season: Any, day: Any
+        self, save_id: str, *, year: Any, season: Any, day: Any, funds: Any = None
     ) -> dict[str, Any]:
         """Settle one real, complete game day exactly once.
 
@@ -2227,6 +3044,9 @@ class WorkStore:
         unfinished and waiting tasks forward, and leaves ``unknown``/``partial``
         work in place as anomalies for a decision — in-progress facts are never
         compressed away and never replayed.
+
+        Day settlement records one progress note on the active main goal
+        (date + completed-task count + funds); it never closes goal statuses.
         """
         key = _day_key(year, season, day)
         if key is None:
@@ -2317,6 +3137,22 @@ class WorkStore:
             state.archive = state.archive[-200:]
             state.last_settled_day = key
             state.scheduler_epoch += 1
+            # Day settlement records progress on the long-term main goal; the
+            # goal itself stays active across days (only a verified preset day
+            # boundary or the player may close a main goal).
+            main = self._active_main_goal(state)
+            if main is not None:
+                completed_today = len(archived_ids)
+                note = f"日结 {key}：当日完成 {completed_today} 项任务"
+                if funds is not None and not isinstance(funds, bool):
+                    note += f"，资金 {funds}"
+                log = main.project.get("progressLog")
+                if not isinstance(log, list):
+                    log = []
+                log.append({"date": key, "note": note[:_PROGRESS_NOTE_LIMIT], "at": _now_iso()})
+                main.project = {**main.project, "progressLog": log[-_PROGRESS_LOG_LIMIT:]}
+                main.updated_at = _now_iso()
+                main.epoch += 1
             result = {
                 "settled": True,
                 "reasonCode": "DAY_ADVANCED",
@@ -2364,19 +3200,29 @@ class WorkStore:
 
         expired: list[dict[str, Any]] = []
 
+        now_dt = datetime.now(UTC) if now is None else datetime.fromtimestamp(now, UTC)
+
+        def waiting_elapsed(task: Task) -> float:
+            if task.status != "waiting":
+                return float("-inf")
+            try:
+                ts_dt = datetime.fromisoformat(task.updated_at or task.created_at)
+                if ts_dt.tzinfo is None:
+                    ts_dt = ts_dt.replace(tzinfo=UTC)
+                return (now_dt - ts_dt).total_seconds()
+            except (ValueError, TypeError):
+                return 0.0
+
+        # Snapshot/UI reads must not serialize the entire ledger when nothing
+        # expires. Recheck the predicate under the mutation lock if repair is due.
+        if not any(waiting_elapsed(task) >= timeout_seconds for task in self.state(save_id).tasks):
+            return expired
+
         def mutate(state: SaveWorkState) -> None:
-            now_dt = datetime.now(UTC) if now is None else datetime.fromtimestamp(now, UTC)
             for task in state.tasks:
                 if task.status != "waiting":
                     continue
-                ts_str = task.updated_at or task.created_at
-                try:
-                    ts_dt = datetime.fromisoformat(ts_str)
-                    if ts_dt.tzinfo is None:
-                        ts_dt = ts_dt.replace(tzinfo=UTC)
-                    elapsed = (now_dt - ts_dt).total_seconds()
-                except Exception:
-                    elapsed = 0.0
+                elapsed = waiting_elapsed(task)
 
                 if elapsed >= timeout_seconds:
                     task.status = "failed"
@@ -2595,6 +3441,19 @@ class WorkStore:
                     "outcome": step.outcome, "commandId": step.command_id,
                 }))
         anomalies = [row for _, row in sorted(ranked_anomalies, key=lambda pair: pair[0], reverse=True)]
+        commands = {entry.command_id: entry for entry in state.executions
+                    if entry.command_id and entry.outcome in TERMINAL_STEP_STATUSES}
+        totals = self._execution_totals(commands.values())
+        request_by_task = {task_id: request for request in state.requests
+                           for task_id in request.get("taskIds", [])}
+        requests = {request["id"]: request for request in state.requests}
+        grouped: dict[str, list[ExecutionEntry]] = {}
+        for entry in commands.values():
+            # Legacy facts retain exact request.taskIds even after reload has
+            # retired their Task objects. A shared goal is never an owner guess.
+            request_id = entry.request_id or request_by_task.get(entry.task_id, {}).get("id")
+            if request_id:
+                grouped.setdefault(request_id, []).append(entry)
         return {
             "saveId": save_id,
             "paused": state.paused,
@@ -2611,12 +3470,237 @@ class WorkStore:
                 "failures", "blocked", "recoveryCondition")} for b in state.branch_failures
                 if b.get("failures", 0) > 0][-5:],
             "recentExecutions": self.execution_log(save_id, limit=5),
+            "confirmedExecutionTotals": {
+                "source": "native_terminal_ledger",
+                "scope": "all retained unique commands for this save; effect counts, not inventory or a new delta",
+                "excludes": "inventory itself; only recorded native effects are counted, including retained history; unretained history is unknown",
+                **totals,
+                "hasUnconfirmedCommands": any(step.command_id and step.command_id not in commands
+                    for task in state.tasks for step in task.steps),
+            },
+            "confirmedRequestTotals": {
+                request_id: {**self._execution_totals(entries), "scope": "original_player_request",
+                             "requestId": request_id, "requestText": requests.get(request_id, {}).get("text"),
+                             "source": "native_terminal_ledger",
+                             "excludes": "other requests; inventory; planned counts"}
+                for request_id, entries in grouped.items()
+            },
             "plantingEvidence": self._planting_evidence(state),
             "waitingConditions": self.wait_conditions(save_id),
             "hasExecutableWork": next_step is not None,
             "lastJob": state.last_job,
             "executionPolicy": "one_model_selected_short_job",
         }
+
+    # ---------------------------------------------------- requests & outbox
+    @staticmethod
+    def _execution_totals(entries) -> dict[str, Any]:
+        entries = list(entries)
+        effect_counts: dict[str, int] = {}
+        item_quantities: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            for effect in entry.effects:
+                kind = effect.get("state")
+                if isinstance(kind, str) and kind != "skipped":
+                    effect_counts[kind] = effect_counts.get(kind, 0) + 1
+                if kind in {"withdrawn", "deposited", "harvested", "shipped"}:
+                    quantity = item_quantities.setdefault(kind, {
+                        "unit": "items", "count": 0, "knownCount": 0, "unknownStackEffects": 0})
+                    stack = effect.get("count") if kind == "shipped" else effect.get("stack")
+                    if isinstance(stack, int) and not isinstance(stack, bool) and stack > 0:
+                        quantity["knownCount"] += stack
+                    else:
+                        quantity["unknownStackEffects"] += 1
+                    quantity["count"] = None if quantity["unknownStackEffects"] else quantity["knownCount"]
+        return {"commandCount": len(entries), "effectCounts": effect_counts,
+                "effectCountUnit": "native_effect_records", "itemQuantities": item_quantities}
+
+    def record_request(
+        self, save_id: str, request_id: str, text: str, origin: str = "player"
+    ) -> dict[str, Any]:
+        if not request_id:
+            raise WorkStateError("request_id is required")
+        clean = (text or "").strip()
+        if not clean:
+            raise WorkStateError("request text cannot be empty")
+        if origin not in REQUEST_ORIGINS:
+            raise WorkStateError("request origin must be 'player', 'player-midflight' or 'autonomy'")
+
+        def mutate(state: SaveWorkState) -> dict[str, Any]:
+            existing = next((r for r in state.requests if r.get("id") == request_id), None)
+            if existing is not None:
+                return dict(existing)
+            state.requests.append(
+                {
+                    "id": request_id,
+                    "text": clean,
+                    "origin": origin,
+                    "createdAt": _now_iso(),
+                    "taskIds": [],
+                    "goalId": None,
+                }
+            )
+            _trim_requests(state)
+            return dict(state.requests[-1])
+
+        return self._mutate(save_id, mutate)
+
+    def bind_request_task(
+        self, save_id: str, request_id: str, task_id: str, goal_id: str
+    ) -> dict[str, Any]:
+        def mutate(state: SaveWorkState) -> dict[str, Any]:
+            request = next((r for r in state.requests if r.get("id") == request_id), None)
+            if request is None:
+                raise WorkStateError(f"unknown request '{request_id}'")
+            task_ids = request.setdefault("taskIds", [])
+            if task_id not in task_ids:
+                task_ids.append(task_id)
+            request["goalId"] = goal_id
+            return dict(request)
+
+        return self._mutate(save_id, mutate)
+
+    def bind_goal_request(self, save_id: str, goal_id: str, request_id: str) -> None:
+        """Retain the literal player instruction behind an accepted arrangement."""
+        def mutate(state: SaveWorkState) -> None:
+            if not any(r.get("id") == request_id for r in state.requests):
+                raise WorkStateError(f"unknown request '{request_id}'")
+            self._find_goal(state, goal_id).constraints["playerRequestId"] = request_id
+        self._mutate(save_id, mutate)
+
+    def find_request_for_task(self, save_id: str, task_id: str) -> dict[str, Any] | None:
+        state = self.state(save_id)
+        request = next(
+            (r for r in reversed(state.requests) if task_id in (r.get("taskIds") or [])),
+            None,
+        )
+        return dict(request) if request is not None else None
+
+    def append_outbox_event(self, save_id: str, event: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(event, dict) or not str(event.get("commandId") or "").strip():
+            raise WorkStateError("outbox event requires a commandId")
+        explicit_kind = event.get("kind") or "terminal"
+        if explicit_kind not in ("terminal", "correction"):
+            raise WorkStateError(f"invalid outbox event kind '{explicit_kind}'")
+
+        return self._mutate(save_id, lambda state: _append_outbox_event(state, event))
+
+    def pending_outbox(self, save_id: str) -> list[dict[str, Any]]:
+        state = self.state(save_id)
+        return [
+            dict(event)
+            for event in state.outbox
+            if (event.get("delivery") or {}).get("state") in {"pending", "sent"}
+        ]
+
+    def mark_outbox_sent(self, save_id: str, ids: list[str]) -> None:
+        wanted = set(ids or [])
+        if not wanted:
+            return
+
+        def mutate(state: SaveWorkState) -> None:
+            for event in state.outbox:
+                delivery = event.get("delivery") or {}
+                if event.get("id") not in wanted or delivery.get("state") == "consumed":
+                    continue
+                delivery["attempts"] = int(delivery.get("attempts") or 0) + 1
+                delivery["sentAt"] = _now_iso()
+                delivery["state"] = "sent"
+
+        self._mutate(save_id, mutate)
+
+    def set_outbox_retry_block(self, save_id: str, reason: str | None) -> None:
+        """Retain undelivered facts while a non-retryable provider error is resolved."""
+        def mutate(state: SaveWorkState) -> None:
+            for event in state.outbox:
+                delivery = event.get("delivery") or {}
+                if delivery.get("state") not in {"pending", "sent"}:
+                    continue
+                if reason:
+                    delivery["retryBlocked"] = reason
+                else:
+                    delivery.pop("retryBlocked", None)
+        self._mutate(save_id, mutate)
+
+    def mark_outbox_consumed(self, save_id: str, ids: list[str]) -> None:
+        wanted = set(ids or [])
+        if not wanted:
+            return
+
+        def mutate(state: SaveWorkState) -> None:
+            for event in state.outbox:
+                delivery = event.get("delivery") or {}
+                if event.get("id") not in wanted or delivery.get("state") == "consumed":
+                    continue
+                delivery["state"] = "consumed"
+                delivery["consumedAt"] = _now_iso()
+
+        self._mutate(save_id, mutate)
+
+    def mark_outbox_notified(self, save_id: str, ids: list[str]) -> None:
+        wanted = set(ids or [])
+        if not wanted:
+            return
+
+        def mutate(state: SaveWorkState) -> None:
+            for event in state.outbox:
+                notify = event.get("notify") or {}
+                if event.get("id") not in wanted or notify.get("state") == "delivered":
+                    continue
+                notify["state"] = "delivered"
+                notify["deliveredAt"] = _now_iso()
+
+        self._mutate(save_id, mutate)
+
+    def queue_outbox_notification(self, save_id: str, ids: list[str], reply: dict[str, Any]) -> None:
+        """Persist the verbatim model reply before sending; replay never runs work."""
+        wanted = set(ids)
+        def mutate(state: SaveWorkState) -> None:
+            for event in state.outbox:
+                if event.get("id") in wanted and event["notify"].get("state") != "delivered":
+                    event["notify"]["reply"] = reply
+        self._mutate(save_id, mutate)
+
+    def pending_outbox_notifications(self, save_id: str) -> list[dict[str, Any]]:
+        replies = {}
+        for event in self.state(save_id).outbox:
+            notify = event.get("notify") or {}
+            reply = notify.get("reply")
+            if notify.get("state") == "pending" and isinstance(reply, dict):
+                replies[reply["payload"]["requestId"]] = reply
+        return list(replies.values())
+
+    def acknowledge_outbox_notification(self, save_id: str, request_id: str, ids: list[str]) -> None:
+        wanted = set(ids)
+        def mutate(state: SaveWorkState) -> None:
+            for event in state.outbox:
+                notify = event.get("notify") or {}
+                payload = (notify.get("reply") or {}).get("payload") or {}
+                if (event.get("id") in wanted and payload.get("requestId") == request_id
+                        and payload.get("saveId") == save_id):
+                    notify.update(state="delivered", deliveredAt=_now_iso())
+        self._mutate(save_id, mutate)
+
+    def pending_midflight_requests(self, save_id: str) -> list[dict[str, Any]]:
+        state = self.state(save_id)
+        return [
+            dict(request)
+            for request in state.requests
+            if request.get("origin") == "player-midflight"
+            and not request.get("consumedByDelivery")
+        ]
+
+    def mark_midflight_consumed(self, save_id: str, request_ids: list[str]) -> None:
+        wanted = set(request_ids or [])
+        if not wanted:
+            return
+
+        def mutate(state: SaveWorkState) -> None:
+            for request in state.requests:
+                if request.get("id") in wanted and not request.get("consumedByDelivery"):
+                    request["consumedByDelivery"] = True
+
+        self._mutate(save_id, mutate)
 
     # ------------------------------------------------------------ helpers
     @staticmethod

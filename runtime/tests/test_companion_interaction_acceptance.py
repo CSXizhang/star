@@ -101,7 +101,13 @@ def test_slow_conversation_never_claims_or_releases_native_worker(tmp_path, monk
         try:
             assert await asyncio.to_thread(started.wait, 1)
             assert not bridge._execution_lock.locked()
-            assert store.state("farm") == before
+            during = store.state("farm")
+            assert during.requests[:-1] == before.requests
+            assert during.requests[-1]["id"] == "chat-during-water"
+            assert during.requests[-1]["text"] == "今天怎么样？"
+            assert during.requests[-1]["origin"] == "player-midflight"
+            during.requests = before.requests
+            assert during == before  # Durable chat input cannot change native ownership/state.
             # A concurrent direct control remains responsive during model latency.
             await bridge._handle_autonomy_control(ws, Envelope.create_autonomy_control(
                 "test-ui", "pause-now", "farm", "pause"), "farm")
@@ -173,7 +179,7 @@ def test_conversation_cache_rejects_switching_to_another_loaded_save(tmp_path, m
 
 
 def test_disabled_idle_help_completes_second_job_after_tool_preparation(tmp_path, monkeypatch):
-    """A completed prerequisite must wake the assigned chain, not stop it."""
+    """A completed prerequisite must reach the assigned request's delivery, not stop it."""
     monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda _: None)
 
     async def scenario():
@@ -210,13 +216,16 @@ def test_disabled_idle_help_completes_second_job_after_tool_preparation(tmp_path
                 return {"success": True, "response": "田里交给我。"}
 
         bridge._backend = Provider()
-        await bridge.handle_chat_submit(AsyncMock(), "assigned", "种地再照料鸡，你安排", "farm")
+        ws = AsyncMock()
+        bridge._chat_ws = ws  # the outbox delivery turn replies on the chat channel
+        await bridge.handle_chat_submit(ws, "assigned", "种地再照料鸡，你安排", "farm")
         assert len(calls) == 1
         for _ in range(2):
             await bridge._plan_worker.evaluate()
-            await bridge.wait_for_chains()
+            await bridge.wait_for_deliveries()
         assert operations == ["refill_watering_can", "water_zone"]
         assert len(calls) == 3
+        assert calls[1].startswith("delivery-") and calls[2].startswith("delivery-")
         assert all(t.status == "completed" for t in bridge._work_store.state("farm").tasks)
         assert bridge._autonomy.state("farm").enabled is False
         assert bridge._work_store.state("farm").paused is False

@@ -13,6 +13,8 @@ public sealed partial class NormalNativeActionAdapter
 {
     private NativeActionStepResult EatFood(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
+        if (ActorGuards.IsPlayerBound(actor))
+            return NativeActionStepResult.Precondition("Native player eating requires the asynchronous player consumption lifecycle.", "player-food-lifecycle-required");
         var farmer = actor.GameFarmer;
         if (farmer is null || !string.Equals(actor.LocationName,request.LocationId,StringComparison.OrdinalIgnoreCase))
             return NativeActionStepResult.Precondition("Companion is not on the requested map.","wrong-map");

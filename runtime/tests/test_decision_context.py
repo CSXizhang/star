@@ -79,7 +79,7 @@ def test_context_matches_real_captured_snapshot_schema() -> None:
     assert context["inventory"]["freeSlots"] == 5
     assert context["inventory"]["items"] == [{"itemId": "(O)472", "name": "Parsnip Seeds", "count": 7, "quality": 0}]
     assert context["inventory"]["tools"] == [{"itemId": "(T)Hoe", "name": "Hoe"}, {"itemId": "(T)WateringCan", "name": "Watering Can"}]
-    assert context["inventory"]["toolResources"]["waterCan"] == {"level": 33, "max": 40}
+    assert context["inventory"]["toolResources"]["waterCan"] == {"currentWater": 33, "capacity": 40, "isFull": False, "isEmpty": False, "unit": "浇水次数", "upgradeLevel": None, "note": "currentWater 是壶内剩余水量，capacity 是装满后的容量；工具升级等级未被原生快照发布，不可从水量推断。"}
     assert context["goals"] == [{"text": "把农场种满胡萝卜", "source": "user"}]
     assert context["currentTask"]["nextStep"]["operation"] == "water_auto"
     # The explicit wait condition travels with the waiting task.

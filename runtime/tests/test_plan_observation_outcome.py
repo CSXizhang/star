@@ -1,10 +1,12 @@
 """Observations complete the read step, without claiming a native mutation."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
 from stardew_ai_runtime.plan_executor import PlanExecutor, classify_step_outcome
+from stardew_ai_runtime.scheduler import CompanionScheduler
 from stardew_ai_runtime.work_state import WorkStore
 
 
@@ -74,3 +76,61 @@ def test_shop_read_completes_but_preserves_facts_for_native_purchase(tmp_path):
 
     asyncio.run(run())
     assert calls == ["query_shop", "purchase_items"]
+
+
+@pytest.mark.parametrize("route_state", ["reachable", "unreachable", "missing", "failed", "malformed"])
+def test_native_route_observation_can_precede_navigation(tmp_path, route_state):
+    async def run():
+        store = WorkStore(tmp_path / "work.json")
+        store.begin_decision("save", "decision")
+        destination = {"locationId": "Farm", "tile": {"x": 58, "y": 22}}
+        store.submit_plan("save", goal_text="查路后回农场", decision_token="decision", tasks=[{
+            "title": "回农场", "steps": [
+                {"operation": "query_route", "params": {"location_id": "Farm", "tile": destination["tile"]}},
+                {"operation": "navigate_to", "params": {"location_id": "Farm", "tile": destination["tile"]}},
+            ],
+        }])
+        # NavigationStateMachine.PreviewRoute emits facts without status/outcome.
+        route = {"reachable": route_state == "reachable", "observedTime": 900,
+                 "origin": {"locationId": "Town", "tile": {"x": 1, "y": 2}},
+                 "destination": destination}
+        if route_state == "reachable":
+            route.update(locations=["Town", "BusStop", "Farm"], walkingTiles=80,
+                         estimatedGameMinutes=31, arrivalTile=destination["tile"])
+        else:
+            route["reason"] = "No reachable route"
+        if route_state == "malformed":
+            route["reachable"] = "true"
+        receipt = {"terminalState": "succeeded", "details": {"route": route}}
+        if route_state == "missing":
+            receipt = {"terminalState": "succeeded", "details": {}}
+        elif route_state == "failed":
+            receipt = {"terminalState": "failed", "error": {"code": "OBSERVATION_FAILED"}}
+        scheduler = CompanionScheduler()
+        scheduler._execute_native_action = AsyncMock(return_value=receipt)
+        calls = []
+
+        async def dispatch(operation, params, command_id):
+            calls.append(operation)
+            if operation == "query_route":
+                return await scheduler.query_route(**params)
+            return {"commandId": command_id, "terminalState": "succeeded"} if route_state == "reachable" else {
+                "commandId": command_id, "terminalState": "rejected", "reasonCode": "NO_ROUTE"}
+
+        executor = PlanExecutor(store, dispatch)
+        observation = await executor.run_once("save", "worker")
+        if route_state in {"reachable", "unreachable"}:
+            assert observation.outcome == "completed"
+            assert observation.result == {**route, "resolvedDestinationTile": destination["tile"]}
+            assert observation.effects == []
+            navigation = await executor.run_once("save", "worker")
+            assert navigation.outcome == ("completed" if route_state == "reachable" else "partial")
+            assert calls == ["query_route", "navigate_to"]
+        else:
+            # A native failure is a confirmed unsuccessful step; missing or
+            # malformed observation data still has an unknown outcome.
+            assert observation.outcome == ("partial" if route_state == "failed" else "unknown")
+            assert (await executor.run_once("save", "worker")).status == "idle"
+            assert calls == ["query_route"]
+
+    asyncio.run(run())

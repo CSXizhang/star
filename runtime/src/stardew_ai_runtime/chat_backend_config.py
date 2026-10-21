@@ -29,13 +29,15 @@ def load_chat_backend_config(path: Path | None = None) -> dict[str, str]:
                         "mcode": ""}
             config = {"backend": str(raw["backend"]), "model": str(raw.get("model") or defaults[raw["backend"]])}
             if raw["backend"] in {"codex", "dsh", "mcode"}:
-                config["effort"] = "low"
+                config["effort"] = "default" if raw["backend"] == "mcode" else "low"
             allowed_efforts = ({"default", "off", "low", "high", "max"} if raw["backend"] == "dsh"
                                else {"default", "low", "medium", "high", "xhigh", "max"} if raw["backend"] == "mcode"
                                else {"default", "low", "medium", "high", "xhigh"} if raw["backend"] == "codex"
                                else {"default", "low", "medium", "high"})
             if raw.get("effort") in allowed_efforts:
                 config["effort"] = str(raw["effort"])
+            if raw["backend"] == "codex" and isinstance(raw.get("httpProvider"), str):
+                config["httpProvider"] = raw["httpProvider"]
             if raw.get("agent"):
                 config["agent"] = str(raw["agent"])
             if raw.get("agentFile"):

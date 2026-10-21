@@ -8,10 +8,12 @@ from stardew_ai_runtime.work_state import WorkStore
 
 _PROGRESS_KEYS = (
     "targetCount", "completedCount", "skippedCount", "failedCount",
-    "unprocessedTargetCount", "remaining", "remainingCountSource",
+    "unprocessedTargetCount", "remaining", "remainingCountSource", "preDispatchObservedCount",
     "worldRevision", "snapshotRevision", "finalWorldRevision", "resources",
     "targetCountSource", "unprocessedTargetCountSource",
-    "candidateCount", "nativeCountsScope",
+    "candidateCount", "nativeCountsScope", "inventoryDelta", "inventoryDeltaScope", "inventoryDeltaObserved", "inventoryDeltaTiming", "inventoryDeltaTruncated", "inventoryDeltaEntryCount",
+    "requestedQuantity", "actualQuantity", "remainingQuantity", "quantityUnit",
+    "finalLocation", "finalTile", "requestedTile", "targetAdjusted", "hopCount",
     # This is the operation's observed scope, not completion of its milestone.
     "goalSatisfied", "knownNoWork", "scopeObservationIncomplete",
 )
@@ -69,10 +71,15 @@ def compact_job_feedback(result: Any, *, operation: str = "", status: str | None
     raw = result if isinstance(result, dict) else {}
     if isinstance(raw.get("native"), dict):
         raw = {**raw["native"], **{k: v for k, v in raw.items() if k != "native"}}
+    if isinstance(raw.get("details"), dict):
+        raw = {**{k: v for k, v in raw["details"].items() if k in _PROGRESS_KEYS}, **raw}
     native_error = raw.get("error")
     if isinstance(native_error, dict):
         raw = {**raw, "reasonCode": raw.get("reasonCode") or native_error.get("code"),
                "message": raw.get("message") or native_error.get("message")}
+    details = raw.get("details")
+    if not raw.get("message") and isinstance(details, dict) and isinstance(details.get("message"), str):
+        raw = {**raw, "message": details["message"]}
     raw = {**raw, "knownNoWork": _known_no_work(raw, status)}
     # Reconciled native receipts can omit targetCount. Only explicit unique
     # coordinates establish an exact count; rectangles and max_tiles do not.
@@ -113,6 +120,9 @@ def compact_job_feedback(result: Any, *, operation: str = "", status: str | None
         value = raw.get(key)
         if value is not None:
             feedback[key] = value[:8] if isinstance(value, list) else value[:320] if isinstance(value, str) else value
+    if isinstance(raw.get("inventoryDelta"), list) and len(raw["inventoryDelta"]) > 8:
+        feedback["inventoryDeltaTruncated"] = True
+        feedback["inventoryDeltaEntryCount"] = len(raw["inventoryDelta"])
     for kind, field in (("skipped", "skipReasons"), ("failed", "failureReasons")):
         reasons = _reason_counts(raw, kind)
         if reasons:
@@ -122,12 +132,106 @@ def compact_job_feedback(result: Any, *, operation: str = "", status: str | None
         feedback["effectsTruncated"] = True
     if len(json.dumps(feedback, ensure_ascii=False)) > 2400:
         essential = {key: feedback[key] for key in (*_PROGRESS_KEYS, "skipReasons", "failureReasons", "commandId") if key in feedback}
-        feedback = {"operation": operation, "status": feedback["status"], "nextBusiness": "new_model_decision_required", "reasonCode": raw.get("reasonCode"), "effectCount": len(effects), "detailsTruncated": True, **essential}
+        # The native message is the original explanation; keep it reachable even
+        # when the full feedback had to be truncated away.
+        feedback = {"operation": operation, "status": feedback["status"], "nextBusiness": "new_model_decision_required",
+                    "reasonCode": raw.get("reasonCode"), "message": raw.get("message"),
+                    "effectCount": len(effects), "detailsTruncated": True, **essential}
     feedback["actualSummary"] = actual_summary
+    # Planned observations used to settle as a generic effect-free command and
+    # lose their actual facts. The next turn then had to re-read (or substitute
+    # its old local tile sample). Keep a bounded, provenance-labelled receipt.
+    observation = raw.get("observation")
+    if (operation in {"talk_npc", "interact_tile", "native_menu_select", "native_advance",
+                      "native_answer", "fish", "attack", "eat_food"}
+            and isinstance(raw.get("details"), dict) and raw["details"]
+            and not isinstance(observation, dict)):
+        observation = {"provenance": "native-action-receipt", "operation": operation,
+                       "commandId": raw.get("commandId"), "worldRevision": raw.get("worldRevision"),
+                       "facts": raw["details"]}
+    if operation in {"observe_player_activities", "get_status", "get_work_overview", "query_inventory", "query_chests", "query_planting_options", "query_route", "query_shop", "query_farm_work",
+                     "observe_production", "observe_farming_helpers", "observe_farm_space",
+                     "observe_crafting", "observe_building_services", "observe_machines", "observe_livestock"} and not raw.get("error") and not isinstance(observation, dict) and (
+                         raw.get("status") not in {"rejected", "failed", "unavailable"}
+                         and raw.get("terminalState") not in {"failed", "rejected", "unknown"}
+                         and raw.get("reasonCode") not in {"STEP_DISPATCH_REJECTED", "TRANSPORT_RETRY_EXHAUSTED"}):
+        # All are existing structured native read operations. Preserve their
+        # returned facts, not an inferred effect or an invented world change.
+        facts = {key: value for key, value in raw.items()
+                 if key not in {"observation", "knownNoWork", "effects", "commandId", "taskId"}}
+        # The scheduler exposes native activities both at the top level and
+        # inside details. Count and deliver them once: two identical copies can
+        # exceed the receipt budget and hide an otherwise usable observation.
+        details = facts.get("details")
+        if (operation == "observe_player_activities"
+                and isinstance(facts.get("activities"), dict)
+                and isinstance(details, dict)
+                and details.get("activities") == facts["activities"]):
+            facts["details"] = {key: value for key, value in details.items()
+                                if key != "activities"}
+        observation = {"provenance": "native-read-operation", "operation": operation, "facts": facts}
+    if (operation == "observe_player_activities" and isinstance(observation, dict)
+            and len(json.dumps(observation, ensure_ascii=False).encode("utf-8")) > 16000):
+        facts = observation.get("facts") or {}
+        activities = facts.get("activities") or (facts.get("details") or {}).get("activities")
+        if isinstance(activities, dict):
+            # Keep current interaction facts even when the location has many NPCs,
+            # shoreline tiles or boundary exits. No action is selected here.
+            compact = dict(activities)
+            player = activities.get("playerTile") or {}
+            for key, value in activities.items():
+                if isinstance(value, list):
+                    rows = value
+                    if key == "festivalExits" and all(type(player.get(k)) is int for k in ("x", "y")):
+                        rows = sorted(value, key=lambda row: sum(abs((row.get("standTile") or {}).get(k, player[k])-player[k]) for k in ("x", "y")))
+                    compact[key] = rows[:8]
+                    compact[key + "Count"] = len(value)
+                    compact[key + "Truncated"] = len(value) > 8
+            observation = {**observation, "facts": {"activities": compact}, "detailsTruncated": True,
+                "retrieve": {"tool": "call_capability", "parameters": {"tool": operation, "params": params or {}}}}
+    if isinstance(observation, dict):
+        if len(json.dumps(observation, ensure_ascii=False).encode("utf-8")) <= 16000:
+            feedback["observation"] = observation
+        elif observation.get("provenance") == "native-action-receipt":
+            # A historical action cannot be retrieved by running it again.
+            # Keep its identity and direct the model to a fresh read instead.
+            feedback["observation"] = {
+                "provenance": "native-action-receipt", "operation": operation,
+                "commandId": raw.get("commandId"), "worldRevision": raw.get("worldRevision"),
+                "status": "details-truncated", "reason": "observation-too-large-for-job-receipt",
+                "nextAction": "Inspect current state with get_status or observe_player_activities. Do not repeat the action to retrieve this historical receipt.",
+            }
+        else:
+            feedback["observation"] = {"status": "available-on-demand", "reason": "observation-too-large-for-job-receipt",
+                                       "operation": operation, "parameters": params or {},
+                                       "retrieve": {"tool": "call_capability", "parameters": {"tool": operation, "params": params or {}}},
+                                       "nextAction": "Read the existing native details with call_capability. Repeating this observation as submit_plan returns the same bounded receipt; it does not reveal the omitted facts."}
+        if not effects and observation.get("provenance") == "native-action-receipt":
+            feedback["actualSummary"] = "已记录原生交互回执；物品或世界变化以实际效果为准"
+        elif not effects:
+            feedback["actualSummary"] = "已取得观察结果；不是物品或田地变化"
     if raw.get("reasonCode") and raw["reasonCode"] != "OK" and not raw["knownNoWork"]:
         feedback["reason"] = WorkStore.reason_summary(raw["reasonCode"], raw.get("message"))
     feedback["progressSummary"] = feedback_summary(feedback)
     return feedback
+
+
+def project_task_feedback_state(feedback: dict[str, Any], task: Any) -> dict[str, Any]:
+    """Refresh task state while retaining the historical native receipt's facts."""
+    steps = task.get("steps", []) if isinstance(task, dict) else task.steps
+    rows = [{"stepId": step["id"], "operation": step["operation"], "status": step["status"]}
+            if isinstance(step, dict) else
+            {"stepId": step.id, "operation": step.operation, "status": step.status}
+            for step in steps]
+    current = {row["stepId"]: row["status"] for row in rows}
+    projected = {**feedback,
+                 "taskStatus": task.get("status") if isinstance(task, dict) else getattr(task, "status", None),
+                 "stepsCompleted": sum(row["status"] == "completed" for row in rows),
+                 "remainingSteps": [row for row in rows if row["status"] != "completed"]}
+    if isinstance(feedback.get("stepResults"), list):
+        projected["stepResults"] = [{**row, "status": current.get(row.get("stepId"), row.get("status"))}
+                                    for row in feedback["stepResults"]]
+    return projected
 
 
 def compact_task_feedback(task: Any, result: Any, *, operation: str = "", status: str | None = None) -> dict[str, Any]:
@@ -151,13 +255,13 @@ def compact_task_feedback(task: Any, result: Any, *, operation: str = "", status
             receipt = compact_job_feedback({"effects": step.effects}, operation=step.operation, status=step.outcome)
         if receipt:
             rows.append({"stepId": step.id, "operation": step.operation, "status": step.status,
-                         **{key: receipt[key] for key in (*_PROGRESS_KEYS, "actualSummary", "skipReasons", "failureReasons", "reason") if key in receipt}})
+                         **{key: receipt[key] for key in (*_PROGRESS_KEYS, "commandId", "reasonCode", "message", "actualSummary", "skipReasons", "failureReasons", "reason", "observation") if key in receipt}})
     if rows:
         feedback["stepResults"] = rows
+        if any("observation" in row for row in rows):
+            feedback.pop("observation", None)  # one copy, tied to its original step
         feedback["countsScope"] = "lastNativeCommand"
-    feedback["stepsCompleted"] = sum(step.status == "completed" for step in task.steps)
-    feedback["remainingSteps"] = [{"stepId": step.id, "operation": step.operation, "status": step.status}
-                                  for step in task.steps if step.status != "completed"]
+    feedback = project_task_feedback_state(feedback, task)
     # The player summary covers all recorded receipts; top-level counters still
     # describe the last command and must not masquerade as a unique plot count.
     summary = {"actualSummary": feedback["actualSummary"]}

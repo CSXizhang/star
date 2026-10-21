@@ -1,4 +1,4 @@
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewAI.Companion.Mod.Adapters;
 using StardewAI.Companion.Mod.Avatar;
@@ -54,6 +54,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
     private readonly List<NativeActionEffect> _completed = new();
     private readonly List<NativeActionEffect> _skipped = new();
     private readonly List<NativeActionEffect> _failed = new();
+    private Dictionary<(string ItemId, int Quality), int>? _inventoryBefore;
     private float _staminaUsed;
     private int _totalCost;
     private int _waterUsed;
@@ -137,6 +138,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         lock (_stateLock)
         {
             _currentRequest = request;
+            _inventoryBefore = ActorGuards.IsPlayerBound(_actor) ? SnapshotNativeInventory() : null;
             _completed.Clear();
             _skipped.Clear();
             _failed.Clear();
@@ -365,7 +367,10 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
         var targetStep = _currentPath[_currentPathIndex];
         var targetTile = targetStep.Tile;
-        var targetPixel = new Vector2(targetTile.X * 64, targetTile.Y * 64);
+        if (ActorGuards.HasReachedWalkingTile(_actor, targetTile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
+        var targetPixel = ActorGuards.WalkingTargetPixel(_actor, targetTile);
         var currentPixel = _actor.PixelPosition;
 
         if (_observer.IsPlayerOnTile(_currentRequest!.LocationId, targetTile))
@@ -397,6 +402,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         var diff = targetPixel - currentPixel;
         float dist = diff.Length();
 
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            _actor.MovePixels(diff.X, diff.Y);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             _actor.PixelPosition = targetPixel;
@@ -427,10 +437,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             return;
         }
         var animationTool = _adapter.GetAnimationTool(_actor, _currentRequest!, _currentTarget);
+        if (ActorGuards.IsPlayerBound(_actor) && animationTool is null && _currentRequest!.Kind is NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.RefillWateringCan) {
+            FinishExecution(ExecutionState.Failed,"The requested native tool/target is unavailable; no action was performed.","NATIVE_TOOL_UNAVAILABLE"); return;
+        }
         if (animationTool is not null)
         {
             try { _actor.BeginUsingTool(animationTool); _nativeToolAnimation = true; }
-            catch (Exception ex) { _actor.EndUsingTool(); Log($"{animationTool} animation unavailable: {ex.Message}", LogLevel.Warn); }
+            catch (Exception ex) { _actor.EndUsingTool(); Log($"{animationTool} animation unavailable: {ex.Message}", LogLevel.Warn);
+                if (ActorGuards.IsPlayerBound(_actor)) { FinishExecution(ExecutionState.Failed,ex.Message,"NATIVE_TOOL_START_FAILED"); return; }
+            }
         }
         CurrentState = ExecutionState.Acting;
     }
@@ -468,6 +483,8 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         bool effectDue = _nativeToolAnimation
             ? phase is ToolAnimationPhase.EffectPoint or ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks / 2
             : _actionTicks >= ActionDurationTicks / 2;
+        if (ActorGuards.IsPlayerBound(_actor) && _nativeToolAnimation)
+            effectDue=phase is ToolAnimationPhase.EffectPoint or ToolAnimationPhase.Completed;
         if (!_actionEffectExecuted && effectDue)
         {
             _actionEffectExecuted = true;
@@ -486,6 +503,9 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         bool finished = _nativeToolAnimation
             ? _actionTicks >= MinToolAnimationTicks && (phase == ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks)
             : _actionTicks >= ActionDurationTicks;
+        if (ActorGuards.IsPlayerBound(_actor) && _nativeToolAnimation && phase != ToolAnimationPhase.Completed && _actionTicks >= MaxToolAnimationTicks) {
+            FinishExecution(ExecutionState.Failed,"Native tool did not finish within its animation limit.","NATIVE_TOOL_TIMEOUT"); return;
+        }
         if (finished)
         {
             if (_nativeToolAnimation) { _actor.EndUsingTool(); _nativeToolAnimation = false; }
@@ -652,7 +672,8 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             retryRecommended: false,
             playerActionRequired: _playerActionRequired,
             progress: _lastProgress,
-            totalCost: _totalCost
+            totalCost: _totalCost,
+            inventoryDelta: MeasureNativeInventoryDelta()
         );
 
         FinalResult = result;
@@ -660,6 +681,34 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
         OnCompleted?.Invoke(result);
         return result;
+    }
+
+    private Dictionary<(string ItemId, int Quality), int> SnapshotNativeInventory()
+    {
+        var totals = new Dictionary<(string, int), int>();
+        if (_actor.GameFarmer is not { } farmer) return totals;
+        foreach (var item in farmer.Items)
+        {
+            if (item is null) continue;
+            var key = (item.QualifiedItemId, item.Quality);
+            totals.TryGetValue(key, out var count);
+            totals[key] = count + item.Stack;
+        }
+        return totals;
+    }
+
+    private IReadOnlyList<Dictionary<string, object>>? MeasureNativeInventoryDelta()
+    {
+        if (_inventoryBefore is null) return null;
+        var after = SnapshotNativeInventory();
+        return _inventoryBefore.Keys.Union(after.Keys).Select(key =>
+        {
+            _inventoryBefore.TryGetValue(key, out var beforeCount);
+            after.TryGetValue(key, out var afterCount);
+            return new Dictionary<string, object> { ["itemId"] = key.ItemId,
+                ["quality"] = key.Quality, ["before"] = beforeCount,
+                ["after"] = afterCount, ["delta"] = afterCount - beforeCount };
+        }).Where(row => (int)row["delta"] != 0).ToArray();
     }
 
     private static string Describe(NativeActionTarget target) =>

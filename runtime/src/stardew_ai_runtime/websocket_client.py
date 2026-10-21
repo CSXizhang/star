@@ -25,6 +25,7 @@ class WebSocketClient:
         self._reader = reader
         self._writer = writer
         self._closed = False
+        self._read_task: asyncio.Task[tuple[int, bytes]] | None = None
 
     @classmethod
     async def connect(
@@ -130,10 +131,19 @@ class WebSocketClient:
             raise ConnectionClosed("WebSocket is closed")
 
         while True:
-            if timeout is not None:
-                frame = await asyncio.wait_for(self._read_frame(), timeout=timeout)
-            else:
-                frame = await self._read_frame()
+            # A polling timeout must not discard a header already consumed by
+            # _read_frame. Keep one reader alive until the whole frame arrives.
+            if self._read_task is None:
+                self._read_task = asyncio.create_task(self._read_frame())
+            try:
+                pending = asyncio.shield(self._read_task)
+                frame = await asyncio.wait_for(pending, timeout) if timeout is not None else await pending
+            except (TimeoutError, asyncio.CancelledError):
+                raise  # The next receive resumes this frame, including if it just completed.
+            except Exception:
+                self._read_task = None
+                raise
+            self._read_task = None
 
             opcode, payload = frame
             if opcode == 0x1:  # Text frame
@@ -199,11 +209,15 @@ class WebSocketClient:
         await self._writer.drain()
 
     async def close(self) -> None:
-        if self._closed:
-            return
+        was_closed = self._closed
         self._closed = True
+        if self._read_task is not None:
+            self._read_task.cancel()
+            await asyncio.gather(self._read_task, return_exceptions=True)
+            self._read_task = None
         try:
-            await self._send_close()
+            if not was_closed:
+                await self._send_close()
         except Exception:
             pass
         finally:

@@ -152,7 +152,9 @@ public class LifeWireContractTests
         var work = state.Work;
         Assert.Equal("command", work.Mode);
         Assert.False(work.Paused);
-        Assert.Equal("优先赚钱：收获出货", work.Goal);
+        // The selected job's project stays current when an unrelated goal is added.
+        Assert.Equal("离线线契约作业", work.Goal);
+        Assert.Equal(work.ActiveGoals![0].Id, work.CurrentGoalId);
         Assert.Equal("shipping", work.BoxPreference);
         Assert.NotNull(work.DailySpend);
         Assert.NotNull(work.ActiveGoals);

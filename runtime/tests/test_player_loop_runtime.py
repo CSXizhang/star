@@ -15,7 +15,6 @@ from stardew_ai_runtime.protocol import Envelope, LifeChatSubmitPayload, Protoco
 
 
 def test_archived_native_result_and_new_job_have_separate_specific_names(tmp_path):
-    from stardew_ai_runtime.chat_bridge import CommandChain
     from stardew_ai_runtime.work_state import ExecutionEntry, Step, Task
     bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
     bridge._work_store._mutate("S", lambda state: (
@@ -38,7 +37,6 @@ def test_archived_native_result_and_new_job_have_separate_specific_names(tmp_pat
         state.decision.update(finished=True),
         setattr(state, "last_job", {"taskId": "water-new", "status": "completed", "effects": [{"state": "watered"}] * 8}),
     ))
-    bridge._command_chains["S"] = CommandChain(instruction="继续种植", save_id="S", started_at=0, waiting_task_id="water-new")
     result = bridge._player_activity("S")
     assert result["phase"] == "completed"
     assert result["summary"] == "浇菜地：已浇水 20 格。"
@@ -46,7 +44,7 @@ def test_archived_native_result_and_new_job_have_separate_specific_names(tmp_pat
     assert bridge._work_store.effect_summary([{"state": "harvested"}] * 25) == "已收获 25 格"
     assert bridge._work_store.effect_summary([{"state": "deposited", "stack": n} for n in (36, 2, 1)]) == "已入箱 39 件"
     assert bridge._work_store.effect_summary([{"state": "refilled"}]) == "水壶已补满"
-    assert bridge._work_store.effect_summary([{"state": "ate-food", "stack": 1}] * 4) == "已吃 4 份食物恢复体力"
+    assert bridge._work_store.effect_summary([{"state": "ate-food", "stack": 1}] * 4) == "已吃 4 份食物；恢复量以原生回执为准"
     bridge._work_store._mutate("S", lambda state: state.executions.append(ExecutionEntry(
         command_id="hoe-partial", task_id="water-new", step_id="hoe", operation="hoe_tiles",
         outcome="partial", effects=[{"state": "hoed"}] * 2, reason_code="STEP_PARTIAL",
@@ -147,6 +145,7 @@ def test_propose_accept_real_work_terminal_reopen_panel(tmp_path, monkeypatch):
         provider = Provider()
         bridge._backend = provider
         ws = AsyncMock()
+        bridge._chat_ws = ws  # the persisted-outbox delivery turn replies on the chat channel
         await bridge._run_life_chat_turn(ws, {"request_id": "plan", "save_id": "S", "mode": "plan", "text": "商量一下菜地"})
         replies = [json.loads(call.args[0]) for call in ws.send_text.call_args_list]
         offered = next(reply["payload"] for reply in reversed(replies) if reply["messageType"] == "life.chat.reply")
@@ -162,9 +161,9 @@ def test_propose_accept_real_work_terminal_reopen_panel(tmp_path, monkeypatch):
         assert bridge._player_activity("S")["phase"] == "working"
         assert not bridge._autonomy.state("S").enabled
         await bridge._plan_worker.evaluate()
-        await bridge.wait_for_chains()
+        await bridge.wait_for_deliveries()
         assert dispatched == ["water_auto"]
-        assert provider.work_turns == 2  # normal chain summary after real native terminal
+        assert provider.work_turns == 2  # outbox delivery turn reports the real native terminal
         activity = bridge._life_work_projection("S")["activity"]
         assert activity["phase"] == "completed"
         assert "浇眼前两格菜地" in activity["summary"]

@@ -15,12 +15,14 @@ public sealed partial class NormalNativeActionAdapter
         switch (request.Kind)
         {
             case NativeActionKind.RefillWateringCan:
+                if (ActorGuards.IsPlayerBound(actor)) return actor.WateringCan != null ? "Watering Can" : null;
                 // An empty can cannot start a pouring animation. Refill is a
                 // separate native transaction and does not pretend to pour.
                 return null;
             case NativeActionKind.CutGrass:
                 return actor.GetToolNames().Contains("Scythe") ? "Scythe" : null;
             case NativeActionKind.ChopTree:
+                if (actor is PlayerActor) return PreparePlayerChop(actor, request, target);
                 if (location.terrainFeatures.TryGetValue(new Vector2(target.Tile.X, target.Tile.Y), out var feature)
                     && feature is Tree tree && tree.falling.Value) return null;
                 return actor.FindTool<Axe>() is not null ? "Axe" : null;

@@ -1,4 +1,4 @@
-"""Regression tests for chat-bridge autonomy settlement and command-chain teardown.
+"""Regression tests for chat-bridge autonomy settlement and outbox delivery.
 
 Two confirmed defects:
 
@@ -8,11 +8,11 @@ Two confirmed defects:
   the current one.  See ``ChatBridge.handle_chat_submit``'s
   ``autonomy_fingerprint`` branch.
 
-* ``ChatBridge._break_command_chain`` cancelled every task in
-  ``_chain_tasks`` — including the chain-continuation task when it broke its
-  own chain at end of turn, which dropped the final reply (the next real
-  await raised ``CancelledError``) and mis-recorded the turn as
-  ``interrupted``.
+* A continuation turn that broke its own chain cancelled every task in
+  ``_chain_tasks`` — including itself — which dropped the final reply (the
+  next real await raised ``CancelledError``) and mis-recorded the turn as
+  ``interrupted``.  The persistent-outbox delivery turn owns the final reply
+  now; ``test_outbox_delivery_delivers_final_reply`` locks that invariant.
 
 All tests use fake backends/clients/WebSockets and isolated ``tmp_path``
 run dirs; no real provider process, save file, or game is touched.
@@ -240,12 +240,14 @@ def test_duplicate_terminal_settles_once(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- defect 2
 
 
-def test_chain_continuation_delivers_final_reply(tmp_path, monkeypatch):
-    """续链正常终止时，最终总结回复必须真正送达（调用者不能被自身取消）。"""
+def test_outbox_delivery_delivers_final_reply(tmp_path, monkeypatch):
+    """终态事实经持久 outbox 投递：最终总结回复必须真正送达（调用者不能被自身取消）。"""
     monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda _: None)
     client = _ScriptedClient()
     bridge = ChatBridge(run_dir=tmp_path, backend="fake", internal_plan_client=client)
     ws = _YieldingWs()
+    bridge._chat_ws = ws  # the outbox delivery turn replies on the chat channel
+    bridge._latest_snapshot_payload = {"world": {"year": 1, "season": "spring", "dayOfMonth": 1}}
 
     class Backend:
         def __init__(self):
@@ -271,102 +273,18 @@ def test_chain_continuation_delivers_final_reply(tmp_path, monkeypatch):
     async def run():
         await bridge.handle_chat_submit(ws, "req-player-1", "种植胡萝卜", "Save1")
         await bridge._plan_worker.evaluate()
-        await bridge.wait_for_chains()
+        await bridge.wait_for_deliveries()
 
         assert backend.turns == 2
+        assert not bridge._work_store.pending_outbox("Save1")
         texts = ws.reply_texts()
         assert any("胡萝卜已种植完毕" in t for t in texts), f"final summary reply missing: {texts}"
 
         commands_file = tmp_path / "chat_commands.jsonl"
         recorded = [json.loads(line) for line in commands_file.read_text(encoding="utf-8").splitlines()]
-        interrupted = [c for c in recorded if c.get("status") == "interrupted" and str(c.get("request_id", "")).startswith("chain-")]
-        assert not interrupted, f"completed chain turn mis-recorded as interrupted: {interrupted}"
-
-    asyncio.run(run())
-
-
-def test_chain_limit_reply_delivered(tmp_path, monkeypatch):
-    """续链达到上限时，上限提示回复必须真正送达。"""
-    monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda _: None)
-    monkeypatch.setenv("STARDEW_COMMAND_CHAIN_MAX", "1")
-    client = _ScriptedClient()
-    bridge = ChatBridge(run_dir=tmp_path, backend="fake", internal_plan_client=client)
-    ws = _YieldingWs()
-
-    class Backend:
-        def __init__(self):
-            self.turns = 0
-
-        def run(self, active_task, cid, prompt):
-            self.turns += 1
-            token = os.environ.get("STARDEW_DECISION_TOKEN")
-            goal = bridge._work_store.add_goal("Save1", "持续开荒", source="user")
-            bridge._work_store.submit_plan(
-                "Save1",
-                goal_id=goal.id,
-                decision_token=token,
-                tasks=[{"id": f"t{self.turns}", "title": f"步骤{self.turns}", "steps": [{"id": f"s{self.turns}", "operation": "clear_debris", "params": {}}]}],
-            )
-            return {"success": True, "response": f"已选择步骤{self.turns}"}
-
-    backend = Backend()
-    bridge._backend = backend
-
-    async def run():
-        await bridge.handle_chat_submit(ws, "req-loop", "开荒", "Save1")
-        await bridge._plan_worker.evaluate()
-        await bridge.wait_for_chains()
-        await bridge._plan_worker.evaluate()
-        await bridge.wait_for_chains()
-
-        assert backend.turns == 2
-        assert "Save1" not in bridge._command_chains
-        texts = ws.reply_texts()
-        assert any("上限" in t for t in texts), f"chain-limit reply missing: {texts}"
-
-    asyncio.run(run())
-
-
-def test_external_cancel_interrupts_pending_chain(tmp_path, monkeypatch):
-    """外部取消仍须中断续链：任务被取消，且不会发出续链最终总结。"""
-    monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda _: None)
-    client = _ScriptedClient()
-    bridge = ChatBridge(run_dir=tmp_path, backend="fake", internal_plan_client=client)
-    ws = _YieldingWs()
-
-    class Backend:
-        def __init__(self):
-            self.turns = 0
-
-        def run(self, active_task, cid, prompt):
-            self.turns += 1
-            token = os.environ.get("STARDEW_DECISION_TOKEN")
-            goal = bridge._work_store.add_goal("Save1", "任务", source="user")
-            bridge._work_store.submit_plan(
-                "Save1",
-                goal_id=goal.id,
-                decision_token=token,
-                tasks=[{"id": f"t{self.turns}", "title": "任务", "steps": [{"id": f"s{self.turns}", "operation": "clear_debris", "params": {}}]}],
-            )
-            return {"success": True, "response": "第一作业已选择" if self.turns == 1 else "续链作业已选择"}
-
-    backend = Backend()
-    bridge._backend = backend
-
-    async def run():
-        await bridge.handle_chat_submit(ws, "req-1", "任务1", "Save1")
-        await bridge._plan_worker.evaluate()
-        chain_tasks = list(bridge._chain_tasks)
-        assert chain_tasks, "chain continuation must be scheduled after the first job terminal"
-
-        await bridge.handle_chat_cancel(ws, "req-1", "player_cancelled", "Save1")
-        # ``_break_command_chain`` clears the live set, so ``wait_for_chains``
-        # would no-op; drive the captured tasks to their cancelled end directly.
-        await asyncio.gather(*chain_tasks, return_exceptions=True)
-
-        assert all(t.cancelled() for t in chain_tasks), "external cancel must still cancel the chain task"
-        assert backend.turns == 1, "cancelled chain must not run another provider turn"
-        texts = ws.reply_texts()
-        assert not any("续链作业已选择" in t for t in texts), f"cancelled chain leaked a final summary: {texts}"
+        interrupted = [c for c in recorded if c.get("status") == "interrupted" and str(c.get("requestId", "")).startswith("delivery-")]
+        assert not interrupted, f"completed delivery turn mis-recorded as interrupted: {interrupted}"
+        delivery_rows = [c for c in recorded if str(c.get("requestId", "")).startswith("delivery-")]
+        assert delivery_rows and all(c.get("status") == "completed" for c in delivery_rows)
 
     asyncio.run(run())

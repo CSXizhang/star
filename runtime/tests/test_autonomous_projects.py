@@ -46,7 +46,12 @@ def test_project_layout_survives_day_and_restart_without_context_dump(tmp_path):
     store.settle_game_day("a", year=1, season="spring", day=2)
     store.settle_game_day("a", year=1, season="spring", day=3)
     restarted = WorkStore(path)
-    assert restarted.state("a").goals[0].project == project
+    persisted = restarted.state("a").goals[0].project
+    # Day settlement appends bounded progress notes; the authored project
+    # fields must survive untouched.
+    for key, value in project.items():
+        assert persisted[key] == value
+    assert [entry["date"] for entry in persisted["progressLog"]] == ["1:spring:3"]
     context = build_decision_context({"world": {"year": 1}}, work=restarted.overview("a"))
     assert "layout" not in context["goals"][0]["project"]
     assert context["goals"][0]["constraints"] == {"keep": "orchard"}

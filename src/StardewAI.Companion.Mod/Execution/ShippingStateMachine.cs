@@ -370,6 +370,9 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
         }
 
         var step = _currentPath[_currentPathIndex];
+        if (ActorGuards.HasReachedWalkingTile(_actor, step.Tile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
 
         // Dynamic collision check BEFORE stepping
         bool isPassable = step.Tile == _actor.Tile ||
@@ -391,14 +394,20 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
             return;
         }
 
-        var targetPixelX = step.Tile.X * 64f + 32f;
-        var targetPixelY = step.Tile.Y * 64f + 32f;
+        var walkingTarget = ActorGuards.WalkingTargetPixel(_actor, step.Tile);
 
         var currentPos = _actor.PixelPosition;
-        float dx = targetPixelX - (currentPos.X + 32f);
-        float dy = targetPixelY - (currentPos.Y + 32f);
+        float dx = walkingTarget.X - currentPos.X;
+        float dy = walkingTarget.Y - currentPos.Y;
 
         float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            // The native actor ignores position setters. Keep driving its held
+            // movement until the measured standing center actually reaches the tile.
+            _actor.MovePixels(dx, dy);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             _actor.PixelPosition = new Vector2(step.Tile.X * 64, step.Tile.Y * 64);
@@ -557,13 +566,13 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
 
         string statusText = terminalState switch
         {
-            ExecutionState.Succeeded => "completed successfully",
-            ExecutionState.PartiallySucceeded => "completed partially",
-            ExecutionState.Cancelled => "cancelled",
-            ExecutionState.Rejected => "rejected",
-            _ => "failed"
+            ExecutionState.Succeeded => "完成",
+            ExecutionState.PartiallySucceeded => "部分完成",
+            ExecutionState.Cancelled => "已取消",
+            ExecutionState.Rejected => "未开始",
+            _ => "未完成"
         };
-        NotifyPlayer($"AI Companion: Shipping task {statusText} ({_shippedItems.Count} items shipped, est. total value: {_estimatedTotalValue}g).");
+        NotifyPlayer($"伙伴出货{statusText}：已投入 {_shippedItems.Sum(item => item.Count)} 件，预计 {_estimatedTotalValue} 金，睡觉后结算。");
 
         return result;
     }

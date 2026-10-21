@@ -46,4 +46,20 @@ public interface IPurchaseAdapter
     /// Counts total units of the specified qualified or unqualified item in companion inventory.
     /// </summary>
     int CountItemInBackpack(IFarmerActor actor, string itemId);
+
+    /// <summary>
+    /// Player-mode native purchase: opens the real <c>ShopMenu</c> for
+    /// <paramref name="shopId"/>, buys <paramref name="count"/> units of
+    /// <paramref name="itemId"/> through the game's own
+    /// <c>ShopMenu.tryToPurchaseItem</c> (native charge + finite-stock bookkeeping),
+    /// delivers the held item into the player's inventory, and closes the menu on
+    /// every path. Only valid for player-bound actors; companion-mode adapters keep
+    /// the default unsupported result.
+    /// </summary>
+    /// <param name="error">Human-readable failure cause when the purchase fails.</param>
+    bool TryPurchaseNative(IFarmerActor actor, string shopId, string itemId, int count, out string error)
+    {
+        error = "unsupported";
+        return false;
+    }
 }

@@ -46,6 +46,14 @@ def _mock_agy_stream(proc, stdout: str, stderr: str) -> None:
     proc.wait.return_value = proc.returncode
 
 
+def _last_chat_reply(ws: AsyncMock) -> dict[str, Any]:
+    for call in reversed(ws.send_text.call_args_list):
+        message = json.loads(call.args[0])
+        if message["messageType"] == "chat.reply":
+            return message
+    raise AssertionError("No chat.reply was sent")
+
+
 def test_internal_client_close_releases_inflight_and_queued_calls(tmp_path: Path) -> None:
     async def scenario():
         started = asyncio.Event()
@@ -84,6 +92,108 @@ def test_internal_client_close_releases_inflight_and_queued_calls(tmp_path: Path
         assert client._task is None
 
     asyncio.run(scenario())
+
+def test_reconcile_and_cancel_reach_paused_dispatch_without_releasing_new_work(tmp_path):
+    from types import SimpleNamespace
+
+    async def scenario():
+        started, cancelled = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def native_call(name, arguments):
+            calls.append(name)
+            if name == "dispatch_plan_operation":
+                started.set()
+                await cancelled.wait()
+                payload = {"terminalState": "cancelled", "effects": [{"state": "harvested"}]}
+            elif name == "reconcile_plan_command":
+                payload = {"found": False}
+            else:
+                assert name == "cancel_plan_command"
+                cancelled.set()
+                payload = {"status": "cancellation-requested"}
+            return SimpleNamespace(isError=False, structuredContent=payload, content=[])
+
+        session = MagicMock()
+        session.initialize = AsyncMock()
+        session.call_tool = native_call
+        session.__aenter__ = AsyncMock(return_value=session)
+        streams = MagicMock()
+        streams.__aenter__ = AsyncMock(return_value=(None, None))
+        client = InternalMcpPlanClient(tmp_path)
+        with patch("mcp.client.stdio.stdio_client", return_value=streams), patch(
+            "mcp.ClientSession", return_value=session
+        ):
+            pending = asyncio.create_task(client.call_tool("dispatch_plan_operation", {"operation": "harvest_auto"}))
+            await asyncio.wait_for(started.wait(), 1)
+            assert await asyncio.wait_for(client.reconcile("old-native"), 1) == {"found": False}
+            assert not pending.done()
+            await asyncio.wait_for(client.call_tool("cancel_plan_command", {"command_id": "old-native"}), 1)
+            assert (await asyncio.wait_for(pending, 1))["effects"] == [{"state": "harvested"}]
+            await client.close()
+        assert calls == ["dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command"]
+
+    asyncio.run(scenario())
+
+
+def test_internal_client_reopen_waits_for_old_close(tmp_path):
+    async def scenario():
+        close_started, finish_close = asyncio.Event(), asyncio.Event()
+        client = InternalMcpPlanClient(tmp_path)
+        client._task = asyncio.create_task(finish_close.wait())
+        client._ready = asyncio.get_running_loop().create_future()
+        client._ready.set_result(None)
+
+        async def close_command(command):
+            assert command[0] == "close"
+            close_started.set()
+            await finish_close.wait()
+
+        async def new_session():
+            client._resolve_ready(None)
+            await asyncio.Event().wait()
+
+        client._command = close_command
+        client._session_loop = new_session
+        closing = asyncio.create_task(client.close())
+        await close_started.wait()
+        opening = asyncio.create_task(client.open())
+        await asyncio.sleep(0)
+        assert not opening.done()
+        finish_close.set()
+        await asyncio.wait_for(asyncio.gather(closing, opening), 1)
+        assert client.connected and client._requests is not None
+        client._task.cancel()
+        await asyncio.gather(client._task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_idle_close_waits_for_native_reconciliation_reply(tmp_path):
+    from types import SimpleNamespace
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        client = InternalMcpPlanClient(tmp_path)
+        client._open_session = AsyncMock()
+
+        async def read_terminal(name, arguments):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(isError=False, structuredContent={"found": True}, content=[])
+
+        client._live_session = SimpleNamespace(call_tool=read_terminal)
+        reading = asyncio.create_task(client.reconcile("old-native"))
+        await entered.wait()
+        closing = asyncio.create_task(client.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+        release.set()
+        assert await asyncio.wait_for(reading, 1) == {"found": True}
+        await asyncio.wait_for(closing, 1)
+
+    asyncio.run(scenario())
+
 
 def test_chat_submit_payload_roundtrip() -> None:
     submit = ChatSubmitPayload(
@@ -200,9 +310,9 @@ def test_format_agent_prompt() -> None:
     assert "主动汇报阶段成果、实质取舍和阻塞，每次不超过三句" in prompt
 
 
-def test_format_chain_prompt_contains_chinese_reply_instruction() -> None:
+def test_format_delivery_prompt_contains_chinese_reply_instruction() -> None:
     bridge = ChatBridge()
-    prompt = bridge._format_chain_prompt("继续播种")
+    prompt = bridge._format_delivery_prompt([], "save", midflight=[], read_only=False)
     assert "始终用中文回复玩家" in prompt
 
 
@@ -353,7 +463,7 @@ def test_handle_chat_submit_player_preempts_old_job_with_fake_provider(tmp_path:
             await bridge.handle_chat_submit(ws,"new","new player instruction","Save1")
         assert old.cancelled
         assert provider.call_count==1
-        assert json.loads(ws.send_text.call_args[0][0])["payload"]["status"]=="decision-completed"
+        assert _last_chat_reply(ws)["payload"]["status"] == "decision-completed"
     asyncio.run(run())
 
 
@@ -563,7 +673,7 @@ def test_resume_omits_cumulative_cli_usage_when_delta_missing(tmp_path: Path) ->
 
             # Check sent reply
             assert mock_ws.send_text.called
-            sent_reply = json.loads(mock_ws.send_text.call_args[0][0])
+            sent_reply = _last_chat_reply(mock_ws)
             payload = sent_reply["payload"]
             assert payload["status"] == "completed"
             assert payload.get("tokensUsed") is None
@@ -609,7 +719,7 @@ def test_new_conversation_allows_session_local_cli_usage(tmp_path: Path) -> None
             )
 
             assert mock_ws.send_text.called
-            sent_reply = json.loads(mock_ws.send_text.call_args[0][0])
+            sent_reply = _last_chat_reply(mock_ws)
             payload = sent_reply["payload"]
             assert payload["tokensUsed"] == 8400
             assert payload["usageSource"] == "cli_direct_new_session"
@@ -956,7 +1066,7 @@ def test_kimi_submit_uses_wire_usage_and_skips_agy_db(tmp_path: Path) -> None:
             )
 
             assert mock_ws.send_text.called
-            payload = json.loads(mock_ws.send_text.call_args[0][0])["payload"]
+            payload = _last_chat_reply(mock_ws)["payload"]
             assert payload["status"] == "completed"
             assert payload["tokensUsed"] == 50710
             assert payload["usageSource"] == "kimi_wire_usage_record"
@@ -1000,7 +1110,7 @@ def test_kimi_unknown_wire_usage_is_reported_unknown_not_zero(tmp_path: Path) ->
                 ws=mock_ws, request_id="req-kimi-2", text="浇水", save_id="SaveK"
             )
 
-            payload = json.loads(mock_ws.send_text.call_args[0][0])["payload"]
+            payload = _last_chat_reply(mock_ws)["payload"]
             assert payload.get("tokensUsed") is None
             assert payload["usageSource"] == "unknown"
 
@@ -1116,7 +1226,7 @@ def test_chat_prompt_injects_compact_live_context() -> None:
     assert '"weather":{"icon":"1","isRaining":true}' in prompt
     assert '"day":6' in prompt
     assert "Parsnip Seeds" in prompt
-    assert '"funds":900' in prompt
+    assert '"spendableMoney":900' in prompt
     assert '"freeSlots":4' in prompt
     assert "tilledUnwateredTiles" not in prompt, "no farm bulk dump in the prompt"
     assert "submit_plan" in prompt and "remember_intent" in prompt
@@ -1140,7 +1250,7 @@ def test_prompt_marks_missing_native_fields_unknown() -> None:
     assert "实时上下文" in prompt
 
 
-def test_day_advance_settles_once_and_rotates_provider_session(tmp_path: Path) -> None:
+def test_day_advance_settles_once_and_keeps_provider_session(tmp_path: Path) -> None:
     async def run() -> None:
         bridge = ChatBridge(run_dir=tmp_path, backend="kimi")
         store = bridge._work_store
@@ -1159,17 +1269,17 @@ def test_day_advance_settles_once_and_rotates_provider_session(tmp_path: Path) -
 
         await bridge._settle_day_advance("save-1", {"year": 1, "season": "spring", "dayOfMonth": 6})
         assert bridge._last_day_settlement["settled"] is True
-        # Safe rotation on the real day advance; the old id stays attributable.
-        assert bridge.get_conversation_id("save-1") is None
-        history = bridge._session_history["kimi:save-1"]
-        assert history[-1] == "conv-1"
+        # Day rollover is an ordinary in-game event, not a model/tool
+        # incompatibility: the same business session persists across game days
+        # so the incremental prompt state and provider cache stay valid.
+        assert bridge.get_conversation_id("save-1") == "conv-1"
         assert first_cid == "conv-1"
+        assert "kimi:save-1" not in bridge._session_history
 
-        # Replaying the same day must not settle or rotate again.
-        bridge.record_conversation_id("save-1", "conv-2")
+        # Replaying the same day must not settle or rotate either.
         await bridge._settle_day_advance("save-1", {"year": 1, "season": "spring", "dayOfMonth": 6})
         assert bridge._last_day_settlement["reasonCode"] == "ALREADY_SETTLED"
-        assert bridge.get_conversation_id("save-1") == "conv-2"
+        assert bridge.get_conversation_id("save-1") == "conv-1"
 
     asyncio.run(run())
 

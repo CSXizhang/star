@@ -214,6 +214,8 @@ def test_overview_exposes_next_step_and_anomalies(tmp_path: Path) -> None:
 def test_submit_plan_resolves_goal_and_supersedes_pending_only(tmp_path: Path) -> None:
     store=_store(tmp_path)
     first=_chosen(store,task_id="a")
+    # Explicit replacement retires the old selection before opening a turn.
+    store.revoke_decision("Save1")
     second=_chosen(store,task_id="b")
     assert first["goalId"]==second["goalId"]
     assert first["goalCreated"] and not second["goalCreated"]
@@ -224,6 +226,7 @@ def test_submit_plan_replace_preserves_running_and_unknown_work(tmp_path: Path) 
     store=_store(tmp_path)
     _chosen(store)
     store.claim_next_step("Save1","w")
+    store.revoke_decision("Save1")
     _chosen(store,task_id="b")
     assert store.list_tasks("Save1")[0]["status"]=="running"
     assert store.claim_next_step("Save1","w2")["taskId"]=="b"

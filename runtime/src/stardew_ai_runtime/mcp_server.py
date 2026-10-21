@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import asdict
 from pathlib import Path
 from types import UnionType
@@ -27,6 +28,7 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import TextContent, ToolAnnotations
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from stardew_ai_runtime.agent_instructions import read_guidance as load_guidance
@@ -37,7 +39,9 @@ from stardew_ai_runtime.companion_milestones import (
     wire_node,
 )
 from stardew_ai_runtime.companion_profile import CompanionProfileStore
+from stardew_ai_runtime.decision_context import water_can_resources
 from stardew_ai_runtime.decision_policy import project_context
+from stardew_ai_runtime.mcode_wire_schema import mcode_tool_schema
 from stardew_ai_runtime.plan_executor import (
     PlanExecutor,
 )
@@ -53,6 +57,7 @@ from stardew_ai_runtime.scheduler import (
     extract_non_tool_items,
     validate_action_tiles,
 )
+from stardew_ai_runtime.snapshot_cache import cache_lock, read_cache
 from stardew_ai_runtime.wiki import WikiLookup
 from stardew_ai_runtime.work_state import (
     PLANT_WORKFLOW_PLAN_ERROR,
@@ -138,14 +143,17 @@ def compact_work_overview(overview: dict[str, Any]) -> dict[str, Any]:
 
 def _unwrap_item_array(value: Any) -> Any:
     """Accept the provider's unambiguous XML-style array wrapper only."""
+    wrapped = False
     for _ in range(8):
         if isinstance(value, dict) and set(value) == {"item"}:
+            wrapped = True
             value = value["item"]
         elif isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict) and set(value[0]) == {"item"}:
+            wrapped = True
             value = value[0]["item"]
         else:
             break
-    return value
+    return [value] if wrapped and not isinstance(value, list) else value
 
 
 def _normalize_wire_arrays(value: Any, annotation: Any) -> Any:
@@ -159,7 +167,20 @@ def _normalize_wire_arrays(value: Any, annotation: Any) -> Any:
     if origin is list:
         value = _unwrap_item_array(value)
         if isinstance(value, list):
-            return [_normalize_wire_arrays(item, args[0]) for item in value]
+            result = []
+            def append_item(item, depth=0):
+                if depth > 8:
+                    raise ValueError("Provider array wrapper nesting exceeds 8")
+                if isinstance(item, dict) and set(item) == {"item"}:
+                    wrapped_item = _unwrap_item_array(item)
+                    if isinstance(wrapped_item, list):
+                        for child in wrapped_item:
+                            append_item(child, depth + 1)
+                        return
+                result.append(_normalize_wire_arrays(item, args[0]))
+            for item in value:
+                append_item(item)
+            return result
     return value
 
 
@@ -199,6 +220,51 @@ class SpatialRegion(BaseModel):
     y: int = Field(ge=0, strict=True)
     width: int = Field(ge=1, strict=True)
     height: int = Field(ge=1, strict=True)
+
+
+class TileXY(BaseModel):
+    """One non-negative native map coordinate for tile-array tool parameters.
+
+    Keeps the wire contract of the former ``list[dict[str, Any]]`` parameters but
+    validates every entry: x/y must be integers (booleans and non-numeric strings
+    are rejected), numerically coercible wire values (e.g. mcode's ``"65"``) stay
+    accepted, and coordinates must be non-negative like _TILE_SHAPE declares.
+    """
+
+    x: Annotated[int, BeforeValidator(_reject_boolean_integer)] = Field(ge=0)
+    y: Annotated[int, BeforeValidator(_reject_boolean_integer)] = Field(ge=0)
+
+
+class InteractionTileXY(BaseModel):
+    """Adjacent native interaction coordinate, including one tile beyond map edges."""
+    x: Annotated[int, BeforeValidator(_reject_boolean_integer)] = Field(ge=-1)
+    y: Annotated[int, BeforeValidator(_reject_boolean_integer)] = Field(ge=-1)
+
+
+class ItemQuantity(BaseModel):
+    """Canonical native item quantity; strings are decoded by the wire adapter.
+
+    Boolean, fractional, negative and missing counts remain invalid.
+    """
+    model_config = ConfigDict(extra="forbid")
+    itemId: str = Field(min_length=1)
+    count: Annotated[int, BeforeValidator(_reject_boolean_integer)] = Field(ge=1)
+    quality: Annotated[int, BeforeValidator(_reject_boolean_integer)] | None = Field(default=None, ge=0)
+
+
+def _item_dicts(items):
+    return [item.model_dump(exclude_none=True) if isinstance(item, BaseModel) else item
+            for item in items] if items is not None else None
+
+
+def _tile_dicts(tiles: Any) -> list[dict[str, Any]]:
+    """Normalize TileXY models (or plain coordinate dicts) for the scheduler API.
+
+    FastMCP keeps validated sub-models as model instances; the guarded plan path
+    already reduced them to plain dicts. Both shapes pass through unchanged in
+    content so the scheduler interface stays dict-based.
+    """
+    return [tile.model_dump() if isinstance(tile, BaseModel) else tile for tile in (tiles or [])]
 
 
 class ShortJobStep(BaseModel):
@@ -393,6 +459,10 @@ stops the job; inspect its effects before choosing the remaining work.
 Only native results prove completion. Keep ongoing goals active and record future
 work with manage_todo conditions rather than polling. Use water_tiles for an exact
 observed planting batch, water_auto for currently observed missing farm watering.
+For water_auto, max_tiles is only a batch limit, not the requested work scope.
+For an instruction such as "only water the nearest N crops", choose at most N
+freshly observed candidate coordinates and pass target_tiles explicitly, including
+inside submit_plan. Auto selection does not promise nearest-first ordering.
 """
 
 
@@ -473,8 +543,14 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
 
 # Plan steps may only invoke these existing operations, through their real
 # scheduler implementation. Unknown operations are rejected; unknown parameters
-# are stripped with a warning before dispatch (persisted steps may carry stale keys).
+# reject semantic parameters outside the operation contract before dispatch.
 _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
+    "observe_player_activities": ("observe_player_activities", frozenset()),
+    "talk_npc": ("talk_npc", frozenset({"npc_name", "location_id"})),
+    "interact_tile": ("interact_tile", frozenset({"tile", "location_id"})),
+    "fish": ("fish", frozenset({"facing", "location_id"})),
+    "attack": ("attack", frozenset({"facing", "location_id"})),
+    "native_menu_select": ("native_menu_select", frozenset({"choice_index", "location_id", "text"})),
     "get_work_overview": ("get_work_overview", frozenset({"detail"})),
     "get_status": ("get_status", frozenset({"detail"})),
     "query_farm_work": ("query_farm_work", frozenset()),
@@ -487,7 +563,7 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
     "water_zone": ("execute_water_zone", frozenset({"center_x", "center_y", "radius", "include_empty_tiles"})),
     "water_auto": ("water_auto", frozenset({"max_tiles", "include_empty_tiles", "target_tiles", "location_id"})),
     "harvest_auto": ("harvest_auto", frozenset({"max_tiles", "target_tiles", "location_id"})),
-    "deposit_to_chest": ("deposit_to_chest", frozenset({"chest_x", "chest_y", "item_ids", "location_id"})),
+    "deposit_to_chest": ("deposit_to_chest", frozenset({"chest_x", "chest_y", "item_ids", "items", "location_id"})),
     "withdraw_from_chest": (
         "withdraw_from_chest",
         frozenset({"chest_x", "chest_y", "items", "item_id", "count", "location_id"}),
@@ -495,13 +571,18 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
     "organize_chest": ("organize_chest", frozenset({"chest_x", "chest_y"})),
     "hoe_tiles": ("execute_hoe_tiles", frozenset({"tiles", "location_id"})),
     "plant_seeds": ("execute_plant_seeds", frozenset({"seed_item_id", "tiles", "location_id"})),
-    "ship_items": ("execute_ship_items", frozenset({"items", "location_id"})),
+    "ship_items": ("execute_ship_items", frozenset({"items", "location_id", "max_game_minutes"})),
     "purchase_items": (
         "execute_purchase_items",
         frozenset({"items", "budget_limit", "shop_id", "location_id"}),
     ),
     "navigate_to": ("execute_navigate_to", frozenset({"location_id", "tile", "landmark"})),
     "pause_task": ("pause_task", frozenset()),
+    "sleep": ("execute_sleep", frozenset()),
+    "open_shop": ("open_shop", frozenset({"shop_id", "location_id"})),
+    "open_chest": ("open_chest", frozenset({"chest_x", "chest_y", "location_id"})),
+    "native_advance": ("execute_native_advance", frozenset({"allow_skip"})),
+    "native_answer": ("execute_native_answer", frozenset({"choice_index"})),
     "resume_task": ("resume_task", frozenset()),
     "cancel_task": ("cancel_task", frozenset({"reason"})),
     # Grouped observation + native agricultural/husbandry actions. Every entry runs
@@ -596,6 +677,9 @@ BASE_TOOLS = frozenset(
         "pause_task",
         "resume_task",
         "cancel_task",
+        "sleep",
+        "player_control",
+        "open_shop",
         # grouped discovery + invocation
         "discover_capabilities",
         "call_capability",
@@ -609,7 +693,7 @@ LIGHT_TOOLS = BASE_TOOLS
 # command id actually reaches the real scheduler/native command (``call_capability``
 # rejects the harness-only ``command_id`` parameter, which is exactly the round6
 # STEP_DISPATCH_FAILED root cause).
-INTERNAL_TOOLS = LIGHT_TOOLS | {"reconcile_plan_command", "dispatch_plan_operation"}
+INTERNAL_TOOLS = LIGHT_TOOLS | {"reconcile_plan_command", "dispatch_plan_operation", "cancel_plan_command"}
 
 # Unified dialogue: cached observation, durable accepted goals, and control
 # intents. Never opens the native action socket or dispatches a physical job.
@@ -653,8 +737,9 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
         "feed_animals",
         "toggle_animal_door",
     ),
-    "shopping": ("query_shop", "purchase_items", "ship_items"),
+    "shopping": ("open_shop", "query_shop", "purchase_items", "ship_items"),
     "chest": (
+        "open_chest",
         "query_inventory",
         "query_chests",
         "deposit_to_chest",
@@ -662,8 +747,9 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
         "organize_chest",
     ),
     "movement": ("get_status", "query_route", "navigate_to"),
+    "native_ui": ("get_status", "observe_player_activities", "talk_npc", "interact_tile", "fish", "attack", "native_menu_select", "native_advance", "native_answer"),
     "knowledge": ("read_guidance", "query_wiki"),
-    "memory": ("manage_goal", "manage_plan", "manage_todo", "work_plan_overview"),
+    "memory": ("manage_goal", "manage_plan", "manage_todo", "record_decision_note", "work_plan_overview"),
 }
 
 # The real nested schema for the two model-facing write entry points. The model
@@ -738,7 +824,7 @@ MEMORY_WRITE_SCHEMA: dict[str, Any] = {
                 {
                     "id": "t1",
                     "title": "浇水",
-                    "steps": [{"operation": "water_auto", "params": {"max_tiles": 10}}],
+                    "steps": [{"operation": "water_auto", "params": {"max_tiles": 2, "target_tiles": [{"x": 62, "y": 27}, {"x": 66, "y": 23}]}}],
                 }
             ],
         },
@@ -798,6 +884,30 @@ def resolve_surface(full: bool | None = None, surface: str | None = None) -> str
     return "full"
 
 
+class _McodeFastMCP(FastMCP):
+    """Avoid mcode appending a second copy of an already structured result.
+
+    Keep the structured result and output schema for MCP validation. Other clients
+    retain FastMCP's backward-compatible JSON text; mixed media and errors survive.
+    """
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        result = await super().call_tool(name, arguments)
+        if not (isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict)):
+            return result
+        content, structured = result
+        retained = []
+        for block in content:
+            if isinstance(block, TextContent) and block.annotations is None and block.meta is None:
+                try:
+                    if json.loads(block.text) == structured:
+                        continue
+                except ValueError:
+                    pass
+            retained.append(block)
+        return retained, structured
+
+
 def create_mcp_server(
     run_dir: Path | str | None = None,
     scheduler: CompanionScheduler | None = None,
@@ -827,7 +937,8 @@ def create_mcp_server(
     inst = instructions if instructions is not None else DEFAULT_MCP_INSTRUCTIONS
     if instructions is None:
         inst += "持续生产授权后可用set_autonomy(goal_id=...)绑定目标并接续，不改变空闲主动帮忙开关。规模工作分批，由模型选择补水/补给/食物恢复及下一业务。持续生产goal保持active，等待用manage_todo的gameTime/machineReady/resource条件，不轮询倒计时；处理完待办再按需记录下一周期。observe_production提供指定地图地面鸡蛋/水源/食物，鸡蛋用pickup_items；building_services能力组提供原生建造升级购动物目录与服务操作。"
-    mcp = FastMCP(server_name, instructions=inst)
+    server_type = _McodeFastMCP if os.environ.get("STARDEW_MCP_WIRE_STYLE") == "mcode" else FastMCP
+    mcp = server_type(server_name, instructions=inst)
     external_codex = os.environ.get("STARDEW_EXTERNAL_CODEX") == "1" and not os.environ.get("STARDEW_DECISION_TOKEN")
     external_token = uuid.uuid4().hex
     external_save_id: str | None = None
@@ -880,6 +991,7 @@ def create_mcp_server(
     # Populated at the end from the real registered tools; shared with the
     # discovery/call closures so both surfaces expose every base op.
     base_tools: dict[str, Any] = {}
+    job_request_owner: ContextVar[str | None] = ContextVar("job_request_owner", default=None)
     base_schemas: dict[str, dict[str, Any]] = {}
     base_metadata: dict[str, Any] = {}
 
@@ -892,10 +1004,27 @@ def create_mcp_server(
                 if field := metadata.arg_model.model_fields.get(key):
                     value = pre_parsed[key] = _normalize_wire_arrays(value, field.annotation)
                     _reject_integer_booleans(value, field.annotation)
+            if name == "withdraw_from_chest" and pre_parsed.get("items") is not None:
+                items = pre_parsed["items"]
+                if isinstance(items, list):
+                    items = [
+                        {**item, "count": int(item["count"])}
+                        if isinstance(item, dict) and isinstance(item.get("count"), str)
+                        and re.fullmatch(r"[0-9]+", item["count"]) else item
+                        for item in items
+                    ]
+                # This field's dict[str, Any] otherwise leaves XML numeric strings
+                # unparsed until dispatch. Validate the whole job before moving.
+                pre_parsed["items"] = CompanionScheduler._validate_withdraw_items(items=items)
             parsed = metadata.arg_model.model_validate(pre_parsed)
             for key in ("tiles", "target_tiles"):
                 if pre_parsed.get(key) is not None:
                     value = getattr(parsed, key)
+                    if isinstance(value, list):
+                        # FastMCP keeps validated sub-models as model instances;
+                        # the scheduler-facing contract stays plain coordinate dicts.
+                        value = [entry.model_dump() if isinstance(entry, BaseModel) else entry
+                                 for entry in value]
                     coordinates = [] if key == "target_tiles" and value == [] else validate_action_tiles(value, preserve_order=True)
                     setattr(parsed, key, coordinates)
         except (ValueError, PolicyViolationError) as ex:
@@ -973,7 +1102,13 @@ def create_mcp_server(
                 step.command_id == command_id and step.operation == operation and _params_match(step.params, params) and step.status == "running"
                 for step in task.steps
             ):
-                raise ToolError("UNAUTHORIZED_JOB_COMMAND: requires claimed step of this model-selected job")
+                raise ToolError("UNAUTHORIZED_JOB_COMMAND: requires claimed step of this model-selected job; "
+                    + str({"taskFound": bool(task), "taskStatus": task.status if task else None,
+                           "paused": state.paused, "expired": d.get("expires", 0) <= time.time(),
+                           "finished": d.get("finished"), "operation": operation,
+                           "claimedSteps": [{"commandId": s.command_id, "operation": s.operation,
+                                             "status": s.status, "paramsMatch": _params_match(s.params, params)}
+                                            for s in task.steps] if task else []}))
         if operation == "query_wiki":
             query = str(params.get("query") or "")
             return await asyncio.to_thread(wiki_for_run().lookup, query)
@@ -981,17 +1116,21 @@ def create_mcp_server(
             raise PolicyViolationError(f"operation '{operation}' is not an allowed plan operation")
         method_name, allowed = entry
         unknown = set(params) - set(allowed)
+        if semantic_unknown := unknown - {"detail", "command_id"}:
+            raise PolicyViolationError(f"INVALID_JOB_PARAMETERS: {operation} does not accept {sorted(semantic_unknown)}; nothing dispatched")
         if unknown:
-            logger.warning(
-                "Stripping unknown parameter(s) %s for operation '%s' before execution",
-                sorted(unknown),
-                operation,
-            )
+            # Presentation detail and the legacy caller id are not execution
+            # quantities or targets. The persisted step supplies command_id.
             params = {k: v for k, v in params.items() if k in allowed}
         method = getattr(sched, method_name, None)
         if method is None:
             raise SchedulerError(f"scheduler does not implement '{operation}'")
         call_params = dict(params)
+        if operation == "get_status":
+            # detail controls the MCP observation view, not native scheduling.
+            detail = call_params.pop("detail", False)
+            result = await method(**call_params)
+            return detailed_status(result) if detail else result
         if command_id and _accepts_command_id(method):
             call_params["command_id"] = command_id
         return await method(**call_params)
@@ -1014,28 +1153,49 @@ def create_mcp_server(
     def classify_step_outcome(result: Any) -> tuple[str, str | None]:
         return _classify_step_outcome(result)
 
-    def life_snapshot() -> dict[str, Any]:
+    async def life_snapshot() -> dict[str, Any]:
         # Written atomically by the existing chat socket, never open native transport.
         path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-snapshot.json"
-        try:
-            cached = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as ex:
-            raise ToolError("游戏近况暂不可用，请稍候。") from ex
-        if time.time() - cached.get("capturedAt", 0) > 120 or not cached.get("saveId"):
-            raise ToolError("游戏近况已过期，等下一次游戏更新再安排。")
+        # Tool-start progress asks the game thread to observe. A bridge-owned
+        # turn may briefly await that chat publication; standalone readers still
+        # reject stale evidence immediately. Never rewrite the observation time.
+        deadline = time.monotonic() + (5 if os.environ.get("STARDEW_LIFE_TURN_ID") else 0)
+        while True:
+            try:
+                cached = read_cache(path)
+            except (OSError, ValueError) as ex:
+                raise ToolError("游戏近况暂不可用，请稍候。") from ex
+            if cached.get("saveId") and time.time() - cached.get("capturedAt", 0) <= 120:
+                break
+            if time.monotonic() >= deadline:
+                raise ToolError("游戏近况已过期，等下一次游戏更新再安排。")
+            assert_life_turn_current()
+            await asyncio.sleep(0.05)
         expected_save = os.environ.get("STARDEW_LIFE_SAVE_ID")
         if expected_save and cached["saveId"] != expected_save:
             raise ToolError("SAVE_CHANGED: conversation belongs to another save")
         sched._latest_snapshot_data = cached
         return cached
 
-    def assert_life_turn_current(*, allow_control: bool = False) -> None:
+    async def life_observation(detail: bool) -> dict[str, Any]:
+        from .decision_context import build_decision_context
+        cached = await life_snapshot()
+        payload = cached["payload"]
+        world = payload.get("world") or {}
+        work = work_for_run().overview(cached["saveId"], snapshot=payload,
+            game_date={"year": world.get("year"), "season": world.get("season"), "day": world.get("dayOfMonth")})
+        facts = build_decision_context(cached, work=work, origin="life-observation")
+        return {"saveId": cached["saveId"], "worldRevision": cached.get("worldRevision"),
+                "capturedAt": cached.get("capturedAt"), "observedFacts": facts,
+                **({"native": payload} if detail and facts.get("observationStatus") != "pending_native_result" else {})}
+
+    def assert_life_turn_current(*, allow_control: bool = False, lease_locked: bool = False) -> None:
         request_id = os.environ.get("STARDEW_LIFE_TURN_ID")
         if not request_id:
             return  # Standalone read/testing MCP clients have no bridge lease.
         path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-turn.json"
         try:
-            lease = json.loads(path.read_text(encoding="utf-8"))
+            lease = json.loads(path.read_text(encoding="utf-8")) if lease_locked else read_cache(path)
         except (OSError, ValueError) as ex:
             raise ToolError("STALE_CONVERSATION") from ex
         if lease.get("requestId") != request_id or lease.get("saveId") != os.environ.get("STARDEW_LIFE_SAVE_ID"):
@@ -1056,7 +1216,7 @@ def create_mcp_server(
 
     async def current_save_id() -> str:
         if resolved_surface == "life":
-            return str(life_snapshot()["saveId"])
+            return str((await life_snapshot())["saveId"])
         if external_codex and external_selected and external_save_id:
             return external_save_id
         current = await sched.get_status()
@@ -1064,6 +1224,17 @@ def create_mcp_server(
         if not sid or sid == "unknown":
             raise SchedulerError("The connected Mod did not publish a current saveId.")
         return str(sid)
+
+    async def validate_actor_operation(operation: str) -> None:
+        if operation != "open_shop":
+            return
+        snapshot = await life_snapshot() if resolved_surface == "life" else sched.latest_snapshot
+        payload = snapshot.get("payload", {}) if isinstance(snapshot, dict) else {}
+        if payload.get("actorMode") == "companion":
+            raise ToolError(
+                "PLAYER_MODE_ONLY: open_shop is unavailable for the companion. "
+                "Use query_shop, navigate_to its observed counter, then purchase_items. No job selected."
+            )
 
     async def record_observation_recovery(result: dict[str, Any], record) -> None:
         """Best-effort bookkeeping cannot turn a successful native read into failure.
@@ -1103,6 +1274,36 @@ def create_mcp_server(
         sid = await current_save_id()
         return read_history(work_for_run().state_path.parent.parent, sid, offset, limit)
 
+    def model_water_observation(result: dict[str, Any]) -> dict[str, Any]:
+        """Life prompts and execution tools share the same native resource meaning."""
+        if resolved_surface == "internal":
+            return result  # Machine consumers retain the native protocol vocabulary.
+        output = dict(result)
+        companion = output.get("companion")
+        if not isinstance(companion, dict):
+            return output
+        cached = getattr(sched, "latest_snapshot", None)
+        payload = cached.get("payload") if isinstance(cached, dict) else None
+        # A scheduler result owns its observed values. Only supplement omitted
+        # overview fields from the exact same observation, never a newer cache
+        # or another save/session that arrived while the tool was awaiting.
+        native = dict(companion)
+        same_observation = isinstance(cached, dict) and all(
+            result.get(key) is not None and result.get(key) == cached.get(key)
+            for key in ("saveId", "worldRevision")
+        ) and (not result.get("gameSessionId") or
+               result.get("gameSessionId") == cached.get("gameSessionId"))
+        cached_companion = payload.get("companion") if isinstance(payload, dict) else None
+        if same_observation and isinstance(cached_companion, dict):
+            for key in ("waterCanLevel", "maxWaterCanLevel"):
+                if key not in native:
+                    native[key] = cached_companion.get(key)
+        water = water_can_resources(native)
+        output["companion"] = {key: value for key, value in companion.items()
+                               if key not in {"waterCanLevel", "maxWaterCanLevel"}}
+        output["companion"]["waterCan"] = water
+        return output
+
     @mcp.tool()
     async def get_work_overview(detail: bool = False) -> dict[str, Any]:
         """Get consolidated farm work, companion backpack, and candidate chests overview.
@@ -1115,10 +1316,9 @@ def create_mcp_server(
                 overview = work_for_run().overview(external_save_id)
                 return {**(overview if detail or resolved_surface == "internal" else compact_work_overview(overview)), "gameSnapshotStale": True}
             if resolved_surface == "life":
-                cached = life_snapshot()
-                return {"saveId": cached["saveId"], "worldRevision": cached.get("worldRevision"), **cached["payload"]}
+                return await life_observation(detail)
             native = await sched.get_work_overview(detail=detail)
-            native = dict(native)
+            native = model_water_observation(native)
             if not detail:
                 native["farmWork"] = {key: value for key, value in (native.get("farmWork") or {}).items() if not key.endswith("Tiles") and key != "matureCrops"}
                 if isinstance(native.get("chests"), list):
@@ -1139,6 +1339,18 @@ def create_mcp_server(
         except Exception as ex:
             raise ToolError(f"Unexpected error getting work overview: {ex}") from None
 
+    def detailed_status(result: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(result)
+        # Reuse only sections actually published in the latest native snapshot.
+        cached = getattr(sched, "latest_snapshot", None)
+        payload = cached.get("payload") if isinstance(cached, dict) else None
+        raw = payload if isinstance(payload, dict) else {}
+        for section in ("inventory", "chests", "planting", "shop"):
+            value = raw.get(section)
+            if isinstance(value, dict):
+                enriched[section] = value
+        return enriched
+
     @mcp.tool()
     async def get_status(detail: bool = False) -> dict[str, Any]:
         """Get companion status (position, stamina, water, task) and world time/weather.
@@ -1155,30 +1367,25 @@ def create_mcp_server(
                 overview = work_for_run().overview(external_save_id)
                 return {**(overview if detail or resolved_surface == "internal" else compact_work_overview(overview)), "gameSnapshotStale": True}
             if resolved_surface == "life":
-                cached = life_snapshot()
-                return {"saveId": cached["saveId"], "worldRevision": cached.get("worldRevision"), **cached["payload"]}
-            res = await sched.get_status()
+                return await life_observation(detail)
+            res = model_water_observation(await sched.get_status())
             if detail:
-                enriched = dict(res)
-                # ``latest_snapshot`` is the raw world.snapshot payload the Mod
-                # pushed; it never triggers a new query.
-                cached = getattr(sched, "latest_snapshot", None)
-                payload = cached.get("payload") if isinstance(cached, dict) else None
-                raw = payload if isinstance(payload, dict) else {}
-                for section in ("inventory", "chests", "planting", "shop"):
-                    value = raw.get(section)
-                    if isinstance(value, dict):
-                        enriched[section] = value
-                return enriched
+                return detailed_status(res)
             comp = res.get("companion", {})
             world = res.get("world", {})
             return {
+                "actorMode": res.get("actorMode"),
+                "actorMultiplayerId": res.get("actorMultiplayerId"),
+                "controlOwner": res.get("controlOwner"),
+                "farmWork": res.get("farmWork"),
                 "companion": {
+                    "locationId": comp.get("locationId"),
                     "tileX": comp.get("tileX", 0),
                     "tileY": comp.get("tileY", 0),
                     "activity": comp.get("activity", "idle"),
-                    "stamina": comp.get("stamina", 0.0),
-                    "waterCanLevel": comp.get("waterCanLevel", 0),
+                    "stamina": comp.get("stamina"),
+                    "maxStamina": comp.get("maxStamina"),
+                    "waterCan": comp.get("waterCan"),
                     "currentTask": comp.get("currentTask"),
                     # Real thin-observer wallet; absent stays absent/unknown.
                     "availableMoney": comp.get("availableMoney"),
@@ -1346,6 +1553,8 @@ def create_mcp_server(
         constraints: dict[str, Any] | None = None,
         source: Literal["agent"] = "agent",
         project: dict[str, Any] | None = None,
+        kind: Literal["main", "stage", "daily"] | None = None,
+        parent_id: str | None = None,
     ) -> dict[str, Any]:
         """Create/revise/pause/resume/complete/cancel/list long-term goals for the current save.
 
@@ -1355,6 +1564,18 @@ def create_mcp_server(
         progress, reason and farmRegion (locationId, bounds, reservedPaths, expansionDirection).
         Keep summary concise; revise after actual results. It does not grant execution authority.
         It never grants authority or proves completion; native execution log does.
+
+        ``kind`` classifies the goal: 'main' is the single long-running main goal
+        (only one active main goal is allowed; preset-sourced goals are 'main'),
+        'stage' is the default for model-created subordinate goals, 'daily' marks
+        day-scoped work; ``parent_id`` links a goal to its main goal. Speculative
+        conclusions must NOT be written as goals or constraints — mark them as
+        speculation with the memory tools instead.
+
+        complete on a 'main' goal is refused with MAIN_GOAL_LOCKED (returned as a
+        friendly blocked result, not an error): a long-term main goal ends only at
+        a run boundary (preset boundary or an explicit player instruction); day to
+        day, record progress and plan the next stage instead of closing it.
         """
         sid = await current_save_id()
         store = work_for_run()
@@ -1364,24 +1585,49 @@ def create_mcp_server(
             if action == "create":
                 if source != "agent":
                     raise WorkStateError("model-created goals must use source='agent'")
+                goal_kwargs: dict[str, Any] = {}
+                if kind is not None or parent_id is not None:
+                    # Forwarded to the work store's goal-kind contract; the store
+                    # rejects a second active 'main' goal (MAIN_GOAL_EXISTS).
+                    goal_kwargs = {"kind": kind, "parent_id": parent_id}
                 goal = store.add_goal(
-                    sid, text or "", source="agent", priority=priority or 0, constraints=constraints
+                    sid, text or "", source="agent", priority=priority or 0, constraints=constraints,
+                    **goal_kwargs,
                 )
                 if project is not None:
                     goal = store.revise_goal(sid, goal.id, project=project)
                 return {"saveId": sid, "goal": asdict(goal)}
             if action == "revise":
+                current = next((g for g in store.state(sid).goals if g.id == goal_id), None)
+                advisory = False
+                if current is not None and current.kind == "main":
+                    if constraints is not None and constraints != current.constraints:
+                        raise WorkStateError("MAIN_CONSTRAINTS_LOCKED: model notes cannot replace the main authorization")
+                    if text is not None and text.strip() != current.text:
+                        project = {**(project or {}), "reason": text}
+                        text = None
+                        advisory = True
                 goal = store.revise_goal(
                     sid, goal_id or "", text=text, priority=priority, constraints=constraints, project=project
                 )
-                return {"saveId": sid, "goal": asdict(goal)}
+                return {"saveId": sid, "goal": asdict(goal),
+                        "advisoryTextStoredAs": "project.reason" if advisory else None}
             if action in {"pause", "resume"}:
                 goal = store.revise_goal(
                     sid, goal_id or "", status="paused" if action == "pause" else "active"
                 )
                 return {"saveId": sid, "goal": asdict(goal)}
             if action in {"complete", "finish"}:
-                goal = store.complete_goal(sid, goal_id or "")
+                try:
+                    goal = store.complete_goal(sid, goal_id or "")
+                except Exception as ex:
+                    if "MAIN_GOAL_LOCKED" in str(ex):
+                        return {"saveId": sid, "goalId": goal_id, "blocked": True,
+                                "reasonCode": "MAIN_GOAL_LOCKED",
+                                "message": "长期主目标（kind='main'）只能由 run 边界终结"
+                                           "（preset 边界或玩家明确指令）；日常请记录进度并规划下一阶段，"
+                                           "不要 complete 主目标。"}
+                    raise
                 return {"saveId": sid, "goal": asdict(goal), "assessment": "model-reviewed; native log unchanged"}
             if action == "cancel":
                 goal = store.cancel_goal(sid, goal_id or "")
@@ -1469,33 +1715,74 @@ def create_mcp_server(
     @mcp.tool()
     async def manage_companion(
         action: Literal["pause", "resume", "cancel", "bedtime"], bedtime: int | None = None,
+        goal_id: str | None = None, all_arrangements: bool = False,
     ) -> dict[str, Any]:
         """Apply an explicit player work control or remember the requested bedtime.
 
-        Only call for the player's current instruction. resume includes 'start now'
-        while paused. bedtime is the COMPANION IN-BED DEADLINE, HHMM 1800..2500 (midnight 2400), ten-minute steps. Finish work and walk home beforehand. The player chooses their own sleep time; never promise to send the player home.
+        Only call for the player's current instruction. cancel withdraws authorization
+        for the arrangement and goal permanently; pause temporarily stops work and
+        keeps it resumable. Never replace an explicit cancellation with pause.
+        goal_id and all_arrangements apply ONLY to cancel. For pause/resume omit
+        both: these controls affect the work scheduler globally, not one goal.
+        Do not withdraw other arrangements just because a new task was assigned;
+        only cancel the scope the player explicitly requested.
+        To cancel a named arrangement read get_work_overview and bind its exact goal_id;
+        do not cancel an unrelated current goal. all_arrangements is only for an
+        explicit request to cancel all work. Omitted goal_id means current work.
+        Negated, quoted or hypothetical cancellation is not a control instruction.
+        resume cannot restore a cancelled arrangement; it requires a new assignment.
+        resume includes 'start now'
+        while paused. bedtime is the COMPANION IN-BED DEADLINE, HHMM 1800..2500 (midnight 2400), ten-minute steps. Finish work and walk home beforehand. The player chooses their own sleep time; never promise to send the player home. In player mode (actorMode=player) there is no companion bedtime at all: sleeping is managed by the sleep tool/native sleep flow, so bedtime is refused there.
         The bridge applies this intent without letting chat own native execution.
         """
         if resolved_surface != "life":
             raise ToolError("This tool belongs to the direct player conversation.")
         sid = await current_save_id()
-        assert_life_turn_current(allow_control=True)
-        request_id = os.environ.get("STARDEW_LIFE_TURN_ID", "")
-        if not request_id or not re.fullmatch(r"[A-Za-z0-9_-]+", request_id):
-            raise ToolError("No active player conversation.")
-        if action == "bedtime":
-            if isinstance(bedtime, bool) or not isinstance(bedtime, int):
-                raise ToolError("Bedtime must be HHMM.")
-            bedtime = bedtime + 2400 if 0 <= bedtime <= 100 else bedtime
-            if not 1800 <= bedtime <= 2500 or bedtime % 100 >= 60 or bedtime % 10:
-                raise ToolError("Bedtime must be 18:00..01:00 in ten-minute steps.")
-        path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-controls" / (request_id + "--" + str(time.time_ns()) + "-" + uuid.uuid4().hex + ".json")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        intent = {"saveId": sid, "requestId": request_id, "action": action, "bedtime": bedtime}
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(intent, ensure_ascii=False), encoding="utf-8")
-        temp.replace(path)
-        return {"accepted": True, "action": action, "bedtime": bedtime}
+        lease_path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-turn.json"
+        # Serialize authority validation and durable writes with bridge revocation.
+        with cache_lock(lease_path):
+            assert_life_turn_current(allow_control=True, lease_locked=True)
+            if (goal_id or all_arrangements) and action != "cancel":
+                raise ToolError("Cancellation scope belongs only to action=cancel.")
+            if goal_id and all_arrangements:
+                raise ToolError("Choose a specific goal_id or all_arrangements, not both.")
+            from stardew_ai_runtime.work_controls import explicit_cancel_scope
+            request_id = os.environ.get("STARDEW_LIFE_TURN_ID", "")
+            if not request_id or not re.fullmatch(r"[A-Za-z0-9_-]+", request_id):
+                raise ToolError("No active player conversation.")
+            lease = json.loads(lease_path.read_text(encoding="utf-8"))
+            if action == "pause" and explicit_cancel_scope(str(lease.get("playerText") or "")) is not None:
+                raise ToolError("CANCEL_NOT_PAUSE: explicit withdrawal requires action=cancel.")
+            if action == "bedtime":
+                snapshot = getattr(sched, "latest_snapshot", None)
+                payload = snapshot.get("payload", {}) if isinstance(snapshot, dict) else {}
+                actor_mode = payload.get("actorMode") if isinstance(payload, dict) else None
+                if actor_mode == "player":
+                    raise ToolError(
+                        "玩家模式下没有伙伴作息：睡觉由 sleep 工具/原生睡眠流程管理，"
+                        "bedtime 只适用于伙伴模式。"
+                    )
+                if isinstance(bedtime, bool) or not isinstance(bedtime, int):
+                    raise ToolError("Bedtime must be HHMM.")
+                bedtime = bedtime + 2400 if 0 <= bedtime <= 100 else bedtime
+                if not 1800 <= bedtime <= 2500 or bedtime % 100 >= 60 or bedtime % 10:
+                    raise ToolError("Bedtime must be 18:00..01:00 in ten-minute steps.")
+            directory = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-controls"
+            directory.mkdir(parents=True, exist_ok=True)
+            # time_ns has finite clock resolution on Windows. A tied timestamp must
+            # not let the random suffix reverse two sequential player controls.
+            stamps = [int(p.stem[len(request_id) + 2:].split("-", 1)[0])
+                      for p in directory.glob(request_id + "--*.json")]
+            stamp = max(time.time_ns(), max(stamps, default=0) + 1)
+            path = directory / (request_id + "--" + str(stamp) + "-" + uuid.uuid4().hex + ".json")
+            intent = {"saveId": sid, "requestId": request_id, "action": action, "bedtime": bedtime,
+                      "goalId": goal_id, "allArrangements": all_arrangements}
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps(intent, ensure_ascii=False), encoding="utf-8")
+            temp.replace(path)
+            return {"accepted": True, "action": action, "bedtime": bedtime,
+                    "status": "queued", "nativeOutcomeConfirmed": False,
+                    "feedbackInstruction": "This accepts a control intent, not a native result. Before reporting current counts after pause/cancel/resume, read get_work_overview for fresh observedFacts; if a native command is still unconfirmed, do not invent its final result."}
 
     @mcp.tool()
     async def manage_milestones(
@@ -1509,7 +1796,7 @@ def create_mcp_server(
         planned_count: int | None = None,
         terms_note: str | None = None,
         reason: str | None = None,
-        preparation: Annotated[list[str] | None, Field(description="For custom propose/revise nodes, capability keys: water, harvest, clear, plant, animals, machines, store, ship, pickup, layout, production. On revise, omitted/null keeps current preparation; a list replaces it and [] clears it, synchronizing the adopted goal and todos. Fixed catalog nodes do not accept preparation changes.")] = None,
+        preparation: Annotated[list[str] | None, Field(description="For custom propose/revise nodes, capability keys: travel, water, harvest, clear, plant, animals, machines, store, ship, pickup, layout, production. Use travel for a player-assigned trip to a specified map and arrival tile. On revise, omitted/null keeps current preparation; a list replaces it and [] clears it, synchronizing the adopted goal and todos. Fixed catalog nodes do not accept preparation changes.")] = None,
         execution_scope: Annotated[dict[str, Any] | None, Field(description="Optional exact observed candidate scope: {locationId:'Farm',tiles:[{x:69,y:18},{x:64,y:23}]} (integer [x,y] pairs also accepted). On revise, omitted/null keeps the saved scope; {} clears it; locationId plus tiles:[] saves an explicit empty candidate range. Candidate tile count is independent of planned_count/seed count; keep a fixed saved range instead of expanding it to consume more seeds. Read the full saved range with action='list', node_id='<node.id>'.", json_schema_extra=_EXECUTION_SCOPE_SCHEMA)] = None,
         id: str | None = None,
         nodeId: str | None = None,
@@ -1532,15 +1819,20 @@ def create_mcp_server(
         confirm that write. Saving is not proof that physical work has run.
 
         For a custom proposal or revision, preparation lists existing capabilities:
+        travel (only navigate to the player-specified destination and report arrival),
         water, harvest, clear, plant (existing seeds), animals, machines, store,
         ship (explicitly approved sale items only), pickup, layout (persistent multi-day design/construction) or production (ongoing farming/husbandry including necessary seed purchases, coop construction, animal acquisition and feed). A player assignment such as "you handle crops and animals" MUST use production, never downgrade it into today-only water/animals. Summary must retain
         location, scope and protected items. For today's ordinary work, omit
         target_date to use the observed game date; no festival node is required.
+        A pure walking assignment MUST use travel so adoption creates executable work.
+        Keep the destination map and arrival tile in summary and execution_scope.
         When changing accepted work, revise the existing node with its current
         scope: update title and terms_note if those old descriptions no longer
         apply, and preparation if the required capabilities change. Omitting
         preparation keeps the existing items; an explicit list replaces them,
         and [] clears them. These changes synchronize the adopted goal/todos.
+        Existing arrangements may be revised or deferred while paused: keep
+        work paused until the updated scope is saved and the player agrees to resume.
         Fixed catalog nodes keep their preparation facts. A failed second adopt
         returns recommendedAction=revise and acceptedFields, including preparation
         and execution_scope. execution_scope records the observed locationId and
@@ -1601,81 +1893,114 @@ def create_mcp_server(
                 "revision": store.revision(sid),
                 "nodes": [wire_node(n) for n in nodes],
             }
-        assert_life_turn_current()
-        if action_clean not in {"propose", "adopt", "revise", "defer", "reopen"}:
-            raise ToolError(
-                f"unsupported milestones action '{action}'; use list|propose|adopt|revise|defer|reopen"
-            )
-        if os.environ.get("STARDEW_LIFE_MODE") not in {"chat", "plan"}:
-            raise ToolError(
-                "LIFE_CONVERSATION_REQUIRED: 修改节点需要当前伙伴对话（chat 或 plan）；"
-                "采纳或修改已接受的安排需玩家明确授权，模式本身不代表授权。"
-            )
-        # The conversation model judges player agreement; this gate only checks
-        # the conversation context, alongside the current-turn/stop checks above.
-        if action_clean != "propose" and not node_id:
-            raise ToolError(
-                'NODE_ID_REQUIRED: use {"action":"' + action_clean + '","node_id":"<node.id>"}; '
-                "copy id from the injected node snapshot or manage_milestones(action='list')."
-            )
+        lease_path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-turn.json"
+        # Serialize authority validation and durable writes with bridge revocation.
+        with cache_lock(lease_path):
+            # Editing or withdrawing an existing arrangement must not require
+            # restarting the old native job. The turn lease still rejects stale
+            # callers, and these writes do not clear the persisted pause state.
+            assert_life_turn_current(allow_control=action_clean in {"revise", "defer"}, lease_locked=True)
+            if action_clean not in {"propose", "adopt", "revise", "defer", "reopen"}:
+                raise ToolError(
+                    f"unsupported milestones action '{action}'; use list|propose|adopt|revise|defer|reopen"
+                )
+            if os.environ.get("STARDEW_LIFE_MODE") not in {"chat", "plan"}:
+                raise ToolError(
+                    "LIFE_CONVERSATION_REQUIRED: 修改节点需要当前伙伴对话（chat 或 plan）；"
+                    "采纳或修改已接受的安排需玩家明确授权，模式本身不代表授权。"
+                )
+            # The conversation model judges player agreement; this gate only checks
+            # the conversation context, alongside the current-turn/stop checks above.
+            if action_clean != "propose" and not node_id:
+                raise ToolError(
+                    'NODE_ID_REQUIRED: use {"action":"' + action_clean + '","node_id":"<node.id>"}; '
+                    "copy id from the injected node snapshot or manage_milestones(action='list')."
+                )
 
-        def saved(node: dict[str, Any]) -> dict[str, Any]:
-            # One complete node is sufficient to acknowledge the write. Omit
-            # absent values, not preparation ownership or observed status.
-            compact = {key: value for key, value in wire_node(node).items() if value is not None}
-            compact["prepItems"] = [
-                {key: value for key, value in prep.items() if value is not None}
-                for prep in compact.get("prepItems", [])
-            ]
-            return {"saveId": sid, "revision": store.revision(sid), "saved": True,
-                    "execution": "not_started_by_this_tool", "node": compact}
+            def saved(node: dict[str, Any]) -> dict[str, Any]:
+                if node.get("status") == "adopted" and node.get("goalId"):
+                    turn_id = os.environ.get("STARDEW_LIFE_TURN_ID")
+                    if turn_id:
+                        work_store = work_for_run()
+                        known_request = any(r.get("id") == turn_id for r in work_store.state(sid).requests)
+                        if not known_request:
+                            lease = json.loads(lease_path.read_text(encoding="utf-8"))
+                            player_text = lease.get("playerText")
+                            if isinstance(player_text, str) and player_text.strip():
+                                work_store.record_request(sid, turn_id, player_text, origin="player")
+                                known_request = True
+                        if known_request:
+                            work_store.bind_goal_request(sid, node["goalId"], turn_id)
+                        # Legacy leases omit playerText and carry no request
+                        # ledger. Preserve that supported authorization path
+                        # without fabricating a player instruction or binding.
+                # One complete node is sufficient to acknowledge the write. Omit
+                # absent values, not preparation ownership or observed status.
+                compact = {key: value for key, value in wire_node(node).items() if value is not None}
+                compact["prepItems"] = [
+                    {key: value for key, value in prep.items() if value is not None}
+                    for prep in compact.get("prepItems", [])
+                ]
+                return {"saveId": sid, "revision": store.revision(sid), "saved": True,
+                        "execution": "not_started_by_this_tool", "node": compact}
 
-        try:
-            if action_clean == "propose":
-                node = store.propose(
-                    sid,
-                    title=title or "",
-                    target_date=target_date or (f"{game_date['year']}:{game_date['season']}:{game_date['day']}" if game_date else ""),
-                    summary=summary,
-                    source_url=source_url,
-                    preparation=preparation,
-                    execution_scope=execution_scope,
-                    game_date=game_date,
-                )
-                return saved(node)
-            if action_clean == "adopt":
-                node = store.adopt(
-                    sid,
-                    node_id or "",
-                    reserved_funds=reserved_funds,
-                    planned_count=planned_count,
-                    terms_note=terms_note,
-                    work_store=work_for_run(),
-                    game_date=game_date,
-                )
-                return {
-                    **saved(node),
-                    "goalId": node.get("goalId"),
-                    "todoIds": node.get("todoIds"),
-                }
-            if action_clean == "revise":
-                node = store.revise(
-                    sid,
-                    node_id or "",
-                    title=title,
-                    summary=summary,
-                    reserved_funds=reserved_funds,
-                    planned_count=planned_count,
-                    terms_note=terms_note,
-                    preparation=preparation,
-                    execution_scope=execution_scope,
-                    game_date=game_date,
-                    target_date=target_date,
-                    work_store=work_for_run(),
-                )
-                return saved(node)
-            if action_clean == "defer":
-                node = store.defer(
+            try:
+                if action_clean == "propose":
+                    node = store.propose(
+                        sid,
+                        title=title or "",
+                        target_date=target_date or (f"{game_date['year']}:{game_date['season']}:{game_date['day']}" if game_date else ""),
+                        summary=summary,
+                        source_url=source_url,
+                        preparation=preparation,
+                        execution_scope=execution_scope,
+                        reserved_funds=reserved_funds,
+                        planned_count=planned_count,
+                        terms_note=terms_note,
+                        game_date=game_date,
+                    )
+                    return saved(node)
+                if action_clean == "adopt":
+                    node = store.adopt(
+                        sid,
+                        node_id or "",
+                        reserved_funds=reserved_funds,
+                        planned_count=planned_count,
+                        terms_note=terms_note,
+                        work_store=work_for_run(),
+                        game_date=game_date,
+                    )
+                    return {
+                        **saved(node),
+                        "goalId": node.get("goalId"),
+                        "todoIds": node.get("todoIds"),
+                    }
+                if action_clean == "revise":
+                    node = store.revise(
+                        sid,
+                        node_id or "",
+                        title=title,
+                        summary=summary,
+                        reserved_funds=reserved_funds,
+                        planned_count=planned_count,
+                        terms_note=terms_note,
+                        preparation=preparation,
+                        execution_scope=execution_scope,
+                        game_date=game_date,
+                        target_date=target_date,
+                        work_store=work_for_run(),
+                    )
+                    return saved(node)
+                if action_clean == "defer":
+                    node = store.defer(
+                        sid,
+                        node_id or "",
+                        reason=reason,
+                        work_store=work_for_run(),
+                        game_date=game_date,
+                    )
+                    return saved(node)
+                node = store.reopen(
                     sid,
                     node_id or "",
                     reason=reason,
@@ -1683,17 +2008,9 @@ def create_mcp_server(
                     game_date=game_date,
                 )
                 return saved(node)
-            node = store.reopen(
-                sid,
-                node_id or "",
-                reason=reason,
-                work_store=work_for_run(),
-                game_date=game_date,
-            )
-            return saved(node)
-        except MilestoneError as ex:
-            return {"saveId": sid, "error": str(ex), "execution": "not_started_by_this_tool",
-                    "saved": False, **getattr(ex, "details", {})}
+            except MilestoneError as ex:
+                return {"saveId": sid, "error": str(ex), "execution": "not_started_by_this_tool",
+                        "saved": False, **getattr(ex, "details", {})}
 
     @mcp.tool()
     async def submit_plan(
@@ -1702,6 +2019,7 @@ def create_mcp_server(
         goal_text: str | None = None,
         replace: bool = False,
         detail: bool = False,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Select ONE semantic short job for the CURRENT provider decision.
 
@@ -1716,10 +2034,16 @@ def create_mcp_server(
         Prefer this over the legacy ``manage_plan`` tool. Exact shape::
 
             tasks = [
-              {"id": "t1", "title": "浇水", "completionCondition": "无未浇水作物",
+              {"id": "t1", "title": "浇水", "completionCondition": "选定的两株作物已浇水",
                "dependencies": [], "steps": [
-                 {"operation": "water_auto", "params": {"max_tiles": 10}}]}
+                 {"operation": "water_auto", "params": {"max_tiles": 2,
+                  "target_tiles": [{"x": 62, "y": 27}, {"x": 66, "y": 23}]}}]}
             ]
+
+        Example coordinates must be replaced with freshly observed candidates.
+        For water_auto, max_tiles limits one batch; target_tiles defines the work
+        scope. A request to water only N crops needs an explicit observed subset,
+        otherwise remaining crops outside the batch still count as unfinished work.
 
         Every ``operation`` must be one of the discoverable plan operations; an
         unknown operation is rejected with the allowed list. ``params`` should
@@ -1727,6 +2051,9 @@ def create_mcp_server(
         before any job is saved or executed. Pass an existing
         active ``goal_id`` from context or ``goal_text`` to resolve/create an agent goal.
         Both may be omitted when the decision has one bound active goal. With
+        a queued player instruction, pass its request_id from the delivery facts
+        to attach this job and its eventual results to that original instruction.
+        Otherwise the current decision's original request owns the job. With
         ``replace=True`` the goal's still-pending tasks are superseded; work already
         running or unknown is preserved. A settled partial may be explicitly
         superseded with replace=True after inspecting its effects; this cancels
@@ -1742,6 +2069,7 @@ def create_mcp_server(
                                 for task in tasks]
             for task in normalized_tasks:
                 for step in task.get("steps", []):
+                    await validate_actor_operation(step["operation"])
                     entry = _PLAN_OPERATION_CALLS.get(step["operation"])
                     if entry and (unknown := set(step.get("params") or {}) - entry[1]):
                         raise WorkStateError(
@@ -1777,6 +2105,7 @@ def create_mcp_server(
                 goal_text=goal_text,
                 replace=replace,
                 decision_token=decision_token(),
+                request_id=request_id,
             )
             if external_codex:
                 external_selected = True
@@ -1785,11 +2114,25 @@ def create_mcp_server(
                 result = {**result, "tasks": [_compact_plan_task(task) for task in result.get("tasks", [])],
                           "detailsAvailable": True,
                           "detailHint": "Read work_plan_overview(detail=True) for stored targets and effects; do not resubmit to retrieve details."}
-            handoff = ({"nextAction": "End this response now. The native executor owns the selected job; its terminal result arrives in your next decision.",
-                        "handoff": "end_decision"} if not external_codex else {})
+            handoff = ({"nextAction": "作业已受理，原生执行器接管。用一两句告诉玩家已安排什么即可；实际终态会作为后续系统事实送达，届时按事实如实汇报。",
+                        "handoff": "ack_async"} if not external_codex else {})
             return {"saveId": sid, "executionScope": "one_short_job", **result, **handoff}
         except WorkStateError as ex:
             raise ToolError(str(ex)) from None
+
+    @mcp.tool()
+    async def record_decision_note(goal_id: str, note: str, category: str, location_id: str,
+                                   basis_command_id: str | None = None) -> dict[str, Any]:
+        """Remember a significant dated decision/discovery without a new stage goal. Categories observation/failure require the exact persisted native basis_command_id; hypotheses are explicitly tentative, intent does not grant authorization. 1..800 chars; current native facts override old notes. Keep siting rationale, useful unlock/route discovery, unresolved bottleneck and next action across provider sessions; no per-step log duplication."""
+        sid = await current_save_id()
+        directory=Path(getattr(sched,"run_dir",None) or run_dir or ".")/"data"
+        from .snapshot_cache import cache_lock
+        with cache_lock(directory/"life-turn.json"):
+            assert_life_turn_current(lease_locked=True)
+            try:
+                return work_for_run().record_decision_note(sid,goal_id,note,category,location_id,basis_command_id)
+            except WorkStateError as ex:
+                raise ToolError(str(ex)) from None
 
     @mcp.tool()
     async def remember_intent(
@@ -1804,6 +2147,12 @@ def create_mcp_server(
 
         Model-created goals are always recorded with source=agent, so the model can
         never label its own idea as a player instruction.
+
+        Only record what you treat as durable intent: a confirmed observation or
+        agreed plan is a fact and may become a goal/todo constraint; a hypothesis or
+        inference is speculation — never write it as a goal or constraint, mark it
+        as speculation with the companion-memory tools instead; a standing rule the
+        player or system set is a constraint and must not be reworded as your own goal.
 
         Exact ``trigger`` shapes (call discover_capabilities("memory") for the same
         schema)::
@@ -2006,6 +2355,9 @@ def create_mcp_server(
                     {
                         "name": name,
                         "description": description[:140],
+                        **({"supportedActorModes": ["player"],
+                            "companionAlternative": "query_shop -> navigate_to observed counter -> purchase_items"}
+                           if name == "open_shop" else {}),
                         "directCall": {"required": list(parameters.get("required") or []),
                                        "parameters": direct_parameters,
                                        "allowedValues": allowed_values,
@@ -2024,7 +2376,11 @@ def create_mcp_server(
             "groups": groups,
             "availableGroups": sorted(CAPABILITY_GROUPS),
             "groupCounts": {name: len(tools) for name, tools in CAPABILITY_GROUPS.items()},
-            "discoveryHint": "Choose one relevant group to get required parameters, nested shapes and examples.",
+            # A name-only group list made the model open unrelated groups just
+            # to locate an operation (e.g. shipping under shopping). Publish a
+            # small index, not all parameter schemas, to allow one targeted read.
+            "groupContents": {name: list(tools) for name, tools in CAPABILITY_GROUPS.items()},
+            "discoveryHint": "Use groupContents to locate the operation, then read only its group for parameters. Reuse schemas already read in this session unless a validation error says they changed.",
             "callWith": "call_capability(tool, params)",
             "planWith": "Use planStep.operation and only planStep.parameters keys in submit_plan steps; null means direct-call-only. Direct-call aliases are not accepted in steps.",
             "fullToolListExposed": resolved_surface == "full",
@@ -2036,11 +2392,14 @@ def create_mcp_server(
         return response
 
     @mcp.tool()
-    async def call_capability(tool: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def call_capability(tool: str, params: dict[str, Any] | None = None,
+                              request_id: str | None = None) -> dict[str, Any]:
         """Invoke a base capability by name with structured params.
 
         This runs the exact same implementation, validation and result shape as the
         corresponding base tool; it is not a parallel code path.
+        When a result delivery offers another queued player instruction, pass its
+        request_id to bind a selected job and its eventual results to that instruction.
         """
         if tool == "observe_map_image":
             raise ToolError("Call observe_map_image directly to receive native image content")
@@ -2061,12 +2420,15 @@ def create_mcp_server(
         if missing:
             raise ToolError(f"missing required parameter(s) for '{tool}': {', '.join(missing)}")
         args = validate_base_arguments(tool, args)
+        owner_token = job_request_owner.set(request_id)
         try:
             result = await base_tools[tool](**args)
         except ToolError:
             raise
         except (PolicyViolationError, SchedulerError, NoActiveTaskError) as ex:
             raise ToolError(str(ex)) from None
+        finally:
+            job_request_owner.reset(owner_token)
         return {"tool": tool, "result": result}
 
     @mcp.tool()
@@ -2076,7 +2438,15 @@ def create_mcp_server(
         This is a read-only packaged reference, not an arbitrary file reader.
         """
         try:
-            return load_guidance(topic)
+            # Actor identity is cached native metadata, not a reason to open a
+            # second game connection or refresh observations merely to read docs.
+            cached_mode = ((sched.latest_snapshot or {}).get("payload") or {}).get("actorMode")
+            if cached_mode is None:
+                try:
+                    cached_mode = (read_cache(Path(sched.run_dir or run_dir or ".") / "data/life-snapshot.json").get("payload") or {}).get("actorMode")
+                except (OSError, ValueError):
+                    pass
+            return load_guidance(topic, actor_mode=cached_mode)
         except ValueError as ex:
             raise ToolError(str(ex)) from None
 
@@ -2101,7 +2471,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def water_tiles(
-        tiles: Annotated[list[dict[str, ChestCoordinate]], BeforeValidator(_unwrap_item_array)],
+        tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)],
         location_id: str = "Farm",
         include_empty_tiles: bool = False,
         detail: bool = False,
@@ -2112,7 +2482,7 @@ def create_mcp_server(
         route rules may stop early; counts and effects describe only real actions.
         """
         try:
-            result = await sched.execute_tiles(tiles=tiles, location_id=location_id,
+            result = await sched.execute_tiles(tiles=_tile_dicts(tiles), location_id=location_id,
                                               include_empty_tiles=include_empty_tiles)
             return result if detail else {**_native_action_response("water-tiles", result),
                 "targetCount": result.get("targetCount"),
@@ -2174,14 +2544,18 @@ def create_mcp_server(
 
     @mcp.tool()
     async def water_auto(
-        max_tiles: int = 25, include_empty_tiles: bool = False, detail: bool = False,
-        target_tiles: Annotated[list[dict[str, ChestCoordinate]] | None, BeforeValidator(_unwrap_item_array), Field(description="Optional exact candidate coordinates [{x:62,y:27},{x:66,y:23}]. Intersect with freshly observed unwatered crops; omitted/null uses observed work, [] selects no work. Coordinates outside this list are never selected.")] = None,
+        max_tiles: Annotated[int, Field(description="Maximum tiles in one batch, not the goal scope. For only N crops, also pass an explicit observed target_tiles subset; omitted targets may leave the overall task partial.")] = 25, include_empty_tiles: bool = False, detail: bool = False,
+        target_tiles: Annotated[list[TileXY] | None, BeforeValidator(_unwrap_item_array), Field(description="Optional exact candidate coordinates [{x:62,y:27},{x:66,y:23}]. Intersect with freshly observed unwatered crops; omitted/null uses observed work, [] selects no work. Coordinates outside this list are never selected.")] = None,
         location_id: str | None = None,
     ) -> dict[str, Any]:
         """Water freshly observed crops in target_tiles when provided; [] means no work.
 
         Omitted target_tiles keeps ordinary auto selection. location_id, if given,
         must match the observed work map. Include empty soil only when enabled.
+        max_tiles is a batch cap; it does not exclude other crops from the goal.
+        For only N crops, select up to N freshly observed target_tiles explicitly.
+        Auto selection does not guarantee nearest-first ordering; choose the
+        observed subset according to the player's requested area or proximity.
         """
         pre_rev = getattr(sched, "latest_world_revision", 0)
         try:
@@ -2189,7 +2563,7 @@ def create_mcp_server(
             if include_empty_tiles:
                 auto_kwargs["include_empty_tiles"] = True
             if target_tiles is not None:
-                auto_kwargs["target_tiles"] = target_tiles
+                auto_kwargs["target_tiles"] = _tile_dicts(target_tiles)
             if location_id is not None:
                 auto_kwargs["location_id"] = location_id
             res = await sched.water_auto(**auto_kwargs)
@@ -2498,20 +2872,29 @@ def create_mcp_server(
     @mcp.tool()
     async def harvest_auto(
         max_tiles: int = 16, detail: bool = False,
-        target_tiles: Annotated[list[dict[str, ChestCoordinate]] | None, BeforeValidator(_unwrap_item_array), Field(description="Optional exact candidate coordinates [{x:62,y:27},{x:66,y:23}]. Intersect with freshly observed mature crops; omitted/null uses observed work, [] selects no work. Coordinates outside this list are never selected.")] = None,
+        target_tiles: Annotated[list[TileXY] | None, BeforeValidator(_unwrap_item_array), Field(description="Optional exact candidate coordinates [{x:62,y:27},{x:66,y:23}]. Intersect with freshly observed mature crops; omitted/null uses observed work, [] selects no work. Coordinates outside this list are never selected.")] = None,
         location_id: str | None = None,
     ) -> dict[str, Any]:
-        """Auto-harvest up to a positive max_tiles mature crops. Stops early if inventory is full.
+        """Harvest up to max_tiles observed mature crop targets using their native harvest method.
 
         target_tiles bounds candidates to freshly observed mature crops; [] selects
         no work. Omitted/null keeps ordinary auto selection. location_id, if given,
         must match the observed work map. Returns remaining count and backpack space.
+        Observed matureCrops.requiresScythe=false identifies hand-pickable crops;
+        true requires a scythe, absent/null is unknown. For a hand-only request,
+        select explicit observed false targets; no wiki lookup is needed for this fact.
+        The real player hand-picks ordinary crops and swings an owned scythe for
+        scythe crops. Native arcs can also harvest neighboring crops; all observed
+        harvested tiles are reported once. Scythe drops enter the bag natively or
+        remain on the ground: per-tile stack is not a yield estimate. inventoryDelta
+        reports measured backpack changes. A full bag can still accept stacks;
+        an actual native capacity refusal stops hand harvesting without discarding.
         """
         pre_rev = getattr(sched, "latest_world_revision", 0)
         try:
             auto_kwargs = {"max_tiles": max_tiles}
             if target_tiles is not None:
-                auto_kwargs["target_tiles"] = target_tiles
+                auto_kwargs["target_tiles"] = _tile_dicts(target_tiles)
             if location_id is not None:
                 auto_kwargs["location_id"] = location_id
             res = await sched.harvest_auto(**auto_kwargs)
@@ -2581,10 +2964,21 @@ def create_mcp_server(
     async def deposit_to_chest(
         chest_x: ChestCoordinate, chest_y: ChestCoordinate, item_ids: list[str] | None = None, detail: bool = False,
         location_id: str = "Farm",
+        items: Annotated[list[ItemQuantity] | None, BeforeValidator(_unwrap_item_array)] = None,
     ) -> dict[str, Any]:
-        """Deposit non-tool items into chest at (chest_x, chest_y). Tools are never deposited.
+        """Deposit explicitly chosen backpack items into chest at (chest_x, chest_y).
 
-        Stops early if chest is full. Returns updated chest and backpack status.
+        Native player mode requires items or item_ids and can store explicitly
+        chosen tools. The model decides what to retain, store or ship; no default
+        player cleanup is selected. Companion mode retains its non-tool default.
+
+        Use items [{itemId, count}] for exact total quantities across backpack
+        stacks in inventory order, preserving native quality and splitting stacks.
+        Native quality codes are 0=normal, 1=silver, 2=gold, 4=iridium.
+        Alternatively item_ids filters whole stacks of the chosen identities.
+        Specify either items or item_ids. A shortage or full chest is partial,
+        with requestedQuantity, actualQuantity and remainingQuantity in details.
+        Returns updated chest and backpack status.
         """
         pre_rev = getattr(sched, "latest_world_revision", 0)
         try:
@@ -2593,6 +2987,7 @@ def create_mcp_server(
                 chest_y=chest_y,
                 item_ids=item_ids,
                 location_id=location_id,
+                **({"items": items} if items is not None else {}),
             )
 
             if res.get("status") == "executing" or res.get("terminalState") == "running":
@@ -2661,13 +3056,18 @@ def create_mcp_server(
         chest_y: ChestCoordinate,
         item_id: str | None = None,
         count: ItemCount = 1,
-        items: list[dict[str, Any]] | None = None,
+        items: Annotated[list[ItemQuantity] | None, BeforeValidator(_unwrap_item_array)] = None,
         location_id: str = "Farm",
         detail: bool = False,
     ) -> dict[str, Any]:
         """Withdraw items from chest at (chest_x, chest_y) into companion backpack.
 
         Specify either item_id and count, or a list of items [{itemId, count}].
+        Count is the total number of items, spanning matching quality stacks in
+        chest order; partial stacks can be split. Each transferred stack retains
+        its native quality. A shortage is partial, with remainingQuantity.
+        Native quality codes are 0=normal, 1=silver, 2=gold, 4=iridium;
+        stack order can change the quality distribution between backpack and chest.
         Returns updated chest and backpack status.
         """
         pre_rev = getattr(sched, "latest_world_revision", 0)
@@ -2675,7 +3075,7 @@ def create_mcp_server(
             res = await sched.withdraw_from_chest(
                 chest_x=chest_x,
                 chest_y=chest_y,
-                items=items,
+                items=_item_dicts(items),
                 item_id=item_id,
                 count=count,
                 location_id=location_id,
@@ -2800,7 +3200,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def hoe_tiles(
-        tiles: list[dict[str, int]], detail: bool = False
+        tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], detail: bool = False
     ) -> dict[str, Any]:
         """Use hoe on the specified non-empty list of dirt tiles to till them.
 
@@ -2810,7 +3210,7 @@ def create_mcp_server(
         pre_rev_getter = getattr(sched, "latest_world_revision", 0)
         pre_rev = pre_rev_getter() if callable(pre_rev_getter) else int(pre_rev_getter)
         try:
-            res = await sched.execute_hoe_tiles(tiles=tiles)
+            res = await sched.execute_hoe_tiles(tiles=_tile_dicts(tiles))
 
             if res.get("status") == "executing" or res.get("terminalState") == "running":
                 return {
@@ -2874,7 +3274,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def plant_seeds(
-        seed_item_id: str, tiles: Annotated[list[dict[str, ChestCoordinate]], BeforeValidator(_unwrap_item_array)], detail: bool = False
+        seed_item_id: str, tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], detail: bool = False
     ) -> dict[str, Any]:
         """Plant specified seeds into the declared tilled empty tiles.
 
@@ -2884,7 +3284,7 @@ def create_mcp_server(
         pre_rev_getter = getattr(sched, "latest_world_revision", 0)
         pre_rev = pre_rev_getter() if callable(pre_rev_getter) else int(pre_rev_getter)
         try:
-            res = await sched.execute_plant_seeds(seed_item_id=seed_item_id, tiles=tiles)
+            res = await sched.execute_plant_seeds(seed_item_id=seed_item_id, tiles=_tile_dicts(tiles))
 
             if res.get("status") == "executing" or res.get("terminalState") == "running":
                 return {
@@ -2962,7 +3362,8 @@ def create_mcp_server(
 
     @mcp.tool()
     async def ship_items(
-        items: list[dict[str, Any]], detail: bool = False
+        items: Annotated[list[ItemQuantity], BeforeValidator(_unwrap_item_array)], detail: bool = False,
+        max_game_minutes: int = 180
     ) -> dict[str, Any]:
         """Ship specified items from companion inventory to the farm shipping bin.
 
@@ -2975,7 +3376,7 @@ def create_mcp_server(
         pre_rev_getter = getattr(sched, "latest_world_revision", 0)
         pre_rev = pre_rev_getter() if callable(pre_rev_getter) else int(pre_rev_getter)
         try:
-            res = await sched.execute_ship_items(items=items)
+            res = await sched.execute_ship_items(items=_item_dicts(items), max_game_minutes=max_game_minutes)
 
             if res.get("status") == "executing" or res.get("terminalState") == "running":
                 return {
@@ -3023,7 +3424,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def purchase_items(
-        items: list[dict[str, Any]],
+        items: Annotated[list[ItemQuantity], BeforeValidator(_unwrap_item_array)],
         budget_limit: int,
         shop_id: str = "SeedShop",
         detail: bool = False,
@@ -3032,6 +3433,8 @@ def create_mcp_server(
         """Purchase items from a shop counter using native game wallet transactions.
 
         Requires companion to be inside the target shop location and adjacent to the counter.
+        Companion mode buys directly here after navigate_to; do not insert the
+        player-only open_shop operation. The adapter rechecks the native shop state.
         Stock, limited stock status, dynamic unit price, and budget/funds limits are evaluated.
         Accepts items list where each item has itemId and count (1..36 items).
         budget_limit is this command's cost check, filled by the model from the native
@@ -3048,7 +3451,7 @@ def create_mcp_server(
             # All purchase paths share pending-result recovery and actual cost
             # accounting in the scheduler, without a daily spending allowance.
             res = await sched.execute_purchase_items(
-                items=items,
+                items=_item_dicts(items),
                 budget_limit=budget_limit,
                 shop_id=shop_id,
                 command_id=command_id,
@@ -3117,14 +3520,14 @@ def create_mcp_server(
             raise ToolError(f"Purchase items failed: {ex}") from None
 
     @mcp.tool()
-    async def query_route(location_id: str, tile: dict[str, int]) -> dict[str, Any]:
-        """Preview a reachable route and walking cost without moving. Uses the same native entrance planner as navigate_to; avoids full map reads and manual pathfinding. Game-minute estimate excludes deliberation and service time."""
+    async def query_route(location_id: str, tile: dict[str, int] | None = None) -> dict[str, Any]:
+        """Preview a native route without moving. Omit tile only for a public adjacent-map exit on the actor's current map; resolvedDestinationTile is the actual native landing, never guessed. A fresh reachable=true proof clears this exact navigation branch; unrelated targets stay blocked. Estimate excludes deliberation and service time."""
         try:
             result = await sched.query_route(location_id=location_id, tile=tile)
             if result.get("reachable") is True:
                 await record_observation_recovery(result, lambda sid:
                     work_for_run().observe_branch_recovery(sid, operation="navigate_to",
-                        target={"location_id": location_id, "tile": tile}, evidence=result))
+                        target={"location_id": location_id, "tile": result.get("resolvedDestinationTile") or tile}, evidence=result))
             return result
         except SchedulerError as ex:
             raise ToolError(str(ex)) from None
@@ -3146,8 +3549,9 @@ def create_mcp_server(
         on each map, and transitions across map boundaries.
         Destination coordinates can be provided via `tile` (dict with 'x', 'y'), or `tile_x`/`tile_y`, or `x`/`y`.
         If tile is omitted, resolves native dynamic interaction points from active game data
-        (e.g. shop counter interactionTile when navigating to a shop). For other locations, explicit
-        destination coordinates must be provided. Hardcoded coordinates are unsupported.
+        (e.g. shop counter interactionTile when navigating to a shop), or a public outgoing
+        warp on the actor's current map for an adjacent exploration destination. Other
+        locations require an observed tile or staged travel. No coordinates are guessed.
         Returns the visited location sequence and final position.
         """
         if tile is not None and isinstance(tile, dict):
@@ -3353,24 +3757,24 @@ def create_mcp_server(
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
-    async def place_items(tiles: list[dict[str, Any]], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
+    async def place_items(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
         """Place copies of one real backpack item at the declared tiles.
 
         Native placement rules, inventory consumption and partial results apply.
         """
         try:
-            return await sched.place_items(tiles=tiles, item_id=item_id, location_id=location_id)
+            return await sched.place_items(tiles=_tile_dicts(tiles), item_id=item_id, location_id=location_id)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
-    async def remove_items(tiles: list[dict[str, Any]], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
+    async def remove_items(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
         """Recover matching placed items into backpack; item_id is required identity.
 
         Use observed identities and explicit tiles. Native mismatches are skipped.
         """
         try:
-            return await sched.remove_items(tiles=tiles, item_id=item_id, location_id=location_id)
+            return await sched.remove_items(tiles=_tile_dicts(tiles), item_id=item_id, location_id=location_id)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
 
@@ -3450,9 +3854,11 @@ def create_mcp_server(
 
     @mcp.tool()
     async def eat_food(item_id: str, location_id: str = "Farm") -> dict[str, Any]:
-        """Consume one observed edible companion item through native food recovery.
+        """Consume one observed edible backpack item through the controlled actor's native food lifecycle.
 
-        A short resupply job; choose subsequent production work in the next decision.
+        item_id selects the first matching backpack stack; its exact slot/quality
+        and native consumption/recovery are reported. Choose whether to consume
+        and what to do afterward from actual state in the next model decision.
         """
         try:
             return _native_action_response("eat-food", await sched.eat_food(item_id=item_id, location_id=location_id))
@@ -3522,7 +3928,7 @@ def create_mcp_server(
         )
 
     @mcp.tool()
-    async def cut_grass(tiles: list[dict[str, Any]], location_id: str = "Farm") -> dict[str, Any]:
+    async def cut_grass(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], location_id: str = "Farm") -> dict[str, Any]:
         """Cut observed grass or clear dead crops with the companion's real Scythe.
 
         Use this for query_planting_options.clearWithScytheTiles. Dead crops are
@@ -3533,19 +3939,20 @@ def create_mcp_server(
         apply. Replant with real Grass Starter via place_items when appropriate.
         """
         try:
-            return _native_action_response("cut-grass", await sched.cut_grass(tiles=tiles, location_id=location_id))
+            return _native_action_response("cut-grass", await sched.cut_grass(tiles=_tile_dicts(tiles), location_id=location_id))
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
-    async def refill_watering_can(location_id: str = "Farm", max_tiles: int = 4, tiles: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    async def refill_watering_can(location_id: str = "Farm", max_tiles: int = 4, tiles: Annotated[list[TileXY] | None, BeforeValidator(_unwrap_item_array)] = None) -> dict[str, Any]:
         """Refill the companion's watering can at native refill tiles on its own map.
 
         Uses the game's own CanRefillWateringCanOnTile judgement; never a hardcoded
         water capacity or cost. Returns an actionable error when no refill tile is known.
         """
         try:
-            res = await sched.refill_watering_can(location_id=location_id, max_tiles=max_tiles, tiles=tiles)
+            res = await sched.refill_watering_can(location_id=location_id, max_tiles=max_tiles,
+                                                  tiles=_tile_dicts(tiles) if tiles is not None else None)
             return _native_action_response("refill-watering-can", res)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
@@ -3554,7 +3961,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def apply_fertilizer(
-        tiles: list[dict[str, Any]],
+        tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)],
         fertilizer_item_id: str,
         location_id: str = "Farm",
     ) -> dict[str, Any]:
@@ -3565,7 +3972,7 @@ def create_mcp_server(
         """
         try:
             res = await sched.apply_fertilizer(
-                tiles=tiles, fertilizer_item_id=fertilizer_item_id, location_id=location_id
+                tiles=_tile_dicts(tiles), fertilizer_item_id=fertilizer_item_id, location_id=location_id
             )
             return _native_action_response("apply-fertilizer", res)
         except (PolicyViolationError, SchedulerError) as ex:
@@ -3574,7 +3981,7 @@ def create_mcp_server(
             raise ToolError(f"Apply fertilizer failed: {ex}") from None
 
     @mcp.tool()
-    async def clear_debris(tiles: list[dict[str, Any]], location_id: str = "Farm") -> dict[str, Any]:
+    async def clear_debris(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], location_id: str = "Farm") -> dict[str, Any]:
         """Clear explicitly selected native weeds, stones or twigs on the given tiles.
 
         The native tool choice is the game's own rule: weeds with the Hoe/Axe, stones
@@ -3586,7 +3993,7 @@ def create_mcp_server(
         fake success.
         """
         try:
-            res = await sched.clear_debris(tiles=tiles, location_id=location_id)
+            res = await sched.clear_debris(tiles=_tile_dicts(tiles), location_id=location_id)
             return _native_action_response("clear-debris", res)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
@@ -3594,13 +4001,13 @@ def create_mcp_server(
             raise ToolError(f"Clear debris failed: {ex}") from None
 
     @mcp.tool()
-    async def pickup_items(tiles: list[dict[str, Any]], location_id: str = "Farm") -> dict[str, Any]:
+    async def pickup_items(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], location_id: str = "Farm") -> dict[str, Any]:
         """Pick up dropped debris / spawned items on explicitly selected tiles.
 
         Uses the native debris collect path and the native ground-item check action.
         """
         try:
-            res = await sched.pickup_items(tiles=tiles, location_id=location_id)
+            res = await sched.pickup_items(tiles=_tile_dicts(tiles), location_id=location_id)
             return _native_action_response("pickup-items", res)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
@@ -3608,7 +4015,7 @@ def create_mcp_server(
             raise ToolError(f"Pickup items failed: {ex}") from None
 
     @mcp.tool()
-    async def chop_tree(tiles: list[dict[str, Any]], location_id: str = "Farm") -> dict[str, Any]:
+    async def chop_tree(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], location_id: str = "Farm") -> dict[str, Any]:
         """Chop explicitly selected wild trees, giant stumps or hollow logs with the companion's own Axe.
 
         Every swing is a real native Axe.DoFunction (companion stamina, native damage
@@ -3616,7 +4023,7 @@ def create_mcp_server(
         choppable target returns no-tree; a missing Axe returns missing-tool:Axe.
         """
         try:
-            res = await sched.chop_tree(tiles=tiles, location_id=location_id)
+            res = await sched.chop_tree(tiles=_tile_dicts(tiles), location_id=location_id)
             return _native_action_response("chop-tree", res)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
@@ -3646,10 +4053,10 @@ def create_mcp_server(
             raise ToolError(f"Insert machine failed: {ex}") from None
 
     @mcp.tool()
-    async def collect_machine(tiles: list[dict[str, Any]], location_id: str = "Farm") -> dict[str, Any]:
+    async def collect_machine(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], location_id: str = "Farm") -> dict[str, Any]:
         """Collect ready output from explicit machine tiles using the native check action."""
         try:
-            res = await sched.collect_machine(tiles=tiles, location_id=location_id)
+            res = await sched.collect_machine(tiles=_tile_dicts(tiles), location_id=location_id)
             return _native_action_response("collect-machine", res)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
@@ -3727,7 +4134,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def toggle_animal_door(
-        tiles: list[dict[str, Any]] | None = None,
+        tiles: Annotated[list[TileXY] | None, BeforeValidator(_unwrap_item_array)] = None,
         building_name: str | None = None,
         location_id: str = "Farm",
     ) -> dict[str, Any]:
@@ -3737,7 +4144,8 @@ def create_mcp_server(
         observe_livestock. The companion must be adjacent to the door.
         """
         try:
-            res = await sched.toggle_animal_door(tiles=tiles, building_name=building_name, location_id=location_id)
+            res = await sched.toggle_animal_door(tiles=_tile_dicts(tiles) if tiles is not None else None,
+                                                 building_name=building_name, location_id=location_id)
             return _native_action_response("toggle-animal-door", res)
         except ToolError:
             raise
@@ -3745,6 +4153,136 @@ def create_mcp_server(
             raise ToolError(str(ex)) from None
         except Exception as ex:
             raise ToolError(f"Toggle animal door failed: {ex}") from None
+
+    @mcp.tool()
+    async def sleep() -> dict[str, Any]:
+        """End the current day natively: walk to the bed, sleep, and settle the new day.
+
+        Player mode only. The mod runs the native bed-sleep sequence (fade,
+        end-of-night menus, new day) and the terminal result reports the new
+        day facts. It resolves and walks the actual home/bed route from the
+        current map; do not invent an interior coordinate from exterior door
+        coordinates before this tool. An optional preceding navigation must
+        use its destination map's observed entry/tile. In companion mode the
+        native side rejects the command; do
+        not plan sleep around the companion's own rest controller.
+        """
+        try:
+            res = await sched.execute_sleep()
+            return _native_action_response("sleep", res)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+        except Exception as ex:
+            raise ToolError(f"Sleep failed: {ex}") from ex
+
+    @mcp.tool()
+    async def player_control(action: str) -> dict[str, Any]:
+        """Claim/release the sole native player control lease. Only 'claim'/'release'; a human takeover always revokes it. Does not move or change resources."""
+        if action not in {"claim", "release"}:
+            raise ToolError("action must be claim or release")
+        assert_life_turn_current()
+        client = await sched.ensure_connected()
+        token = decision_token()
+        if token:
+            store = work_for_run()
+            store._assert_decision_valid(store.state(client.save_id), token)
+        if client.actor_mode != "player":
+            raise ToolError("PLAYER_MODE_REQUIRED")
+        await client.send_player_control(action)
+        await asyncio.sleep(0.2)
+        return {"action":action, "requested":True, "actorMode":client.actor_mode,
+                "actorMultiplayerId":str(client.actor_multiplayer_id) if client.actor_multiplayer_id is not None else None, "saveId":client.save_id,
+                "note":"Read get_status for current authoritative ownership; sending a request is not proof of ownership."}
+
+    @mcp.tool()
+    async def observe_player_activities() -> dict[str, Any]:
+        """Read live current-map NPC names/tiles, public map actions and shore stand/facing options. Unobserved future loot or locks remain unknown. Use native walking to approach; touch actions require walking onto their tiles."""
+        result = await sched.observe_player_activities()
+        if isinstance(result.get("activities"), dict):
+            await record_observation_recovery(result, lambda sid:
+                work_for_run().observe_interaction_recovery(sid, result["activities"]))
+        return result
+
+    @mcp.tool()
+    async def talk_npc(npc_name: str, location_id: str) -> dict[str, Any]:
+        """Initiate native conversation with an observed adjacent NPC. Do not guess their current schedule. Follow native UI with native_advance/native_answer; routine authorized dialogue can continue, significant permanent choices require player authorization."""
+        return _native_action_response("talk_npc", await sched.talk_npc(npc_name,location_id))
+
+    @mcp.tool()
+    async def interact_tile(tile: InteractionTileXY, location_id: str) -> dict[str, Any]:
+        """Activate one observed adjacent public map Action via native checkAction. Native doors, mine entrance/ladders, signs and mailbox retain their rules. A TouchAction is not a forced warp: navigate onto its observed tile. Never infer a failed interaction unlocked something."""
+        return _native_action_response("interact_tile", await sched.interact_tile(tile.model_dump(),location_id))
+
+    @mcp.tool()
+    async def attack(facing: int, location_id: str) -> dict[str, Any]:
+        """One native melee swing (facing 0 up,1 right,2 down,3 left). Requires real non-scythe weapon. Observe living nearby monsters, approach safely, respect health/time; do not assert damage, kill or loot until native receipts/inventory show it. Native weapon animation/hitbox/monster rules execute; no direct HP editing."""
+        return _native_action_response("attack",await sched.attack(facing,location_id))
+
+    @mcp.tool()
+    async def native_menu_select(choice_index: int, location_id: str, text: str | None = None) -> dict[str, Any]:
+        """Select an observed item slot, crafting cursor destination, unlocked mine elevator button, or native NamingMenu confirmation. For NamingMenu use observed index 0 and explicit text (1..64 characters); the native text box filters and bounds it. If NAME_TEXT_CHANGED, read the resulting text before a new decision: no confirmation was sent. Naming UI input is not proof of a completed world transaction; inspect the resulting native state. Read current indexed choices with observe_player_activities. Choices and names follow the player's existing authorized intent; no story, trash, purchase or item decision is implicit."""
+        return _native_action_response("native_menu_select",await sched.native_menu_select(choice_index,location_id,text=text))
+
+    @mcp.tool()
+    async def fish(facing: int, location_id: str) -> dict[str, Any]:
+        """One complete bounded native cast from a reached shore (0 up,1 right,2 down,3 left). Requires player's real FishingRod; obtain through normal Willy event/shop, never grant it. Native timing, minigame physics/random catch, stamina/rewards/inventory remain game-owned. A failed/no-gain cast is not a catch. Model decides location, duration by repeated deliberate casts and when to stop."""
+        return _native_action_response("fish", await sched.fish(facing,location_id))
+
+    @mcp.tool()
+    async def open_shop(shop_id: str, location_id: str) -> dict[str, Any]:
+        """Player mode only; companions use query_shop then navigate_to and purchase_items.
+
+        After the player reaches an adjacent counter, open its native menu and
+        read sale IDs, prices and stock. Does not buy; closed shops fail explicitly.
+        """
+        return _native_action_response("open_shop", await sched.open_shop(shop_id,location_id))
+
+    @mcp.tool()
+    async def open_chest(chest_x: int, chest_y: int, location_id: str = "Farm") -> dict[str, Any]:
+        """Open an adjacent normal chest through native interaction to learn its contents. Navigate beside it first."""
+        return _native_action_response("open_chest", await sched.open_chest(chest_x,chest_y,location_id))
+
+    @mcp.tool()
+    async def native_advance(allow_skip: bool = False) -> dict[str, Any]:
+        """Advance the actor's current native UI one step (native-advance).
+
+        Use for ordinary dialogue (advances one line), informational menus
+        (dismissed), and — only with allow_skip=True — a legally skippable cutscene.
+        A question dialogue is NEVER answered implicitly: it is rejected with
+        CHOICE_REQUIRED and details.responses lists the options; answer it with
+        native_answer(choice_index=...). The model must not pick on the player's
+        behalf without authorized intent. Festival free-roam is not a cutscene:
+        observe_player_activities exposes NPCs, native actions and boundary exits.
+        Waiting does not end a festival. Rejection reasonCodes: EVENT_ACTIVE (scripted event),
+        FESTIVAL_FREE_ROAM (observe and choose an available native action),
+        CHOICE_REQUIRED (list options, then native_answer), MENU_OWNED_BY_SLEEP_FLOW
+        (leave sleep-flow menus alone), NAME_INPUT_REQUIRED (NamingMenu needs
+        explicit native_menu_select text; closing it does not complete naming),
+        NOTHING_TO_ADVANCE (no native UI to act on).
+        """
+        try:
+            return _native_action_response("native-advance", await sched.execute_native_advance(allow_skip=allow_skip))
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+        except Exception as ex:
+            raise ToolError(f"Native advance failed: {ex}") from None
+
+    @mcp.tool()
+    async def native_answer(choice_index: int) -> dict[str, Any]:
+        """Answer the current question dialogue or confirmation with an explicit choice (native-answer).
+
+        choice_index selects one of the responses a CHOICE_REQUIRED native-advance
+        rejection listed in details.responses (0-based, in display order). Answering
+        is never implicit: never choose for the player without their instruction. A
+        non-question state is rejected NOT_A_QUESTION. Native ConfirmationDialog
+        choices are 0=confirm, 1=cancel; read its text in get_status first.
+        """
+        try:
+            return _native_action_response("native-answer", await sched.execute_native_answer(choice_index=choice_index))
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+        except Exception as ex:
+            raise ToolError(f"Native answer failed: {ex}") from None
 
     @mcp.tool()
     async def pause_task() -> dict[str, Any]:
@@ -3787,6 +4325,23 @@ def create_mcp_server(
             raise ToolError(f"Cancel failed: {ex}") from None
         except Exception as ex:
             raise ToolError(f"Unexpected cancel error: {ex}") from None
+
+    @mcp.tool()
+    async def cancel_plan_command(command_id: str) -> dict[str, Any]:
+        """Retire only a persisted native command whose task authorization was revoked."""
+        if resolved_surface != "internal":
+            raise ToolError("HARNESS_ONLY: native command retirement is an internal control")
+        sid = await current_save_id()
+        state = work_for_run().state(sid)
+        if not any(task.status == "cancelled" and any(
+            step.command_id == command_id and step.status in {"running", "unknown", "waiting"}
+            for step in task.steps
+        ) for task in state.tasks):
+            raise ToolError("COMMAND_NOT_REVOKED: no cancelled task owns this unresolved command")
+        client = await sched.ensure_connected()
+        await client.cancel_skill(command_id="retire-" + uuid.uuid4().hex,
+                                  correlation_id=command_id, reason="Accepted work scope changed")
+        return {"status": "cancellation-requested", "commandId": command_id}
 
     @mcp.tool()
     async def reconcile_plan_command(command_id: str) -> dict[str, Any]:
@@ -3864,9 +4419,12 @@ def create_mcp_server(
                 return await fn(*args, **kwargs)
             if name not in _PLAN_OPERATION_CALLS:
                 raise ToolError("SHORT_JOB_UNSUPPORTED: choose a discoverable native plan operation")
+            await validate_actor_operation(name)
             if args:
                 raise ToolError("Short job parameters must be named")
-            params = validate_base_arguments(name, dict(kwargs))
+            # Direct action calls become durable jobs too. Serialize nested
+            # validated values (e.g. ItemQuantity) before persisting the plan.
+            params = validate_base_arguments(name, dict(kwargs), for_plan=True)
             if name == "navigate_to":
                 destinations = [params.get("tile")]
                 for x_key, y_key in (("tile_x", "tile_y"), ("x", "y")):
@@ -3892,20 +4450,24 @@ def create_mcp_server(
                         raise ToolError("navigate_to needs an observed destination tile. No job selected.")
                 if any(type(params["tile"].get(key)) is not int or params["tile"][key] < 0 for key in ("x", "y")):
                     raise ToolError("Destination must contain non-negative integer x and y. No job selected.")
+            unknown = set(params) - _PLAN_OPERATION_CALLS[name][1] - {"detail", "command_id"}
+            if unknown:
+                raise ToolError(f"INVALID_JOB_PARAMETERS: {name} does not accept {sorted(unknown)}; no job selected")
             try:
                 decision = store.state(sid).decision
                 bound_goal_id = decision.get("goalScope") or decision.get("goalId")
                 selected = store.submit_plan(sid, goal_id=bound_goal_id,
                     goal_text=None if bound_goal_id else "Current model-selected short job",
                     tasks=[{"title": name, "steps": [{"operation": name, "params": params}]}],
-                    decision_token=decision_token())
+                    decision_token=decision_token(), request_id=job_request_owner.get())
             except WorkStateError as ex:
                 raise ToolError(str(ex)) from None
             if external_codex:
                 external_selected = True
                 await sched.close()
             return {"status": "job-selected", "taskId": selected["tasks"][0]["id"], "goalId": selected["goalId"],
-                    "effectStatus": "not_executed_yet", "nextBusiness": "new_model_decision_required"}
+                    "effectStatus": "not_executed_yet", "nextBusiness": "new_model_decision_required",
+                    **({"handoff": "ack_async", "nextAction": "结束当前回复，让原生执行器接管。实际结果将在后续job.result送达；此思考回合内不要轮询get_status等待尚未开始的作业，也不要重复提交。"} if not external_codex else {})}
         return guarded
 
     def protect_external_observation(fn):
@@ -3937,9 +4499,43 @@ def create_mcp_server(
             return await fn(*args, **kwargs)
         return guarded
 
-    readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "read_guidance", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
+    readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "read_guidance", "read_reload_history", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
+    declared_tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+    wire_param_shapes = {}
+    def wire_type(shape):
+        # Generic operation fields need concrete converter types. Conditional
+        # bounds/defaults belong to the chosen tool's canonical server validator,
+        # not the first unrelated operation encountered by this projection.
+        if not isinstance(shape, dict):
+            return shape
+        alternatives = shape.get("anyOf") or shape.get("oneOf")
+        if alternatives:
+            nonnull = next((part for part in alternatives if part.get("type") != "null"), {})
+            return wire_type(nonnull)
+        result = {k: v for k, v in shape.items() if k in
+                  {"type", "properties", "items", "required", "additionalProperties"}}
+        if "properties" in result:
+            result["properties"] = {k: wire_type(v) for k, v in result["properties"].items()}
+        if "items" in result:
+            result["items"] = wire_type(result["items"])
+        return result
+    for name in sorted(set(_PLAN_OPERATION_CALLS) | {n for group in CAPABILITY_GROUPS.values() for n in group}):
+        declaration = declared_tools.get(name)
+        if declaration is None:
+            continue
+        for field, shape in declaration.parameters.get("properties", {}).items():
+            canonical = capability_parameter_shape(field, shape, declaration.parameters)
+            wire_param_shapes.setdefault(field, wire_type(canonical))
     for tool in mcp._tool_manager.list_tools():
-        exempt = {"request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "work_plan_overview"}
+        # These tools are bounded to the current Stardew Valley save. Wiki
+        # lookup and its generic dispatcher can access public knowledge; keep
+        # those open-world. Write/destructive defaults remain conservative.
+        passive = tool.name in {"get_status", "query_inventory", "work_plan_overview",
+                                "discover_capabilities", "read_guidance", "read_reload_history", "autonomy_status", "query_wiki"}
+        tool.annotations = ToolAnnotations(readOnlyHint=passive, destructiveHint=not passive,
+                                           openWorldHint=tool.name in {"query_wiki", "call_capability"})
+        tool.description = "Stardew Valley (SMAPI), current saved game. " + tool.description
+        exempt = {"player_control", "request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "record_decision_note", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command", "work_plan_overview"}
         if tool.name not in exempt and tool.name not in readonly and not tool.name.startswith(("query_", "get_", "list_", "discover_", "observe_")):
             tool.fn = protect_job(tool.name, tool.fn)
         if tool.name.startswith(("query_", "observe_")) and tool.name != "query_wiki":
@@ -3951,6 +4547,9 @@ def create_mcp_server(
             "parameters": tool.parameters,
         }
         base_metadata[tool.name] = tool.fn_metadata
+        if os.environ.get("STARDEW_MCP_WIRE_STYLE") == "mcode":
+            tool.parameters = mcode_tool_schema(tool.name, tool.parameters,
+                wire_param_shapes if tool.name in {"submit_plan", "call_capability", "manage_plan"} else None)
     if resolved_surface == "light":
         allowed = LIGHT_TOOLS | ({"begin_game_turn", "work_plan_overview"} if external_codex else set())
     elif resolved_surface == "internal":

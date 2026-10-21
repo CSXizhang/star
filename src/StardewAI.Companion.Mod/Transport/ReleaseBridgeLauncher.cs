@@ -18,6 +18,7 @@ public static class ReleaseBridgeLauncher
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
             WorkingDirectory = root,
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
@@ -155,6 +156,9 @@ public sealed class ReleaseBridgeLaunch : IDisposable
             if (_stopping) return false;
             if (!process.Start()) return false;
             _process = process;
+            // This background service never consumes the game's console input.
+            // Give PowerShell and its Python child EOF instead of inheriting it.
+            if (process.StartInfo.RedirectStandardInput) process.StandardInput.Close();
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
             return true;

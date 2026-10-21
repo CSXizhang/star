@@ -10,7 +10,7 @@ from stardew_ai_runtime.websocket_client import WebSocketError
 
 
 @pytest.mark.parametrize("connected", [False, True])
-def test_decision_revocation_requires_successful_chat_connection(tmp_path, monkeypatch, connected):
+def test_successful_chat_connection_restarts_worker_and_never_mutates_saved_work(tmp_path, monkeypatch, connected):
     async def scenario():
         bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
         store = bridge._work_store
@@ -41,8 +41,10 @@ def test_decision_revocation_requires_successful_chat_connection(tmp_path, monke
         await bridge.run(stop)
         if connected:
             worker.start.assert_called_once()
-            assert store.state("farm").scheduler_epoch == before_epoch + 1
-            assert store.state("farm").decision == {}
+            # A bridge reconnect in the same game session retains the persisted
+            # authorized selection; only a real native reload revokes it.
+            assert store.state("farm").scheduler_epoch == before_epoch
+            assert store.state("farm").decision["token"] == "still-valid-token"
             ws.close.assert_awaited_once()
         else:
             worker.start.assert_not_called()

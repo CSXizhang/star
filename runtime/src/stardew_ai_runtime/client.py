@@ -39,6 +39,13 @@ class TransportClient:
         self._completed_results: dict[str, Envelope] = {}
         self._native_revision_session: tuple[str, str] | None = None
         self._native_command_revisions: dict[str, int] = {}
+        # Player-mode welcome facts; every field keeps its safe default when
+        # the mod does not publish it (companion mode is unchanged).
+        self.actor_mode: str = "companion"
+        self.actor_name: str | None = None
+        self.actor_multiplayer_id: int | None = None
+        self.authority: str | None = None
+        self.supports_thinking_pause: bool = False
 
     @property
     def is_connected(self) -> bool:
@@ -115,6 +122,7 @@ class TransportClient:
             )
 
         self.mod_welcome = welcome
+        self._apply_welcome_actor_fields(welcome)
         self.save_id = welcome.save_id
         self.game_session_id = welcome.game_session_id
         self.world_revision = welcome.world_revision
@@ -399,6 +407,7 @@ class TransportClient:
         max_water: int = 20,
         cancel_policy: str = "safe-point",
         world_revision: int | None = None,
+        items: list[dict[str, Any]] | None = None,
     ) -> str:
         """Dispatches a skill.execute command targeting a deposit-chest."""
         if not self.save_id or not self.game_session_id:
@@ -422,6 +431,7 @@ class TransportClient:
             chest_x=chest_x,
             chest_y=chest_y,
             item_ids=item_ids,
+            items=items,
             idempotency_key=idem_key,
             expires_at=expires_at,
             max_game_minutes=max_game_minutes,
@@ -668,6 +678,155 @@ class TransportClient:
         await self.send_envelope(execute_envelope)
         return cmd_id
 
+    async def execute_open_shop(self, location_id: str, shop_id: str,
+                                command_id: str | None = None, task_id: str | None = None,
+                                idempotency_key: str | None = None, expires_seconds: float = 30.0,
+                                world_revision: int | None = None) -> str:
+        """Dispatches a skill.execute command targeting open-shop."""
+        if not self.save_id or not self.game_session_id:
+            raise TransportClientError("Handshake must be completed before executing skills")
+        cmd_id = command_id or f"cmd-{uuid.uuid4().hex[:8]}"
+        tsk_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        envelope = Envelope.create_execute_skill(
+            sender_instance_id=self.instance_id,
+            sequence_number=self._next_sequence_number(),
+            save_id=self.save_id,
+            game_session_id=self.game_session_id,
+            world_revision=self.world_revision if world_revision is None else world_revision,
+            command_id=cmd_id,
+            task_id=tsk_id,
+            skill_id="open-shop",
+            parameters={"locationId": location_id, "shopId": shop_id},
+            idempotency_key=idempotency_key or f"{self.save_id}:{tsk_id}:attempt-1",
+            expires_at=datetime.now(UTC) + timedelta(seconds=expires_seconds),
+        )
+        await self.send_envelope(envelope)
+        return cmd_id
+
+    async def execute_open_chest(self, location_id: str, chest_x: int, chest_y: int,
+                                 command_id: str | None = None, task_id: str | None = None,
+                                 idempotency_key: str | None = None, expires_seconds: float = 30.0,
+                                 max_game_minutes: int = 60, world_revision: int | None = None) -> str:
+        """Dispatches a skill.execute command targeting open-chest."""
+        if not self.save_id or not self.game_session_id:
+            raise TransportClientError("Handshake must be completed before executing skills")
+        cmd_id = command_id or f"cmd-{uuid.uuid4().hex[:8]}"
+        tsk_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        envelope = Envelope.create_execute_skill(
+            sender_instance_id=self.instance_id,
+            sequence_number=self._next_sequence_number(),
+            save_id=self.save_id,
+            game_session_id=self.game_session_id,
+            world_revision=self.world_revision if world_revision is None else world_revision,
+            command_id=cmd_id,
+            task_id=tsk_id,
+            skill_id="open-chest",
+            parameters={"locationId": location_id, "chestTile": {"x": chest_x, "y": chest_y}},
+            idempotency_key=idempotency_key or f"{self.save_id}:{tsk_id}:attempt-1",
+            expires_at=datetime.now(UTC) + timedelta(seconds=expires_seconds),
+            max_game_minutes=max_game_minutes,
+        )
+        await self.send_envelope(envelope)
+        return cmd_id
+
+    def _native_ui_location(self) -> str:
+        payload = self.latest_snapshot.payload if self.latest_snapshot else {}
+        world = payload.get("world") or {}
+        return str(world.get("currentLocation") or "current-native-ui")
+
+    async def execute_native_advance(self, allow_skip: bool = False,
+                                     command_id: str | None = None, task_id: str | None = None,
+                                     idempotency_key: str | None = None, expires_seconds: float = 30.0,
+                                     world_revision: int | None = None) -> str:
+        """Dispatches the native-advance UI continuation (skip cutscene/advance dialogue/dismiss menu)."""
+        if not self.save_id or not self.game_session_id:
+            raise TransportClientError("Handshake must be completed before executing skills")
+        cmd_id = command_id or f"cmd-{uuid.uuid4().hex[:8]}"
+        tsk_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        envelope = Envelope.create_execute_skill(
+            sender_instance_id=self.instance_id,
+            sequence_number=self._next_sequence_number(),
+            save_id=self.save_id,
+            game_session_id=self.game_session_id,
+            world_revision=self.world_revision if world_revision is None else world_revision,
+            command_id=cmd_id,
+            task_id=tsk_id,
+            skill_id="native-advance",
+            parameters={"locationId": self._native_ui_location(), "allowSkip": allow_skip is True},
+            idempotency_key=idempotency_key or f"{self.save_id}:{tsk_id}:attempt-1",
+            expires_at=datetime.now(UTC) + timedelta(seconds=expires_seconds),
+        )
+        await self.send_envelope(envelope)
+        return cmd_id
+
+    async def execute_native_answer(self, choice_index: int,
+                                    command_id: str | None = None, task_id: str | None = None,
+                                    idempotency_key: str | None = None, expires_seconds: float = 30.0,
+                                    world_revision: int | None = None) -> str:
+        """Dispatches the native-answer dialogue choice (explicit choiceIndex)."""
+        if not self.save_id or not self.game_session_id:
+            raise TransportClientError("Handshake must be completed before executing skills")
+        if isinstance(choice_index, bool) or not isinstance(choice_index, int) or choice_index < 0:
+            raise TransportClientError("choice_index must be a non-negative integer")
+        cmd_id = command_id or f"cmd-{uuid.uuid4().hex[:8]}"
+        tsk_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        envelope = Envelope.create_execute_skill(
+            sender_instance_id=self.instance_id,
+            sequence_number=self._next_sequence_number(),
+            save_id=self.save_id,
+            game_session_id=self.game_session_id,
+            world_revision=self.world_revision if world_revision is None else world_revision,
+            command_id=cmd_id,
+            task_id=tsk_id,
+            skill_id="native-answer",
+            parameters={"locationId": self._native_ui_location(), "choiceIndex": choice_index},
+            idempotency_key=idempotency_key or f"{self.save_id}:{tsk_id}:attempt-1",
+            expires_at=datetime.now(UTC) + timedelta(seconds=expires_seconds),
+        )
+        await self.send_envelope(envelope)
+        return cmd_id
+
+    async def execute_sleep(
+        self,
+        command_id: str | None = None,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+        expires_seconds: float = 300.0,
+        max_game_minutes: int = 720,
+        max_stamina: float = 0.0,
+        max_water: int = 0,
+        cancel_policy: str = "safe-point",
+        world_revision: int | None = None,
+    ) -> str:
+        """Dispatches the player-mode native sleep skill (empty parameters)."""
+        if not self.save_id or not self.game_session_id:
+            raise TransportClientError("Handshake must be completed before executing skills")
+
+        cmd_id = command_id or f"cmd-{uuid.uuid4().hex[:8]}"
+        tsk_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        idem_key = idempotency_key or f"{self.save_id}:{tsk_id}:attempt-1"
+        expires_at = datetime.now(UTC) + timedelta(seconds=expires_seconds)
+        target_revision = self.world_revision if world_revision is None else world_revision
+
+        execute_envelope = Envelope.create_execute_sleep(
+            sender_instance_id=self.instance_id,
+            sequence_number=self._next_sequence_number(),
+            save_id=self.save_id,
+            game_session_id=self.game_session_id,
+            world_revision=target_revision,
+            command_id=cmd_id,
+            task_id=tsk_id,
+            idempotency_key=idem_key,
+            expires_at=expires_at,
+            max_game_minutes=max_game_minutes,
+            max_stamina=max_stamina,
+            max_water=max_water,
+            cancel_policy=cancel_policy,
+        )
+
+        await self.send_envelope(execute_envelope)
+        return cmd_id
+
     async def cancel_skill(
         self,
         command_id: str,
@@ -736,6 +895,59 @@ class TransportClient:
         )
         await self.send_envelope(resume)
 
+    async def request_command_result(self, command_id: str) -> None:
+        """Read the current native session's cached receipt; never redispatch work."""
+        if not self.save_id or not self.game_session_id:
+            raise TransportClientError("Cannot reconcile before handshake")
+        await self.send_envelope(Envelope.create_result_query(
+            self.instance_id, self._next_sequence_number(), self.save_id,
+            self.game_session_id, self.world_revision, command_id,
+        ))
+
+    def _apply_welcome_actor_fields(self, welcome: Envelope) -> None:
+        """Store optional player-mode welcome fields with companion-safe defaults."""
+        payload = welcome.payload if isinstance(welcome.payload, Mapping) else {}
+        self.actor_mode = "player" if payload.get("actorMode") == "player" else "companion"
+        actor_name = payload.get("actorName")
+        self.actor_name = str(actor_name) if actor_name is not None else None
+        actor_mid = payload.get("actorMultiplayerId")
+        self.actor_multiplayer_id = (
+            actor_mid if isinstance(actor_mid, int) and not isinstance(actor_mid, bool) else None
+        )
+        authority = payload.get("authority")
+        self.authority = str(authority) if authority in {"human", "agent"} else None
+        self.supports_thinking_pause = payload.get("supportsThinkingPause") is True
+
+    async def send_agent_thinking(
+        self,
+        state: str,
+        lease_id: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Sends agent.thinking on the chat channel (player-mode thinking pause)."""
+        envelope = Envelope.create_agent_thinking(
+            sender_instance_id=self.instance_id,
+            request_id=request_id or f"thinking-{uuid.uuid4().hex[:8]}",
+            state=state,
+            lease_id=lease_id,
+            save_id=self.save_id, game_session_id=self.game_session_id,
+        )
+        await self.send_envelope(envelope)
+
+    async def send_player_control(
+        self,
+        action: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Sends player.control claim/release on the chat channel."""
+        envelope = Envelope.create_player_control(
+            sender_instance_id=self.instance_id,
+            request_id=request_id or f"player-control-{uuid.uuid4().hex[:8]}",
+            action=action,
+            save_id=self.save_id, game_session_id=self.game_session_id,
+        )
+        await self.send_envelope(envelope)
+
     def get_cached_result(self, command_id: str) -> Envelope | None:
         """Returns and clears cached skill.result envelope for command_id if already received."""
         return self._completed_results.pop(command_id, None)
@@ -763,6 +975,10 @@ class TransportClient:
                     return envelope
                 if res_cmd:
                     self._completed_results[res_cmd] = envelope
+            elif (envelope.message_type == "skill.result.status"
+                  and envelope.payload.get("commandId") == command_id
+                  and envelope.payload.get("status") == "unknown"):
+                raise TimeoutError(f"Native session has no cached result for command {command_id}")
             elif envelope.message_type == "protocol.error":
                 code = envelope.payload.get("code", "UNKNOWN")
                 msg = envelope.payload.get("message", "Error")

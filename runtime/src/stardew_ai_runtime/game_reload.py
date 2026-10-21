@@ -55,7 +55,18 @@ def _reconcile(name: str, record: dict[str, Any], committed: dict[str, Any], loa
     """Keep current intent; only the real save can establish completed world facts."""
     record = copy.deepcopy(record)
     if name == "work-state.json":
+        # An unsent result from the discarded day is no longer a current-world
+        # fact. Keep only checkpoint-owned receipts; the reload before-image
+        # archives discarded receipts without replaying them to the model.
+        prior_outbox = {event.get("id"): event for event in record.get("outbox", [])}
+        restored_outbox = copy.deepcopy(committed.get("outbox", []))
+        for event in restored_outbox:
+            previous = prior_outbox.get(event.get("id"), {})
+            for field, terminal in (("delivery", "consumed"), ("notify", "delivered")):
+                if (previous.get(field) or {}).get("state") == terminal:
+                    event[field] = copy.deepcopy(previous[field])
         record.update(tasks=[], executions=committed.get("executions", []), decision={}, lastJob={},
+                      outbox=restored_outbox,
                       archive=committed.get("archive", []), branchFailures=[],
                       lastSettledDay=loaded_day, schedulerEpoch=int(record.get("schedulerEpoch", 0)) + 1)
         saved_goals = {g["id"]: g for g in committed.get("goals", [])}

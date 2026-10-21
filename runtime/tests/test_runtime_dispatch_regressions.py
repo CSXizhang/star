@@ -129,7 +129,7 @@ def test_waiting_wakeup_rechecks_pause_and_latest_resources(tmp_path):
         bridge._busy_lock.release()
         await finish_tracked(tracked)
         prompt = bridge._execute_turn.call_args.args[2]
-        assert '"current":15' in prompt and '"level":40' in prompt
+        assert '"current":15' in prompt and '"currentWater":40' in prompt
         assert bridge._autonomy.state("save").last_attempt_revision == 2
     asyncio.run(run())
 
@@ -181,7 +181,7 @@ def test_cancelled_work_keeps_model_slot_until_executor_restores_state(tmp_path)
         calls = []
         def provider(active, *args):
             calls.append(active.request_id)
-            if active.request_id == "chain-interrupted":
+            if active.request_id == "work-interrupted":
                 started.set()
                 assert release.wait(3)
                 restored.set()  # models the backend's environment restore/finally
@@ -189,7 +189,7 @@ def test_cancelled_work_keeps_model_slot_until_executor_restores_state(tmp_path)
                 assert restored.is_set(), "new work overlapped the interrupted provider"
             return {"success": True, "response": "待命。", "conversation_id": "work-session"}
         bridge._execute_turn.side_effect = provider
-        first = asyncio.create_task(bridge.handle_chat_submit(None, "chain-interrupted", "执行", "save"))
+        first = asyncio.create_task(bridge.handle_chat_submit(None, "work-interrupted", "执行", "save"))
         assert await asyncio.to_thread(started.wait, 1)
         first.cancel()
         await asyncio.sleep(0)
@@ -331,7 +331,7 @@ def test_noop_profile_save_preserves_revision_and_life_session(tmp_path):
 
 
 @pytest.mark.parametrize("provider_success", [True, False])
-def test_job_selection_hides_premature_model_result_and_keeps_native_feedback(tmp_path, provider_success):
+def test_job_selection_delivers_model_reply_verbatim_and_keeps_native_feedback(tmp_path, provider_success):
     async def run():
         bridge = bridge_for_work(tmp_path)
         store = bridge._work_store
@@ -342,9 +342,12 @@ def test_job_selection_hides_premature_model_result_and_keeps_native_feedback(tm
                 "title": "给水壶补水", "steps": [{"operation": "refill_watering_can", "params": {}}]}])
             return {"success": provider_success, "response": "补水失败，没办法继续。", "conversation_id": "work-session"}
         bridge._execute_turn.side_effect = select
-        await bridge.handle_chat_submit(ws, "chain-refill", "补水", "save")
+        await bridge.handle_chat_submit(ws, "req-refill", "补水", "save")
         selected = next(row for row in wire_payloads(ws) if row.get("status") == "selected")
-        assert selected["replyText"] == "已选择「给水壶补水」，等待原生执行；结果尚未确认。"
+        # The selection acknowledgement is the model's own text, delivered
+        # verbatim; the confirmed terminal closes the command via the outbox
+        # delivery turn, not via a premature override.
+        assert selected["replyText"] == "补水失败，没办法继续。"
         assert selected["commandComplete"] is False
         assert not store.state("save").last_job
         task_id = store.state("save").decision["taskId"]
@@ -354,7 +357,9 @@ def test_job_selection_hides_premature_model_result_and_keeps_native_feedback(tm
             outcome="completed", message="水量已恢复到40。"))
         terminal = next(row for row in wire_payloads(ws) if row.get("status") == "job-completed")
         assert "水量已恢复到40" in terminal["replyText"]
-        assert terminal["commandComplete"] is True
+        # A player-bound job never completes the command in a progress reply;
+        # the pending outbox delivery turn owns the final closure.
+        assert terminal["commandComplete"] is False
         tracked = set()
         await bridge._maybe_schedule_autonomy(snapshot(stamina=15, water=40), "save", tracked, None, force=True)
         await finish_tracked(tracked)

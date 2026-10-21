@@ -264,8 +264,9 @@ class AutonomyController:
 
     def set_goal_scope(self, save_id: str, goal_id: str | None) -> None:
         def mutate(state: SaveAutonomyState) -> None:
-            state.goal_scope = goal_id
-            state.decision_epoch += 1
+            if state.goal_scope != goal_id:
+                state.goal_scope = goal_id
+                state.decision_epoch += 1
         self._mutate(save_id, mutate)
 
     def set_preferences(
@@ -338,9 +339,18 @@ class AutonomyController:
             state.breaker_reason = None
         return self._mutate(save_id, mutate)
 
-    def observe_rest_state(self, save_id: str, rest_state: Any) -> None:
-        """A completed daytime rest is one native wakeup, even within a resource band."""
+    def observe_rest_state(self, save_id: str, rest_state: Any, *, player_mode: bool = False) -> None:
+        """A completed daytime rest is one native wakeup, even within a resource band.
+
+        Player-mode snapshots may omit ``restState`` entirely (the player has
+        no companion rest controller): a missing/None value is skipped, never
+        recorded as an anomaly.
+        """
         if not isinstance(rest_state, str) or self.state(save_id).observed_rest_state == rest_state:
+            if not isinstance(rest_state, str) and player_mode:
+                return
+            if not isinstance(rest_state, str):
+                return
             return
         def mutate(state: SaveAutonomyState) -> None:
             if state.observed_rest_state == "resting" and rest_state == "awake":

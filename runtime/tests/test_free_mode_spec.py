@@ -249,6 +249,7 @@ def test_free_purchase_selection_does_not_consume_budget(tmp_path: Path) -> None
 
     async def run() -> None:
         for command_id in ("cmd-a", "cmd-b", "cmd-c"):
+            store.revoke_decision("save-a")  # Independent unexecuted selection cases.
             store.begin_decision("save-a", "decision-fp")
             with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-fp"}):
                 _, result = await server.call_tool("purchase_items", {

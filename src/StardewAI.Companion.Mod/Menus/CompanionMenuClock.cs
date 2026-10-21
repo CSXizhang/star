@@ -14,12 +14,43 @@ public static class CompanionMenuClock
          || ReferenceEquals(menu, OwnedQuestion));
     public static bool HasBlockingMenu => Game1.activeClickableMenu != null && !IsConversation(Game1.activeClickableMenu);
 
-    public static void Install() => new Harmony("StardewAI.Companion.ConversationClock").Patch(
-        AccessTools.Method(typeof(Game1), nameof(Game1.shouldTimePass)),
-        transpiler: new HarmonyMethod(typeof(CompanionMenuClock), nameof(Transpile)));
+    public static void Install()
+    {
+        var harmony = new Harmony("StardewAI.Companion.ConversationClock");
+        harmony.Patch(AccessTools.Method(typeof(Game1), nameof(Game1.shouldTimePass)),
+            transpiler: new HarmonyMethod(typeof(CompanionMenuClock), nameof(Transpile)));
+        harmony.Patch(AccessTools.Method(typeof(Game1), "_update"),
+            transpiler: new HarmonyMethod(typeof(CompanionMenuClock), nameof(TranspileClockDispatch)));
+    }
 
     private static IClickableMenu? ClockMenu() => IsConversation(Game1.activeClickableMenu) ? null : Game1.activeClickableMenu;
     private static bool ClockCanMove(Farmer farmer) => farmer.CanMove || IsConversation(Game1.activeClickableMenu);
+
+    private static IEnumerable<CodeInstruction> TranspileClockDispatch(IEnumerable<CodeInstruction> instructions)
+    {
+        var code = instructions.ToList();
+        var menuGetter = AccessTools.PropertyGetter(typeof(Game1), nameof(Game1.activeClickableMenu));
+        var multiplayerGetter = AccessTools.PropertyGetter(typeof(Game1), nameof(Game1.IsMultiplayer));
+        var minigameGetter = AccessTools.PropertyGetter(typeof(Game1), nameof(Game1.currentMinigame));
+        var matches = 0;
+        for (var i = 2; i + 2 < code.Count; i++)
+        {
+            // Only the menu gate immediately following the multiplayer check
+            // and preceding the minigame check guards UpdateGameClock. Keep
+            // actual menu update/input dispatch and all other pause gates intact.
+            if (code[i].Calls(menuGetter) && code[i - 2].Calls(multiplayerGetter)
+                && code[i - 1].opcode.FlowControl == FlowControl.Cond_Branch
+                && code[i + 1].opcode.FlowControl == FlowControl.Cond_Branch
+                && code[i + 2].Calls(minigameGetter))
+            {
+                code[i].operand = AccessTools.Method(typeof(CompanionMenuClock), nameof(ClockMenu));
+                matches++;
+            }
+        }
+        if (matches != 1)
+            throw new InvalidOperationException($"Expected one conversation clock dispatch gate, found {matches}.");
+        return code;
+    }
 
     private static IEnumerable<CodeInstruction> Transpile(IEnumerable<CodeInstruction> instructions)
     {

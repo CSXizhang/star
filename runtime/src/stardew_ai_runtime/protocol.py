@@ -16,6 +16,12 @@ class ProtocolError(ValueError):
 # here, schedule, transport, MCP schema and the C# handler all validate the same
 # contract, and an unknown skill/parameter is rejected instead of being forwarded.
 NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
+    "inspect-player-activities": frozenset({"locationId"}),
+    "talk-npc": frozenset({"locationId", "npcName"}),
+    "interact-tile": frozenset({"locationId", "tile"}),
+    "fish": frozenset({"locationId", "facing"}),
+    "attack": frozenset({"locationId", "facing"}),
+    "native-menu-select": frozenset({"locationId", "choiceIndex", "menuText"}),
     "cut-grass": frozenset({"locationId", "tiles"}),
     "inspect-building-services": frozenset({"locationId"}),
     "build-building": frozenset({"locationId", "buildingType", "tile", "budget_limit"}),
@@ -32,6 +38,8 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "inspect-planting": frozenset({"locationId", "region"}),
     "inspect-route": frozenset({"locationId", "tile"}),
     "inspect-livestock": frozenset({"locationId"}),
+    "open-shop": frozenset({"locationId", "shopId"}),
+    "open-chest": frozenset({"locationId", "chestTile"}),
     "inspect-shop": frozenset({"locationId", "shopId"}),
     "place-items": frozenset({"locationId", "tiles", "itemId"}),
     "remove-items": frozenset({"locationId", "tiles", "itemId"}),
@@ -46,6 +54,10 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "feed-animals": frozenset({"locationId", "buildingName"}),
     "toggle-animal-door": frozenset({"locationId", "tiles"}),
     "collect-animal-produce": frozenset({"locationId", "tiles", "animalName", "animalId"}),
+    # UI continuations act on the actor's current UI. Location labels retain
+    # compatibility with native transport shape validation, never select a map.
+    "native-advance": frozenset({"locationId", "allowSkip"}),
+    "native-answer": frozenset({"locationId", "choiceIndex"}),
 }
 
 NATIVE_ACTION_TASK_PREFIXES: dict[str, str] = {
@@ -63,6 +75,8 @@ NATIVE_ACTION_TASK_PREFIXES: dict[str, str] = {
     "feed-animals": "task-feed-",
     "toggle-animal-door": "task-door-",
     "collect-animal-produce": "task-aprod-",
+    "native-advance": "task-advance-",
+    "native-answer": "task-answer-",
 }
 
 
@@ -76,7 +90,9 @@ def validate_native_action_parameters(skill_id: str, parameters: Mapping[str, An
         raise ProtocolError(
             f"unsupported parameter(s) for '{skill_id}': {', '.join(sorted(unknown))}"
         )
-    if "locationId" not in parameters:
+    # Location-bound skills must name their map; UI-state skills (native-advance,
+    # native-answer) declare no locationId and act on the actor's current UI.
+    if "locationId" in allowed and "locationId" not in parameters:
         raise ProtocolError(f"'locationId' is required for '{skill_id}'")
 
 
@@ -212,6 +228,64 @@ class Envelope:
         policy_decision_id: str = "policy-allow",
     ) -> Envelope:
         """Builds skill.execute for one explicitly allow-listed native action."""
+        validate_native_action_parameters(skill_id, parameters)
+        return cls(
+            protocol_version="0.1",
+            message_type="skill.execute",
+            message_id=f"msg-exec-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id,
+            sequence_number=sequence_number,
+            world_revision=world_revision,
+            sent_at=datetime.now(UTC),
+            save_id=save_id,
+            game_session_id=game_session_id,
+            idempotency_key=idempotency_key,
+            expires_at=expires_at,
+            payload={
+                "commandId": command_id,
+                "taskId": task_id,
+                "skillId": skill_id,
+                "skillVersion": "0.1",
+                "expectedWorldRevision": world_revision,
+                "parameters": dict(parameters),
+                "budgets": {
+                    "maxGameMinutes": max_game_minutes,
+                    "maxStamina": max_stamina,
+                    "maxWater": max_water,
+                },
+                "cancelPolicy": cancel_policy,
+                "policyDecisionId": policy_decision_id,
+            },
+        )
+
+    @classmethod
+    def create_execute_skill(
+        cls,
+        sender_instance_id: str,
+        sequence_number: int,
+        save_id: str,
+        game_session_id: str,
+        world_revision: int,
+        command_id: str,
+        task_id: str,
+        skill_id: str,
+        parameters: Mapping[str, Any],
+        idempotency_key: str,
+        expires_at: datetime,
+        max_game_minutes: int = 60,
+        max_stamina: float = 50.0,
+        max_water: int = 20,
+        cancel_policy: str = "safe-point",
+        policy_decision_id: str = "policy-allow",
+    ) -> Envelope:
+        """Builds skill.execute for any allow-listed skill id and parameter map.
+
+        This is the generic constructor shared by the thin native skills that
+        have no dedicated envelope factory (open-shop/open-chest, the
+        native-advance/native-answer UI continuations). ``skill_id`` and
+        ``parameters`` are first-class here instead of being patched onto an
+        unrelated envelope after construction.
+        """
         validate_native_action_parameters(skill_id, parameters)
         return cls(
             protocol_version="0.1",
@@ -475,6 +549,7 @@ class Envelope:
         max_water: int = 20,
         cancel_policy: str = "safe-point",
         policy_decision_id: str = "policy-allow",
+        items: list[dict[str, Any]] | None = None,
     ) -> Envelope:
         parameters: dict[str, Any] = {
             "locationId": location_id,
@@ -482,6 +557,8 @@ class Envelope:
         }
         if item_ids is not None:
             parameters["itemIds"] = item_ids
+        if items is not None:
+            parameters["items"] = items
         return cls(
             protocol_version="0.1",
             message_type="skill.execute",
@@ -781,6 +858,54 @@ class Envelope:
         )
 
     @classmethod
+    def create_execute_sleep(
+        cls,
+        sender_instance_id: str,
+        sequence_number: int,
+        save_id: str,
+        game_session_id: str,
+        world_revision: int,
+        command_id: str,
+        task_id: str,
+        idempotency_key: str,
+        expires_at: datetime,
+        max_game_minutes: int = 720,
+        max_stamina: float = 0.0,
+        max_water: int = 0,
+        cancel_policy: str = "safe-point",
+        policy_decision_id: str = "policy-allow",
+    ) -> Envelope:
+        """Builds skill.execute for the player-mode native sleep (empty parameters)."""
+        return cls(
+            protocol_version="0.1",
+            message_type="skill.execute",
+            message_id=f"msg-exec-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id,
+            sequence_number=sequence_number,
+            world_revision=world_revision,
+            sent_at=datetime.now(UTC),
+            save_id=save_id,
+            game_session_id=game_session_id,
+            idempotency_key=idempotency_key,
+            expires_at=expires_at,
+            payload={
+                "commandId": command_id,
+                "taskId": task_id,
+                "skillId": "sleep",
+                "skillVersion": "0.1",
+                "expectedWorldRevision": world_revision,
+                "parameters": {"locationId": "FarmHouse"},
+                "budgets": {
+                    "maxGameMinutes": max_game_minutes,
+                    "maxStamina": max_stamina,
+                    "maxWater": max_water,
+                },
+                "cancelPolicy": cancel_policy,
+                "policyDecisionId": policy_decision_id,
+            },
+        )
+
+    @classmethod
     def create_cancel(
         cls,
         sender_instance_id: str,
@@ -840,6 +965,62 @@ class Envelope:
                 "commandId": command_id,
                 "reason": reason,
             },
+        )
+
+    @classmethod
+    def create_agent_thinking(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        state: str,
+        lease_id: str,
+        save_id: str | None = None,
+        game_session_id: str | None = None,
+    ) -> Envelope:
+        """Pause/release the world clock around one provider model turn (player mode)."""
+        if state not in {"begin", "renew", "end"}:
+            raise ProtocolError("agent.thinking: state must be 'begin', 'renew' or 'end'")
+        return cls(
+            protocol_version="0.1", message_type="agent.thinking",
+            message_id=f"msg-thinking-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id, game_session_id=game_session_id,
+            payload={"requestId": request_id, "saveId": save_id,
+                     "state": state, "leaseId": lease_id},
+        )
+
+    @classmethod
+    def create_player_control(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        action: str,
+        save_id: str | None = None,
+        game_session_id: str | None = None,
+    ) -> Envelope:
+        """Claim or release native player control (player mode only)."""
+        if action not in {"claim", "release"}:
+            raise ProtocolError("player.control: action must be 'claim' or 'release'")
+        return cls(
+            protocol_version="0.1", message_type="player.control",
+            message_id=f"msg-player-control-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id, game_session_id=game_session_id,
+            payload={"requestId": request_id, "saveId": save_id, "action": action},
+        )
+
+    @classmethod
+    def create_result_query(
+        cls, sender_instance_id: str, sequence_number: int, save_id: str,
+        game_session_id: str, world_revision: int, command_id: str,
+    ) -> Envelope:
+        return cls(
+            protocol_version="0.1", message_type="skill.result.query",
+            message_id=f"msg-result-query-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=sequence_number,
+            save_id=save_id, game_session_id=game_session_id,
+            world_revision=world_revision, sent_at=datetime.now(UTC),
+            payload={"commandId": command_id},
         )
 
     @classmethod
@@ -1611,7 +1792,7 @@ class LifeMemoryEditPayload:
 # life.milestones.* (contract §2): milestone planning nodes on the life channel.
 # ---------------------------------------------------------------------------
 
-_MILESTONE_STATUSES = frozenset({"suggested", "adopted", "deferred", "completed", "missed"})
+_MILESTONE_STATUSES = frozenset({"suggested", "adopted", "deferred", "completed", "missed", "cancelled"})
 _MILESTONE_VERIFICATIONS = frozenset({"verified", "unverified"})
 _MILESTONE_SUPPORTS = frozenset({"manual", "capability"})
 _MILESTONE_PREP_STATUSES = frozenset({"pending", "done", "unknown"})

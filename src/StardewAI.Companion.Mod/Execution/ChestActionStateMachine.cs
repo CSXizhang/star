@@ -12,8 +12,8 @@ namespace StardewAI.Companion.Mod.Execution;
 /// <summary>
 /// Tick-driven execution state machine for the "deposit-chest" and "organize-chest" skills.
 /// Navigates the companion adjacent to a normal farm chest, then either moves companion
-/// inventory items into the chest (genuine chest transfer via IChestAdapter, tools always
-/// excluded, stops early when the chest is full) or merges same-type stacks inside the
+/// inventory items into the chest (genuine chest transfer via IChestAdapter; native
+/// player deposits require explicit item choices, including any tools) or merges same-type stacks inside the
 /// chest (Item.addToStack, conservation-checked). Lifecycle mirrors the water-zone machine:
 /// safe pause/resume/cancel boundaries, measured clock budget, and monotonic timeout.
 /// </summary>
@@ -37,6 +37,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
     private List<InventoryItem> _depositPlan = new();
     private int _depositPlanIndex;
     private int _withdrawPlanIndex;
+    private int _withdrawRemainingCount;
     private List<PathStep> _currentPath = new();
     private int _currentPathIndex;
     private int _replanCount;
@@ -116,6 +117,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
             _replanCount = 0;
             _depositPlanIndex = 0;
             _withdrawPlanIndex = 0;
+            _withdrawRemainingCount = 0;
             _startClock = _observer.TimeOfDay;
             _cancelRequested = false;
             _cancelReason = null;
@@ -178,16 +180,34 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
             }
             else if (request.Kind == ChestActionKind.Deposit)
             {
+                bool playerBound = ActorGuards.IsPlayerBound(_actor);
+                if (playerBound && request.DepositItems is not { Count: > 0 } && request.ItemIds is not { Count: > 0 })
+                {
+                    earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
+                        "Choose explicit backpack itemIds or item quantities; native player storage never selects a cleanup policy.", "EXPLICIT_ITEMS_REQUIRED");
+                    return false;
+                }
+                if (request.DepositItems is not null &&
+                    (request.DepositItems.Count == 0 || request.ItemIds is not null ||
+                     request.DepositItems.Any(x => string.IsNullOrWhiteSpace(x.ItemId) || x.Count < 1)))
+                {
+                    earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
+                        "Specify either itemIds or positive deposit item quantities.", "INVALID_PARAMETERS");
+                    return false;
+                }
                 var inventory = _actor.GetInventorySnapshot();
+                var remaining = request.DepositItems?.GroupBy(x => x.ItemId.StartsWith("(") ? x.ItemId : $"(O){x.ItemId}")
+                    .ToDictionary(g => g.Key, g => g.Sum(x => x.Count), StringComparer.Ordinal);
                 HashSet<string>? filter = request.ItemIds is { Count: > 0 }
                     ? new HashSet<string>(request.ItemIds.Select(id => id.StartsWith("(") ? id : $"(O){id}"), StringComparer.Ordinal)
                     : null;
 
                 foreach (var slot in inventory)
                 {
-                    if (slot.IsTool)
+                    if (slot.IsTool && !playerBound)
                     {
-                        if (filter is null || filter.Contains(slot.ItemId))
+                        if (remaining is not null ? remaining.ContainsKey(slot.ItemId)
+                            : filter is null || filter.Contains(slot.ItemId))
                         {
                             _skippedItems.Add(new SkippedItemInfo(slot.ItemId, "tool-excluded"));
                         }
@@ -199,14 +219,25 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
                         continue;
                     }
 
-                    _depositPlan.Add(slot);
+                    if (remaining is not null)
+                    {
+                        if (!remaining.TryGetValue(slot.ItemId, out int needed) || needed == 0) continue;
+                        int planned = Math.Min(needed, slot.Stack);
+                        _depositPlan.Add(slot with { Stack = planned });
+                        remaining[slot.ItemId] -= planned;
+                    }
+                    else _depositPlan.Add(slot);
                 }
+
+                if (remaining is not null)
+                    foreach (var missing in remaining.Where(x => x.Value > 0))
+                        _failedItems.Add(new FailedItemInfo(missing.Key, $"insufficient-quantity: {missing.Value} items unavailable"));
 
                 if (_depositPlan.Count == 0)
                 {
-                    CurrentState = ExecutionState.Succeeded;
+                    CurrentState = _failedItems.Count == 0 ? ExecutionState.Succeeded : ExecutionState.Failed;
                     _actor.SetActiveTask(null);
-                    earlyTerminalResult = FinishExecution(ExecutionState.Succeeded);
+                    earlyTerminalResult = FinishExecution(CurrentState);
                     return true;
                 }
             }
@@ -361,6 +392,9 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
         }
 
         var step = _currentPath[_currentPathIndex];
+        if (ActorGuards.HasReachedWalkingTile(_actor, step.Tile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
 
         // Dynamic collision check BEFORE stepping towards destination tile
         bool isPassable = step.Tile == _actor.Tile ||
@@ -392,14 +426,20 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
             return;
         }
 
-        var targetPixelX = step.Tile.X * 64f + 32f;
-        var targetPixelY = step.Tile.Y * 64f + 32f;
+        var walkingTarget = ActorGuards.WalkingTargetPixel(_actor, step.Tile);
 
         var currentPos = _actor.PixelPosition;
-        float dx = targetPixelX - (currentPos.X + 32f);
-        float dy = targetPixelY - (currentPos.Y + 32f);
+        float dx = walkingTarget.X - currentPos.X;
+        float dy = walkingTarget.Y - currentPos.Y;
 
         float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            // The native actor ignores position setters. Keep driving its held
+            // movement until the measured standing center actually reaches the tile.
+            _actor.MovePixels(dx, dy);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             // Arrived at step tile
@@ -523,7 +563,8 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
         }
 
         var spec = withdrawList[_withdrawPlanIndex];
-        var result = _adapter.WithdrawItem(_actor, _currentRequest!.LocationId, _currentRequest.ChestTile, spec.ItemId, spec.Count);
+        if (_withdrawRemainingCount == 0) _withdrawRemainingCount = spec.Count;
+        var result = _adapter.WithdrawItem(_actor, _currentRequest!.LocationId, _currentRequest.ChestTile, spec.ItemId, _withdrawRemainingCount);
 
         if (result.Success)
         {
@@ -532,10 +573,11 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
                 result.ItemName ?? spec.ItemId,
                 result.Quality,
                 result.MovedStack));
-            _withdrawPlanIndex++;
+            _withdrawRemainingCount -= result.MovedStack;
+            if (_withdrawRemainingCount == 0) _withdrawPlanIndex++;
             Log($"Withdrew {result.ItemId} x{result.MovedStack} from chest ({_currentRequest.ChestTile.X}, {_currentRequest.ChestTile.Y}).");
 
-            if (result.BackpackFull)
+            if (result.BackpackFull && (_withdrawRemainingCount > 0 || _withdrawPlanIndex < withdrawList.Count))
             {
                 Log("Companion backpack is full; stopping withdrawal early.");
                 ExecutionState endState = _withdrawnItems.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed;
@@ -560,6 +602,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
         {
             _failedItems.Add(new FailedItemInfo(spec.ItemId, "item-not-found"));
             _withdrawPlanIndex++;
+            _withdrawRemainingCount = 0;
             Log($"Item {spec.ItemId} not found in chest ({_currentRequest.ChestTile.X}, {_currentRequest.ChestTile.Y}).");
             return;
         }
@@ -608,7 +651,8 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
         }
 
         var planItem = _depositPlan[_depositPlanIndex];
-        var result = _adapter.DepositItem(_actor, _currentRequest!.LocationId, _currentRequest.ChestTile, planItem.SlotIndex);
+        var result = _adapter.DepositItem(_actor, _currentRequest!.LocationId, _currentRequest.ChestTile,
+            planItem.SlotIndex, _currentRequest.DepositItems is null ? null : planItem.Stack);
 
         if (result.Success)
         {
@@ -730,7 +774,9 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
             errorMessage: errorMessage,
             errorCode: errorCode,
             retryRecommended: retryRecommended,
-            withdrawnItems: _withdrawnItems.ToList()
+            withdrawnItems: _withdrawnItems.ToList(),
+            requestedQuantity: kind == ChestActionKind.Withdraw ? _currentRequest?.WithdrawItems?.Sum(x => x.Count)
+                : kind == ChestActionKind.Deposit ? _currentRequest?.DepositItems?.Sum(x => x.Count) : null
         );
 
         var level = state is ExecutionState.Failed or ExecutionState.Rejected ? LogLevel.Warn : LogLevel.Info;
@@ -751,20 +797,20 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
         {
             NotifyPlayer(kind switch
             {
-                ChestActionKind.Deposit => $"AI Companion: Deposit task completed ({_depositedItems.Count} items).",
-                ChestActionKind.Withdraw => $"AI Companion: Withdraw task completed ({_withdrawnItems.Count} items).",
+                ChestActionKind.Deposit => $"AI Companion: Deposit task completed ({_depositedItems.Sum(x => x.Stack)} items).",
+                ChestActionKind.Withdraw => $"AI Companion: Withdraw task completed ({_withdrawnItems.Sum(x => x.Stack)} items).",
                 _ => $"AI Companion: Organize task completed ({_merges.Count} merges)."
             });
         }
         else if (state == ExecutionState.Cancelled)
         {
-            NotifyPlayer($"AI Companion: Task cancelled ({_depositedItems.Count + _withdrawnItems.Count} processed).");
+            NotifyPlayer($"AI Companion: Task cancelled ({_depositedItems.Sum(x => x.Stack) + _withdrawnItems.Sum(x => x.Stack)} items processed).");
         }
         else if (state == ExecutionState.PartiallySucceeded)
         {
             NotifyPlayer(chestFull
-                ? $"AI Companion: Chest full ({_depositedItems.Count}/{_depositPlan.Count} deposited)."
-                : $"AI Companion: {verb} task partially completed ({_depositedItems.Count + _withdrawnItems.Count} items).");
+                ? $"AI Companion: Chest full ({_depositedItems.Sum(x => x.Stack)}/{_depositPlan.Sum(x => x.Stack)} items deposited)."
+                : $"AI Companion: {verb} task partially completed ({_depositedItems.Sum(x => x.Stack) + _withdrawnItems.Sum(x => x.Stack)} items).");
         }
         else if (state == ExecutionState.Failed)
         {

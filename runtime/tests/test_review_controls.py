@@ -58,6 +58,9 @@ def work_bridge(tmp_path, *, paused=True, mode="free", finished=False):
     native = FakeNativeClient()
     bridge = ChatBridge(run_dir=tmp_path, backend="fake", internal_plan_client=native)
     store = bridge._work_store
+    # Independent arrangements are siblings; cancelling a main goal also
+    # retires its children, so neither arrangement should parent the other.
+    store.add_goal(SAVE, "农场日常", source="user")
     selected = store.add_goal(SAVE, "照料鸡群", source="user")
     unrelated = store.add_goal(SAVE, "明天浇水", source="user")
     trigger = {"type": "calendar", "year": 1, "season": "spring", "day": 2}
@@ -76,8 +79,11 @@ def work_bridge(tmp_path, *, paused=True, mode="free", finished=False):
     bridge._autonomy.set_preferences(SAVE, goal="照料鸡群")
     bridge._autonomy.set_paused(SAVE, paused)
     store.set_paused(SAVE, paused)
-    bridge._register_command_chain(SAVE, "照料鸡群", None, ROOT)
-    bridge._command_chains[SAVE].waiting_task_id = "animal-job"
+    # The saved root player request owns the selected job; the terminal of
+    # "animal-job" attributes its confirmed fact to ROOT in the outbox.
+    store.record_request(SAVE, ROOT, "照料鸡群", origin="player")
+    store.bind_request_task(SAVE, ROOT, "animal-job", selected.id)
+    bridge._active_player_requests[SAVE] = ROOT
     bridge._job_reply_binding = (ROOT, SAVE, "animal-job", None, ROOT)
     return bridge, native, selected.id, unrelated.id, selected_todo.id, other_todo.id
 
@@ -108,14 +114,15 @@ def test_explicit_cancel_preserves_mode_and_pause_and_only_cancels_selected_goal
         assert state.goal == "" and state.goal_scope is None and not state.pending
         work = bridge._work_store.state(SAVE)
         assert work.paused is paused
-        assert {g.id: g.status for g in work.goals} == {selected: "cancelled", other: "active"}
+        assert {g.id: g.status for g in work.goals if g.id in {selected, other}} == {selected: "cancelled", other: "active"}
+        assert next(g for g in work.goals if g.kind == "main").status == "active"
         assert {t.id: t.status for t in work.todos} == {todo: "cancelled", other_todo: "pending"}
         assert work.tasks[0].status == "cancelled"
         assert work.tasks[0].steps[0].command_id == "native-existing-pet"
-        assert not work.decision and SAVE not in bridge._command_chains
+        assert not work.decision and SAVE not in bridge._active_player_requests
+        assert not bridge._work_store.pending_outbox(SAVE)
         assert [p["operation"] for name, p in native.operations if name == "dispatch_plan_operation"] == ["cancel_task"]
-        ack = replies(ws)[-1]
-        assert ack["messageType"] == "autonomy.state"
+        ack = next(r for r in reversed(replies(ws)) if r["messageType"] == "autonomy.state")
         assert ack["payload"]["requestId"] == "cancel-request"
         assert ack["payload"]["status"] == "confirmed"
     asyncio.run(run())
@@ -131,7 +138,7 @@ def test_paused_chat_uses_life_surface_and_preserves_existing_work(tmp_path, mon
     async def run():
         bridge, native, *_ = work_bridge(tmp_path, finished=finished)
         work_before = deepcopy(bridge._work_store.state(SAVE))
-        chain_before = deepcopy(bridge._command_chains[SAVE])
+        roots_before = deepcopy(bridge._active_player_requests)
         binding_before = bridge._job_reply_binding
         observed = []
 
@@ -155,7 +162,7 @@ def test_paused_chat_uses_life_surface_and_preserves_existing_work(tmp_path, mon
         assert observed == ["human-readonly"]
         assert bridge._work_store.state(SAVE) == work_before
         assert bridge._autonomy.state(SAVE).paused is True
-        assert bridge._command_chains[SAVE] == chain_before
+        assert bridge._active_player_requests == roots_before
         assert bridge._job_reply_binding == binding_before
         assert native.operations == []
         final = replies(ws)[-1]["payload"]
@@ -174,7 +181,7 @@ def test_exact_continue_applies_resume_and_rejects_stale_controls(tmp_path):
     async def run():
         bridge, native, *_ = work_bridge(tmp_path)
         bridge._backend = MagicMock()
-        chain_before = deepcopy(bridge._command_chains[SAVE])
+        roots_before = deepcopy(bridge._active_player_requests)
         ws = AsyncMock()
         await bridge.handle_chat_submit(ws, "human-resume", "继续工作", SAVE)
         bridge._backend.run.assert_not_called()
@@ -184,7 +191,7 @@ def test_exact_continue_applies_resume_and_rejects_stale_controls(tmp_path):
         assert final["commandId"] == "human-resume"
         assert bridge._autonomy.state(SAVE).paused is False
         assert bridge._work_store.state(SAVE).paused is False
-        assert bridge._command_chains[SAVE] == chain_before
+        assert bridge._active_player_requests == roots_before
         assert native.operations == []
         # A control for another save cannot serve as this resume acknowledgement.
         await bridge._handle_autonomy_control(ws, Envelope.create_autonomy_control(

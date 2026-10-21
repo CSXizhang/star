@@ -167,6 +167,8 @@ async def _run_purchase_plan(
         )
     assert selected["status"] == "job-selected"
     _, execution = await server.call_tool("run_next_step", {})
+    # Match the PlanWorker's terminal/unknown feedback boundary before the next turn.
+    store.finish_job(SAVE, execution, task_id=store.state(SAVE).decision.get("taskId"))
     return execution
 
 

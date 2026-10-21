@@ -30,6 +30,20 @@ def _work_store(tmp_path: Path) -> WorkStore:
     return WorkStore(tmp_path / "data" / "work-state.json")
 
 
+@pytest.mark.parametrize("restored_record", [{}, {"lastGameDate": None}])
+def test_day_settle_handles_an_empty_record_restored_from_the_game(tmp_path, restored_record):
+    state_path = tmp_path / "companion-milestones.json"
+    state_path.write_text(json.dumps({SAVE: restored_record}), encoding="utf-8")
+    store = CompanionMilestoneStore(state_path)
+
+    changed, candidates = store.on_day_settled(SAVE, **DATE_11, player_items=[])
+
+    assert changed is False
+    assert candidates == []
+    assert json.loads(state_path.read_text(encoding="utf-8"))[SAVE]["nodes"] == {}
+    assert CompanionMilestoneStore(state_path).list_nodes(SAVE) == []
+
+
 # ---------------------------------------------------------------- catalogue
 def test_earn_playstyle_suggests_strawberry_node(tmp_path: Path) -> None:
     store = _store(tmp_path)
@@ -380,6 +394,34 @@ def test_custom_node_without_capability_items_creates_no_work(tmp_path: Path) ->
     store.adopt(SAVE, node["id"], work_store=work, game_date=DATE_11)
     assert work.list_goals(SAVE) == []
     assert work.list_todos(SAVE) == []
+
+
+def test_propose_persists_agreed_terms_and_rejects_invalid(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    node = store.propose(
+        SAVE, title="春季播种安排", target_date="1:spring:16", game_date=DATE_11,
+        planned_count=19, terms_note="预留1000g只用于买种子", reserved_funds=1000,
+    )
+    assert node["plannedCount"] == 19
+    assert node["termsNote"] == "预留1000g只用于买种子"
+    assert node["reservedFunds"] == 1000
+    # The wire receipt carries the same saved values (no silent drop).
+    wired = wire_node(node)
+    assert wired["plannedCount"] == 19
+    assert wired["termsNote"] == "预留1000g只用于买种子"
+    assert wired["reservedFunds"] == 1000
+    # A re-sent identical proposal folds newly provided terms into the stored node.
+    again = store.propose(
+        SAVE, title="春季播种安排", target_date="1:spring:16", game_date=DATE_11,
+        planned_count=24,
+    )
+    assert again["id"] == node["id"]
+    assert again["plannedCount"] == 24
+    # Invalid values are rejected explicitly, mirroring adopt/revise.
+    with pytest.raises(MilestoneError, match="non-negative"):
+        store.propose(SAVE, title="坏金额", target_date="1:spring:16", reserved_funds=-5)
+    with pytest.raises(MilestoneError, match="positive"):
+        store.propose(SAVE, title="坏数量", target_date="1:spring:16", planned_count=0)
 
 
 # ---------------------------------------------------------------- ordering / wire

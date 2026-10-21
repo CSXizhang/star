@@ -99,7 +99,6 @@ def test_cancel_attributes_receipt_to_active_turn_and_includes_independent_cache
                           start_max_idx=7, provider_conversation_id=NEW_CID)
     bridge._active_task = task
     bridge._current_command_id = Mock(return_value="root-command")
-    bridge._break_command_chain = Mock()
     bridge._interrupt_short_job = AsyncMock(return_value=True)
     bridge._release_execution = AsyncMock()
     bridge._send_reply = AsyncMock()
@@ -127,7 +126,6 @@ def test_cancel_uses_baseline_reset_by_buffered_cid_during_provider_join(tmp_pat
                           start_max_idx=7, provider_conversation_id=OLD_CID)
     bridge._active_task = task
     bridge._current_command_id = Mock(return_value="root-command")
-    bridge._break_command_chain = Mock()
     bridge._interrupt_short_job = AsyncMock(return_value=True)
     bridge._send_reply = AsyncMock()
     bridge.get_conversation_id = Mock(return_value=OLD_CID)

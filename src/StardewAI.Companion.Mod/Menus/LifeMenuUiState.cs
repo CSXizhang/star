@@ -87,6 +87,17 @@ public sealed class LifeMenuUiState
 
     /// <summary>Whether a life-chat request is in flight.</summary>
     public bool IsChatPending => PendingChatRequestId is not null;
+    private DateTime _pendingChatStartedAt;
+    public string PendingChatDescription
+    {
+        get
+        {
+            if (!IsChatPending) return string.Empty;
+            string phase = ChatStatus == LifeChatStatus.Queued ? "消息排队中" : "正在回复";
+            int seconds = Math.Max(0, (int)(DateTime.UtcNow - _pendingChatStartedAt).TotalSeconds);
+            return seconds >= 30 ? $"{phase} · 已等待 {seconds} 秒" : phase;
+        }
+    }
 
     /// <summary>Current status of the chat exchange.</summary>
     public LifeChatStatus ChatStatus { get; private set; } = LifeChatStatus.Idle;
@@ -226,6 +237,7 @@ public sealed class LifeMenuUiState
             "suggested" => "建议",
             "adopted" => "已采纳",
             "deferred" => "暂缓",
+            "cancelled" => "已撤销",
             "completed" => "已完成",
             "missed" => "已错过",
             _ => status
@@ -268,12 +280,18 @@ public sealed class LifeMenuUiState
     // Life-chat methods
     // -----------------------------------------------------------------------
 
-    /// <summary>Starts a life-chat exchange.</summary>
-    /// <returns><see langword="false"/> when a request is already in flight.</returns>
-    public bool BeginChat(string requestId, string mode)
+    private readonly Dictionary<string, string> _pendingChats = new();
+    public IReadOnlyList<string> PendingChatRequestIds => _pendingChats.Keys.ToArray();
+    /// <summary>Tracks bounded exchanges; the most recent exchange owns the current UI status.</summary>
+    public bool BeginChat(string requestId, string mode, bool priority = false)
     {
-        if (IsChatPending) return false;
+        if (_pendingChats.Count >= 8 && !priority) return false;
+        // Reserve admission for controls even when ordinary conversations fill
+        // the queue. Bound retained UI state without blocking native stopping.
+        if (_pendingChats.Count >= 32) _pendingChats.Remove(_pendingChats.Keys.First());
+        _pendingChats[requestId] = mode;
         PendingChatRequestId = requestId;
+        _pendingChatStartedAt = DateTime.UtcNow;
         PendingChatMode = mode;
         ChatStatus = LifeChatStatus.Sending;
         ReplyText = null;
@@ -295,8 +313,11 @@ public sealed class LifeMenuUiState
         int profileRevision,
         int memoryRevision)
     {
+        if (!_pendingChats.ContainsKey(requestId)) return false;
+        bool terminal = status is "completed" or "failed";
+        if (terminal) _pendingChats.Remove(requestId);
         if (!string.Equals(PendingChatRequestId, requestId, StringComparison.Ordinal))
-            return false;
+            return terminal; // Persist an older receipt without changing current status.
 
         ProfileRevision = profileRevision;
         MemoryRevision = memoryRevision;
@@ -324,6 +345,20 @@ public sealed class LifeMenuUiState
         }
 
         return true;
+    }
+
+    /// <summary>Receive a persisted work result independently of a pending chat turn.</summary>
+    public bool ReceiveWorkResult(string deliveryId, string text, string gameDate)
+    {
+        if (string.IsNullOrWhiteSpace(deliveryId) || string.IsNullOrWhiteSpace(text)) return false;
+        RecordConversation("work:" + deliveryId, CompanionName, text, gameDate, false, unread: true);
+        if (!IsChatPending)
+        {
+            ChatStatus = LifeChatStatus.Completed;
+            ReplyText = text;
+            ErrorText = null;
+        }
+        return true; // Duplicates still acknowledge the same durable receipt.
     }
 
     // -----------------------------------------------------------------------
@@ -450,6 +485,7 @@ public sealed class LifeMenuUiState
         _decisionNoticeKeys.Clear();
         PendingChatRequestId = null;
         PendingChatMode = null;
+        _pendingChats.Clear();
         ChatStatus = LifeChatStatus.Idle;
         ReplyText = null;
         ErrorText = null;

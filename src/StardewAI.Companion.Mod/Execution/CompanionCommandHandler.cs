@@ -104,18 +104,28 @@ public static class CompanionCommandHandler
 
             case "pause":
             case "暂停":
+            case "先停一下":
+            case "暂停工作":
+            case "先停下":
+            case "停一下":
                 command = new ParsedInGameCommand(InGameCommandType.Pause);
                 errorMessage = null;
                 return true;
 
             case "resume":
             case "继续":
+            case "继续工作":
+            case "继续干活":
+            case "恢复工作":
                 command = new ParsedInGameCommand(InGameCommandType.Resume);
                 errorMessage = null;
                 return true;
 
             case "cancel":
             case "取消":
+            case "取消当前任务":
+            case "取消现在的工作":
+            case "取消任务":
                 command = new ParsedInGameCommand(InGameCommandType.Cancel);
                 errorMessage = null;
                 return true;

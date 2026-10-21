@@ -139,6 +139,10 @@ def test_native_action_parameter_contract() -> None:
         "feed-animals",
         "toggle-animal-door",
         "collect-animal-produce",
+        "open-shop",
+        "open-chest",
+        "native-advance",
+        "native-answer",
     }
     validate_native_action_parameters("clear-debris", {"locationId": "Farm", "tiles": [{"x": 1, "y": 2}]})
     with pytest.raises(ProtocolError, match="unsupported native action skill"):

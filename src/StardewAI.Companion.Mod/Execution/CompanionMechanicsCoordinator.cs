@@ -14,7 +14,7 @@ namespace StardewAI.Companion.Mod.Execution;
 /// Transport subsystem with the independent Mechanics Actor and tick-driven execution
 /// state machines (water-zone, harvest-zone, deposit-chest, organize-chest).
 /// </summary>
-public sealed class CompanionMechanicsCoordinator : ITransportHandler
+public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
 {
     private const int MaxReportedMatureCrops = 64;
     private const int MaxReportedChests = 16;
@@ -50,12 +50,20 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
 
     private ITransportServer? _transportServer;
     private EnvelopeDto? _currentExecuteEnvelope;
+    private string? _currentExecuteCommandId;
     private WaterZoneResult? _lastResult;
     private SkillResultPayload? _lastSkillResultPayload;
 
     private readonly HashSet<string> _cancelledTaskIds = new();
 
     public CompanionRestController Rest { get; }
+    public StardewAI.Companion.Mod.PlayerMode.PlayerControlAuthority? PlayerAuthority { get; set; }
+    private PlayerSleepStateMachine? _sleepMachine;
+    private PlayerChestObservationMachine? _chestObservation;
+    private PlayerEatingMachine? _eatingMachine;
+    private bool _sleepCompletionBound;
+    private string _sleepSkillId = "sleep";
+    public Func<bool>? PresetBusinessAllowed { get; set; }
     public IFarmerActor Actor => _actor;
     public CompanionAvatar? Avatar => _avatar;
     public WaterZoneStateMachine StateMachine => _stateMachine;
@@ -78,6 +86,11 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
     {
         get
         {
+            if (_fishingMachine?.IsExecuting == true) return _fishingMachine;
+            if (_combatMachine?.IsExecuting == true) return _combatMachine;
+            if (_eatingMachine?.IsExecuting == true) return _eatingMachine;
+            if (_chestObservation?.IsExecuting == true) return _chestObservation;
+            if (_sleepMachine?.IsExecuting == true) return _sleepMachine;
             if (_stateMachine.IsExecuting) return _stateMachine;
             if (_harvestMachine?.IsExecuting == true) return _harvestMachine;
             if (_chestMachine?.IsExecuting == true) return _chestMachine;
@@ -211,7 +224,13 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
     /// </summary>
     public void Update(GameTime? time, long tickCount)
     {
-        Rest.Update(time, tickCount, ActiveMachine);
+        if (_actor is PlayerActor binding && !binding.BindingValid) { _eatingMachine?.Update(time, tickCount); PlayerAuthority?.Release("actor-binding-lost"); return; }
+        if (!ActorGuards.IsPlayerBound(_actor)) Rest.Update(time, tickCount, ActiveMachine);
+        _sleepMachine?.Update(time, tickCount);
+        _chestObservation?.Update(time,tickCount);
+        _fishingMachine?.Update(time,tickCount);
+        _combatMachine?.Update(time,tickCount);
+        _eatingMachine?.Update(time,tickCount);
         _stateMachine.Update(time, tickCount);
         _harvestMachine?.Update(time, tickCount);
         _chestMachine?.Update(time, tickCount);
@@ -256,6 +275,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             // 2. Start tick-driven state machine
             if (!_stateMachine.Start(request, out earlyResult))
@@ -305,6 +325,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_harvestMachine.Start(request, out earlyResult))
             {
@@ -353,6 +374,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_chestMachine.Start(request, out earlyResult))
             {
@@ -401,6 +423,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_hoeMachine.Start(request, out earlyResult))
             {
@@ -449,6 +472,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_plantMachine.Start(request, out earlyResult))
             {
@@ -494,6 +518,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_shippingMachine.Start(request, out earlyResult))
             {
@@ -539,6 +564,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_purchaseMachine.Start(request, out earlyResult))
             {
@@ -577,6 +603,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_navigationMachine.Start(request, out earlyResult))
             {
@@ -593,6 +620,23 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
 
     private bool TryCheckIdle(out string? rejectReason)
     {
+        if (_fishingMachine?.IsExecuting == true) { rejectReason="Native player is fishing."; return false; }
+        if (_combatMachine?.IsExecuting == true) { rejectReason="Native player is using a weapon."; return false; }
+        if (_eatingMachine?.IsExecuting == true) { rejectReason="Native player is eating."; return false; }
+        if (_actor is PlayerActor nativeActor && nativeActor.GameFarmer is { } nativeFarmer
+            && nativeFarmer.isEating)
+        { rejectReason="Native player eating is still settling."; return false; }
+        if (_chestObservation?.IsExecuting == true) { rejectReason="Actor is opening a native chest."; return false; }
+        if (_actor is PlayerActor player && (!player.BindingValid || PlayerAuthority?.AgentOwns != true))
+        {
+            rejectReason = "PLAYER_AUTHORITY_REQUIRED: a valid native-player binding and agent ownership are required.";
+            return false;
+        }
+        if (_sleepMachine?.IsExecuting == true)
+        {
+            rejectReason = "Actor is busy completing native sleep and save.";
+            return false;
+        }
         if (Rest.IsResting)
         {
             rejectReason = Rest.IsDaytimeRest
@@ -626,6 +670,83 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
         lock (_taskLock)
         {
             string skillId = payload.SkillId ?? "";
+            if (PresetBusinessAllowed is not null && !skillId.StartsWith("inspect-") && !PresetBusinessAllowed())
+            {
+                rejectResult = BuildRejection(payload, "PRESET_DAY_LIMIT", "Independent preset day budget ended; only observation/reporting is allowed. NewRun starts a fresh budget.", false);
+                return false;
+            }
+            if (_actor is PlayerActor binding && !binding.BindingValid) {
+                rejectResult=BuildRejection(payload,"ACTOR_BINDING_LOST","Native player binding changed; no substitute actor is allowed.",false); return false;
+            }
+            if (ActorGuards.IsPlayerBound(_actor) && !skillId.StartsWith("inspect-") && PlayerAuthority?.AgentOwns != true) {
+                rejectResult = BuildRejection(payload, "PLAYER_CONTROL_NOT_HELD", "Agent does not hold player control.", false); return false;
+            }
+            if (skillId is "native-advance" or "native-answer") {
+                if (!TryCheckIdle(out var busy)) { rejectResult=BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
+                if (skillId == "native-advance") return TryAcceptNativeAdvance(payload,envelope,out rejectResult);
+                if (payload.Parameters.ChoiceIndex is not int) {
+                    rejectResult=BuildRejection(payload,"CHOICE_REQUIRED","Explicit choiceIndex is required; no default choice is made.",false); return false;
+                }
+                return TryAcceptNativeAnswer(payload,envelope,out rejectResult);
+            }
+            if (skillId=="native-menu-select") return TryAcceptPlayerInteraction(payload,envelope,out rejectResult);
+            if (ActorGuards.IsPlayerBound(_actor) && !skillId.StartsWith("inspect-")
+                && !(skillId == "sleep" && _sleepMachine?.CanResumeOwnedOvernight == true)
+                && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items")) {
+                rejectResult=BuildRejection(payload,uiCode,uiMessage,true,NativeUiDetails()); return false;
+            }
+            if (skillId is "talk-npc" or "interact-tile" or "fish" or "attack")
+                return TryAcceptPlayerInteraction(payload,envelope,out rejectResult);
+            if (skillId == "eat-food" && _actor is PlayerActor eatingPlayer)
+            {
+                if (!TryCheckIdle(out var busy)) { rejectResult=BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
+                if (_cancelledTaskIds.Contains(payload.TaskId) || _cancelledTaskIds.Contains(payload.CommandId))
+                { rejectResult=BuildRejection(payload,"CANCELLED","This food command was cancelled before execution.",false); return false; }
+                if (_eatingMachine is null)
+                {
+                    _eatingMachine = new(eatingPlayer, () => PlayerAuthority?.AgentOwns == true, () => _observer.WorldRevision);
+                    _eatingMachine.Completed += CompleteExecution;
+                }
+                _currentExecuteEnvelope = envelope;
+                _currentExecuteCommandId = payload.CommandId;
+                return _eatingMachine.Start(payload, out rejectResult);
+            }
+            if (skillId == "open-shop" && _actor is PlayerActor shopPlayer) {
+                if (!TryCheckIdle(out var busy)) { rejectResult=BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
+                StardewValley.Menus.ShopMenu? opened=null;
+                try {
+                    var shopId=payload.Parameters.ShopId ?? throw new ArgumentException("Shop ID is required.");
+                    var metadata=_observer.GetShopActionMetadata(shopId,payload.Parameters.LocationId);
+                    if (metadata.LocationName != shopPlayer.LocationName || !_observer.GetShopCounterTiles(shopId,shopPlayer.LocationName).Any(t=>shopPlayer.Tile.IsAdjacentTo(t) || shopPlayer.Tile==t))
+                        throw new InvalidOperationException("Navigate to the requested shop counter on the same map first.");
+                    if (Game1.activeClickableMenu != null) throw new InvalidOperationException("An existing native menu is open.");
+                    shopPlayer.Halt();
+                    if (!StardewAI.Companion.Mod.PlayerMode.NativeShopInteraction.TryOpen(_observer,shopPlayer,shopId,out opened,out var openError))
+                        throw new InvalidOperationException(openError);
+                    var result=new SkillResultPayload(payload.CommandId,payload.TaskId,"succeeded",1,0,0,_observer.WorldRevision,new(),SkillId:skillId,
+                        Details:new Dictionary<string,object>{["shop"]=InspectShop(shopId),["observationScope"]="native-menu-at-counter"});
+                    _lastSkillResultPayload=result;
+                    if (_transportServer != null) _ = _transportServer.SendSkillResultAsync(result,envelope.MessageId,envelope.IdempotencyKey);
+                    rejectResult=null; return true;
+                } catch (Exception ex) { rejectResult=BuildRejection(payload,"SHOP_OPEN_UNAVAILABLE",ex.Message,false);return false; }
+                finally { if (opened != null && ReferenceEquals(Game1.activeClickableMenu,opened)) opened.exitThisMenu(); }
+            }
+            if (skillId == "open-chest" && _actor is PlayerActor nativePlayer && _observer is StardewAI.Companion.Mod.PlayerMode.PlayerKnownObserver knownObserver) {
+                if (!TryCheckIdle(out var busy)) { rejectResult=BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
+                if (_chestObservation == null) { _chestObservation=new(nativePlayer,knownObserver); _chestObservation.Completed += CompleteExecution; }
+                _currentExecuteEnvelope=envelope; _currentExecuteCommandId=payload.CommandId;
+                _chestObservation.Start(payload); rejectResult=null; return true;
+            }
+            if (skillId == "sleep" && ActorGuards.IsPlayerBound(_actor)) {
+                if (!TryCheckIdle(out var busy)) { rejectResult = BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
+                _sleepMachine ??= new PlayerSleepStateMachine(_actor,_observer,new NavigationStateMachine(_actor,_observer,_navigator,_mapGraph,null,_log),log: _log);
+                if (!_sleepCompletionBound) { _sleepMachine.OnCompleted += r => CompleteExecution(r.ToTransportPayload() with { SkillId = _sleepSkillId }); _sleepCompletionBound=true; }
+                _currentExecuteEnvelope=envelope; _currentExecuteCommandId=payload.CommandId;
+                _sleepSkillId = "sleep";
+                var started = _sleepMachine.Start(new PlayerSleepRequest(payload.CommandId,payload.TaskId,envelope.IdempotencyKey,payload.ExpectedWorldRevision,payload.Budgets.MaxGameMinutes,payload.CancelPolicy),out var error);
+                rejectResult = error?.ToTransportPayload(); return started;
+            }
+
             bool isWater = string.Equals(skillId, "water-zone", StringComparison.OrdinalIgnoreCase);
             bool isHarvest = string.Equals(skillId, "harvest-zone", StringComparison.OrdinalIgnoreCase);
             bool isDeposit = string.Equals(skillId, "deposit-chest", StringComparison.OrdinalIgnoreCase);
@@ -661,12 +782,18 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 "move-building" => NativeActionKind.MoveBuilding,
                 _ => null
             };
+            if (ActorGuards.IsPlayerBound(_actor) && nativeKind.HasValue && nativeKind.Value is not
+                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems))
+            {
+                rejectResult=BuildRejection(payload,"PLAYER_ACTION_UNSUPPORTED","This action has not been enabled in the native player farming phase.",false);
+                return false;
+            }
 
-            if (skillId is "inspect-location" or "inspect-map-image" or "inspect-crafting" or "inspect-machines" or "inspect-production" or "inspect-building-services" or "inspect-planting" or "inspect-route" or "inspect-livestock" or "inspect-shop")
+            if (skillId is "inspect-player-activities" or "inspect-location" or "inspect-map-image" or "inspect-crafting" or "inspect-machines" or "inspect-production" or "inspect-building-services" or "inspect-planting" or "inspect-route" or "inspect-livestock" or "inspect-shop")
             {
                 try
                 {
-                    object space = skillId == "inspect-location"
+                    object space = skillId == "inspect-player-activities" ? InspectPlayerActivities() : skillId == "inspect-location"
                         ? _observer.InspectLocation(payload.Parameters.LocationId, payload.Parameters.Region is { } region ? new Rectangle(region.X, region.Y, region.Width, region.Height) : null)
                         : skillId == "inspect-livestock" ? InspectLivestock(payload.Parameters.LocationId)
                         : skillId == "inspect-shop" ? InspectShop(payload.Parameters.ShopId ?? throw new ArgumentException("Shop ID is required."))
@@ -680,7 +807,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                         : _observer.InspectMapImage(payload.Parameters.LocationId);
                     var result = new SkillResultPayload(payload.CommandId, payload.TaskId, "succeeded", 0, 0, 0,
                         _observer.WorldRevision, new(), new SkillResultResources(0, 0, 0), SkillId: skillId,
-                        Details: new Dictionary<string, object> { [skillId == "inspect-shop" ? "shop" : skillId == "inspect-livestock" ? "livestock" : skillId == "inspect-route" ? "route" : skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-planting" ? "planting" : skillId == "inspect-crafting" ? "crafting" : skillId == "inspect-building-services" ? "buildingServices" : skillId == "inspect-machines" ? "machines" : skillId == "inspect-production" ? "production" : "mapImage"] = space });
+                        Details: new Dictionary<string, object> { [skillId == "inspect-player-activities" ? "activities" : skillId == "inspect-shop" ? "shop" : skillId == "inspect-livestock" ? "livestock" : skillId == "inspect-route" ? "route" : skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-planting" ? "planting" : skillId == "inspect-crafting" ? "crafting" : skillId == "inspect-building-services" ? "buildingServices" : skillId == "inspect-machines" ? "machines" : skillId == "inspect-production" ? "production" : "mapImage"] = space });
                     _lastSkillResultPayload = result;
                     if (_transportServer is not null)
                         _ = _transportServer.SendSkillResultAsync(result, envelope.MessageId, envelope.IdempotencyKey);
@@ -742,6 +869,15 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             if ((isDeposit || isOrganize) && payload.Parameters.ChestTile is null)
             {
                 rejectResult = BuildRejection(payload, "INVALID_PARAMETERS", "parameters.chestTile is required for chest skills.", retryable: false);
+                return false;
+            }
+
+            if (isDeposit && payload.Parameters.Items is not null &&
+                (payload.Parameters.ItemIds is not null || payload.Parameters.Items.Count == 0 ||
+                 payload.Parameters.Items.Any(i => string.IsNullOrWhiteSpace(i.ItemId) || i.Count < 1)))
+            {
+                rejectResult = BuildRejection(payload, "INVALID_PARAMETERS",
+                    "Deposit requires either itemIds or non-empty items with positive counts.", retryable: false);
                 return false;
             }
 
@@ -1099,6 +1235,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     LocationId: payload.Parameters.LocationId,
                     ChestTile: new TileCoordinate(chestTile.X, chestTile.Y),
                     ItemIds: isDeposit ? payload.Parameters.ItemIds : null,
+                    DepositItems: isDeposit ? payload.Parameters.Items?.Select(i => new DepositItemSpec(i.ItemId, i.Count)).ToList() : null,
                     MaxStamina: payload.Budgets.MaxStamina,
                     MaxWater: payload.Budgets.MaxWater,
                     MaxGameMinutes: payload.Budgets.MaxGameMinutes,
@@ -1181,6 +1318,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             }
 
             _currentExecuteEnvelope = envelope;
+            _currentExecuteCommandId = request.CommandId;
 
             if (!_nativeActionMachine.Start(request, out earlyResult))
             {
@@ -1195,7 +1333,14 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
         }
     }
 
-    private SkillResultPayload BuildRejection(SkillExecutePayload payload, string code, string message, bool retryable)    {
+    private SkillResultPayload BuildRejection(SkillExecutePayload payload, string code, string message, bool retryable, Dictionary<string, object>? extraDetails = null)    {
+        Dictionary<string, object>? details = null;
+        if (extraDetails is not null)
+        {
+            details = new Dictionary<string, object>(extraDetails);
+            var native = CaptureNativeUi();
+            if (native != null) details["native"] = native;
+        }
         return new SkillResultPayload(
             CommandId: payload.CommandId,
             TaskId: payload.TaskId,
@@ -1206,7 +1351,8 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             FinalWorldRevision: _observer.WorldRevision,
             Effects: new List<Dictionary<string, object>>(),
             Error: new SkillResultError(code, message, null, retryable),
-            SkillId: payload.SkillId
+            SkillId: payload.SkillId,
+            Details: details
         );
     }
 
@@ -1324,7 +1470,14 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             {
                 _cancelledTaskIds.Add(envelope.CorrelationId);
             }
-            ActiveMachine?.RequestCancel(payload.Reason);
+            var target = !string.IsNullOrEmpty(envelope?.CorrelationId)
+                ? envelope.CorrelationId : payload.CommandId;
+            var active = ActiveMachine;
+            if (active != null && (string.Equals(target, _currentExecuteCommandId, StringComparison.Ordinal)
+                || string.Equals(target, active.ActiveTaskId, StringComparison.Ordinal)))
+            {
+                active.RequestCancel(payload.Reason);
+            }
         }
     }
 
@@ -1457,6 +1610,31 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 var workItems = _observer.ScanFarmWork(farmWorkLocation);
                 if (workItems.Count > 0)
                 {
+                    // Preserve actual cultivated layout even when all young crops are watered.
+                    // Connected native soil, not candidate debris or inferred model ownership.
+                    var soil = workItems.GroupBy(w => w.Tile).ToDictionary(g => g.Key, g => g.First());
+                    var remainingSoil = soil.Keys.ToHashSet();
+                    var plots = new List<CultivatedPlotSnapshot>();
+                    while (remainingSoil.Count > 0)
+                    {
+                        var seed = remainingSoil.OrderBy(t => t.Y).ThenBy(t => t.X).First();
+                        remainingSoil.Remove(seed);
+                        var pending = new Queue<TileCoordinate>();
+                        pending.Enqueue(seed);
+                        var component = new List<TileCoordinate>();
+                        while (pending.Count > 0)
+                        {
+                            var tile = pending.Dequeue();
+                            component.Add(tile);
+                            foreach (var neighbor in tile.CardinalNeighbors())
+                                if (remainingSoil.Remove(neighbor)) pending.Enqueue(neighbor);
+                        }
+                        int x = component.Min(t => t.X), y = component.Min(t => t.Y);
+                        plots.Add(new CultivatedPlotSnapshot(x, y,
+                            component.Max(t => t.X) - x + 1, component.Max(t => t.Y) - y + 1,
+                            component.Count, component.Count(t => soil[t].HasCrop)));
+                    }
+                    var orderedPlots = plots.OrderByDescending(p => p.SoilCount).ThenBy(p => p.Y).ThenBy(p => p.X).ToList();
                     var unwatered = workItems
                         .Where(w => !w.IsWatered && !w.IsDead)
                         .Select(w => new TileCoord(w.Tile.X, w.Tile.Y))
@@ -1474,7 +1652,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
 
                     var matureCrops = workItems
                         .Where(w => w.IsHarvestable && !w.IsDead)
-                        .Select(w => new MatureCropTile(w.Tile.X, w.Tile.Y, w.CropId ?? ""))
+                        .Select(w => new MatureCropTile(w.Tile.X, w.Tile.Y, w.CropId ?? "", w.RequiresScythe))
                         .ToList();
                     int matureCount = matureCrops.Count;
                     bool matureTruncated = matureCount > MaxReportedMatureCrops;
@@ -1499,12 +1677,17 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                         CropUnwateredTruncated: cropTruncated,
                         DeadCropCount: workItems.Count(w => w.IsDead),
                         LocationId: farmWorkLocation,
-                        ObservationStatus: "observed"
+                        ObservationStatus: "observed",
+                        Scope: "location",
+                        CultivatedPlots: orderedPlots.Take(8).ToList(),
+                        CultivatedPlotCount: orderedPlots.Count,
+                        CultivatedPlotsTruncated: orderedPlots.Count > 8,
+                        TotalCropCount: soil.Values.Count(w => w.HasCrop)
                     );
                 }
                 else
                 {
-                    farmWork = FarmWorkSnapshot.CreateEmpty(farmWorkLocation, "observed");
+                    farmWork = FarmWorkSnapshot.CreateEmpty(farmWorkLocation, "observed") with { Scope = "location" };
                 }
             }
             catch
@@ -1524,7 +1707,8 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 PlayerItems: BuildPlayerItemsSnapshot(MaxReportedPlayerItems),
                 PlayerMoney: Game1.player?.Money,
                 PlayerStamina: Game1.player?.Stamina,
-                PlayerMaxStamina: Game1.player?.MaxStamina
+                PlayerMaxStamina: Game1.player?.MaxStamina,
+                Native: CaptureNativeUi()
             );
 
             // Companion inventory section
@@ -1556,6 +1740,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                         Tile: new TileCoord(c.Tile.X, c.Tile.Y),
                         Capacity: c.Capacity,
                         FreeSlots: c.FreeSlots,
+                        ContentsObserved: c.ContentsObserved,
                         Contents: c.Contents
                             .Select(s => new ChestSlotSnapshot(s.Slot, s.ItemId, s.Name, s.DisplayName, s.Stack, s.Quality, s.IsSeed, s.Seasons?.ToList()))
                             .ToList()
@@ -1572,7 +1757,7 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
             PlantingSnapshot? planting = null;
             try
             {
-                var scan = _observer.ScanPlantingOptions(locationName, _actor.Tile, 15, _actor);
+                var scan = _observer.ScanPlantingOptions(_observer is StardewAI.Companion.Mod.PlayerMode.PlayerKnownObserver ? "Farm" : locationName, _actor.Tile, 15, _actor);
                 var seeds = scan.Seeds
                     .Select(s => new SeedItemSnapshot(
                         ItemId: s.ItemId,
@@ -1613,7 +1798,10 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                     CompanionHasHoe: scan.CompanionHasHoe,
                     Seeds: seeds,
                     CandidateTiles: candidateTiles,
-                    SearchBounds: bounds
+                    SearchBounds: bounds,
+                    ObservationStatus: "observed",
+                    Scope: _observer is StardewAI.Companion.Mod.PlayerMode.PlayerKnownObserver ? "location" : "search-region",
+                    LocationId: _observer is StardewAI.Companion.Mod.PlayerMode.PlayerKnownObserver ? "Farm" : locationName
                 );
             }
             catch
@@ -1754,7 +1942,11 @@ public sealed class CompanionMechanicsCoordinator : ITransportHandler
                 Livestock: livestock,
                 Farming: farming,
                 ProductionSignals: _observer.GetProductionSignals().ToList(),
-                ProductionSignalsTruncated: _observer.ProductionSignalsTruncated
+                ProductionSignalsTruncated: _observer.ProductionSignalsTruncated,
+                ActorMode: ActorGuards.IsPlayerBound(_actor) ? "player" : "companion",
+                ControlOwner: PlayerAuthority?.AgentOwns == true ? "agent" : "human",
+                ActorMultiplayerId: _actor.GameFarmer?.UniqueMultiplayerID,
+                ObservedAt: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0
             );
         }
     }

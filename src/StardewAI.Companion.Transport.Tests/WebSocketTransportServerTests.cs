@@ -13,6 +13,35 @@ namespace StardewAI.Companion.Mod.Transport.Tests;
 public class WebSocketTransportServerTests
 {
     [Fact]
+    public async Task LifeRequestPublishesNativeObservationFirstAndRetainsItsCaptureTime()
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler);
+        using var socket = new ControlledChatSocket();
+        SetChatSocket(server, socket, 1);
+        var observation = handler.CaptureCurrentSnapshot(7) with { ObservedAt = 123.5 };
+        Assert.True(await server.SendLifeChatSubmitAsync(new LifeChatSubmitPayload("r", "save", "chat", "work"), observation));
+        Assert.Equal(2, socket.SentMessages.Count);
+        using var first = JsonDocument.Parse(socket.SentMessages[0]);
+        Assert.Equal("world.snapshot", first.RootElement.GetProperty("messageType").GetString());
+        Assert.Equal(123.5, first.RootElement.GetProperty("payload").GetProperty("observedAt").GetDouble());
+        using var second = JsonDocument.Parse(socket.SentMessages[1]);
+        Assert.Equal("life.chat.submit", second.RootElement.GetProperty("messageType").GetString());
+    }
+
+    [Fact]
+    public async Task LifeRequestDoesNotDispatchWhenObservationPublicationFails()
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler);
+        using var socket = new ControlledChatSocket(fail: true);
+        SetChatSocket(server, socket, 1);
+        Assert.False(await server.SendLifeChatSubmitAsync(new LifeChatSubmitPayload("r", "save", "chat", "work"),
+            handler.CaptureCurrentSnapshot(7)));
+        Assert.DoesNotContain(socket.SentMessages, text => text.Contains("life.chat.submit"));
+    }
+
+    [Fact]
     public async Task ChatSnapshotBackpressureReportsSafeTimeoutOnceOnGameThread()
     {
         var logs = new ConcurrentQueue<string>();
@@ -532,6 +561,153 @@ public class WebSocketTransportServerTests
         Assert.Equal("skill.result", replayedResult.MessageType);
         Assert.Equal("succeeded", replayedResult.Payload["terminalState"]?.ToString());
         Assert.Equal("cmd-water-1", replayedResult.Payload["commandId"]?.ToString());
+    }
+
+    private static string CreateResultQueryJson(string commandId, string? saveId = "save-123", string? sessionId = "session-456") =>
+        JsonSerializer.Serialize(new {
+            protocolVersion = "0.1", messageType = "skill.result.query", messageId = $"query-{commandId}",
+            senderInstanceId = "runtime-restarted", sequenceNumber = 2, worldRevision = 1,
+            sentAt = DateTimeOffset.UtcNow.ToString("O"), saveId, gameSessionId = sessionId,
+            payload = new { commandId }
+        });
+
+    [Theory]
+    [InlineData("succeeded")]
+    [InlineData("partially-succeeded")]
+    [InlineData("cancelled")]
+    [InlineData("failed")]
+    public async Task CommandResultQueryAfterReconnectReplaysTerminalWithoutRedispatch(string terminal)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using (var first = await ConnectClientAsync(server.Port, "test-token"))
+        {
+            await SendRawJsonAsync(first, CreateHelloJson("test-token"));
+            await ReceiveEnvelopeAsync(first);
+            server.Update();
+            await ReceiveEnvelopeAsync(first);
+            await SendAndDrainAsync(first, server, CreateExecuteJson("old-command", "old-task", "old-key"));
+            await server.SendSkillResultAsync(new SkillResultPayload("old-command", "old-task", terminal, 1, 0, 0, 2,
+                new List<Dictionary<string, object>> { new() { ["tile"] = new TileCoord(64, 15), ["state"] = "watered" } },
+                new SkillResultResources(2, 1, 10)), "original-execute", "old-key");
+            var original = await ReceiveEnvelopeAsync(first);
+            await first.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "runtime exits", CancellationToken.None);
+            await Task.Delay(60);
+            server.Update();
+
+            using var restarted = await ConnectClientAsync(server.Port, "test-token");
+            await SendRawJsonAsync(restarted, CreateHelloJson("test-token"));
+            await ReceiveEnvelopeAsync(restarted);
+            server.Update();
+            await ReceiveEnvelopeAsync(restarted);
+            await SendAndDrainAsync(restarted, server, CreateResultQueryJson("old-command"));
+            var recovered = await ReceiveEnvelopeAsync(restarted);
+            Assert.Equal("skill.result", recovered.MessageType);
+            Assert.Equal("query-old-command", recovered.CorrelationId);
+            Assert.Equal(original.Payload.ToJsonString(), recovered.Payload.ToJsonString());
+            Assert.Equal("save-123", recovered.SaveId);
+            Assert.Equal("session-456", recovered.GameSessionId);
+            Assert.Equal(1, handler.AcceptCount);
+            Assert.Null(server.ActiveCommandId);
+        }
+    }
+
+    [Theory]
+    [InlineData("unknown")]
+    [InlineData("in-flight")]
+    public async Task CommandResultQueryWithoutTerminalDoesNotFabricateOrExecute(string status)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        if (status == "in-flight")
+            await SendAndDrainAsync(client, server, CreateExecuteJson("pending-command", "pending-task", "pending-key"));
+        await SendAndDrainAsync(client, server, CreateResultQueryJson("pending-command"));
+        var result = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("skill.result.status", result.MessageType);
+        Assert.Equal(status, result.Payload["status"]?.ToString());
+        Assert.Null(result.Payload["terminalState"]);
+        Assert.Equal(status == "in-flight" ? 1 : 0, handler.AcceptCount);
+        Assert.Equal(status == "in-flight" ? "pending-command" : null, server.ActiveCommandId);
+    }
+
+    [Theory]
+    [InlineData(null, "session-456")]
+    [InlineData("save-123", null)]
+    [InlineData("wrong-save", "session-456")]
+    [InlineData("save-123", "old-session")]
+    public async Task CommandResultQueryRequiresExactSaveAndSession(string? saveId, string? sessionId)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server, CreateResultQueryJson("command", saveId, sessionId));
+        var result = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("protocol.error", result.MessageType);
+        Assert.Equal("RESULT_SESSION_MISMATCH", result.Payload["code"]?.ToString());
+        Assert.Equal(0, handler.AcceptCount);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(null)]
+    [InlineData(123)]
+    public async Task CommandResultQueryRejectsInvalidIdentityWithoutExecuting(object? commandId)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        var query = JsonNode.Parse(CreateResultQueryJson("command"))!.AsObject();
+        query["payload"]!["commandId"] = JsonSerializer.SerializeToNode(commandId);
+        await SendAndDrainAsync(client, server, query.ToJsonString());
+        var result = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("protocol.error", result.MessageType);
+        Assert.Equal("INVALID_PARAMETERS", result.Payload["code"]?.ToString());
+        Assert.Equal(0, handler.AcceptCount);
+    }
+
+    [Fact]
+    public async Task QueryingOldTerminalCannotClearOrRepeatOtherActiveWork()
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        var welcome = await ReceiveEnvelopeAsync(client);
+        Assert.True(welcome.Payload["commandResultQuery"]!.GetValue<bool>());
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server, CreateExecuteJson("old-command", "old-task", "old-key"));
+        await server.SendSkillResultAsync(new SkillResultPayload("old-command", "old-task", "succeeded", 1, 0, 0, 2,
+            new List<Dictionary<string, object>>()), "old-execute", "old-key");
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server, CreateExecuteJson("new-command", "new-task", "new-key"));
+        for (int retry = 0; retry < 2; retry++)
+        {
+            await SendAndDrainAsync(client, server, CreateResultQueryJson("old-command"));
+            var oldResult = await ReceiveEnvelopeAsync(client);
+            Assert.Equal("succeeded", oldResult.Payload["terminalState"]?.ToString());
+            Assert.Equal("old-command", oldResult.Payload["commandId"]?.ToString());
+            Assert.Equal("new-command", server.ActiveCommandId);
+            Assert.Equal(2, handler.AcceptCount);
+        }
     }
 
     [Fact]
@@ -1358,7 +1534,4 @@ asyncio.run(main())
         Assert.False(server.IsChatConnected);
     }
 }
-
-
-
 

@@ -162,7 +162,8 @@ def test_codex_removes_shared_core_from_user_prompt(tmp_path: Path) -> None:
     with patch("subprocess.Popen", return_value=proc) as popen:
         result = CodexBackend(tmp_path).run(_task(), None, runtime_instructions() + "\n只读观察")
     assert result["success"]
-    assert popen.call_args.args[0][-1] == "只读观察"
+    assert popen.call_args.args[0][-1] == "-"
+    proc.stdin.write.assert_called_once_with("只读观察")
 
 
 def test_codex_config_inspection_failure_does_not_start_model(tmp_path: Path) -> None:
@@ -270,15 +271,130 @@ def _run_mcode(backend: McodeBackend, proc: MagicMock, session_id=None, prompt="
         return backend.run(_task(), session_id, prompt), popen
 
 
-def test_chat_backend_config_defaults_mcode_to_local_model_and_low_effort(tmp_path: Path) -> None:
+def _binding_event(name, status=3, text=None, *, action=None):
+    event = {"type": "item.completed", "item": {"type": "tool_call", "toolCall": {
+        "name": name, "status": status, "output": {"content": [{"type": "text",
+        "text": text or f"Tool {name} not found"}]}}}}
+    if action is not None:
+        event["item"]["toolCall"]["input"] = {"action": action}
+    return event
+
+
+def _binding_exec(session):
+    return {"type": "exec.completed", "result": {"status": "succeeded", "sessionId": session,
+        "output": "honest reply", "usage": {"inputTokens": 100, "outputTokens": 10,
+        "cacheReadTokens": 0, "totalTokens": 110}}}
+
+
+def test_mcode_repairs_unregistered_game_alias_once_with_fresh_context_and_full_usage(tmp_path):
+    first = _mcode_proc([_binding_event("manage_milestones"), _binding_exec("bad")])
+    second = _mcode_proc([_binding_event("mcp__stardew-companion__manage_milestones", 2, "saved"),
+                          _binding_exec("good")])
+    with patch.object(McodeBackend, "_executable", return_value="mcode.exe"), \
+            patch("subprocess.Popen", side_effect=[first, second]) as popen:
+        result = McodeBackend(tmp_path).run(_task(), "old", "player's authorized instruction")
+    assert result["success"] and result["conversation_id"] == "good"
+    assert result["binding_recovery"]["previousSession"] == "bad"
+    assert "--session" in popen.call_args_list[0].args[0]
+    assert "--session" not in popen.call_args_list[1].args[0]
+    assert result["usage"]["total_tokens"] == 220
+
+
+def test_mcode_does_not_replay_after_successful_game_write(tmp_path):
+    proc = _mcode_proc([_binding_event("mcp__stardew-companion__manage_milestones", 2, "saved"),
+                        _binding_event("submit_plan"), _binding_exec("already-saved")])
+    result, popen = _run_mcode(McodeBackend(tmp_path), proc)
+    assert not result["success"] and result["error"] == "MCODE_TOOL_BINDING_FAILED"
+    assert popen.call_count == 1
+
+
+def test_mcode_corrected_alias_within_same_invocation_needs_no_replay(tmp_path):
+    proc = _mcode_proc([_binding_event("manage_milestones"),
+                        _binding_event("mcp__stardew-companion__manage_milestones", 2, "saved"),
+                        _binding_exec("good")])
+    result, popen = _run_mcode(McodeBackend(tmp_path), proc)
+    assert result["success"] and popen.call_count == 1
+
+
+def test_mcode_binding_failure_stops_after_one_recovery(tmp_path):
+    calls = [_mcode_proc([_binding_event("manage_milestones"), _binding_exec(f"bad-{i}")])
+             for i in range(2)]
+    with patch.object(McodeBackend, "_executable", return_value="mcode.exe"), \
+            patch("subprocess.Popen", side_effect=calls) as popen:
+        result = McodeBackend(tmp_path).run(_task(), None, "authorized instruction")
+    assert not result["success"] and result["error"] == "MCODE_TOOL_BINDING_FAILED"
+    assert popen.call_count == 2
+
+
+@pytest.mark.parametrize("fails_again", [False, True])
+def test_mcode_successful_milestone_list_does_not_complete_or_block_failed_propose(tmp_path, fails_again):
+    # Real failure sequence: bare propose -> registered list -> bare propose.
+    # A list neither mutates game state nor performs the failed action.
+    events = [_binding_event("manage_milestones", action="propose"),
+              _binding_event("mcp__stardew-companion__manage_milestones", 2, "nodes: []", action="list")]
+    if fails_again:
+        events.append(_binding_event("manage_milestones", action="propose"))
+    first = _mcode_proc([*events, _binding_exec("read-only")])
+    second = _mcode_proc([_binding_event("mcp__stardew-companion__manage_milestones", 2, "saved", action="propose"),
+                          _binding_exec("recovered")])
+    with patch.object(McodeBackend, "_executable", return_value="mcode.exe"), \
+            patch("subprocess.Popen", side_effect=[first, second]) as popen:
+        result = McodeBackend(tmp_path).run(_task(), "original", "authorized scope")
+    assert result["success"] and result["conversation_id"] == "recovered"
+    assert popen.call_count == 2 and "--session" not in popen.call_args_list[1].args[0]
+    assert result["usage"]["total_tokens"] == 220
+
+
+def test_mcode_tool_start_progress_arrives_before_mcp_result_can_complete(tmp_path):
+    import threading
+
+    refresh_requested = threading.Event()
+    tool_returned = threading.Event()
+    progress_events = []
+
+    def progress(event):
+        progress_events.append(event)
+        if event.kind == "tool_started" and event.tool_name == "get_status":
+            assert not tool_returned.is_set()
+            refresh_requested.set()
+
+    def waiting_mcp_stream():
+        yield json.dumps({"type": "item.started", "item": {"type": "tool_call", "toolCall": {
+            "name": "mcp__stardew-companion__get_status"}}}) + "\n"
+        if not refresh_requested.wait(2):
+            yield json.dumps({"type": "turn.failed", "error": "native observation was never requested before MCP finished"}) + "\n"
+            return
+        tool_returned.set()
+        yield json.dumps(_binding_event("mcp__stardew-companion__get_status", 2, "fresh observation")) + "\n"
+        yield json.dumps(_binding_exec("fresh")) + "\n"
+
+    proc = _mcode_proc([])
+    proc.stdout = waiting_mcp_stream()
+    result, popen = _run_mcode(McodeBackend(tmp_path, progress=progress), proc)
+    assert result["success"] and refresh_requested.is_set() and tool_returned.is_set()
+    assert [e.kind for e in progress_events if e.tool_name == "get_status"] == ["tool_started", "tool_completed"]
+    assert popen.call_count == 1
+
+
+def test_mcode_native_tool_failure_does_not_reset_context_or_repeat_work(tmp_path):
+    proc = _mcode_proc([_binding_event("mcp__stardew-companion__manage_milestones", 3,
+                                    "Error executing tool: game observation expired"), _binding_exec("current")])
+    result, popen = _run_mcode(McodeBackend(tmp_path), proc)
+    assert result["success"] and "binding_recovery" not in result
+    assert popen.call_count == 1
+
+
+def test_chat_backend_config_defaults_mcode_to_local_model_and_default_effort(tmp_path: Path) -> None:
     config = tmp_path / "chat-backend.json"
     config.write_text('{"backend":"mcode"}', encoding="utf-8")
-    assert load_chat_backend_config(config) == {"backend": "mcode", "model": "", "effort": "low"}
+    assert load_chat_backend_config(config) == {"backend": "mcode", "model": "", "effort": "default"}
 
 
 def test_mcode_backend_binds_run_local_mcp_workspace_and_normalizes_usage(tmp_path: Path) -> None:
     proc = _mcode_proc([
         {"type": "session.started", "sessionId": "mvs-session-1"},
+        {"type": "item.started", "item": {"type": "tool_call", "toolCall": {
+            "name": "mcp__stardew-companion__get_status"}}},
         {"type": "item.completed", "item": {"type": "tool_call", "toolCall": {
             "name": "mcp__stardew-companion__get_status"}}},
         {"type": "item.completed", "item": {"type": "agent_message", "content": "农场还空着。"}},
@@ -315,6 +431,7 @@ def test_mcode_backend_binds_run_local_mcp_workspace_and_normalizes_usage(tmp_pa
     server = profile["mcpServers"]["stardew-companion"]
     assert server["args"][4] == str(tmp_path)
     assert server["env"]["STARDEW_MCP_SURFACE"] == "life"
+    assert server["env"]["STARDEW_MCP_WIRE_STYLE"] == "mcode"
     assert server["env"]["STARDEW_DECISION_TOKEN"] == "tok-1"
     assert any(e.tool_name == "get_status" and e.kind == "tool_started" for e in events)
 
@@ -330,18 +447,39 @@ def test_mcode_leaves_model_and_effort_to_the_cli_when_unset(tmp_path: Path) -> 
     assert result["success"] is True
 
 
-def test_mcode_retries_once_with_a_fresh_session_when_resume_fails(tmp_path: Path) -> None:
+@pytest.mark.parametrize("recovered", [False, True])
+def test_mcode_rejected_plan_cannot_be_reported_as_submitted(tmp_path: Path, recovered: bool) -> None:
+    lines = [{"type": "item.completed", "item": {"type": "tool_call", "toolCall": {
+        "name": "mcp__stardew-companion__submit_plan", "status": 3,
+        "output": {"content": [{"type": "text", "text": "Validation failed for tool: steps must be array"}]}}}}]
+    if recovered:
+        lines.append({"type": "item.completed", "item": {"type": "tool_call", "toolCall": {
+            "name": "mcp__stardew-companion__submit_plan", "status": 2,
+            "output": {"details": {"mcp": {"structuredContent": {"tasks": [{"id": "t1"}]}}}}}}})
+    lines.append({"type": "exec.completed", "result": {"status": "succeeded", "output": "已交给执行端"}})
+    result, popen = _run_mcode(McodeBackend(tmp_path), _mcode_proc(lines))
+    assert result["success"] is recovered
+    assert popen.call_count == 1
+    if not recovered:
+        assert result["error"] == "MCODE_TOOL_ARGUMENTS_INVALID"
+        assert "没有成功提交" in result["response"]
+        assert "已交给执行端" not in result["response"]
+
+
+def test_mcode_session_unavailable_passthrough_without_retry(tmp_path: Path) -> None:
+    """A dead resume session surfaces MCODE_SESSION_UNAVAILABLE with no retry.
+
+    The backend reports the failure once; the chat bridge rotates the session
+    honestly and retries once with the full instructions.
+    """
     failed = _mcode_proc([], returncode=4, stderr="mcode exec failed: session not found\n")
-    fresh = _mcode_proc([{"type": "exec.completed", "result": {
-        "status": "succeeded", "output": "新会话已开工", "sessionId": "fresh-1"}}])
     with patch("stardew_ai_runtime.agent_backends.McodeBackend._executable", return_value="mcode.exe"), \
-         patch("subprocess.Popen", side_effect=[failed, fresh]) as popen:
+         patch("subprocess.Popen", return_value=failed) as popen:
         result = McodeBackend(tmp_path).run(_task(), "gone-1", "继续")
-    assert result["success"] is True
-    assert result["conversation_id"] == "fresh-1"
-    assert popen.call_count == 2
-    assert "--session" in popen.call_args_list[0].args[0]
-    assert "--session" not in popen.call_args_list[1].args[0]
+    assert result["success"] is False
+    assert result["error"] == "MCODE_SESSION_UNAVAILABLE"
+    assert result["conversation_id"] is None
+    assert popen.call_count == 1
 
 
 @pytest.mark.parametrize("returncode,expected", [(2, "MCODE_REQUEST_INVALID"), (3, "MCODE_CONFIG_INVALID"),
@@ -351,6 +489,27 @@ def test_mcode_maps_cli_exit_codes(tmp_path: Path, returncode: int, expected: st
     result, _ = _run_mcode(McodeBackend(tmp_path), proc)
     assert result["success"] is False
     assert result["error"] == expected
+
+
+@pytest.mark.parametrize("source", ["turn.failed", "exec.completed", "stderr"])
+def test_mcode_missing_default_model_reports_configuration_fix_without_retry(tmp_path: Path, source: str) -> None:
+    error = {"category": "runtime", "message": "defaultModel is not configured", "retryable": True}
+    lines = []
+    stderr = ""
+    if source == "stderr":
+        stderr = "mcode exec failed: The run failed: defaultModel is not configured.\n"
+    elif source == "turn.failed":
+        lines = [{"type": "session.resumed", "sessionId": "session-1"},
+                 {"type": "turn.failed", "error": error}]
+    else:
+        lines = [{"type": "exec.completed", "result": {"status": "failed", "error": error}}]
+    result, popen = _run_mcode(McodeBackend(tmp_path), _mcode_proc(lines, returncode=4, stderr=stderr), "session-1")
+    assert result["success"] is False
+    assert result["error"] == "MCODE_MODEL_NOT_CONFIGURED"
+    assert "默认模型" in result["response"]
+    assert "defaultModel" in result["response"]
+    assert result["usage"] is None
+    assert popen.call_count == 1
 
 
 def test_mcode_missing_cli_reports_install_hint_without_starting_process(tmp_path: Path) -> None:

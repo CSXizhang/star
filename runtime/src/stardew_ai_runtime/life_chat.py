@@ -34,6 +34,28 @@ _PLAY_STYLE_SUMMARIES: dict[str, str] = {
     "decor": "装修：结合地形商量布局，可准备材料和清理玩家明确授权的位置；可按真实背包物品分批摆放和回收家具、地板、围栏与物件；可制造已解锁配方并在原生规则允许时搬迁建筑；新建升级建筑可先观察原生目录与材料费用，按玩家目标与实际资金到服务柜台办理并等待真实工期，不冒充已经完成",
 }
 
+_FACT_FEEDBACK_RULES = (
+    "方案比较先用本轮已知状态；简单收获、浇水和出货不需要为确认已有作物身份遍查领域指导或Wiki。"
+    "手采收获本身不恢复体力，不能抵扣浇水消耗；实际体力变化以原生回执为准。"
+    "没有测得路线或耗时依据时只比较路程长短，不编造精确分钟。Wiki读取失败就保留未知，不能把记忆猜测说成已核实。"
+    "控制语义：取消/撤销是撤回目标与安排授权，必须用manage_companion(action='cancel')，不能替换成pause；"
+    "pause仅用于暂时停下且保留继续，resume不能复活已撤销安排。玩家点名安排时先读取真实目标并传goal_id，"
+    "只有明确取消全部工作才传all_arrangements=true；否定、假设或讨论取消不执行控制。"
+    "生活对话保存或修改安排后，桥接会按到期、暂停与真实执行条件交给执行模型；"
+    "你的工具表没有submit_plan是正常分工，不是系统缺少执行入口，不要求玩家挂工具或重配服务。"
+    "保存安排的成功回包只确认保存；manage_companion的queued只确认控制意图已接收，不确认原生命令终态。"
+    "任务仍在执行或本轮暂停/取消/继续后，开场库存与田地数量可能已变化；要报当前数量或取消结果，先读一次get_work_overview的observedFacts。"
+    "仍有未确认原生命令就说明结果待核实，不照抄开场数字冒充当前值。"
+    "pending_native_result时库存/田地标为unknown；账里尚无收获不等于实际收获零，不可说一株没收或库存没变。"
+    "cropUnwateredTiles每格都有作物，不能说成空地；成熟列表不包括幼苗，缺水列表也不包括已浇幼苗。"
+    "tilledUnwateredCount包含有作物的缺水耕地，不能全称为空地；空耕地数量看cropWaterFacts.unwateredEmptySoilCount。"
+    "玩家这轮累计引用confirmedRequestTotals[原requestId]及其original_player_request范围；"
+    "物品件数读itemQuantities[kind].count，null就是未知；effectCounts计的是原生记录条数，不能当物品件数。一条出货记录可以包含多个物品。"
+    "confirmedExecutionTotals仅为整个存档保留的累计，不是这轮数量。最近批次已经计入，不再相加。"
+    "不能用库存补算effectCounts；读档保留的原生执行记录照常计入，账外历史未知就说未知。分开说‘执行账确认的累计’与‘当前背包’。"
+    "当前库存以最新原生快照为准，旧对话、目标summary和待办里的数量都是历史叙述，不能覆盖原生事实或另算累计。"
+)
+
 
 def _life_session_key(backend: str, save_id: str) -> str:
     return f"life:{backend}:{save_id}"
@@ -215,6 +237,14 @@ class LifeChatService:
         milestones: list[dict[str, Any]] | None, live_context: dict[str, Any] | None,
     ) -> str:
         live = self.compact_live_context(live_context)
+        if (live_context or {}).get("actorMode") == "player":
+            from .agent_instructions import load_instruction_bundle
+            return "\n".join([
+                load_instruction_bundle(actor_mode="player").text,
+                "你控制唯一真实玩家。按本轮明确意图修改同一长期目标，阶段安排使用真实工具；聊天意见本身不等于派工。明确取消应撤销目标，不能当作暂停。日总结不是多日目标完成。",
+                "实时上下文：" + json.dumps(live, ensure_ascii=False, separators=(",", ":")),
+                "相关当前待办：" + json.dumps({"work":work_summary,"milestones":milestones or [],"memory":memory_render or {}}, ensure_ascii=False, separators=(",", ":")),
+            ])
         reload = live.get("reloadSummary")
         if isinstance(reload, dict):
             reload_id = reload.get("gameSessionId")
@@ -226,30 +256,35 @@ class LifeChatService:
             if reload_id:
                 self._pending_reload[save_id] = reload_id
         continuing = bool(conversation_id) and self._prompt_sessions.get(save_id) == (conversation_id, mode)
+        facts = {"live": live, "work": work_summary,
+                 "recentSharedEvents": (memory_render or {}).get("recentEvents", []),
+                 "milestones": milestones or []}
+        facts_block = "实时上下文：" + json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
         if not continuing:
+            # Use the same structured block on initialization and continuation,
+            # so acknowledged state can be delivered as lossless deltas.
+            initial_memory = dict(memory_render or {})
+            initial_memory.pop("recentEvents", None)
             return self.build_system_prompt(
-                profile, memory_render, work_summary, mode=mode, milestones=milestones,
-                live_context=live,
+                profile, initial_memory, None, mode=mode, milestones=None,
+                live_context=None,
                 # A provider continuation already contains its actual dialogue.
                 # This local fallback is needed only for a new/stateless session.
                 discussion=self.discussion_context(save_id, mode) if not conversation_id else None,
-            )
+            ) + "\n" + facts_block
         permission = "直接回应玩家；明确派活时，已有adopted安排用revise(node_id,summary等正式字段)更新同一目标范围，新的目标才propose再adopt；node_id使用真实节点id。保存失败不能宣称接下新范围，按工具返回的已保存安排回应；询问意见只讨论。暂停/继续/取消或作息用manage_companion。"
         permission += "修订自定义安排的业务范围时，同时同步title、summary、terms_note和preparation；如改为播种加浇水，preparation应包含plant，terms_note不能仍只允许浇水。未变更字段可省略；preparation=[]清空准备项。"
         permission += "玩家指定地图与候选坐标时，propose/revise必须用execution_scope={locationId,tiles}完整保存该范围；summary和terms_note保持候选集合的含义，不能改成消耗背包种子数量。固定候选已种就跳过，处理完同批就结束，不在别处开田凑planned_count或耗尽余种。省略execution_scope保留旧范围，明确取消旧坐标限制才传{}；更广的持续目标不编造坐标。"
         permission += "nodeSaved=true且executionSynced=false仅表示安排已保存，不能说工作已接续；用revise同节点重试同步。"
         permission += "待决定事项的playerConfirmedDecision为false时只继续商量，为true时才提交该事项的决定。"
-        facts = {"live": live, "work": work_summary,
-                 "recentSharedEvents": (memory_render or {}).get("recentEvents", []),
-                 "milestones": milestones or []}
         return (
             permission + "\n继续使用已确认的人格和偏好；本轮明确意愿优先。"
             "默认只答一到两句、约80字以内；追问细节才展开，不用Markdown或内部字段。就寝时间是你上床的截止时间，提前收尾回家；玩家自己决定作息。没核实的具体价格先查wiki，不凭记忆报价。\n"
-            "【本轮最新事实：完整替换此前状态块】空列表表示当前没有，unknown/null表示未知，"
+            "【本轮最新事实】snapshot完整替换此前状态块，delta按版本化增量协议更新。空列表表示当前没有，unknown/null表示未知，"
             "不能沿用旧金币、背包、日期、暂停或工作结果补全。玩家与伙伴钱包分别理解。"
             "已有事实不要重复查询；仅缺少且影响当前决定时查询一次对应工具。"
-            "成功工具回包就是操作确认，不为确认保存再list；按真实执行结果说话。\n"
-            + json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
+            "不为确认保存再次list；按真实执行结果说话。" + _FACT_FEEDBACK_RULES + "\n"
+            + facts_block
         )
 
     @staticmethod
@@ -280,7 +315,7 @@ class LifeChatService:
 
         parts.append("你和玩家一起经营农场，主动分担，先看现状再商量。不要把伙伴交流变成让玩家填预算、数量和约束的表单。")
         parts.append("玩家一句话明确交付目标就能开始安排，询问意见则先商量。安排用一句自然话概括目标；数量、路线、坐标、工具参数和等待条件由自己依据现状处理，留在内部项目记录。")
-        parts.append("每轮最新事实完整替换旧状态：unknown/null是未知，空列表表示当前没有，不沿用旧数据补全。已提供的实时事实不要重复查询；只有缺少且影响决定时才查对应工具。成功工具回包已经确认操作，不为确认保存再次list。")
+        parts.append("每轮最新事实完整替换旧状态：unknown/null是未知，空列表表示当前没有，不沿用旧数据补全。未变化的实时事实不重复查询；不为确认保存再次list。" + _FACT_FEEDBACK_RULES)
         parts.append(
             "这是统一伙伴对话。理解当前对话意图：闲聊自然回应，征求意见只讨论，明确派活直接安排。"
             "玩家说‘去浇水’‘直接开始’‘你安排’‘按刚才的来’就是对应范围的执行授权；"

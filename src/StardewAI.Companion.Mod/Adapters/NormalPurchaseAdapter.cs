@@ -2,6 +2,7 @@ using StardewModdingAPI;
 using StardewValley;
 using StardewValley.Internal;
 using StardewValley.GameData.Shops;
+using StardewValley.Menus;
 using StardewAI.Companion.Mod.Domain;
 using StardewAI.Companion.Mod.Observation;
 
@@ -19,9 +20,16 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// 7. New Item instance created from salable key ISalable.GetSalableInstance(), stack set, and
 ///    delivered via FarmerMechanicsActor.TryAddItemToInventory.
 /// 8. Two-sided balance and backpack verification with rollback on mismatch.
+/// 9. Player-bound actors instead buy through the real ShopMenu natively
+///    (TryOpenShopMenu -> tryToPurchaseItem -> heldItem delivered to the player,
+///    menu closed on every path); finite stock is supported via the game's own
+///    HandleSynchedItemPurchase bookkeeping.
 /// </summary>
 public sealed class NormalPurchaseAdapter : IPurchaseAdapter
 {
+    private static readonly System.Reflection.MethodInfo? TryToPurchaseItemMethod =
+        typeof(ShopMenu).GetMethod("tryToPurchaseItem", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
     private readonly IWorldObserver _observer;
     private readonly IMonitor? _monitor;
 
@@ -140,6 +148,16 @@ public sealed class NormalPurchaseAdapter : IPurchaseAdapter
 
     public IReadOnlyDictionary<ISalable, ItemStockInformation>? GetRawShopStock(string shopId, IFarmerActor actor)
     {
+        if (ActorGuards.IsPlayerBound(actor)) {
+            StardewValley.Menus.ShopMenu? menu=null;
+            try {
+                if (!StardewAI.Companion.Mod.PlayerMode.NativeShopInteraction.TryOpen(_observer,actor,shopId,out menu,out _)) return null;
+                _observer.ScanShop(shopId,actor); // retain this actually observed quotation
+                return menu!.itemPriceAndStock.ToDictionary(p=>p.Key,p=>p.Value);
+            } finally {
+                if (menu != null && ReferenceEquals(Game1.activeClickableMenu,menu)) menu.exitThisMenu();
+            }
+        }
         if (ShopStockResolver != null)
         {
             return ShopStockResolver(shopId, actor);
@@ -164,5 +182,182 @@ public sealed class NormalPurchaseAdapter : IPurchaseAdapter
     public int CountItemInBackpack(IFarmerActor actor, string itemId)
     {
         return actor.GetItemCount(itemId);
+    }
+
+    public bool TryPurchaseNative(IFarmerActor actor, string shopId, string itemId, int count, out string error)
+    {
+        error = string.Empty;
+        if (!ActorGuards.IsPlayerBound(actor))
+        {
+            error = "Native purchase requires a player-bound actor.";
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(shopId))
+        {
+            error = "shopId cannot be empty.";
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(itemId))
+        {
+            error = "itemId cannot be empty.";
+            return false;
+        }
+        if (count <= 0)
+        {
+            error = "count must be positive.";
+            return false;
+        }
+        if (TryToPurchaseItemMethod is null)
+        {
+            error = "ShopMenu.tryToPurchaseItem is unavailable in this game version.";
+            return false;
+        }
+
+        var player = actor.GameFarmer!;
+        ShopMenu? menu = null;
+        int moneyBefore = player.Money;
+        try
+        {
+            // Open the real shop menu natively (sets Game1.activeClickableMenu).
+            if (!StardewAI.Companion.Mod.PlayerMode.NativeShopInteraction.TryOpen(_observer,actor,shopId,out menu,out error))
+            {
+                error = $"Shop '{shopId}' is closed or unavailable.";
+                return false;
+            }
+            if (Game1.activeClickableMenu is not ShopMenu opened)
+            {
+                error = $"Shop '{shopId}' did not open a shop menu.";
+                return false;
+            }
+            menu = opened;
+
+            ISalable? salable = null;
+            foreach (var candidate in menu.forSale)
+            {
+                if (candidate != null && SalableIdMatches(candidate, itemId))
+                {
+                    salable = candidate;
+                    break;
+                }
+            }
+            if (salable is null)
+            {
+                error = $"Item '{itemId}' is not sold by shop '{shopId}'.";
+                return false;
+            }
+            if (!menu.itemPriceAndStock.TryGetValue(salable, out var stockInfo))
+            {
+                error = $"Shop '{shopId}' has no price/stock entry for '{itemId}'.";
+                return false;
+            }
+            if (!salable.CanBuyItem(player))
+            {
+                error = $"Item '{itemId}' cannot be bought by the player right now.";
+                return false;
+            }
+            bool infinite = stockInfo.Stock == int.MaxValue || salable.IsInfiniteStock();
+            if (!infinite && stockInfo.Stock < count)
+            {
+                error = $"Shop '{shopId}' has only {stockInfo.Stock} of '{itemId}' in stock (requested {count}).";
+                return false;
+            }
+
+            // One native call buys at most one maximum-size stack.
+            int maxStack = Math.Max(1, salable.GetSalableInstance().maximumStackSize());
+            if (count > maxStack)
+            {
+                error = $"Requested count {count} exceeds the maximum stack size for one native purchase ({maxStack}).";
+                return false;
+            }
+            int unitCount = Math.Max(1, salable.Stack);
+            int totalCost = stockInfo.Price * count;
+            if (player.Money < totalCost)
+            {
+                error = $"Insufficient funds: '{itemId}' x{count} costs {totalCost}g, player has {player.Money}g.";
+                return false;
+            }
+
+            // Precise inventory-space precheck with the exact instance shape the menu
+            // would deliver, so the post-purchase addItemToInventory cannot overflow.
+            if (salable.GetSalableInstance() is not Item probe)
+            {
+                error = $"Item '{itemId}' cannot be delivered to the player inventory (non-item salable).";
+                return false;
+            }
+            probe.Stack = count * unitCount;
+            if (!player.couldInventoryAcceptThisItem(probe))
+            {
+                error = $"Player inventory cannot accept '{itemId}' x{probe.Stack}.";
+                return false;
+            }
+
+            int centerX = menu.xPositionOnScreen + menu.width / 2;
+            int centerY = menu.yPositionOnScreen + menu.height / 2;
+
+            // Native purchase. The bool return is NOT a success signal (the IL returns
+            // false even on a normal purchase while stock remains); success is
+            // delivered through menu.heldItem plus the native chargePlayer deduction.
+            _ = TryToPurchaseItemMethod.Invoke(menu, new object?[] { salable, null, count, centerX, centerY });
+
+            var held = menu.heldItem;
+
+            int charged = moneyBefore - player.Money;
+            if (held is null)
+            {
+                error = charged > 0
+                    ? $"Purchase of '{itemId}' charged {charged}g without delivering an item."
+                    : $"Purchase of '{itemId}' did not complete (native purchase rejected).";
+                return false;
+            }
+            menu.heldItem = player.addItemToInventory((Item)held);
+            if (menu.heldItem is not null)
+            {
+                error = "Native purchase left an item on the shop cursor; the menu remains open for human recovery.";
+                return false;
+            }
+            if (charged != totalCost)
+            {
+                error = $"Purchase delivered '{itemId}' but charged {charged}g, expected {totalCost}g.";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Native purchase failed: {ex.Message}";
+            Log($"TryPurchaseNative({shopId}, {itemId} x{count}) failed: {ex}", LogLevel.Error);
+            return false;
+        }
+        finally
+        {
+            if (menu is not null && menu.heldItem is null && ReferenceEquals(Game1.activeClickableMenu, menu))
+            {
+                menu.exitThisMenu(false);
+            }
+        }
+    }
+
+    private static bool SalableIdMatches(ISalable salable, string itemId)
+    {
+        string qid = salable.QualifiedItemId;
+        if (string.Equals(qid, itemId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string rawId = salable is Item item
+            ? item.ItemId
+            : (qid.StartsWith("(", StringComparison.Ordinal) && qid.IndexOf(')') > 0
+                ? qid.Substring(qid.IndexOf(')') + 1)
+                : qid);
+        if (string.Equals(rawId, itemId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string normalized = SeedIdNormalizer.ToCropDataId(itemId);
+        return !string.Equals(normalized, itemId, StringComparison.Ordinal) &&
+               string.Equals(rawId, normalized, StringComparison.OrdinalIgnoreCase);
     }
 }

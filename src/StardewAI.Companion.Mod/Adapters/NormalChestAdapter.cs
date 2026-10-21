@@ -16,9 +16,12 @@ namespace StardewAI.Companion.Mod.Adapters;
 ///    mirrors Chest.grabItemFromInventory. Note: Chest.grabItemFromInventory itself cannot
 ///    be called outside an open ItemGrabMenu (it dereferences Game1.activeClickableMenu and
 ///    mutates the menu's held item), so the adapter uses the identical underlying transfer
-///    call and verifies both-side deltas explicitly.
+///    call and verifies both-side deltas explicitly. Player-bound actors use the verified
+///    headless native sequence instead: Chest.addItem + Farmer.removeItemFromInventory /
+///    addItemToInventory(leftover) + Chest.clearNulls, never opening a menu.
 /// 4. Tools are never deposited; the human player's inventory is never touched and is
-///    verified unchanged after each operation.
+///    verified unchanged after each operation (companion mode only; in player mode the
+///    actor IS the human player, so the transfer targets that inventory by design).
 /// 5. Organize merges only same (QualifiedItemId, quality) stacks into the earliest slot via
 ///    Item.addToStack, never reorders, and verifies per-(itemId, quality) conservation.
 /// </summary>
@@ -39,7 +42,8 @@ public sealed class NormalChestAdapter : IChestAdapter
         IFarmerActor actor,
         string locationName,
         TileCoordinate chestTile,
-        int inventorySlotIndex)
+        int inventorySlotIndex,
+        int? count = null)
     {
         ArgumentNullException.ThrowIfNull(actor);
 
@@ -86,7 +90,8 @@ public sealed class NormalChestAdapter : IChestAdapter
             return ChestDepositResult.PreconditionError($"Inventory slot {inventorySlotIndex} is empty.");
         }
 
-        if (item is Tool)
+        bool playerBound = ActorGuards.IsPlayerBound(actor);
+        if (item is Tool && !playerBound)
         {
             return ChestDepositResult.PreconditionError(
                 $"Item '{item.Name}' is a tool and is never deposited.", skipReason: "tool-excluded");
@@ -96,20 +101,92 @@ public sealed class NormalChestAdapter : IChestAdapter
         string itemName = item.Name;
         int quality = item.Quality;
         int stackBefore = item.Stack;
+        if (count is < 1)
+            return ChestDepositResult.PreconditionError("Deposit count must be positive.");
+        int transferCount = Math.Min(count ?? stackBefore, stackBefore);
 
         // Human player baseline isolation BEFORE the transfer
-        var playerBefore = _observer.GetPlayerSnapshot();
-        var originalPlayerRef = Game1.player;
+        // (skipped entirely in player mode: the actor IS Game1.player).
+        PlayerResourceSnapshot? playerBefore = null;
+        Farmer? originalPlayerRef = null;
+        if (!playerBound)
+        {
+            playerBefore = _observer.GetPlayerSnapshot();
+            originalPlayerRef = Game1.player;
+        }
         int chestTotalBefore = ChestTotalStack(chest);
 
         try
         {
-            // Genuine game transfer: identical stacking/partial-transfer semantics to the
-            // chest UI (Chest.grabItemFromInventory delegates to Chest.addItem for the move).
-            Item leftover = chest.addItem(item);
-            int moved = leftover is null ? stackBefore : stackBefore - item.Stack;
+            // A partial stack uses the same native clone/transfer primitives as
+            // withdrawal. Keep the unrequested remainder in the player's slot.
+            Item transfer = item;
+            bool partial = transferCount < stackBefore;
+            if (partial)
+            {
+                transfer = item.getOne();
+                transfer.Stack = transferCount;
+            }
 
-            if (leftover is null)
+            if (playerBound)
+            {
+                // Player mode: headless native deposit mirroring Chest.grabItemFromInventory
+                // exactly (minus the menu). Chest.addItem is the game's own merge primitive
+                // and consumes from the transfer; a fully merged transfer is removed from
+                // the player's inventory, and a remainder that did not fit is re-added
+                // natively after the original reference is removed.
+                var player = actor.GameFarmer!;
+                Item? leftover = chest.addItem(transfer);
+                int moved = leftover is null ? transferCount : transferCount - transfer.Stack;
+
+                if (!partial)
+                {
+                    player.removeItemFromInventory(transfer);
+                    if (leftover is not null)
+                    {
+                        var stillLeft = player.addItemToInventory(leftover);
+                        if (stillLeft is not null)
+                        {
+                            throw new InvalidOperationException(
+                                $"Chest deposit remainder could not be returned to the player inventory at {chestTile}.");
+                        }
+                    }
+                }
+                else
+                {
+                    item.Stack -= moved;
+                }
+
+                chest.clearNulls();
+
+                // Verify the chest-side delta: it gained exactly what left the player.
+                int chestTotalAfterNative = ChestTotalStack(chest);
+                if (chestTotalAfterNative != chestTotalBefore + moved)
+                {
+                    throw new InvalidOperationException(
+                        $"Chest deposit delta verification failed at {chestTile}: chest total {chestTotalBefore} -> {chestTotalAfterNative}, moved {moved}.");
+                }
+
+                if (moved <= 0)
+                {
+                    return ChestDepositResult.PreconditionError(
+                        $"Chest at {chestTile} is full; nothing was deposited.", skipReason: "chest-full");
+                }
+
+                return ChestDepositResult.Succeeded(moved, leftover is not null, itemId, itemName, quality);
+            }
+
+            // Companion mode: genuine game transfer with identical
+            // stacking/partial-transfer semantics to the chest UI
+            // (Chest.grabItemFromInventory delegates to Chest.addItem for the move).
+            Item leftoverCompanion = chest.addItem(transfer);
+            int movedCompanion = leftoverCompanion is null ? transferCount : transferCount - transfer.Stack;
+
+            if (!object.ReferenceEquals(transfer, item))
+            {
+                item.Stack -= movedCompanion;
+            }
+            else if (leftoverCompanion is null)
             {
                 // Fully moved: the item object now lives in the chest; clear the companion slot.
                 // (Companion-side bookkeeping mirroring grabItemFromInventory's removal branch.)
@@ -120,36 +197,42 @@ public sealed class NormalChestAdapter : IChestAdapter
                 }
             }
 
-            bool chestFull = leftover is not null;
+            bool chestFull = leftoverCompanion is not null;
+            int companionAfter = actor.GameFarmer.Items[inventorySlotIndex]?.Stack ?? 0;
+            if (stackBefore - companionAfter != movedCompanion)
+                throw new InvalidOperationException("Chest deposit companion delta verification failed.");
 
             // Verify both-side deltas: chest gained exactly what the companion lost.
             int chestTotalAfter = ChestTotalStack(chest);
-            if (chestTotalAfter != chestTotalBefore + moved)
+            if (chestTotalAfter != chestTotalBefore + movedCompanion)
             {
                 throw new InvalidOperationException(
-                    $"Chest deposit delta verification failed at {chestTile}: chest total {chestTotalBefore} -> {chestTotalAfter}, moved {moved}.");
+                    $"Chest deposit delta verification failed at {chestTile}: chest total {chestTotalBefore} -> {chestTotalAfter}, moved {movedCompanion}.");
             }
 
-            if (moved <= 0)
+            if (movedCompanion <= 0)
             {
                 return ChestDepositResult.PreconditionError(
                     $"Chest at {chestTile} is full; nothing was deposited.", skipReason: "chest-full");
             }
 
-            return ChestDepositResult.Succeeded(moved, chestFull, itemId, itemName, quality);
+            return ChestDepositResult.Succeeded(movedCompanion, chestFull, itemId, itemName, quality);
         }
         finally
         {
-            if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+            if (!playerBound)
             {
-                throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during chest deposit!");
-            }
+                if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+                {
+                    throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during chest deposit!");
+                }
 
-            var playerAfter = _observer.GetPlayerSnapshot();
-            if (!playerBefore.EqualsPlayerResources(playerAfter))
-            {
-                throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion chest deposit! Before: {playerBefore}, After: {playerAfter}");
+                var playerAfter = _observer.GetPlayerSnapshot();
+                if (!playerBefore!.EqualsPlayerResources(playerAfter))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion chest deposit! Before: {playerBefore}, After: {playerAfter}");
+                }
             }
         }
     }
@@ -188,8 +271,14 @@ public sealed class NormalChestAdapter : IChestAdapter
             return ChestOrganizeResult.PreconditionError($"No normal chest found at tile {chestTile}.");
         }
 
-        var playerBefore = _observer.GetPlayerSnapshot();
-        var originalPlayerRef = Game1.player;
+        bool playerBound = ActorGuards.IsPlayerBound(actor);
+        PlayerResourceSnapshot? playerBefore = null;
+        Farmer? originalPlayerRef = null;
+        if (!playerBound)
+        {
+            playerBefore = _observer.GetPlayerSnapshot();
+            originalPlayerRef = Game1.player;
+        }
         var totalsBefore = ChestTotalsByKey(chest);
 
         try
@@ -263,16 +352,21 @@ public sealed class NormalChestAdapter : IChestAdapter
         }
         finally
         {
-            if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+            // Organize is chest-internal; the player-resource invariant only exists
+            // for companion mode (in player mode the actor IS the player).
+            if (!playerBound)
             {
-                throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during chest organize!");
-            }
+                if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+                {
+                    throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during chest organize!");
+                }
 
-            var playerAfter = _observer.GetPlayerSnapshot();
-            if (!playerBefore.EqualsPlayerResources(playerAfter))
-            {
-                throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion chest organize! Before: {playerBefore}, After: {playerAfter}");
+                var playerAfter = _observer.GetPlayerSnapshot();
+                if (!playerBefore!.EqualsPlayerResources(playerAfter))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion chest organize! Before: {playerBefore}, After: {playerAfter}");
+                }
             }
         }
     }
@@ -356,8 +450,15 @@ public sealed class NormalChestAdapter : IChestAdapter
         int matchedQuality = foundItem.Quality;
 
         // Human player baseline isolation BEFORE the transfer
-        var playerBefore = _observer.GetPlayerSnapshot();
-        var originalPlayerRef = Game1.player;
+        // (skipped entirely in player mode: the actor IS Game1.player).
+        bool playerBound = ActorGuards.IsPlayerBound(actor);
+        PlayerResourceSnapshot? playerBefore = null;
+        Farmer? originalPlayerRef = null;
+        if (!playerBound)
+        {
+            playerBefore = _observer.GetPlayerSnapshot();
+            originalPlayerRef = Game1.player;
+        }
         int chestTotalBefore = ChestTotalStack(chest);
 
         try
@@ -374,6 +475,56 @@ public sealed class NormalChestAdapter : IChestAdapter
             {
                 itemToTransfer = foundItem.getOne();
                 itemToTransfer.Stack = toWithdraw;
+            }
+
+            if (playerBound)
+            {
+                // Player mode: headless native withdrawal mirroring Chest.grabItemFromChest
+                // (without the menu): gate on the native accept check, remove the item from
+                // the chest, then deliver it directly into the player's inventory (the
+                // native UI puts it on the cursor instead; headless it goes straight in).
+                var player = actor.GameFarmer!;
+                if (!player.couldInventoryAcceptThisItem(itemToTransfer))
+                {
+                    return ChestWithdrawResult.PreconditionError(
+                        "Player inventory cannot accept this item.", skipReason: "backpack-full");
+                }
+
+                if (entireStack)
+                {
+                    chest.GetItemsForPlayer().Remove(itemToTransfer);
+                }
+                else
+                {
+                    foundItem.Stack -= toWithdraw;
+                    if (foundItem.Stack <= 0)
+                    {
+                        chest.GetItemsForPlayer().Remove(foundItem);
+                    }
+                }
+
+                var leftover = player.addItemToInventory(itemToTransfer);
+                if (leftover is not null)
+                {
+                    // Defensive: couldInventoryAcceptThisItem should guarantee acceptance.
+                    chest.addItem(leftover);
+                    chest.clearNulls();
+                    return ChestWithdrawResult.Failed(
+                        "Player inventory rejected the item after the native accept check; the item was returned to the chest.");
+                }
+
+                chest.clearNulls();
+
+                // Verify the chest-side delta: it lost exactly what the player received.
+                int chestTotalAfterNative = ChestTotalStack(chest);
+                if (chestTotalAfterNative != chestTotalBefore - toWithdraw)
+                {
+                    throw new InvalidOperationException(
+                        $"Chest withdraw delta verification failed at {chestTile}: chest total {chestTotalBefore} -> {chestTotalAfterNative}, expected deduction {toWithdraw}.");
+                }
+
+                bool backpackFullAfterNative = actor.FreeInventorySlots <= 0;
+                return ChestWithdrawResult.Succeeded(toWithdraw, backpackFullAfterNative, matchedItemId, matchedItemName, matchedQuality);
             }
 
             bool added = actor.TryAddItemToInventory(itemToTransfer);
@@ -411,16 +562,19 @@ public sealed class NormalChestAdapter : IChestAdapter
         }
         finally
         {
-            if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+            if (!playerBound)
             {
-                throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during chest withdraw!");
-            }
+                if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+                {
+                    throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during chest withdraw!");
+                }
 
-            var playerAfter = _observer.GetPlayerSnapshot();
-            if (!playerBefore.EqualsPlayerResources(playerAfter))
-            {
-                throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion chest withdraw! Before: {playerBefore}, After: {playerAfter}");
+                var playerAfter = _observer.GetPlayerSnapshot();
+                if (!playerBefore!.EqualsPlayerResources(playerAfter))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion chest withdraw! Before: {playerBefore}, After: {playerAfter}");
+                }
             }
         }
     }

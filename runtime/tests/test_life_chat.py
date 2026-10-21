@@ -1019,7 +1019,9 @@ def test_same_todo_ids_scope_revision_starts_due_work_once_without_global_autono
         assert after[node["id"]]["todoIds"] == before[node["id"]]["todoIds"]
         assert after[node["id"]]["scope"]["plannedCount"] == 100
         delivered_contexts = []
-        async def existing_work_path(*args):
+        async def existing_work_path(*args, _goal_scope=None, _slot_owned=False):
+            assert _slot_owned and bridge._busy_lock.locked()
+            assert _goal_scope == node["goalId"]
             delivered_contexts.append(bridge._decision_context("S", origin="preparation"))
         bridge.handle_chat_submit = AsyncMock(side_effect=existing_work_path)
         await bridge._start_accepted_preparation(None, "S", before)
@@ -1049,7 +1051,9 @@ def test_life_preparation_revision_delivers_updated_business_scope_without_free_
                                                  terms_note="播种与浇水，已有作物的跳过",
                                                  preparation=["plant", "water"], work_store=bridge._work_store)
         contexts = []
-        async def choose_updated_scope(*args):
+        async def choose_updated_scope(*args, _goal_scope=None, _slot_owned=False):
+            assert _slot_owned and bridge._busy_lock.locked()
+            assert _goal_scope == revised["goalId"]
             contexts.append(bridge._decision_context("S", origin="preparation"))
         bridge.handle_chat_submit = AsyncMock(side_effect=choose_updated_scope)
         await bridge._start_accepted_preparation(None, "S", before)

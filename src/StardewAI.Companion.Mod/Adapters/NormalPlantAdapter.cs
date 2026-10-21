@@ -16,7 +16,10 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// 4. Tile must be tilled soil without existing crop or obstacle (CRITICAL: preserve existing crops).
 /// 5. Season and location legality via HoeDirt.canPlantThisSeedHere.
 /// 6. Real seed deduction from companion inventory (no free creation from air).
-/// 7. Strict human player resource and Game1.player isolation.
+///    Player-bound actors instead plant through the full native placementAction path,
+///    which consumes the seed natively (reduceActiveItemByOne).
+/// 7. Strict human player resource and Game1.player isolation (companion mode only;
+///    skipped for player-bound actors, where the actor IS the player).
 /// </summary>
 public sealed class NormalPlantAdapter : IPlantAdapter
 {
@@ -128,6 +131,15 @@ public sealed class NormalPlantAdapter : IPlantAdapter
             return PlantTileResult.Failed("Companion actor has no GameFarmer instance.");
         }
 
+        if (ActorGuards.IsPlayerBound(actor))
+        {
+            // Player mode: use the full native planting path (placementAction plants
+            // into the HoeDirt through the game's own mechanics and the native caller
+            // consumes the seed via reduceActiveItemByOne). No manual debit and no
+            // human-player invariants: the actor IS the player.
+            return PlantViaNativePlacement(actor, location, targetTile, seedItemId);
+        }
+
         // 7. Verify human player baseline isolation BEFORE planting
         var playerBefore = _observer.GetPlayerSnapshot();
         var originalPlayerRef = Game1.player;
@@ -168,5 +180,73 @@ public sealed class NormalPlantAdapter : IPlantAdapter
                     $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion planting! Before: {playerBefore}, After: {playerAfter}");
             }
         }
+    }
+
+    /// <summary>
+    /// Player-mode planting through the full native path: the seed object at the
+    /// player's active slot plants into the HoeDirt via
+    /// <see cref="StardewValley.Object.placementAction"/> (which performs the same
+    /// legality checks and HoeDirt.plant call as a real click), and the native
+    /// caller-side consumption (Farmer.reduceActiveItemByOne) deducts exactly one
+    /// seed. The previous active slot is restored afterwards.
+    /// </summary>
+    private static PlantTileResult PlantViaNativePlacement(
+        IFarmerActor actor,
+        GameLocation location,
+        TileCoordinate targetTile,
+        string seedItemId)
+    {
+        var player = actor.GameFarmer!;
+
+        // Resolve the seed slot: seeds are StardewValley.Object with Category -74,
+        // matched by the same id rules the companion inventory uses.
+        int seedSlot = -1;
+        StardewValley.Object? seedObject = null;
+        var items = player.Items;
+        for (int i = 0; i < items.Count; i++)
+        {
+            if (items[i] is StardewValley.Object obj && obj.Category == -74 &&
+                FarmerMechanicsActor.ItemMatchesId(obj, seedItemId))
+            {
+                seedSlot = i;
+                seedObject = obj;
+                break;
+            }
+        }
+
+        if (seedObject is null || seedSlot < 0)
+        {
+            return PlantTileResult.PreconditionError(
+                $"Cannot plant: player has no seed '{seedItemId}' in inventory.", skipReason: "out-of-seeds");
+        }
+
+        int previousToolIndex = player.CurrentToolIndex;
+        bool placed;
+        try
+        {
+            // placementAction reads the seed through Farmer.ActiveObject, so point the
+            // player's active slot at the seed for the duration of the native call.
+            player.CurrentToolIndex = seedSlot;
+            placed = seedObject.placementAction(location, targetTile.X * 64, targetTile.Y * 64, player);
+            if (placed)
+            {
+                // Mirror the native caller (Utility.tryToPlaceItem): a successful
+                // seed placement consumes exactly one unit of the active item.
+                player.reduceActiveItemByOne();
+            }
+        }
+        finally
+        {
+            player.CurrentToolIndex = previousToolIndex;
+        }
+
+        if (!placed)
+        {
+            return PlantTileResult.Failed(
+                $"seedObject.placementAction returned false for seed '{seedItemId}' on tile {targetTile}.");
+        }
+
+        int remainingStack = actor.GetItemCount(seedItemId);
+        return PlantTileResult.Succeeded(seedItemId, remainingStack);
     }
 }

@@ -45,7 +45,7 @@ def test_missing_destination_is_rejected_before_job_selection(tmp_path):
             job["tasks"][0]["steps"][0]["params"] = {"location_id": "SeedShop"}
             _, result = await server.call_tool("submit_plan", job)
         assert result["executionScope"] == "one_short_job"
-        assert result["handoff"] == "end_decision"
+        assert result["handoff"] == "ack_async"
         assert store.state("S").tasks[0].steps[0].params["tile"] == {"x": 4, "y": 5}
     asyncio.run(check())
 

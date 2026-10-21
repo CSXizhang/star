@@ -78,7 +78,7 @@ def test_completed_job_invalidates_pre_execution_next_action(tmp_path):
     assert bridge._player_activity("farm")["nextStep"] == "将成品放入既有箱子"
 
 
-def test_chain_prompt_keeps_full_batch_accounting_when_receipt_coordinates_are_truncated(tmp_path):
+def test_delivery_prompt_keeps_full_batch_accounting_when_receipt_coordinates_are_truncated(tmp_path):
     import json
 
     from stardew_ai_runtime.chat_bridge import ChatBridge
@@ -103,7 +103,7 @@ def test_chain_prompt_keeps_full_batch_accounting_when_receipt_coordinates_are_t
     ))
     for snapshot in (None, {"world": {"season": "summer", "dayOfMonth": 16}}):
         bridge._latest_snapshot_payload = snapshot
-        prompt = bridge._format_chain_prompt("继续原目标", "farm")
+        prompt = bridge._format_delivery_prompt([], "farm", midflight=[], read_only=False)
         context = json.loads(prompt.split("实时上下文：", 1)[1].split("\n", 1)[0])
         evidence = context["plantingEvidence"]
         assert evidence == store.overview("farm")["plantingEvidence"]

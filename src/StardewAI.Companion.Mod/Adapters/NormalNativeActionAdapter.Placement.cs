@@ -36,6 +36,27 @@ public sealed partial class NormalNativeActionAdapter
             return NativeActionStepResult.Precondition("Entrance/warp tiles must stay clear.", "protected-entrance");
         if (loc.objects.ContainsKey(tile) || loc.terrainFeatures.ContainsKey(tile) || loc.GetFurnitureAt(tile) is not null)
             return NativeActionStepResult.Precondition("Target already contains an object or terrain feature; inspect before changing it.", "occupied");
+        if (ActorGuards.IsPlayerBound(actor))
+        {
+            int previous = farmer.CurrentToolIndex;
+            int quantityBefore = actor.GetItemCount(source.QualifiedItemId);
+            bool accepted;
+            try
+            {
+                farmer.CurrentToolIndex = farmer.Items.IndexOf(source);
+                // The real caller owns placement predicates, source identity,
+                // furniture cursor handling and reduceActiveItemByOne.
+                accepted = Utility.tryToPlaceItem(loc, source, target.Tile.X * 64, target.Tile.Y * 64);
+            }
+            finally { farmer.CurrentToolIndex = previous; }
+            bool changed = loc.objects.TryGetValue(tile, out var nativeObject) && SameItem(nativeObject.QualifiedItemId, source.QualifiedItemId)
+                || loc.furniture.Any(f => f.TileLocation == tile && SameItem(f.QualifiedItemId, source.QualifiedItemId))
+                || loc.terrainFeatures.TryGetValue(tile, out var nativeFeature) && nativeFeature is Flooring or Tree or FruitTree or Bush or Grass;
+            int consumed = quantityBefore - actor.GetItemCount(source.QualifiedItemId);
+            if (!accepted || !changed || consumed != 1)
+                return NativeActionStepResult.Failed($"Native placement result={accepted}, placed entity={changed}, consumed={consumed}. Reobserve; no depletion or recovery was fabricated.");
+            return NativeActionStepResult.Succeeded("placed", itemId: source.QualifiedItemId, itemCount: 1);
+        }
         var placed = (StardewValley.Object)source.getOne();
         if (!placed.canBePlacedHere(loc, tile))
             return NativeActionStepResult.Precondition("Native placement rules refuse this item at the requested tile.", "native-placement-refused");

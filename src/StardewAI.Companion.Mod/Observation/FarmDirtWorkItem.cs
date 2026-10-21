@@ -11,5 +11,6 @@ public sealed record FarmDirtWorkItem(
     bool HasCrop,
     string? CropId,
     bool IsHarvestable,
-    bool IsDead = false
+    bool IsDead = false,
+    bool? RequiresScythe = null
 );

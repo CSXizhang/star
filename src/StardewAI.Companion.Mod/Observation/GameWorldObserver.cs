@@ -22,6 +22,7 @@ public sealed partial class GameWorldObserver : IWorldObserver
     private int _worldRevision = 1;
 
     public int WorldRevision => _worldRevision;
+    public Func<Farmer?>? NativeCollisionActor { get; set; }
 
     public string? CurrentLocationName =>
         !string.IsNullOrWhiteSpace(Game1.currentLocation?.NameOrUniqueName)
@@ -49,7 +50,9 @@ public sealed partial class GameWorldObserver : IWorldObserver
         if (!IsMainThread) throw new InvalidOperationException("Spatial observation requires the game thread.");
         var location = Game1.getLocationFromName(locationName)
             ?? throw new InvalidOperationException($"Location '{locationName}' is not loaded.");
-        return FarmSpaceObserver.Capture(location, this, region);
+        var observation = FarmSpaceObserver.Capture(location, this, region);
+        observation["interactables"] = ScanInteractables(locationName);
+        return observation;
     }
 
     public Dictionary<string, object> InspectMapImage(string locationName)
@@ -86,8 +89,8 @@ public sealed partial class GameWorldObserver : IWorldObserver
                 countPerCraft = recipe.numberProducedPerCraft, ingredients = recipe.recipeList.Select(p => new { itemId = p.Key, count = p.Value }).ToList(),
                 craftableCount = count });
         }
-        return new Dictionary<string, object> { ["recipes"] = recipes, ["recipeKnowledge"] = "player-unlocked", ["inventoryOwner"] = "companion",
-            ["note"] = "Counts use companion ingredients only; overlapping modded ingredient categories are revalidated transactionally at execution." };
+        return new Dictionary<string, object> { ["recipes"] = recipes, ["recipeKnowledge"] = "player-unlocked", ["inventoryOwner"] = ActorGuards.IsPlayerBound(actor) ? "player" : "companion",
+            ["note"] = "Counts use only the bound actor's backpack; native ingredient matching is revalidated at execution. No chest materials are consumed implicitly." };
     }
 
     public bool IsTilePassable(string locationName, TileCoordinate tile)
@@ -123,7 +126,19 @@ public sealed partial class GameWorldObserver : IWorldObserver
 
         // Check map tile impassability
         var tileLoc = new xTile.Dimensions.Location(tile.X, tile.Y);
-        return loc.isTilePassable(tileLoc, Game1.viewport);
+        if (!loc.isTilePassable(tileLoc, Game1.viewport)) return false;
+        var collisionActor=NativeCollisionActor?.Invoke();
+        if (collisionActor!=null && ReferenceEquals(loc,collisionActor.currentLocation))
+        {
+            // Match the native standing-center path geometry. This is a pure
+            // collision query: pathfinding and skipCollisionEffects prevent
+            // damage/doors/other collision side effects. No actor is moved.
+            var body=collisionActor.GetBoundingBox();
+            var probe=new Rectangle(tile.X*64+32-body.Width/2,tile.Y*64+32-body.Height/2,body.Width,body.Height);
+            if(loc.isCollidingPosition(probe,Game1.viewport,true,0,false,collisionActor,
+                pathfinding:true,projectile:false,ignoreCharacterRequirement:false,skipCollisionEffects:true))return false;
+        }
+        return true;
     }
 
     public bool IsWarpOrDoorTile(string locationName, TileCoordinate tile)
@@ -305,7 +320,9 @@ public sealed partial class GameWorldObserver : IWorldObserver
                         HasCrop: hasCrop,
                         CropId: cropId,
                         IsHarvestable: isHarvestable,
-                        IsDead: dirt.crop?.dead.Value == true
+                        IsDead: dirt.crop?.dead.Value == true,
+                        RequiresScythe: dirt.crop is null ? null :
+                            dirt.crop.GetHarvestMethod() == StardewValley.GameData.Crops.HarvestMethod.Scythe
                     ));
                 }
             }
@@ -1876,14 +1893,18 @@ public sealed partial class GameWorldObserver : IWorldObserver
                 }
                 catch { isStone = false; isTwig = false; }
 
-                bool canGrab = obj.CanBeGrabbed;
-                string kind = isWeed ? "weed" : (isStone ? "stone" : (isTwig ? "twig" : (canGrab ? "object" : "obstacle")));
+                bool parcel = obj is StardewValley.Objects.Chest { giftbox.Value: true };
+                // These identities are the installed game's native Hoe branch
+                // (Object.performToolAction); CanBeGrabbed alone is not pickup eligibility.
+                bool digSpot = obj.QualifiedItemId is "(O)590" or "(O)SeedSpot";
+                bool canGrab = !parcel && !digSpot && !isWeed && !isStone && !isTwig && obj.CanBeGrabbed;
+                string kind = parcel ? "giftbox" : digSpot ? "dig-spot" : isWeed ? "weed" : (isStone ? "stone" : (isTwig ? "twig" : (canGrab ? "object" : "obstacle")));
                 string? clearTool = isWeed ? "hoe" : (isStone ? "pickaxe" : (isTwig ? "axe" : null));
                 items.Add(new GroundItemScanInfo(
                     Tile: new TileCoordinate(ox, oy),
                     Kind: kind,
                     ItemId: obj.QualifiedItemId ?? obj.ItemId ?? "",
-                    Name: obj.DisplayName ?? obj.Name ?? "",
+                    Name: parcel ? "原生礼包（按所观测地图open_chest开启；不是杂物，不用clear_debris；动画后核对原生入包和实际掉落，不凭空重复拾取）" : digSpot ? (obj.DisplayName ?? obj.Name) + "（原生需锄头交互；不是普通拾取）" : obj.DisplayName ?? obj.Name ?? "",
                     Stack: obj.Stack,
                     IsDropped: false,
                     IsWeed: isWeed,

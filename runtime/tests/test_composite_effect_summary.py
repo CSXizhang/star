@@ -8,7 +8,7 @@ def test_supplies_preparation_and_plant_water_all_keep_confirmed_counts():
                *[{"state": "watered"}] * 2,
                {"state": "skipped"}, {"state": "unknown"}, {"state": "failed"}]
     summary = WorkStore.effect_summary(effects)
-    for actual in ("已记录 1 段行程", "水壶已补满", "已吃 1 份食物恢复体力",
+    for actual in ("已记录 1 段行程", "水壶已补满", "已吃 1 份食物；恢复量以原生回执为准",
                    "已取出 20 件", "已开垦 2 格", "已种下 2 格", "已浇水 2 格"):
         assert actual in summary
     assert "记录 3 项实际变化" not in summary

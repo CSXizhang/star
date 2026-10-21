@@ -18,7 +18,7 @@ def test_gateway_route_uses_native_planner_and_returns_bounded_summary():
         server_scheduler.query_route = scheduler.query_route
         server = create_mcp_server(scheduler=server_scheduler, surface="light")
         _, result = await server.call_tool("call_capability", {"tool": "query_route", "params": {"location_id": "Farm", "tile": {"x": 58, "y": 22}}})
-        assert result["result"] == native
+        assert result["result"] == {**native, "resolvedDestinationTile": {"x": 58, "y": 22}}
         scheduler._execute_native_action.assert_awaited_once_with("inspect-route", {"locationId": "Farm", "tile": {"x": 58, "y": 22}}, tiles=[])
     asyncio.run(check())
 

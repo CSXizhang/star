@@ -29,7 +29,9 @@ def test_business_exception_has_terminal_no_retry(tmp_path,message):
     e=PlanExecutor(store,dispatch=dispatch)
     result=asyncio.run(e.run_once("s","w"))
     assert result.outcome=="partial" and result.message==message
-    assert result.result["status"]=="rejected"
+    # An adapter exception is not a native rejection receipt. The persisted
+    # partial outcome must agree with the returned feedback and must not retry.
+    assert result.result["status"]==result.outcome=="partial"
     assert asyncio.run(e.run_once("s","w")).status=="idle" and len(calls)==1
 
 

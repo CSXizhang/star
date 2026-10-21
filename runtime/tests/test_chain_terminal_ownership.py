@@ -104,6 +104,8 @@ def _bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client: _BlockingCl
     monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda _: None)
     bridge = ChatBridge(run_dir=tmp_path, backend="fake", internal_plan_client=client)
     bridge._backend = backend
+    # A connected game supplies a snapshot before terminal delivery is allowed.
+    bridge._latest_snapshot_payload = {"world": {}}
     return bridge
 
 

@@ -198,6 +198,7 @@ def test_disabled_idle_help_completes_second_job_after_tool_preparation(tmp_path
                 pass
 
         bridge = ChatBridge(run_dir=tmp_path, backend="fake", internal_plan_client=Native())
+        bridge._latest_snapshot_payload = {"world": {}}
         bridge._autonomy.set_mode("farm", "command")
         calls = []
         assigned_goal = bridge._work_store.add_goal("farm", "种地再照料鸡", source="user")

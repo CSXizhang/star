@@ -63,7 +63,9 @@ def test_tool_profile_preserves_mcp_discovery_and_execution_authority():
     assert "features.code_mode_host=true" in args
     assert "features.code_mode=false" not in args
     assert "features.code_mode_host=false" not in args
-    assert CODEX_GAME_TOOL_PROFILE_VERSION == "stardew-game-tools-v2"
+    assert CODEX_GAME_TOOL_PROFILE_VERSION == "stardew-game-tools-v5"
+    assert "mcp_optional_startup_grace_ms=0" in args
+    assert "features.skip_host_skill_discovery=true" in args
     assert "features.apps=false" in args
     assert "features.plugins=false" in args
     assert not any("approval_policy" in arg or "sandbox_mode" in arg for arg in args)

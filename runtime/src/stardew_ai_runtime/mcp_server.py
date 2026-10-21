@@ -174,6 +174,8 @@ def _normalize_wire_arrays(value: Any, annotation: Any) -> Any:
                 if isinstance(item, dict) and set(item) == {"item"}:
                     wrapped_item = _unwrap_item_array(item)
                     if isinstance(wrapped_item, list):
+                        if len(wrapped_item) != 1:
+                            raise ValueError("Each array item wrapper must contain exactly one item")
                         for child in wrapped_item:
                             append_item(child, depth + 1)
                         return

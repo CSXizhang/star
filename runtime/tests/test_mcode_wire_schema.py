@@ -35,17 +35,18 @@ def test_real_singleton_item_job_selects_exact_tile(tmp_path, monkeypatch, wrapp
         "location_id": "Farm", "tiles": [{"x": 65, "y": 15}], "include_empty_tiles": False}
 
 
-def test_mcode_schema_inlines_references_and_advertises_only_supported_wrappers(tmp_path, monkeypatch):
+def test_mcode_schema_inlines_references_and_advertises_canonical_arrays(tmp_path, monkeypatch):
     _, server = setup_game(tmp_path, monkeypatch)
 
     async def run():
         tools = {tool.name: tool for tool in await server.list_tools()}
         plan = tools["submit_plan"].inputSchema
         assert "$ref" not in str(plan)
-        canonical, wrapper = plan["properties"]["tasks"]["anyOf"]
+        canonical = plan["properties"]["tasks"]
+        assert canonical["type"] == "array" and "anyOf" not in canonical
         assert canonical["minItems"] == canonical["maxItems"] == 1
-        assert wrapper["additionalProperties"] is False
-        steps = canonical["items"]["properties"]["steps"]["anyOf"][0]
+        steps = canonical["items"]["properties"]["steps"]
+        assert steps["type"] == "array" and "anyOf" not in steps
         assert steps["minItems"] == 1 and steps["maxItems"] == 32
         assert canonical["items"]["properties"]["dependencies"]["maxItems"] == 0
         observation = tools["observe_farm_space"].inputSchema

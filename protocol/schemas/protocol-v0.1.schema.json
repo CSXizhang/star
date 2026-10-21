@@ -110,6 +110,12 @@
               "cropId": {
                 "type": "string",
                 "minLength": 1
+              },
+              "requiresScythe": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
               }
             },
             "additionalProperties": false
@@ -160,6 +166,65 @@
         },
         "scope": {
           "type": "string"
+        },
+        "cultivatedPlots": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "object",
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height",
+              "soilCount",
+              "cropCount"
+            ],
+            "properties": {
+              "x": {
+                "type": "integer"
+              },
+              "y": {
+                "type": "integer"
+              },
+              "width": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "height": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "soilCount": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "cropCount": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "cultivatedPlotCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cultivatedPlotsTruncated": {
+          "type": "boolean"
+        },
+        "totalCropCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
         }
       },
       "additionalProperties": false

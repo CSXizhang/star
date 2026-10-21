@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -135,7 +136,8 @@ def test_backend_cancel_and_timeout_results_keep_recorded_usage(tmp_path):
             return {"success": False, "conversation_id": SESSION, "usage": None, "error": error}
 
         with patch.dict("os.environ", {"CODEX_HOME": str(home)}), patch.object(CodexBackend, "_run", side_effect=stopped):
-            result = CodexBackend(tmp_path).run(None, SESSION, "next")
+            task = SimpleNamespace(request_id=f"usage-{error}", cancelled=False, process=None)
+            result = CodexBackend(tmp_path).run(task, SESSION, "next")
         assert result["success"] is False
         assert result["error"] == error
         assert result["usage"]["total_tokens"] == 33

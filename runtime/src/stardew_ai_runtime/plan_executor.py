@@ -192,6 +192,10 @@ def classify_step_outcome(result: Any, operation: str | None = None) -> tuple[st
                     if isinstance(effect, dict) and effect.get("state") == "skipped"]
         counts = Counter(str(row.get("reason") or "unspecified")[:80]
                          for row in rows if isinstance(row, dict))
+        if operation == "refill_watering_can" and counts.get("already-full") and not result.get("failedCount"):
+            # This service requests a full can, not a water increase. The native
+            # success confirms that state without inventing a refill effect.
+            return "completed", None
         summary = ", ".join(f"{reason}={count}" for reason, count in counts.most_common(4)) or "unspecified"
         return "partial", f"ALL_TILES_SKIPPED: 0 completed, {result['skippedCount']} skipped: {summary}"
     if outcome in {"completed", "partial", "unknown"}:
@@ -343,11 +347,9 @@ def merge_reconciled_operation_result(
         elif remaining is None:
             result.update(outcome="unknown", reasonCode="NATIVE_COUNTS_UNCONFIRMED")
         else:
-            # Match each scheduler operation's existing completion contract.
-            partial = operation == "water_auto" and remaining > 0
-            result.update(outcome="partial" if partial else "completed",
-                          goalSatisfied=remaining == 0,
-                          reasonCode="REMAINING_WORK" if partial else "OK")
+            # Native success completes the selected batch. Remaining farm work
+            # is objective progress, not a failure of this bounded plan step.
+            result.update(outcome="completed", goalSatisfied=remaining == 0, reasonCode="OK")
     return result
 
 

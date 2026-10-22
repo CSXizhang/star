@@ -1800,7 +1800,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             TargetTiles: targets,
             MaxStamina: _actor.Stamina,
             MaxWater: _actor.WaterLeft,
-            MaxGameMinutes: 120,
+            MaxGameMinutes: 0,
             CancelPolicy: "safe-point",
             IdempotencyKey: cmdId,
             ExpectedWorldRevision: _observer.WorldRevision

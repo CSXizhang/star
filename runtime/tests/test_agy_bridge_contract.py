@@ -74,10 +74,10 @@ def test_twenty_measured_multigeneration_turns_do_not_rotate_on_consumption_or_c
     state = bridge._session_context_state["Save1"]
     assert state["latestInputContext"] == 49999 and state["maxInputContext"] == 49999
     assert state["unmeasuredRequests"] == 0 and bridge._session_requests["Save1"] == 20
-    assert bridge._note_session_context("Save1", {**usage, "latestRequestInputContext": 100000}) == "SESSION_CONTEXT_BUDGET"
+    assert bridge._note_session_context("Save1", {**usage, "latestRequestInputContext": 100000}) is None
 
 
-def test_fallback_requires_twenty_consecutive_unknown_turns_and_measurement_resets_it(tmp_path, monkeypatch):
+def test_unknown_context_remains_diagnostic_and_does_not_reset_session(tmp_path, monkeypatch):
     bridge = _bridge(tmp_path, monkeypatch)
     bridge._session_request_checkpoint = 20
     unknown = {"input_tokens": 1000000, "cache_read_tokens": 4000000,
@@ -89,7 +89,7 @@ def test_fallback_requires_twenty_consecutive_unknown_turns_and_measurement_rese
     assert bridge._session_context_state["Save1"]["unmeasuredRequests"] == 0
     for _ in range(19):
         assert bridge._note_session_context("Save1", unknown) is None
-    assert bridge._note_session_context("Save1", unknown) == "SESSION_REQUEST_CHECKPOINT"
+    assert bridge._note_session_context("Save1", unknown) is None
     assert bridge._session_context_state["Save1"]["unmeasuredRequests"] == 20
 
 

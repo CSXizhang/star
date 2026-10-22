@@ -712,7 +712,9 @@ class WorkStore:
             try:
                 self._load()
                 state = self._states.setdefault(save_id, SaveWorkState())
+                self._settle_cancelled_selection(state)
                 result = mutate(state)
+                self._settle_cancelled_selection(state)
                 self._write_unlocked()
                 return result
             except Exception:
@@ -1243,16 +1245,13 @@ class WorkStore:
             raise WorkStateError("Explicit observation/intent map scope required")
         def mutate(state):
             goal=self._find_goal(state,goal_id)
-            if goal.kind!="main" or goal.status!="active":
-                raise WorkStateError("Decision notes attach to the active long-term main goal, not a new authorizing stage")
+            if goal.status!="active":
+                raise WorkStateError("Decision notes require an active goal")
             basis=next((e for e in reversed(state.executions) if e.command_id==basis_command_id),None)
-            if category in {"observation","failure"} and basis is None:
-                raise WorkStateError("A real persisted basis_command_id is required; unverified interpretations belong to hypothesis")
-            if category=="observation" and basis.outcome!="completed":
-                raise WorkStateError("Unknown/failed commands cannot establish observation facts")
             row={"category":category,"text":note.strip(),"locationId":location_id,"recordedAt":_now_iso(),
                  "source":"model-interpretation" if category=="observation" else "model",
                  "basisCommandId":basis_command_id,"basisOperation":basis.operation if basis else None,
+                 "verified": bool(basis and basis.outcome == "completed"),
                  "gameDate":basis.game_date if basis else state.last_settled_day,
                  "rule":"Current native evidence overrides this dated note. Intent is advisory, not additional authorization."}
             notes=goal.project.get("decisionNotes") or []
@@ -1293,6 +1292,24 @@ class WorkStore:
 
     def cancel_goal(self, save_id: str, goal_id: str) -> Goal:
         return self.revise_goal(save_id, goal_id, status="cancelled")
+
+    @staticmethod
+    def _settle_cancelled_selection(state: SaveWorkState) -> None:
+        """Release retired intent, but never invent a dispatched command's result.
+
+        Run at the transaction boundary so every cancellation path, including
+        persisted pre-fix state, obeys the same ownership rule. This is not a
+        native result and must not replace last_job or enqueue a completion.
+        """
+        decision = state.decision
+        if not decision.get("selected") or decision.get("finished"):
+            return
+        task = next((t for t in state.tasks if t.id == decision.get("taskId")), None)
+        if task is None or task.status != "cancelled":
+            return
+        if any(s.command_id and s.status in {"running", "unknown", "waiting"} for s in task.steps):
+            return
+        decision.update(finished=True, retirementReason="TASK_CANCELLED")
 
     @staticmethod
     def _cancel_task_steps(task: Task) -> None:
@@ -1447,6 +1464,10 @@ class WorkStore:
         """A fresh provider invocation, not a goal/todo, may select one short job."""
         def mutate(state: SaveWorkState) -> None:
             current = state.decision
+            if any(t.status == "cancelled" and any(
+                    s.command_id and s.status in {"running", "unknown", "waiting"} for s in t.steps)
+                   for t in state.tasks):
+                raise WorkStateError("GAME_BUSY: a cancelled native command still awaits its terminal result")
             selected_ids = current.get("taskIds") or [current.get("taskId")]
             if (current.get("selected") and not current.get("finished")
                     and any(t.id in selected_ids and t.status in {"pending", "running", "waiting", "unknown"}
@@ -1485,15 +1506,17 @@ class WorkStore:
         self._mutate(save_id, mutate)
 
     @staticmethod
-    def _assert_decision_valid(state: SaveWorkState, token: str | None) -> None:
-        guide = "若无法继续，请直接向玩家说明当前阻塞原因，不要尝试文件系统操作排查。"
-        if state.decision.get("selected"):
-            raise WorkStateError(f"NEW_MODEL_DECISION_REQUIRED: 当前决策周期已选择过任务（one semantic job per provider decision）。{guide}")
+    def _assert_decision_valid(state: SaveWorkState, token: str | None, *, allow_append: bool = False) -> None:
         d = state.decision
         if not token or d.get("token") != token:
-            raise WorkStateError(f"NEW_MODEL_DECISION_REQUIRED: 决策令牌缺失或不匹配。{guide}")
+            raise WorkStateError("STALE_DECISION: decision token missing or revoked")
         if d.get("expires", 0) <= _time.time():
-            raise WorkStateError(f"NEW_MODEL_DECISION_REQUIRED: 决策令牌已过期。{guide}")
+            raise WorkStateError("STALE_DECISION: decision token expired")
+        if d.get("selected"):
+            task = next((task for task in state.tasks if task.id == d.get("taskId")), None)
+            if (not allow_append or d.get("finished") or task is None or task.status != "pending"
+                    or any(step.status != "pending" or step.command_id or step.lease_owner for step in task.steps)):
+                raise WorkStateError("JOB_IN_PROGRESS: the dispatched job must settle before it can be changed")
 
     @staticmethod
     def _decision_valid(state: SaveWorkState, token: str | None) -> bool:
@@ -1586,7 +1609,8 @@ class WorkStore:
 
         def mutate(state: SaveWorkState) -> None:
             nonlocal resolved_goal_id, resolved_goal_source, created_goal
-            self._assert_decision_valid(state, decision_token)
+            self._assert_decision_valid(state, decision_token, allow_append=True)
+            queued = next((task for task in state.tasks if task.id == state.decision.get("taskId")), None)
             owning_request_id = request_id or state.decision.get("requestId")
             offered = [state.decision.get("requestId"), *state.decision.get("requestIds", [])]
             if not request_id and len({r for r in offered if r}) > 1:
@@ -1667,6 +1691,8 @@ class WorkStore:
                                 "修复该原因并取得对应对象或路线的新原生可执行证据")
                             + "; choose another branch")
 
+            if queued and (queued.goal_id != goal.id or owning_request_id != state.decision.get("requestId")):
+                raise WorkStateError("QUEUED_JOB_SCOPE_MISMATCH: additions must belong to the same goal and player request")
             if replace:
                 for existing in state.tasks:
                     if existing.goal_id != goal.id:
@@ -1687,11 +1713,24 @@ class WorkStore:
                             step.lease_until = 0.0
                     superseded.append(existing.id)
 
-            created.extend(self._append_plan(state, goal.id, tasks))
+            appended = self._append_plan(state, goal.id, tasks)
+            if queued and not replace:
+                steps = [step for task in appended for step in task.steps]
+                if {step.id for step in queued.steps} & {step.id for step in steps}:
+                    raise WorkStateError("duplicate step id in queued job")
+                queued.steps.extend(steps)
+                queued.title = "；".join([queued.title, *(task.title for task in appended)])
+                queued.updated_at = _now_iso()
+                for task in appended:
+                    state.tasks.remove(task)
+                created.append(queued)
+            else:
+                created.extend(appended)
             for task in created:
                 task.decision_token = decision_token
                 if owning_request is not None:
-                    owning_request.setdefault("taskIds", []).append(task.id)
+                    if task.id not in owning_request.setdefault("taskIds", []):
+                        owning_request["taskIds"].append(task.id)
                     owning_request["goalId"] = goal.id
                     if owning_request.get("origin") == "player-midflight":
                         owning_request["consumedByDelivery"] = True

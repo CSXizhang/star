@@ -13,6 +13,35 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class WaterZoneStateMachineTests
 {
+    [Fact]
+    public void DefaultTimeBudgetAllowsWateringAfterMoreThanAnHourOfGameTime()
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var tile = new TileCoordinate(10, 12);
+        observer.SetDirt(tile, TileDirtState.DryDirt(hasCrop: true));
+        Assert.True(machine.Start(new WaterZoneRequest("long-water", "long-water-task", "Farm",
+            new[] { tile }, 50f, 20), out _));
+        observer.TimeOfDay = 1900;
+        machine.StepTicks(200);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Single(machine.FinalResult.WateredTiles);
+        Assert.Equal(39, actor.WaterLeft);
+        Assert.True(machine.FinalResult.GameMinutesElapsed > 60);
+    }
+
+    [Fact]
+    public void PartialWateringReceiptKeepsFailedTileReasons()
+    {
+        var result = new WaterZoneResult("partial", "partial-task", ExecutionState.PartiallySucceeded,
+            new[] { new TileCoordinate(10, 12) }, Array.Empty<SkippedTileInfo>(),
+            new[] { new FailedTileInfo(new TileCoordinate(11, 12), "Dirt remained unwatered.") },
+            2f, 1, 50, 3);
+        var json = System.Text.Json.JsonSerializer.SerializeToElement(result.ToTransportPayload());
+        Assert.Equal("Dirt remained unwatered.", json.GetProperty("details").GetProperty("failedTiles")[0].GetProperty("reason").GetString());
+        Assert.Equal(11, json.GetProperty("details").GetProperty("failedTiles")[0].GetProperty("tile").GetProperty("x").GetInt32());
+        Assert.Single(json.GetProperty("effects").EnumerateArray());
+    }
+
     [Theory]
     [InlineData(false, 1)]
     [InlineData(true, 2)]

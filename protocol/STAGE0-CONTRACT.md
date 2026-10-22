@@ -213,7 +213,7 @@ Dispatches execution of a registered skill. Stage 0 focus: `skillId = "water-zon
 #### Parameter Bounds for `water-zone`:
 - `locationId`: Non-empty string matching the Companion's current map (cross-map execution rejected).
 - `tiles`: Array of 1 to 100 coordinates `{"x": int, "y": int}`.
-- `budgets.maxGameMinutes`: Integer in `[1, 1440]`.
+- `budgets.maxGameMinutes`: Non-negative integer. Zero or omission means no game-clock time limit (the default). A positive value is an explicitly requested budget; elapsed time is still measured in the result. Stalled execution, cancellation and actual resource exhaustion are handled independently.
 - `budgets.maxStamina`: Float in `[0.0, 500.0]`.
 - `budgets.maxWater`: Integer in `[0, 100]`.
 

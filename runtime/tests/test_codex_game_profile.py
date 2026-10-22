@@ -6,7 +6,6 @@ from unittest.mock import patch
 import pytest
 
 from stardew_ai_runtime.codex_game_profile import (
-    CODEX_GAME_TOOL_PROFILE_VERSION,
     game_tool_config,
     unrelated_mcp_config,
     write_game_instructions,
@@ -56,17 +55,10 @@ def test_inherited_game_http_transport_fails_before_mixing_stdio_configuration(t
             unrelated_mcp_config("codex.exe", tmp_path)
 
 
-def test_tool_profile_preserves_mcp_discovery_and_execution_authority():
+
+def test_tool_profile_keeps_harness_capabilities_and_existing_authority():
     args = game_tool_config()
-    assert "features.shell_tool=false" in args
-    assert "features.unified_exec=false" in args
     assert "features.code_mode_host=true" in args
-    assert "features.code_mode=false" not in args
-    assert "features.code_mode_host=false" not in args
-    assert CODEX_GAME_TOOL_PROFILE_VERSION == "stardew-game-tools-v5"
+    assert not any(arg.startswith("features.") and arg.endswith("=false") for arg in args)
     assert "mcp_optional_startup_grace_ms=0" in args
-    assert "features.skip_host_skill_discovery=true" in args
-    assert "features.apps=false" in args
-    assert "features.plugins=false" in args
     assert not any("approval_policy" in arg or "sandbox_mode" in arg for arg in args)
-    assert not any("tool_search=" in arg or "apply_patch_freeform=" in arg for arg in args)

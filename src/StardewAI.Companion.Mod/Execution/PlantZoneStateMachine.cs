@@ -19,7 +19,7 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600;
+    private const long MaxNoProgressTicks = 3600;
     private const int ActionDurationTicks = 6; // Brief pause per plant action
 
     private readonly IFarmerActor _actor;
@@ -48,6 +48,7 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
     private float _staminaUsed;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
     private bool _outOfSeeds;
 
@@ -106,6 +107,7 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
             _staminaUsed = 0f;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _actionTicks = 0;
             _actionEffectExecuted = false;
@@ -160,12 +162,12 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be at least 1.", "INVALID_PARAMETERS");
+                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be non-negative; 0 means no time limit.", "INVALID_PARAMETERS");
                 return false;
             }
 
@@ -250,15 +252,15 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
 
             _elapsedTicks++;
 
-            if (_elapsedTicks > MaxMonotonicTicks)
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
-                Log($"plant-seeds monotonic timeout exceeded ({MaxMonotonicTicks} ticks). Terminating.", LogLevel.Warn);
-                FinishExecution(ExecutionState.Failed, "Monotonic tick limit exceeded.", "TIMEOUT");
+                Log($"plant-seeds no-progress timeout exceeded ({MaxNoProgressTicks} ticks). Terminating.", LogLevel.Warn);
+                FinishExecution(ExecutionState.Failed, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
             int elapsedMinutes = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (_currentRequest is not null && elapsedMinutes > _currentRequest.MaxGameMinutes)
+            if (_currentRequest is not null && _currentRequest.MaxGameMinutes > 0 && elapsedMinutes > _currentRequest.MaxGameMinutes)
             {
                 Log($"plant-seeds budget exceeded: {elapsedMinutes} > {_currentRequest.MaxGameMinutes} minutes.", LogLevel.Warn);
                 FinishExecution(ExecutionState.PartiallySucceeded, "Game-clock minute budget exceeded.", "BUDGET_EXCEEDED");

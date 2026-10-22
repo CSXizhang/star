@@ -195,7 +195,7 @@ def test_create_execute_native_action_envelope_shape() -> None:
     assert env.message_type == "skill.execute"
     assert env.payload["skillId"] == "feed-animals"
     assert env.payload["parameters"] == {"locationId": "Coop", "buildingName": "Coop"}
-    assert env.payload["budgets"]["maxGameMinutes"] == 60
+    assert env.payload["budgets"]["maxGameMinutes"] == 0
 
 
 def test_scheduler_apply_fertilizer_dispatches_allowlisted_command(native_compatible_run_dir) -> None:

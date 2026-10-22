@@ -21,7 +21,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600; // 60 seconds at 60 fps safety timeout
+    private const long MaxNoProgressTicks = 3600; // 60 seconds without observed progress
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -49,6 +49,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
     private readonly List<FailedItemInfo> _failedItems = new();
     private readonly List<ChestMergeInfo> _merges = new();
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
 
     // Signals
@@ -114,6 +115,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
             _failedItems.Clear();
             _merges.Clear();
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _depositPlanIndex = 0;
             _withdrawPlanIndex = 0;
@@ -141,12 +143,12 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    "MaxGameMinutes budget must be at least 1.",
+                    "MaxGameMinutes must be non-negative; 0 means no time limit.",
                     "INVALID_PARAMETERS");
                 return false;
             }
@@ -311,7 +313,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
 
             // 4. Actual game clock delta measurement & budget check
             int gameMinutesElapsed = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (gameMinutesElapsed > _currentRequest.MaxGameMinutes)
+            if (_currentRequest.MaxGameMinutes > 0 && gameMinutesElapsed > _currentRequest.MaxGameMinutes)
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
@@ -322,15 +324,15 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
                 return;
             }
 
-            // 5. Monotonic timeout guard
-            if (_elapsedTicks > MaxMonotonicTicks)
+            // 5. No-progress timeout guard
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
                 var terminalState = _depositedItems.Count > 0 || _merges.Count > 0
                     ? ExecutionState.PartiallySucceeded
                     : ExecutionState.Failed;
-                FinishExecution(terminalState, "Execution exceeded monotonic tick timeout limit.", "TIMEOUT");
+                FinishExecution(terminalState, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 

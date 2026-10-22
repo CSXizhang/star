@@ -21,7 +21,7 @@ def choose(store, token="decision-1", plan=None):
 def test_decision_owns_one_sequence_and_can_combine_operation_kinds(tmp_path):
     store=WorkStore(tmp_path/"work.json")
     choose(store)
-    with pytest.raises(WorkStateError, match="NEW_MODEL"):
+    with pytest.raises(WorkStateError, match="QUEUED_JOB_SCOPE_MISMATCH"):
         store.submit_plan("save", goal_text="store", tasks=tasks("deposit_to_chest"), decision_token="decision-1")
     store.revoke_decision("save")
     store.begin_decision("save", "second")
@@ -58,7 +58,7 @@ def test_same_seed_batch_runs_then_returns_to_model_or_stops_on_partial(tmp_path
     asyncio.run(PlanWorker(store, Client()).evaluate())
     assert calls == expected_calls
     assert store.state("save").decision["finished"] is True
-    with pytest.raises(WorkStateError, match="NEW_MODEL"):
+    with pytest.raises(WorkStateError, match="JOB_IN_PROGRESS"):
         store.submit_plan("save", goal_text="more", tasks=tasks(), decision_token="decision-1")
 
 
@@ -191,8 +191,9 @@ def test_mcp_direct_and_capability_cannot_bypass_job_selection(tmp_path, monkeyp
     monkeypatch.setenv("STARDEW_DECISION_TOKEN","one")
     first=asyncio.run(tools["water_auto"](max_tiles=3))
     assert first["status"]=="job-selected" and first["effectStatus"]=="not_executed_yet"
-    with pytest.raises(ToolError,match="NEW_MODEL"):
-        asyncio.run(tools["call_capability"](tool="water_auto",params={"max_tiles":3}))
+    asyncio.run(tools["call_capability"](tool="water_auto",params={"max_tiles":3}))
+    assert len(store.state("save").tasks) == 1
+    assert len(store.state("save").tasks[0].steps) == 2
     with pytest.raises(ToolError,match="UNAUTHORIZED"):
         asyncio.run(tools["dispatch_plan_operation"](operation="water_auto",params={"max_tiles":3},command_id="forged"))
 
@@ -270,7 +271,7 @@ def test_fake_provider_two_decisions_receive_real_worker_feedback(tmp_path, monk
             steps=[{"operation":"navigate_to","params":{"location_id":"Farm","tile":{"x":i,"y":1}}} for i in range(3)]
             steps += [{"operation":"water_auto","params":{"max_tiles":3}}]
             asyncio.run(registered["submit_plan"](tasks=tasks(steps=steps),goal_text="care"))
-            with pytest.raises(ToolError,match="NEW_MODEL"):
+            with pytest.raises(ToolError,match="QUEUED_JOB_SCOPE_MISMATCH"):
                 asyncio.run(registered["submit_plan"](tasks=tasks(steps=[{"operation":"ship_items","params":{"items":[{"itemId":"(O)24","count":1}]}}]),goal_text="later"))
             return {"success":True,"response":"selected"}
     # This test intentionally has no game/DLL; isolate the backend from packaging checks.

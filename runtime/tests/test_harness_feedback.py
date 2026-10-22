@@ -37,7 +37,7 @@ def test_native_counts_and_skip_reasons_survive_detail_truncation(targets, compl
     assert f"已种下 {targets} 格" not in feedback["progressSummary"]
 
 
-def test_composite_worker_uses_same_actual_facts_for_prompt_reply_memory_and_care(tmp_path):
+def test_composite_worker_uses_same_actual_facts_without_duplicate_care(tmp_path):
     async def scenario():
         bridge = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)
         store = bridge._work_store
@@ -90,7 +90,7 @@ def test_composite_worker_uses_same_actual_facts_for_prompt_reply_memory_and_car
         fact = events[0]["text"]
         assert "已种下 2 格，已浇水 2 格" in fact and "跳过 17" in fact
         assert "完成了「种下19" not in fact
-        assert bridge._maybe_fire_care.await_args.kwargs["fact"] == fact
+        bridge._maybe_fire_care.assert_not_awaited()
         assert bridge._decision_context("farm")["lastResult"]["progressSummary"] == feedback["progressSummary"]
         await worker.evaluate()
         assert len(calls) == 2

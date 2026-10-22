@@ -2130,7 +2130,8 @@
                   "properties": {
                     "maxGameMinutes": {
                       "type": "integer",
-                      "minimum": 1
+                      "minimum": 0,
+                      "description": "Optional game-clock budget. Zero or omission means no time limit."
                     },
                     "maxStamina": {
                       "type": "number",

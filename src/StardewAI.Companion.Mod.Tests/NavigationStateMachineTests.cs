@@ -336,7 +336,7 @@ public class NavigationStateMachineTests
             TaskId: "task-1",
             LocationId: "Town",
             TargetTile: new TileCoordinate(10, 10),
-            MaxGameMinutes: 0
+            MaxGameMinutes: -1
         );
 
         bool started = machine.Start(req, out var earlyResult);

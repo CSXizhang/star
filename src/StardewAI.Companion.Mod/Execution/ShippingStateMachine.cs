@@ -21,7 +21,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600;
+    private const long MaxNoProgressTicks = 3600;
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -49,6 +49,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
     private readonly Dictionary<string, int> _remainingBackpackCounts = new(StringComparer.OrdinalIgnoreCase);
 
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
 
     private volatile bool _cancelRequested;
@@ -109,6 +110,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
             _estimatedTotalValue = 0;
             _shippingBinTotalCount = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _startClock = _observer.TimeOfDay;
             _cancelRequested = false;
@@ -142,12 +144,12 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    "MaxGameMinutes budget must be at least 1.", "INVALID_PARAMETERS");
+                    "MaxGameMinutes must be non-negative; 0 means no time limit.", "INVALID_PARAMETERS");
                 return false;
             }
 
@@ -266,7 +268,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
 
             // 4. Actual game clock delta measurement & budget check
             int gameMinutesElapsed = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (gameMinutesElapsed > _currentRequest.MaxGameMinutes)
+            if (_currentRequest.MaxGameMinutes > 0 && gameMinutesElapsed > _currentRequest.MaxGameMinutes)
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
@@ -277,15 +279,15 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
                 return;
             }
 
-            // 5. Monotonic timeout guard
-            if (_elapsedTicks > MaxMonotonicTicks)
+            // 5. No-progress timeout guard
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
                 var terminalState = _shippedItems.Count > 0
                     ? ExecutionState.PartiallySucceeded
                     : ExecutionState.Failed;
-                FinishExecution(terminalState, "Execution exceeded monotonic tick timeout limit.", "TIMEOUT");
+                FinishExecution(terminalState, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 

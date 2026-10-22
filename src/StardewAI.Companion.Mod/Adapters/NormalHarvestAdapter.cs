@@ -2,16 +2,17 @@
 using StardewModdingAPI;
 using StardewValley;
 using StardewValley.TerrainFeatures;
+using StardewValley.Tools;
 using StardewAI.Companion.Mod.Domain;
 using StardewAI.Companion.Mod.Observation;
 
 namespace StardewAI.Companion.Mod.Adapters;
 
 /// <summary>
-/// Production hand-harvest adapter executing crop.harvest through normal game mechanics.
+/// Production harvest adapter using crop.harvest or the crop's native scythe callback.
 /// Enforces:
 /// 1. Main-thread execution on the companion's loaded map.
-/// 2. Maturity via HoeDirt.readyForHarvest() only; scythe crops rejected.
+/// 2. Maturity via HoeDirt.readyForHarvest() only; scythe crops require an owned scythe.
 /// 3. Conservative inventory capacity precheck (one empty slot required).
 /// 4. Game1.player is temporarily swapped to the companion Farmer for the duration of
 ///    crop.harvest (the game's harvest adds produce to Game1.player's inventory) and is
@@ -92,10 +93,11 @@ public sealed class NormalHarvestAdapter : IHarvestAdapter
             return HarvestTileResult.PreconditionError(
                 $"Tile {targetTile} does not contain a mature crop.", skipReason: "not-ready");
         }
-        if (dirtState.RequiresScythe)
+        var scythe = actor.GameFarmer?.Items.OfType<MeleeWeapon>().FirstOrDefault(tool => tool.isScythe());
+        if (dirtState.RequiresScythe && scythe is null)
         {
             return HarvestTileResult.PreconditionError(
-                $"Crop on tile {targetTile} requires a scythe to harvest.", skipReason: "scythe-required");
+                $"Crop on tile {targetTile} requires an owned scythe.", skipReason: "missing-tool:Scythe");
         }
 
         // Companion isolation retains its conservative capacity check. The native player
@@ -128,10 +130,11 @@ public sealed class NormalHarvestAdapter : IHarvestAdapter
         }
 
         var crop = hoeDirt.crop;
-        if (crop.GetHarvestMethod() == StardewValley.GameData.Crops.HarvestMethod.Scythe)
+        bool requiresScythe = crop.GetHarvestMethod() == StardewValley.GameData.Crops.HarvestMethod.Scythe;
+        if (requiresScythe && scythe is null)
         {
             return HarvestTileResult.PreconditionError(
-                $"Crop on tile {targetTile} requires a scythe to harvest.", skipReason: "scythe-required");
+                $"Crop on tile {targetTile} requires an owned scythe.", skipReason: "missing-tool:Scythe");
         }
 
         string? cropId = crop.indexOfHarvest?.Value;
@@ -175,10 +178,16 @@ public sealed class NormalHarvestAdapter : IHarvestAdapter
                 SetGamePlayer(companion);
                 try
                 {
-                    removeCrop = crop.harvest(targetTile.X, targetTile.Y, hoeDirt);
-                    if (removeCrop && !crop.RegrowsAfterHarvest())
+                    if (requiresScythe)
                     {
-                        hoeDirt.destroyCrop(showAnimation: false);
+                        HarvestWithScythe(companion, location, hoeDirt, scythe!, tileVector);
+                        removeCrop = hoeDirt.crop is null;
+                    }
+                    else
+                    {
+                        removeCrop = crop.harvest(targetTile.X, targetTile.Y, hoeDirt);
+                        if (removeCrop && !crop.RegrowsAfterHarvest())
+                            hoeDirt.destroyCrop(showAnimation: false);
                     }
                 }
                 finally
@@ -218,14 +227,9 @@ public sealed class NormalHarvestAdapter : IHarvestAdapter
 
             if (itemId is null && !playerBound)
             {
-                // The crop is gone (harvest returned true) but no measurable delta was found;
-                // report the crop's own harvest item id with a nominal single unit.
                 _monitor.Log(
-                    $"Harvest on tile {targetTile}: no positive inventory delta measured; reporting crop item '{cropId}' with stack 1.",
+                    $"Harvest on tile {targetTile}: crop changed but no inventory gain measured; reporting zero items. Inspect remaining native drops.",
                     LogLevel.Warn);
-                itemId = cropId;
-                gainedStack = 1;
-                gainedQuality = 0;
             }
 
             // A successful native crop action without an inventory delta does not prove
@@ -254,6 +258,45 @@ public sealed class NormalHarvestAdapter : IHarvestAdapter
                         $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion harvest! Before: {playerBefore}, After: {playerAfter}");
                 }
             }
+        }
+    }
+
+    private static void HarvestWithScythe(Farmer farmer, GameLocation location, HoeDirt dirt,
+        MeleeWeapon scythe, Microsoft.Xna.Framework.Vector2 tile)
+    {
+        // Crop.harvest creates native drops on Game1.currentLocation. The player may
+        // be indoors: scope the backing field for this synchronous call only, without
+        // firing player location-change events. Game1.player is already actor-scoped.
+        var flags = BindingFlags.Public | BindingFlags.NonPublic;
+        var game = typeof(Game1).GetField("game1", flags | BindingFlags.Static)?.GetValue(null);
+        var locationField = typeof(Game1).GetField("instanceGameLocation", flags | BindingFlags.Instance);
+        if (game is null || locationField is null)
+            throw new InvalidOperationException("Cannot scope native crop harvest location.");
+        var previousLocation = locationField.GetValue(game);
+        var previousDebris = location.debris.ToHashSet();
+        try
+        {
+            locationField.SetValue(game, location);
+            // DoFunction binds the real tool's last user. The native HoeDirt callback
+            // harvests just this authorized tile, including native wheat/hay yields.
+            // Do not invoke a wide weapon arc which could cut neighboring crops.
+            scythe.DoFunction(location, (int)tile.X * 64 + 32, (int)tile.Y * 64 + 32, 0, farmer);
+            if (!ReferenceEquals(scythe.getLastFarmerToUse(), farmer))
+                throw new InvalidOperationException("Scythe user did not bind to companion.");
+            dirt.performToolAction(scythe, 0, tile);
+            // Collect only drops generated by this exact native action, through the
+            // game's inventory rules. Rejected drops remain on the ground.
+            foreach (var debris in location.debris.Where(d => !previousDebris.Contains(d)
+                         && NativeAnimalHarvestInventoryScope.IsOrdinaryDebris(d)).ToList())
+            {
+                for (int i = debris.Chunks.Count - 1; i >= 0; i--)
+                    if (debris.collect(farmer, debris.Chunks[i])) debris.Chunks.RemoveAt(i);
+                if (debris.Chunks.Count == 0) location.debris.Remove(debris);
+            }
+        }
+        finally
+        {
+            locationField.SetValue(game, previousLocation);
         }
     }
 

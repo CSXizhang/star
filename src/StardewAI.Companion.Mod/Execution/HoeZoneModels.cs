@@ -10,7 +10,7 @@ public sealed record HoeZoneRequest(
     IReadOnlyList<TileCoordinate> TargetTiles,
     float MaxStamina = 100f,
     int MaxWater = 0,
-    int MaxGameMinutes = 60,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
     long ExpectedWorldRevision = 1

@@ -363,6 +363,7 @@ public sealed class CompanionDialogueController
             new Response("history", "历史记录"),
             new Response("memory", "偏好和约定"),
             new Response("settings", "设置和用量"),
+            new Response("close", "结束对话"),
         }, key =>
         {
             switch (key)
@@ -372,6 +373,7 @@ public sealed class CompanionDialogueController
                 case "history": (_records ?? _progress)(); OwnF8Child(); break;
                 case "memory": _memory(); OwnF8Child(); break;
                 case "settings": (_hubSettings ?? _settings)(); OwnF8Child(); break;
+                case "close": _f8Active = false; break;
             }
         }, caption);
     }
@@ -735,7 +737,13 @@ public sealed class CompanionDialogueController
     private void ShowSpeech(string text, bool responses, Action? onDisplayed = null)
     {
         UseReadableDialogueFont();
-        _pages = _ownedMenu = new CompanionNpcDialogueBox(MakeDialogue(text), onDisplayed);
+        _pages = _ownedMenu = new CompanionNpcDialogueBox(MakeDialogue(text), onDisplayed,
+            onReply: () =>
+            {
+                if (!HandleEscape()) return;
+                _f8Active = true;
+                _next = _replyInput ?? _conversation ?? (() => ShowInput("chat"));
+            }, onClose: () => HandleEscape());
         _returnAfterPages = responses;
         Game1.activeClickableMenu = _pages;
     }

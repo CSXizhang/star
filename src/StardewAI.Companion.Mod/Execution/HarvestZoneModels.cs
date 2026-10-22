@@ -10,7 +10,7 @@ public sealed record HarvestZoneRequest(
     IReadOnlyList<TileCoordinate> TargetTiles,
     float MaxStamina,
     int MaxWater,
-    int MaxGameMinutes,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
     long ExpectedWorldRevision = 1

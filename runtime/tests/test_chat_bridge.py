@@ -304,16 +304,14 @@ def test_format_agent_prompt() -> None:
     bridge = ChatBridge()
     prompt = bridge._format_agent_prompt("收割所有成熟作物")
     assert "收割所有成熟作物" in prompt
-    assert "stardew-companion" in prompt
-    assert "MCP" in prompt
     assert decision_policy() in prompt
-    assert "主动汇报阶段成果、实质取舍和阻塞，每次不超过三句" in prompt
+    assert prompt.endswith("玩家指令：收割所有成熟作物")
 
 
 def test_format_delivery_prompt_contains_chinese_reply_instruction() -> None:
     bridge = ChatBridge()
     prompt = bridge._format_delivery_prompt([], "save", midflight=[], read_only=False)
-    assert "始终用中文回复玩家" in prompt
+    assert decision_policy() in prompt
 
 
 def test_execute_agy_turn_success_parsing() -> None:
@@ -1229,7 +1227,7 @@ def test_chat_prompt_injects_compact_live_context() -> None:
     assert '"spendableMoney":900' in prompt
     assert '"freeSlots":4' in prompt
     assert "tilledUnwateredTiles" not in prompt, "no farm bulk dump in the prompt"
-    assert "submit_plan" in prompt and "remember_intent" in prompt
+    assert decision_policy() in prompt
     assert "收割所有成熟作物" not in prompt
 
 
@@ -1486,7 +1484,7 @@ def test_injected_context_and_f8_expose_persisted_wait_condition(tmp_path: Path)
     assert payload["hasExecutableWork"] is False
 
 
-def test_codex_explicit_request_context_uses_engineering_budget(tmp_path: Path) -> None:
+def test_codex_explicit_context_is_diagnostic_without_session_budget_gate(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path, backend="codex")
     bridge._session_token_budget = 100000
     bridge._session_request_checkpoint = 1
@@ -1515,15 +1513,13 @@ def test_codex_explicit_request_context_uses_engineering_budget(tmp_path: Path) 
         "usage_latest_request_input_context": 100000,
     })
     reason = bridge._note_session_context("save-1", usage)
-    assert reason == "SESSION_CONTEXT_BUDGET"
+    assert reason is None
     assert bridge._session_context_state["save-1"]["latestInputContext"] == 100000
-    bridge._rotate_provider_session("save-1", reason=reason)
-    assert bridge.get_conversation_id("save-1") is None
-    assert bridge._session_history["codex:save-1"] == ["codex-1"]
+    assert bridge.get_conversation_id("save-1") == "codex-1"
     assert bridge._codex_turn_usage({"usage": None}) is None
 
 
-def test_session_context_budget_rotates_on_latest_request_not_sum(tmp_path: Path) -> None:
+def test_context_diagnostic_records_latest_request_without_rotation(tmp_path: Path) -> None:
     bridge = ChatBridge(run_dir=tmp_path, backend="kimi")
     bridge._session_token_budget = 100
     bridge.record_conversation_id("save-1", "conv-1")
@@ -1549,12 +1545,9 @@ def test_session_context_budget_rotates_on_latest_request_not_sum(tmp_path: Path
         "save-1",
         {"latestRequestInputContext": 120, "input_context_measured": True, "generations_count": 1},
     )
-    assert reason == "SESSION_CONTEXT_BUDGET"
-    bridge._rotate_provider_session("save-1", reason=reason)
-    assert bridge.get_conversation_id("save-1") is None
-    assert bridge._session_history["kimi:save-1"] == ["conv-1"]
-    # A new session starts the context bookkeeping from zero.
-    assert bridge._session_context_state["save-1"]["latestInputContext"] is None
+    assert reason is None
+    assert bridge.get_conversation_id("save-1") == "conv-1"
+    assert bridge._session_context_state["save-1"]["latestInputContext"] == 120
 
 
 def test_session_request_checkpoint_is_bounded_fallback_when_unmeasured(tmp_path: Path) -> None:
@@ -1566,7 +1559,7 @@ def test_session_request_checkpoint_is_bounded_fallback_when_unmeasured(tmp_path
         assert bridge._note_session_context("save-2", None) is None
     # Unknown measurement never invents a context length: it uses the bounded,
     # clearly-labelled request-count checkpoint instead.
-    assert bridge._note_session_context("save-2", None) == "SESSION_REQUEST_CHECKPOINT"
+    assert bridge._note_session_context("save-2", None) is None
     assert bridge._session_context_state["save-2"]["latestInputContext"] is None
 
 

@@ -241,8 +241,7 @@ def test_autonomous_submit_injects_current_core_once_for_each_backend(tmp_path, 
                 assert task.instructions_text == bundle.text
                 assert prompt.count(bundle.text) == 1
                 assert "remainingBudget" not in prompt
-                assert prompt.count("主动汇报阶段成果、实质取舍和阻塞，每次不超过三句") == 1
-                assert "接续、等待与完成" in prompt
+                assert "未派工作业，重新决定" not in prompt
                 assert os.environ.get("STARDEW_DECISION_TOKEN") == task.decision_token
                 assert bridge._work_store.state(SAVE).decision["token"] == task.decision_token
                 return {"success": True, "response": "等待加工完成，之后继续。"}

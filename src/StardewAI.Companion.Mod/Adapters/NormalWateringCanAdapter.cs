@@ -137,7 +137,8 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
             int companionWaterBefore = actor.WaterLeft;
 
             // Call normal game tool execution using the companion's independent Farmer
-            can.DoFunction(location, pixelX, pixelY, power: 1, who: actor.GameFarmer);
+            NativeToolLocationContext.Run(location,
+                () => can.DoFunction(location, pixelX, pixelY, power: 1, who: actor.GameFarmer));
 
             // Capture before/after actual costs directly from game execution:
             float measuredStaminaCost = Math.Max(0f, companionStaminaBefore - actor.Stamina);

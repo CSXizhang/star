@@ -1,4 +1,4 @@
-﻿using StardewAI.Companion.Mod.Domain;
+using StardewAI.Companion.Mod.Domain;
 using StardewAI.Companion.Mod.Transport;
 
 namespace StardewAI.Companion.Mod.Execution;
@@ -66,7 +66,7 @@ public sealed record NativeActionRequest(
     int ItemCount = 1,
     float MaxStamina = 100f,
     int MaxWater = 0,
-    int MaxGameMinutes = 60,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
     long ExpectedWorldRevision = 1,

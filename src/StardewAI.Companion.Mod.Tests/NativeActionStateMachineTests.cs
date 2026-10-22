@@ -9,6 +9,26 @@ namespace StardewAI.Companion.Mod.Tests;
 public class NativeActionStateMachineTests
 {
     [Fact]
+    public void AlreadyFullCanSatisfiesRefillWithoutVisitingOtherSourcesOrInventingAnEffect()
+    {
+        var (machine, actor, observer, adapter) = CreateHarness();
+        adapter.SimulatePrecondition = true;
+        adapter.PreconditionSkipReason = "already-full";
+        var blocked = new TileCoordinate(30, 30);
+        foreach (var tile in new[] { blocked, new TileCoordinate(29, 30), new TileCoordinate(31, 30),
+            new TileCoordinate(30, 29), new TileCoordinate(30, 31) }) observer.SetPassable(tile, false);
+        Assert.True(machine.Start(Request(NativeActionKind.RefillWateringCan,
+            new TileCoordinate(10, 11), blocked), out _));
+        machine.StepTicks(400);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Null(machine.FinalResult.ErrorCode);
+        Assert.Empty(machine.FinalResult.Effects);
+        Assert.Equal("already-full", Assert.Single(machine.FinalResult.Skipped).Reason);
+        Assert.Equal(1, adapter.CallCount);
+        Assert.Equal(40, actor.WaterLeft);
+    }
+
+    [Fact]
     public void PausedCancelSettlesAndPreservesConfirmedEffectsWithoutAnotherAction()
     {
         var (machine, _, _, adapter) = CreateHarness();
@@ -775,11 +795,12 @@ public class NativeActionStateMachineTests
         Assert.Equal(1, adapter.CallCount);
 
         var maxTicksField = typeof(NativeActionStateMachine).GetField(
-            "MaxMonotonicTicks", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+            "MaxNoProgressTicks", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
         long maxTicks = (long)maxTicksField.GetValue(null)!;
         var elapsedField = typeof(NativeActionStateMachine).GetField(
             "_elapsedTicks", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        elapsedField.SetValue(machine, maxTicks);
+        machine.Update(null, 7); // observe the resource change before simulating a stall
+        elapsedField.SetValue(machine, maxTicks + 7);
         machine.Update(null, 7); // timeout fires while the result is still pending
 
         var result = machine.FinalResult!;

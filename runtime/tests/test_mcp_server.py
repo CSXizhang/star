@@ -826,19 +826,19 @@ def test_mcp_server_call_water_zone(mock_scheduler, tmp_path):
             )
         assert data["status"] == "job-selected"
         assert data["effectStatus"] == "not_executed_yet"
-        assert data["nextBusiness"] == "new_model_decision_required"
+        assert data["canAppendBeforeDispatch"] is True
         mock_scheduler.execute_water_zone.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "water_zone"
         assert step.params == {"center_x": 64, "center_y": 15, "radius": 0,
                                "include_empty_tiles": False, "detail": False}
 
-        # A second job in the same decision is rejected.
+        # Another same-turn operation extends the pending serial queue.
         with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-1"}):
-            with pytest.raises(ToolError, match="当前决策周期已选择过任务"):
-                await server.call_tool(
-                    "water_zone", {"center_x": 64, "center_y": 15, "radius": 0}
-                )
+            _, appended = await server.call_tool(
+                "water_zone", {"center_x": 65, "center_y": 15, "radius": 0})
+        assert appended["taskId"] == data["taskId"]
+        assert len(store.state("mock-save-123").tasks[0].steps) == 2
         mock_scheduler.execute_water_zone.assert_not_awaited()
 
     asyncio.run(run())
@@ -1155,7 +1155,7 @@ def test_mcp_server_call_ship_items(mock_scheduler, tmp_path):
         mock_scheduler.execute_ship_items.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "ship_items"
-        assert step.params == {"items": [{"itemId": "(O)24", "count": 2}], "detail": False, "max_game_minutes": 180}
+        assert step.params == {"items": [{"itemId": "(O)24", "count": 2}], "detail": False, "max_game_minutes": 0}
 
     asyncio.run(run())
 
@@ -1341,7 +1341,7 @@ def test_mcp_server_error_handling(mock_scheduler, tmp_path):
 
         # Guarded native tools surface guard rejections (no live decision) as ToolError.
         server = create_mcp_server(scheduler=mock_scheduler)
-        with pytest.raises(ToolError, match="决策令牌缺失或不匹配"):
+        with pytest.raises(ToolError, match="STALE_DECISION"):
             await server.call_tool(
                 "water_zone", {"center_x": -1, "center_y": 15, "radius": 0}
             )
@@ -1551,7 +1551,7 @@ def test_mcp_server_stdio_integration_with_mock_transport(tmp_path: Path):
                     auto_data = json.loads(auto_res.content[0].text)
                     assert auto_data["status"] == "job-selected"
                     assert auto_data["effectStatus"] == "not_executed_yet"
-                    assert auto_data["nextBusiness"] == "new_model_decision_required"
+                    assert auto_data["canAppendBeforeDispatch"] is True
 
                     # 5. Call pause_task when idle -> must return isError: True
                     pause_res = await session.call_tool("pause_task", {})
@@ -1751,7 +1751,7 @@ def test_mcp_server_executing_status_propagation(mock_scheduler, tmp_path):
                 _, data = await server.call_tool(tool_name, args)
             assert data["status"] == "job-selected", f"{tool_name} should only select"
             assert data["effectStatus"] == "not_executed_yet"
-            assert data["nextBusiness"] == "new_model_decision_required"
+            assert data["canAppendBeforeDispatch"] is True
         mock_scheduler.execute_water_zone.assert_not_awaited()
         mock_scheduler.harvest_auto.assert_not_awaited()
         mock_scheduler.deposit_to_chest.assert_not_awaited()
@@ -2041,27 +2041,7 @@ def test_submit_plan_and_remember_intent_are_the_model_entry_points(mock_schedul
             )
         assert plan["tasks"][0]["id"] == "t1"
 
-        # One short job per decision: revising in the same decision is rejected.
-        with patch.dict(os.environ, env):
-            with pytest.raises(ToolError, match="当前决策周期已选择过任务"):
-                await server.call_tool(
-                    "submit_plan",
-                    {
-                        "goal_id": goal["goal"]["id"],
-                        "replace": True,
-                        "tasks": [
-                            {
-                                "id": "t2",
-                                "title": "收获",
-                                "steps": [{"id": "s2", "operation": "harvest_auto", "params": {}}],
-                            }
-                        ],
-                    },
-                )
-
-        # A fresh decision may revise: the still-pending task is superseded.
-        store.revoke_decision("mock-save-123")
-        store.begin_decision("mock-save-123", "decision-sp")
+        # Pending work can be revised before native dispatch.
         with patch.dict(os.environ, env):
             _, revised = await server.call_tool(
                 "submit_plan",

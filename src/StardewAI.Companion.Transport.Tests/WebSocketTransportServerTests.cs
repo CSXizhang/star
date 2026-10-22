@@ -374,7 +374,8 @@ public class WebSocketTransportServerTests
         string taskId,
         string idempotencyKey,
         List<TileCoord>? tiles = null,
-        DateTimeOffset? expiresAt = null)
+        DateTimeOffset? expiresAt = null,
+        int maxGameMinutes = 60)
     {
         return JsonSerializer.Serialize(new
         {
@@ -403,7 +404,7 @@ public class WebSocketTransportServerTests
                 },
                 budgets = new
                 {
-                    maxGameMinutes = 60,
+                    maxGameMinutes = maxGameMinutes,
                     maxStamina = 50.0f,
                     maxWater = 20
                 },
@@ -510,6 +511,29 @@ public class WebSocketTransportServerTests
         Assert.Equal("skill.result", reject2.MessageType);
         Assert.Equal("rejected", reject2.Payload["terminalState"]?.ToString());
         Assert.Equal("BOUNDS_VIOLATION", reject2.Payload["error"]?["code"]?.ToString());
+    }
+
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(-1, false)]
+    public async Task UnlimitedGameTimeIsAcceptedButNegativeBudgetIsRejected(int minutes, bool accepted)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server,
+            CreateExecuteJson("budget-command", "budget-task", "budget-key", maxGameMinutes: minutes));
+        Assert.Equal(accepted ? 1 : 0, handler.AcceptCount);
+        if (!accepted)
+        {
+            var result = await ReceiveEnvelopeAsync(client);
+            Assert.Equal("rejected", result.Payload["terminalState"]?.ToString());
+        }
     }
 
     [Fact]

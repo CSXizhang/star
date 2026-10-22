@@ -1303,9 +1303,9 @@ public sealed class WebSocketTransportServer : ITransportServer
             return false;
         }
 
-        if (payload.Budgets.MaxGameMinutes is < 1 or > 1440)
+        if (payload.Budgets.MaxGameMinutes < 0)
         {
-            error = "MaxGameMinutes must be between 1 and 1440.";
+            error = "MaxGameMinutes must be non-negative; 0 means no time limit.";
             return false;
         }
 

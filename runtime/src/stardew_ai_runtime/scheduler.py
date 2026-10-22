@@ -2343,7 +2343,7 @@ class CompanionScheduler:
         self,
         items: list[dict[str, Any]],
         location_id: str = "Farm",
-        max_game_minutes: int = 180,
+        max_game_minutes: int = 0,
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
@@ -2354,8 +2354,8 @@ class CompanionScheduler:
         - items must be a list of 1..36 items with valid itemId and count >= 1.
         - single active task concurrency check.
         """
-        if type(max_game_minutes) is not int or not 1 <= max_game_minutes <= 480:
-            raise PolicyViolationError("max_game_minutes must be an integer from 1 to 480")
+        if type(max_game_minutes) is not int or max_game_minutes < 0:
+            raise PolicyViolationError("max_game_minutes must be a non-negative integer; 0 means no time limit")
         validated_items = self._validate_ship_items(items)
 
         async def dispatch(
@@ -3938,12 +3938,12 @@ class CompanionScheduler:
                 )
         if terminal_state == "succeeded" and scope_incomplete:
             outcome_name, goal_satisfied, reason_code = "partial", False, "OBSERVATION_TRUNCATED"
-        elif terminal_state == "succeeded" and remaining <= 0:
-            outcome_name, goal_satisfied, reason_code = "completed", True, "OK"
+        elif terminal_state == "succeeded":
+            # max_tiles bounds this step, not the entire farm objective. A
+            # completed batch must allow the following refill/watering step.
+            outcome_name, goal_satisfied, reason_code = "completed", remaining <= 0, "OK"
         elif terminal_state in {"running", "unknown", None}:
             outcome_name, goal_satisfied, reason_code = "unknown", False, "IN_PROGRESS"
-        elif terminal_state == "succeeded":
-            outcome_name, goal_satisfied, reason_code = "partial", False, "REMAINING_WORK"
         else:
             outcome_name = "partial" if (completed or 0) > 0 or terminal_state in {"failed", "rejected"} else "unknown"
             goal_satisfied, reason_code = False, "WATER_INCOMPLETE"

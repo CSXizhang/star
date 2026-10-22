@@ -28,7 +28,7 @@ public sealed record ChestActionRequest(
     IReadOnlyList<WithdrawItemSpec>? WithdrawItems = null,
     float MaxStamina = 270f,
     int MaxWater = 40,
-    int MaxGameMinutes = 60,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
     long ExpectedWorldRevision = 1,

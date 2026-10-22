@@ -41,22 +41,18 @@ def test_core_injection_is_shared_and_once(monkeypatch):
     assert "优先已有种子和不花钱" not in life
 
 
+
 @pytest.mark.parametrize("mode", ["chat", "plan"])
-def test_decision_policy_stays_in_core_and_continuation_only_repeats_flag(tmp_path, mode):
+def test_core_is_shared_and_only_repeated_for_a_new_session(tmp_path, mode):
+    from stardew_ai_runtime.prompt_delivery import PromptDelivery
     core = runtime_instructions()
     service = LifeChatService("fake", {}, tmp_path / "sessions.json", {}, tmp_path / "fingerprints.json")
-    options = dict(mode=mode, milestones=[], live_context={})
-    first = service.build_turn_prompt("farm", None, None, None, None, **options)
-    service.mark_prompt_delivered("farm", "cid", mode)
-    continuation = service.build_turn_prompt("farm", "cid", None, None, None, **options)
-    assert first.count(core) == 1
-    # The policy has one source even when life-specific instructions are appended.
-    for policy in ("任务物品的指定用途", "已承诺支出", "承担不可恢复的损失",
-                   "原生作息控制器会安全收尾", "未经成功回包不宣称"):
-        assert first.count(policy) == 1
-        assert policy not in continuation
-    assert first.count("playerConfirmedDecision") == 1
-    assert continuation.count("playerConfirmedDecision") == 1
-    assert "false时只继续商量，为true时才提交该事项的决定" in continuation
-    assert "真实执行前不宣称" not in first + continuation
-    assert "已明确的选择直接记录并安排" not in first + continuation
+    prompt = service.build_turn_prompt("farm", None, None, None, None,
+        mode=mode, milestones=[], live_context={})
+    delivery = PromptDelivery(tmp_path / "delivery.json")
+    sent, pending = delivery.prepare("fake:farm", None, prompt, core)
+    assert sent.count(core) == 1
+    delivery.acknowledge("fake:farm", pending, "cid")
+    sent, _ = delivery.prepare("fake:farm", "cid", prompt, core)
+    assert core not in sent and "实时上下文：" in sent
+    assert delivery.prepare("fake:farm", "new", prompt, core)[0].count(core) == 1

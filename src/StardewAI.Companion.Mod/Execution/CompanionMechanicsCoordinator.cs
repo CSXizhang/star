@@ -1093,7 +1093,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                     TaskId: payload.TaskId,
                     LocationId: payload.Parameters.LocationId,
                     TargetTile: new TileCoordinate(targetTile.X, targetTile.Y),
-                    MaxGameMinutes: payload.Budgets?.MaxGameMinutes > 0 ? payload.Budgets.MaxGameMinutes : 120,
+                    MaxGameMinutes: payload.Budgets?.MaxGameMinutes ?? 0,
                     MaxStamina: payload.Budgets?.MaxStamina > 0 ? payload.Budgets.MaxStamina : 50f,
                     MaxWater: payload.Budgets?.MaxWater ?? 0,
                     CancelPolicy: payload.CancelPolicy ?? "safe-point"
@@ -1118,7 +1118,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                     BudgetLimit: budgetLimit,
                     MaxStamina: payload.Budgets?.MaxStamina > 0 ? payload.Budgets.MaxStamina : 50f,
                     MaxWater: payload.Budgets?.MaxWater ?? 0,
-                    MaxGameMinutes: payload.Budgets?.MaxGameMinutes > 0 ? payload.Budgets.MaxGameMinutes : 60,
+                    MaxGameMinutes: payload.Budgets?.MaxGameMinutes ?? 0,
                     CancelPolicy: payload.CancelPolicy ?? "safe-point",
                     IdempotencyKey: envelope.IdempotencyKey,
                     ExpectedWorldRevision: payload.ExpectedWorldRevision
@@ -1173,7 +1173,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                     ItemCount: payload.Parameters.ItemCount ?? 1,
                     MaxStamina: payload.Budgets?.MaxStamina > 0 ? payload.Budgets.MaxStamina : 50f,
                     MaxWater: payload.Budgets?.MaxWater ?? 0,
-                    MaxGameMinutes: payload.Budgets?.MaxGameMinutes > 0 ? payload.Budgets.MaxGameMinutes : 60,
+                    MaxGameMinutes: payload.Budgets?.MaxGameMinutes ?? 0,
                     CancelPolicy: payload.CancelPolicy ?? "safe-point",
                     IdempotencyKey: envelope.IdempotencyKey,
                     ExpectedWorldRevision: payload.ExpectedWorldRevision,

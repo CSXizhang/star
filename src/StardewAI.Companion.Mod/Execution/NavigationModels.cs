@@ -9,7 +9,7 @@ public sealed record NavigationRequest(
     string TaskId,
     string LocationId,
     TileCoordinate TargetTile,
-    int MaxGameMinutes = 120,
+    int MaxGameMinutes = 0,
     float MaxStamina = 50f,
     int MaxWater = 0,
     string CancelPolicy = "safe-point"

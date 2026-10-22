@@ -151,26 +151,8 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             }
             else
             {
-                // Vanilla WateringCan.DoFunction checks Game1.currentLocation for the
-                // refill tile, even though it receives `loc` explicitly. The human
-                // player may be indoors while the companion refills on the farm.
-                // Set the backing field only for this synchronous native call: the
-                // public setter emits location-change events for the human player.
-                var game1Field = typeof(Game1).GetField("game1", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-                var currentLocationField = typeof(Game1).GetField("instanceGameLocation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-                var game = game1Field?.GetValue(null);
-                if (game is null || currentLocationField is null)
-                    return NativeActionStepResult.Failed("Cannot access native watering-can location context.");
-                var previousLocation = currentLocationField.GetValue(game);
-                try
-                {
-                    currentLocationField.SetValue(game, loc);
-                    can.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer);
-                }
-                finally
-                {
-                    currentLocationField.SetValue(game, previousLocation);
-                }
+                NativeToolLocationContext.Run(loc,
+                    () => can.DoFunction(loc, pixelX, pixelY, power: 1, who: actor.GameFarmer));
             }
 
             int after = actor.WaterLeft;

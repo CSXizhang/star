@@ -22,7 +22,7 @@ public sealed record PlayerSleepRequest(
     string TaskId,
     string? IdempotencyKey = null,
     long ExpectedWorldRevision = 1,
-    int MaxGameMinutes = 240,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point"
 );
 

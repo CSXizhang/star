@@ -120,9 +120,9 @@ def test_codex_backend_uses_run_local_mcp_and_qualified_session(tmp_path: Path) 
     assert "model_providers.custom.supports_websockets=false" in cmd
     assert "-m" in cmd and cmd[cmd.index("-m") + 1] == "gpt-local"
     assert "mcp_servers.unrelated.enabled=false" in cmd
-    assert "features.shell_tool=false" in cmd
-    assert "features.plugins=false" in cmd
-    assert "features.apps=false" in cmd
+    assert "features.shell_tool=false" not in cmd
+    assert "features.plugins=false" not in cmd
+    assert "features.apps=false" not in cmd
     instructions_file = tmp_path / "config" / "agent-system-instructions.md"
     assert instructions_file.read_text(encoding="utf-8") == runtime_instructions()
     assert f"model_instructions_file={json.dumps(str(instructions_file))}" in cmd
@@ -143,8 +143,8 @@ def test_codex_resume_uses_exact_thread_id(tmp_path: Path) -> None:
     assert "approval_policy=never" in popen.call_args.args[0]
     assert 'model_reasoning_effort="high"' in popen.call_args.args[0]
     assert "mcp_servers.unrelated.enabled=false" in popen.call_args.args[0]
-    assert "features.shell_tool=false" in popen.call_args.args[0]
-    assert "features.plugins=false" in popen.call_args.args[0]
+    assert "features.shell_tool=false" not in popen.call_args.args[0]
+    assert "features.plugins=false" not in popen.call_args.args[0]
     assert any(arg.startswith("model_instructions_file=") for arg in popen.call_args.args[0])
     assert result["conversation_id"] == "thread-for-this-save"
     assert result["success"]
@@ -286,25 +286,22 @@ def _binding_exec(session):
         "cacheReadTokens": 0, "totalTokens": 110}}}
 
 
-def test_mcode_repairs_unregistered_game_alias_once_with_fresh_context_and_full_usage(tmp_path):
-    first = _mcode_proc([_binding_event("manage_milestones"), _binding_exec("bad")])
-    second = _mcode_proc([_binding_event("mcp__stardew-companion__manage_milestones", 2, "saved"),
-                          _binding_exec("good")])
-    with patch.object(McodeBackend, "_executable", return_value="mcode.exe"), \
-            patch("subprocess.Popen", side_effect=[first, second]) as popen:
-        result = McodeBackend(tmp_path).run(_task(), "old", "player's authorized instruction")
-    assert result["success"] and result["conversation_id"] == "good"
-    assert result["binding_recovery"]["previousSession"] == "bad"
-    assert "--session" in popen.call_args_list[0].args[0]
-    assert "--session" not in popen.call_args_list[1].args[0]
-    assert result["usage"]["total_tokens"] == 220
+
+def test_mcode_tool_error_keeps_same_harness_run_and_exact_usage(tmp_path):
+    proc = _mcode_proc([_binding_event("manage_milestones"), _binding_exec("old")])
+    result, popen = _run_mcode(McodeBackend(tmp_path), proc, "old", "player's authorized instruction")
+    assert result["success"] and result["conversation_id"] == "old"
+    assert popen.call_count == 1 and "binding_recovery" not in result
+    cmd = popen.call_args.args[0]
+    assert cmd[cmd.index("--session") + 1] == "old"
+    assert result["usage"]["total_tokens"] == 110
 
 
 def test_mcode_does_not_replay_after_successful_game_write(tmp_path):
     proc = _mcode_proc([_binding_event("mcp__stardew-companion__manage_milestones", 2, "saved"),
                         _binding_event("submit_plan"), _binding_exec("already-saved")])
     result, popen = _run_mcode(McodeBackend(tmp_path), proc)
-    assert not result["success"] and result["error"] == "MCODE_TOOL_BINDING_FAILED"
+    assert result["success"] and result["response"] == "honest reply"
     assert popen.call_count == 1
 
 
@@ -316,14 +313,14 @@ def test_mcode_corrected_alias_within_same_invocation_needs_no_replay(tmp_path):
     assert result["success"] and popen.call_count == 1
 
 
-def test_mcode_binding_failure_stops_after_one_recovery(tmp_path):
+def test_mcode_binding_failure_does_not_start_a_recovery_session(tmp_path):
     calls = [_mcode_proc([_binding_event("manage_milestones"), _binding_exec(f"bad-{i}")])
              for i in range(2)]
     with patch.object(McodeBackend, "_executable", return_value="mcode.exe"), \
             patch("subprocess.Popen", side_effect=calls) as popen:
         result = McodeBackend(tmp_path).run(_task(), None, "authorized instruction")
-    assert not result["success"] and result["error"] == "MCODE_TOOL_BINDING_FAILED"
-    assert popen.call_count == 2
+    assert result["success"] and result["response"] == "honest reply"
+    assert popen.call_count == 1
 
 
 @pytest.mark.parametrize("fails_again", [False, True])
@@ -340,9 +337,9 @@ def test_mcode_successful_milestone_list_does_not_complete_or_block_failed_propo
     with patch.object(McodeBackend, "_executable", return_value="mcode.exe"), \
             patch("subprocess.Popen", side_effect=[first, second]) as popen:
         result = McodeBackend(tmp_path).run(_task(), "original", "authorized scope")
-    assert result["success"] and result["conversation_id"] == "recovered"
-    assert popen.call_count == 2 and "--session" not in popen.call_args_list[1].args[0]
-    assert result["usage"]["total_tokens"] == 220
+    assert result["success"] and result["conversation_id"] == "read-only"
+    assert popen.call_count == 1
+    assert result["usage"]["total_tokens"] == 110
 
 
 def test_mcode_tool_start_progress_arrives_before_mcp_result_can_complete(tmp_path):
@@ -447,23 +444,19 @@ def test_mcode_leaves_model_and_effort_to_the_cli_when_unset(tmp_path: Path) -> 
     assert result["success"] is True
 
 
+
 @pytest.mark.parametrize("recovered", [False, True])
-def test_mcode_rejected_plan_cannot_be_reported_as_submitted(tmp_path: Path, recovered: bool) -> None:
-    lines = [{"type": "item.completed", "item": {"type": "tool_call", "toolCall": {
-        "name": "mcp__stardew-companion__submit_plan", "status": 3,
-        "output": {"content": [{"type": "text", "text": "Validation failed for tool: steps must be array"}]}}}}]
+def test_mcode_forwards_harness_result_without_tool_error_replay(tmp_path: Path, recovered: bool) -> None:
+    lines = [_binding_event("mcp__stardew-companion__submit_plan", text="Validation failed: steps must be array")]
     if recovered:
-        lines.append({"type": "item.completed", "item": {"type": "tool_call", "toolCall": {
-            "name": "mcp__stardew-companion__submit_plan", "status": 2,
-            "output": {"details": {"mcp": {"structuredContent": {"tasks": [{"id": "t1"}]}}}}}}})
-    lines.append({"type": "exec.completed", "result": {"status": "succeeded", "output": "已交给执行端"}})
+        lines.append(_binding_event("mcp__stardew-companion__submit_plan", 2, "queued"))
+    reply = "已加入执行队列" if recovered else "安排未提交成功"
+    lines.append({"type": "exec.completed", "result": {"status": "succeeded", "output": reply}})
     result, popen = _run_mcode(McodeBackend(tmp_path), _mcode_proc(lines))
-    assert result["success"] is recovered
+    assert result["success"] and result["response"] == reply
     assert popen.call_count == 1
-    if not recovered:
-        assert result["error"] == "MCODE_TOOL_ARGUMENTS_INVALID"
-        assert "没有成功提交" in result["response"]
-        assert "已交给执行端" not in result["response"]
+    # Provider completion only describes the model turn; no native result is invented.
+    assert "effects" not in result
 
 
 def test_mcode_session_unavailable_passthrough_without_retry(tmp_path: Path) -> None:
@@ -556,7 +549,7 @@ def test_mcode_long_unicode_prompt_reaches_stdin_literally(tmp_path):
     fake = tmp_path / "fake_mcode.py"
     fake.write_text(
         "import sys,json,hashlib\n"
-        "text=sys.stdin.buffer.read().split(b'\\n\\n',1)[1]\n"
+        "text=sys.stdin.buffer.read()\n"
         "print(json.dumps({'type':'exec.completed','result':{'status':'succeeded',"
         "'sessionId':'fake','output':hashlib.sha256(text).hexdigest()}}))\n", encoding="utf-8")
     backend = McodeBackend(tmp_path, command=sys.executable)

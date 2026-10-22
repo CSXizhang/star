@@ -149,6 +149,7 @@ def test_factory_methods() -> None:
     )
     assert exec_env.message_type == "skill.execute"
     assert exec_env.payload["skillId"] == "water-zone"
+    assert exec_env.payload["budgets"]["maxGameMinutes"] == 0
     assert exec_env.payload["parameters"]["tiles"] == [{"x": 10, "y": 20}]
     assert exec_env.payload["parameters"]["includeEmptyTiles"] is False
 
@@ -216,7 +217,7 @@ def test_factory_farm_autonomy_skill_executes() -> None:
         "tiles": [{"x": 64, "y": 15}],
     }
     assert harvest.payload["budgets"] == {
-        "maxGameMinutes": 60,
+        "maxGameMinutes": 0,
         "maxStamina": 50.0,
         "maxWater": 20,
     }
@@ -380,7 +381,7 @@ def test_create_execute_ship_items_envelope() -> None:
         "items": [{"itemId": "(O)24", "count": 2}],
     }
     assert ship.payload["budgets"] == {
-        "maxGameMinutes": 60,
+        "maxGameMinutes": 0,
         "maxStamina": 50.0,
         "maxWater": 20,
     }
@@ -412,7 +413,7 @@ def test_create_execute_navigate_to_envelope() -> None:
         "tile": {"x": 43, "y": 58},
     }
     assert nav.payload["budgets"] == {
-        "maxGameMinutes": 120,
+        "maxGameMinutes": 0,
         "maxStamina": 50.0,
         "maxWater": 0,
     }
@@ -448,7 +449,7 @@ def test_create_execute_purchase_items_envelope() -> None:
         "budgetLimit": 100,
     }
     assert purchase.payload["budgets"] == {
-        "maxGameMinutes": 60,
+        "maxGameMinutes": 0,
         "maxStamina": 50.0,
         "maxWater": 0,
     }

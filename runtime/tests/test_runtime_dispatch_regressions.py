@@ -55,7 +55,7 @@ def test_accepted_work_context_reports_actual_idle_help_preference(tmp_path, ena
     assert context["idleHelpEnabled"] is enabled
     assert context["autonomyMode"] == ("free" if enabled else "command")
     assert context["origin"] == ("free-mode" if enabled else "accepted-work")
-    assert ("闲时主动帮忙当前开启" if enabled else "闲时主动帮忙当前关闭") in prompt
+    assert "要求模型立即派工" not in prompt
 
 
 def snapshot(*, stamina=2, water=0, rest="awake", revision=1):
@@ -295,16 +295,16 @@ def test_care_and_player_chat_share_persisted_session_and_refresh_corrected_memo
         _, agreement = reloaded._memory_store.add("save", kind="agreement", text="保留树木", source="player",
                                                   game_date="1:spring:16", expected_revision=1)
         await reloaded._run_life_chat_turn(None, {"request_id": "player-two", "save_id": "save", "text": "继续聊"})
-        assert reloaded._await_life_provider.call_args.args[1] is None
+        assert reloaded._await_life_provider.call_args.args[1] == "life-session"
         assert "保留树木" in reloaded._await_life_provider.call_args.args[2]
         reloaded._memory_store.delete("save", agreement["entry"]["id"], expected_revision=2)
         await reloaded._run_life_chat_turn(None, {"request_id": "player-three", "save_id": "save", "text": "继续聊"})
-        assert reloaded._await_life_provider.call_args.args[1] is None
+        assert reloaded._await_life_provider.call_args.args[1] == "life-session"
         assert "保留树木" not in reloaded._await_life_provider.call_args.args[2]
     asyncio.run(run())
 
 
-def test_profile_edit_during_life_turn_rotates_next_context(tmp_path):
+def test_profile_edit_during_life_turn_preserves_session(tmp_path):
     async def run():
         bridge = bridge_for_work(tmp_path)
         bridge._profile_store.set("save", {"onboarded": True}, 0)
@@ -313,7 +313,7 @@ def test_profile_edit_during_life_turn_rotates_next_context(tmp_path):
             return {"success": True, "response": "你好。", "conversation_id": "old-profile-session"}
         bridge._await_life_provider = provider
         await bridge._run_life_chat_turn(None, {"request_id": "chat-one", "save_id": "save", "text": "你好"})
-        assert bridge._life_chat.rotate_if_needed("save", 2, 0) is None
+        assert bridge._life_chat.rotate_if_needed("save", 2, 0) == "old-profile-session"
     asyncio.run(run())
 
 

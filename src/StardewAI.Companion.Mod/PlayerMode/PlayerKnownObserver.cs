@@ -113,7 +113,7 @@ public sealed class PlayerKnownObserver : IWorldObserver
         // the interface's not-supported shape for anything else (the inner observer
         // would reject it as well, as a non-current-map screenshot).
         if (!IsCurrentLocation(locationName)) throw LocationNotKnown(nameof(InspectMapImage), locationName);
-        throw new NotSupportedException("Whole-map screenshots expose offscreen facts; player mode uses structured visible observations.");
+        return _inner.InspectMapImage(locationName);
     }
 
     public TileDirtState GetDirtState(string locationName, TileCoordinate tile)

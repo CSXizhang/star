@@ -237,7 +237,7 @@ def test_wire_schema_and_four_preferences():
         LifeChatSubmitPayload.from_mapping({"requestId": "r", "saveId": "S", "mode": "chat", "text": "行", "acceptedNodeId": "n"})
     for style in ("earn", "workhorse", "community", "decor"):
         prompt = LifeChatService.build_system_prompt({"playStyle": style}, {}, {}, mode="plan")
-        assert "propose" in prompt and "软偏好" in prompt and "选择方向本身不是工作授权" in prompt
+        assert json.loads(prompt.split("实时上下文：", 1)[1])["profile"]["playStyle"] == style
     decor = LifeChatService.build_system_prompt({"playStyle": "decor"}, {}, {}, mode="plan")
     assert "摆放和回收家具、地板、围栏与物件" in decor
     assert "制造已解锁配方" in decor and "搬迁建筑" in decor

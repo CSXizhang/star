@@ -123,8 +123,9 @@ def test_multi_business_can_be_repaired_once_without_consuming_decision(tmp_path
         _, result = await server.call_tool("submit_plan", {"tasks": tasks[:1]})
         assert result["goalId"] == goal.id
         assert len(result["tasks"]) == 1
-        with pytest.raises(ToolError, match="NEW_MODEL_DECISION_REQUIRED"):
-            await server.call_tool("submit_plan", {"tasks": tasks[:1]})
+        _, appended = await server.call_tool("submit_plan", {"tasks": [{"title": "water", "steps": [{"operation": "water_auto"}]}]})
+        assert appended["tasks"][0]["id"] == result["tasks"][0]["id"]
+        assert [s.operation for s in store.state("save").tasks[0].steps] == ["harvest_auto", "water_auto"]
 
     asyncio.run(run())
 

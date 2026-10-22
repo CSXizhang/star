@@ -11,36 +11,9 @@ from pathlib import Path
 
 CODEX_GAME_TOOL_PROFILE_VERSION = "stardew-game-tools-v5"
 
-# Verified with the local 0.162.0-alpha.17.2 CLI and the official configuration schema.
-# Do not use removed apply_patch_freeform/tool_search switches: those do not
-# remove tools. The CLI has no documented general native-tool allowlist.
-_DISABLED_FEATURES = (
-    "shell_tool", "unified_exec",
-    "apps", "plugins", "remote_plugin", "hooks", "skill_search",
-    "skill_mcp_dependency_install", "multi_agent", "multi_agent_v2",
-    "browser_use", "computer_use", "image_generation", "view_image",
-    "artifact", "workspace_dependencies", "goals", "sleep_tool",
-)
-
-
 def game_tool_config() -> list[str]:
-    """Keep execution authority unchanged while removing unrelated surfaces."""
-    values = [f"features.{name}=false" for name in _DISABLED_FEATURES]
-    values.extend([
-        # This CLI exposes game MCP calls through functions.exec/ALL_TOOLS.
-        # Its code-mode host is transport infrastructure, not a shell surface.
-        # Disabling it leaves listed MCP tools unusable (verified in r18).
-        "features.code_mode_host=true",
-        # The bundled game MCP takes ~1.2s to import/list on this host. Codex's
-        # default optional-server grace is 1s; never build an empty game catalog.
-        "mcp_optional_startup_grace_ms=0",
-        "features.skip_host_skill_discovery=true",
-        "skills.bundled.enabled=false",
-        "skills.include_instructions=false",
-        'web_search="disabled"',
-        "tools.update_plan.enabled=false",
-    ])
-    return [part for value in values for part in ("-c", value)]
+    """Add the game transport without disabling the harness's native tools."""
+    return ["-c", "features.code_mode_host=true", "-c", "mcp_optional_startup_grace_ms=0"]
 
 
 def unrelated_mcp_config(command: str, run_dir: Path) -> list[str]:

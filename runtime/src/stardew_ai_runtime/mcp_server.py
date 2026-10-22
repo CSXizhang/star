@@ -2023,7 +2023,11 @@ def create_mcp_server(
         detail: bool = False,
         request_id: str | None = None,
     ) -> dict[str, Any]:
-        """Select ONE semantic short job for the CURRENT provider decision.
+        """Queue sequential game operations for the current model turn.
+
+        Further calls in the same turn append to its pending job for the same
+        goal and player request. Execution begins after the turn returns;
+        a dispatched job cannot be edited through this tool.
 
         One task may combine sequential navigation, inventory transfers,
         preparation, planting and exact-tile watering across maps. Native map,
@@ -2043,9 +2047,9 @@ def create_mcp_server(
             ]
 
         Example coordinates must be replaced with freshly observed candidates.
-        For water_auto, max_tiles limits one batch; target_tiles defines the work
-        scope. A request to water only N crops needs an explicit observed subset,
-        otherwise remaining crops outside the batch still count as unfinished work.
+        For water_auto, max_tiles limits one batch; target_tiles optionally limits
+        its location scope. A successful batch can be followed by refill/watering
+        steps even when crops remain. goalSatisfied reports the wider scope.
 
         Every ``operation`` must be one of the discoverable plan operations; an
         unknown operation is rejected with the allowed list. ``params`` should
@@ -2116,8 +2120,9 @@ def create_mcp_server(
                 result = {**result, "tasks": [_compact_plan_task(task) for task in result.get("tasks", [])],
                           "detailsAvailable": True,
                           "detailHint": "Read work_plan_overview(detail=True) for stored targets and effects; do not resubmit to retrieve details."}
-            handoff = ({"nextAction": "作业已受理，原生执行器接管。用一两句告诉玩家已安排什么即可；实际终态会作为后续系统事实送达，届时按事实如实汇报。",
-                        "handoff": "ack_async"} if not external_codex else {})
+            handoff = ({"effectStatus": "not_executed_yet", "canAppendBeforeDispatch": True,
+                        "executionStarts": "after_current_turn", "handoff": "ack_async"}
+                       if not external_codex else {})
             return {"saveId": sid, "executionScope": "one_short_job", **result, **handoff}
         except WorkStateError as ex:
             raise ToolError(str(ex)) from None
@@ -2125,7 +2130,11 @@ def create_mcp_server(
     @mcp.tool()
     async def record_decision_note(goal_id: str, note: str, category: str, location_id: str,
                                    basis_command_id: str | None = None) -> dict[str, Any]:
-        """Remember a significant dated decision/discovery without a new stage goal. Categories observation/failure require the exact persisted native basis_command_id; hypotheses are explicitly tentative, intent does not grant authorization. 1..800 chars; current native facts override old notes. Keep siting rationale, useful unlock/route discovery, unresolved bottleneck and next action across provider sessions; no per-step log duplication."""
+        """Keep a dated note on an active goal. An optional basis_command_id links
+        native evidence; notes without that evidence remain unverified model
+        interpretation. Intent grants no extra work authorization. Current game
+        observations override old notes. Use 1..800 characters.
+        """
         sid = await current_save_id()
         directory=Path(getattr(sched,"run_dir",None) or run_dir or ".")/"data"
         from .snapshot_cache import cache_lock
@@ -3365,7 +3374,7 @@ def create_mcp_server(
     @mcp.tool()
     async def ship_items(
         items: Annotated[list[ItemQuantity], BeforeValidator(_unwrap_item_array)], detail: bool = False,
-        max_game_minutes: int = 180
+        max_game_minutes: int = 0
     ) -> dict[str, Any]:
         """Ship specified items from companion inventory to the farm shipping bin.
 
@@ -3859,8 +3868,8 @@ def create_mcp_server(
         """Consume one observed edible backpack item through the controlled actor's native food lifecycle.
 
         item_id selects the first matching backpack stack; its exact slot/quality
-        and native consumption/recovery are reported. Choose whether to consume
-        and what to do afterward from actual state in the next model decision.
+        and native consumption/recovery are reported. Additional food and
+        follow-up operations may be queued in order in the same turn.
         """
         try:
             return _native_action_response("eat-food", await sched.eat_food(item_id=item_id, location_id=location_id))
@@ -4468,8 +4477,8 @@ def create_mcp_server(
                 external_selected = True
                 await sched.close()
             return {"status": "job-selected", "taskId": selected["tasks"][0]["id"], "goalId": selected["goalId"],
-                    "effectStatus": "not_executed_yet", "nextBusiness": "new_model_decision_required",
-                    **({"handoff": "ack_async", "nextAction": "结束当前回复，让原生执行器接管。实际结果将在后续job.result送达；此思考回合内不要轮询get_status等待尚未开始的作业，也不要重复提交。"} if not external_codex else {})}
+                    "effectStatus": "not_executed_yet", "canAppendBeforeDispatch": True,
+                    **({"handoff": "ack_async", "executionStarts": "after_current_turn"} if not external_codex else {})}
         return guarded
 
     def protect_external_observation(fn):

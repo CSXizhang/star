@@ -653,13 +653,15 @@ def test_scheduler_water_auto_compact_snapshot_targets_crops_only(mock_transport
     asyncio.run(run())
 
 
-def test_scheduler_water_auto_with_truncation(mock_transport_client, native_compatible_run_dir):
+@pytest.mark.parametrize("total,batch", [(10, 4), (151, 18)])
+def test_scheduler_water_auto_bounded_batch_completes_with_remaining_work(
+    mock_transport_client, native_compatible_run_dir, total, batch,
+):
     async def run():
-        # 10 unwatered tiles, max_tiles=4
-        tiles = [{"x": 60 + i, "y": 10} for i in range(10)]
+        tiles = [{"x": 50 + i % 20, "y": 10 + i // 20} for i in range(total)]
         mock_transport_client.latest_snapshot.payload["farmWork"] = {
             "tilledUnwateredTiles": tiles,
-            "tilledUnwateredCount": 10,
+            "tilledUnwateredCount": total,
             "isTruncated": False,
             "matureCropCount": 0,
         }
@@ -679,7 +681,7 @@ def test_scheduler_water_auto_with_truncation(mock_transport_client, native_comp
                 "commandId": "cmd-auto-2",
                 "taskId": "task-auto-2",
                 "terminalState": "succeeded",
-                "completedCount": 4,
+                "completedCount": batch,
                 "skippedCount": 0,
                 "failedCount": 0,
                 "effects": [],
@@ -688,14 +690,14 @@ def test_scheduler_water_auto_with_truncation(mock_transport_client, native_comp
         mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-auto-2")
         mock_transport_client.wait_for_result = AsyncMock(return_value=result_env)
 
-        res = await scheduler.water_auto(max_tiles=4)
+        res = await scheduler.water_auto(max_tiles=batch)
 
         assert res["status"] == "executed"
-        assert res["targetCount"] == 4
-        assert res["remainingUnwateredCount"] == 6
+        assert res["targetCount"] == batch
+        assert res["remainingUnwateredCount"] == total - batch
+        assert res["outcome"] == "completed" and res["goalSatisfied"] is False
         assert res["isTruncated"] is True
-        # Verify first 4 tiles were targeted
-        assert res["targetTiles"] == tiles[:4]
+        assert res["targetTiles"] == tiles[:batch]
 
     asyncio.run(run())
 

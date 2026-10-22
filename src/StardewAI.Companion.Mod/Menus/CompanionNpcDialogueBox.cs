@@ -11,19 +11,43 @@ namespace StardewAI.Companion.Mod.Menus;
 public sealed class CompanionNpcDialogueBox : DialogueBox
 {
     private Action? _onDisplayed;
-    public CompanionNpcDialogueBox(Dialogue dialogue, Action? onDisplayed = null) : base(dialogue)
+    private readonly Action? _onReply;
+    private readonly Action? _onClose;
+    private Rectangle ReplyButton => new(x + width - 248, Math.Max(0, y - 56), 112, 48);
+    private Rectangle CloseButton => new(x + width - 128, Math.Max(0, y - 56), 112, 48);
+
+    public CompanionNpcDialogueBox(Dialogue dialogue, Action? onDisplayed = null,
+        Action? onReply = null, Action? onClose = null) : base(dialogue)
     {
         _onDisplayed = onDisplayed;
+        _onReply = onReply;
+        _onClose = onClose;
         FitToViewport(dialogue.getCurrentDialogue());
     }
 
     public override void draw(SpriteBatch b)
     {
         base.draw(b);
+        if (_onReply != null) DrawButton(b, ReplyButton, "回复");
+        if (_onClose != null) DrawButton(b, CloseButton, "关闭");
+        if (_onReply != null || _onClose != null) drawMouse(b);
         if (characterIndexInDialogue <= 0 && getCurrentString().Length > 0) return;
         var displayed = _onDisplayed;
         _onDisplayed = null;
         displayed?.Invoke();
+    }
+
+    private static void DrawButton(SpriteBatch b, Rectangle bounds, string text)
+    {
+        IClickableMenu.drawTextureBox(b, bounds.X, bounds.Y, bounds.Width, bounds.Height, Color.White);
+        SpriteText.drawString(b, text, bounds.X + 20, bounds.Y + 10);
+    }
+
+    public override void receiveLeftClick(int x, int y, bool playSound = true)
+    {
+        if (_onReply != null && ReplyButton.Contains(x, y)) { _onReply(); return; }
+        if (_onClose != null && CloseButton.Contains(x, y)) { _onClose(); return; }
+        base.receiveLeftClick(x, y, playSound);
     }
 
     public override void receiveKeyPress(Keys key)

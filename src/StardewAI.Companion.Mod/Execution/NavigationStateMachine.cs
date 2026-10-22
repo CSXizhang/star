@@ -19,7 +19,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerLeg = 3;
-    private const long MaxMonotonicTicks = 7200;
+    private const long MaxNoProgressTicks = 7200;
     private const int VerificationSettleTicks = 3;
 
     private readonly IFarmerActor _actor;
@@ -52,6 +52,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
     private float _staminaUsed;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
     private int? _pauseStartedClock;
     private int _pausedGameMinutes;
@@ -155,6 +156,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             _staminaUsed = 0f;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _startClock = _observer.TimeOfDay;
             _pauseStartedClock = null;
             _pausedGameMinutes = 0;
@@ -177,12 +179,12 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be at least 1.", "INVALID_PARAMETERS");
+                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be non-negative; 0 means no time limit.", "INVALID_PARAMETERS");
                 return false;
             }
 
@@ -292,10 +294,10 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
 
             _elapsedTicks++;
 
-            if (_elapsedTicks > MaxMonotonicTicks)
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
-                Log($"navigate-to monotonic timeout exceeded ({MaxMonotonicTicks} ticks). Terminating.", LogLevel.Warn);
-                FinishExecution(ExecutionState.Failed, "Monotonic tick limit exceeded.", "TIMEOUT");
+                Log($"navigate-to no-progress timeout exceeded ({MaxNoProgressTicks} ticks). Terminating.", LogLevel.Warn);
+                FinishExecution(ExecutionState.Failed, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
@@ -303,7 +305,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             // to report the actual game-clock duration including player pauses.
             int elapsedMinutes = Math.Max(0,
                 IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay) - _pausedGameMinutes);
-            if (_currentRequest is not null && elapsedMinutes > _currentRequest.MaxGameMinutes)
+            if (_currentRequest is not null && _currentRequest.MaxGameMinutes > 0 && elapsedMinutes > _currentRequest.MaxGameMinutes)
             {
                 Log($"navigate-to budget exceeded: {elapsedMinutes} > {_currentRequest.MaxGameMinutes} minutes.", LogLevel.Warn);
                 FinishExecution(ExecutionState.PartiallySucceeded, "Game-clock minute budget exceeded.", "BUDGET_EXCEEDED");

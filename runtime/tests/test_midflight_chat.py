@@ -109,7 +109,7 @@ def test_midflight_player_chat_is_recorded_and_answered_read_only(tmp_path, monk
         assert seen == [{"surface": "life", "token": None, "mode": "chat"}]
         active, prompt = life_turns[0]
         assert active.read_only is True
-        assert "【在途作业】" in prompt
+        assert '"workDispatchAvailable": false' in prompt
         assert '"taskId": "t1"' in prompt
 
         # The original text is persisted as a midflight request.

@@ -1,4 +1,4 @@
-﻿using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewValley;
 using StardewAI.Companion.Mod.Adapters;
@@ -21,7 +21,7 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600; // 60 seconds at 60 fps safety timeout
+    private const long MaxNoProgressTicks = 3600; // 60 seconds without observed progress
     private const int ActionDurationTicks = 4; // brief pause per harvest action (no fabricated tool animation)
 
     private readonly IFarmerActor _actor;
@@ -46,6 +46,7 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
     private HarvestTileResult? _lastHarvestResult;
     private PlayerScytheHarvest? _nativeScytheHarvest;
     private bool _nativeScytheUsed;
+    private bool _companionScytheAnimation;
     private Dictionary<(string ItemId, int Quality), int>? _inventoryBefore;
 
     // Output tracking
@@ -55,6 +56,7 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
     private float _staminaUsed;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
     private int? _pauseStartedClock;
     private int _pausedGameMinutes;
@@ -118,13 +120,15 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
             _staminaUsed = 0f;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _actionTicks = 0;
             _actionEffectExecuted = false;
             _lastHarvestResult = null;
             _nativeScytheHarvest = null;
             _nativeScytheUsed = false;
-            _inventoryBefore = ActorGuards.IsPlayerBound(_actor) && _actor.GameFarmer is { } player
+            _companionScytheAnimation = false;
+            _inventoryBefore = _actor.GameFarmer is { } player
                 ? NormalHarvestAdapter.SnapshotInventoryTotals(player) : null;
             _startClock = _observer.TimeOfDay;
             _pauseStartedClock = null;
@@ -159,12 +163,12 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    "MaxGameMinutes budget must be at least 1.",
+                    "MaxGameMinutes must be non-negative; 0 means no time limit.",
                     "INVALID_PARAMETERS");
                 return false;
             }
@@ -180,10 +184,6 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
                 {
                     _skippedTiles.Add(new SkippedTileInfo(tile, "not-ready"));
                 }
-                else if (dirt.RequiresScythe && _actor is not PlayerActor)
-                {
-                    _skippedTiles.Add(new SkippedTileInfo(tile, "scythe-required"));
-                }
                 else if (dirt.RequiresScythe && !_actor.GetToolNames().Contains("Scythe"))
                 {
                     _skippedTiles.Add(new SkippedTileInfo(tile, "missing-tool:Scythe"));
@@ -196,9 +196,11 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
 
             if (_pendingTargets.Count == 0)
             {
-                CurrentState = ExecutionState.Succeeded;
                 _actor.SetActiveTask(null);
-                earlyTerminalResult = FinishExecution(ExecutionState.Succeeded);
+                bool missingTool = _skippedTiles.Any(tile => tile.Reason == "missing-tool:Scythe");
+                earlyTerminalResult = FinishExecution(missingTool ? ExecutionState.Rejected : ExecutionState.Succeeded,
+                    missingTool ? "Mature crops require a scythe in the actor's inventory." : null,
+                    missingTool ? "MISSING_TOOL" : null);
                 return true;
             }
 
@@ -311,7 +313,7 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
             // the full observed game-clock duration in terminal result resources.
             int gameMinutesElapsed = Math.Max(0,
                 IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay) - _pausedGameMinutes);
-            if (gameMinutesElapsed > _currentRequest.MaxGameMinutes && _nativeScytheHarvest is null)
+            if (_currentRequest.MaxGameMinutes > 0 && gameMinutesElapsed > _currentRequest.MaxGameMinutes && _nativeScytheHarvest is null && !_companionScytheAnimation)
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
@@ -320,13 +322,13 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
                 return;
             }
 
-            // 5. Monotonic timeout guard
-            if (_elapsedTicks > MaxMonotonicTicks && _nativeScytheHarvest is null)
+            // 5. No-progress timeout guard
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex) && _nativeScytheHarvest is null && !_companionScytheAnimation)
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
                 var terminalState = _harvestedTiles.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed;
-                FinishExecution(terminalState, "Execution exceeded monotonic tick timeout limit.", "TIMEOUT");
+                FinishExecution(terminalState, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
@@ -496,9 +498,9 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
             AdvanceToNextTarget();
             return;
         }
-        if (dirt.RequiresScythe && _actor is not PlayerActor)
+        if (dirt.RequiresScythe && !_actor.GetToolNames().Contains("Scythe"))
         {
-            _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "scythe-required"));
+            _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "missing-tool:Scythe"));
             AdvanceToNextTarget();
             return;
         }
@@ -520,6 +522,21 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
             }
             _nativeScytheHarvest = new PlayerScytheHarvest(nativePlayer, _observer, _currentRequest.LocationId, _currentTargetTile);
             _nativeScytheUsed = true;
+        }
+        else if (dirt.RequiresScythe)
+        {
+            try
+            {
+                _actor.BeginUsingTool("Scythe");
+                _companionScytheAnimation = true;
+                _nativeScytheUsed = true;
+            }
+            catch (Exception ex)
+            {
+                _actor.EndUsingTool();
+                FinishExecution(ExecutionState.Failed, ex.Message, "NATIVE_TOOL_START_FAILED");
+                return;
+            }
         }
 
         // Hand harvest has no fabricated animation. Scythe harvest above owns a
@@ -561,6 +578,15 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
             return;
         }
 
+        var phase = _companionScytheAnimation ? _actor.UpdateToolAnimation(time, tickCount) : ToolAnimationPhase.None;
+        if (_companionScytheAnimation && !_actionEffectExecuted &&
+            phase is not (ToolAnimationPhase.EffectPoint or ToolAnimationPhase.Completed))
+        {
+            if (_actionTicks >= 180)
+                FinishExecution(ExecutionState.Failed, "Scythe animation did not reach its effect point.", "NATIVE_TOOL_TIMEOUT");
+            return;
+        }
+
         if (!_actionEffectExecuted)
         {
             _actionEffectExecuted = true;
@@ -596,8 +622,10 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
             Log($"Harvest effect applied on tile ({_currentTargetTile.X}, {_currentTargetTile.Y}): item={harvestResult.ItemId} x{harvestResult.Stack}.");
         }
 
-        if (_actionTicks >= ActionDurationTicks)
+        if (_companionScytheAnimation ? phase == ToolAnimationPhase.Completed || _actionTicks >= 180
+            : _actionTicks >= ActionDurationTicks)
         {
+            EndCompanionScytheAnimation();
             _avatar?.SetAnimation("idle");
             CurrentState = ExecutionState.Verifying;
         }
@@ -662,6 +690,7 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
 
     private void AdvanceToNextTarget()
     {
+        EndCompanionScytheAnimation();
         // Explicit cursor increment: marks current target completed so pause/resume NEVER repeats it
         _currentTargetIndex++;
         // One native scythe arc can also harvest later requested tiles. Their
@@ -726,6 +755,7 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
         bool retryRecommended = false,
         bool inventoryFull = false)
     {
+        EndCompanionScytheAnimation();
         CurrentState = state;
         _actor.Halt();
         _actor.SetActiveTask(null);
@@ -805,6 +835,13 @@ public sealed class HarvestZoneStateMachine : ISkillExecutionMachine
         }
 
         return result;
+    }
+
+    private void EndCompanionScytheAnimation()
+    {
+        if (!_companionScytheAnimation) return;
+        _actor.EndUsingTool();
+        _companionScytheAnimation = false;
     }
 
     private IReadOnlyList<Dictionary<string, object>>? MeasuredInventoryDelta()

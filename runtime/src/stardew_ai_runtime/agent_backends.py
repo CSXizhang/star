@@ -660,8 +660,6 @@ class DshBackend:
         patch = [
             {"id": "sdk-jsonrpc-server", "disabled": True},
             {"insert": [{"id": "stardew-sdk-resume", "name": resume_plugin.as_uri()}]},
-            {"id": "persistent-bash", "disabled": True},
-            {"id": "persistent-pwsh", "disabled": True},
             {"id": "session-log-deepseek", "disabled": True},
             {"insert": [{"id": "stardew-mcp", "name": "@deepseek-ai/dsh-mcp-client", "config": {
                 "transport": "stdio", "serverName": "stardew-companion", "command": str(python),
@@ -1118,10 +1116,6 @@ class McodeBackend:
             usage = None
             status = ""
             errors: list[str] = []
-            plan_validation_failed = False
-            game_job_selected = False
-            unregistered_game_tools: set[tuple[str, str | None]] = set()
-            game_mutation_succeeded = False
             deadline = start + self.timeout_seconds
             while len(done) < 2 and time.monotonic() < deadline:
                 if active_task.cancelled:
@@ -1187,34 +1181,6 @@ class McodeBackend:
                         reply = str(item["content"])
                     elif item.get("type") == "tool_call":
                         call = item.get("toolCall") or {}
-                        name = str(call.get("name") or "")
-                        call_input = call.get("input") or {}
-                        action = call_input.get("action") if isinstance(call_input, dict) else None
-                        action = action if isinstance(action, str) else None
-                        output = call.get("output") or {}
-                        content = output.get("content") or []
-                        from .mcp_server import BASE_TOOLS, LIFE_TOOLS
-                        if (name in BASE_TOOLS | LIFE_TOOLS and call.get("status") == 3
-                                and any(part.get("text") == f"Tool {name} not found"
-                                        for part in content if isinstance(part, dict))):
-                            unregistered_game_tools.add((name, action))
-                        if name.startswith(f"mcp__{self.server_name}__") and call.get("status") == 2:
-                            short_name = self._tool_label(name)
-                            # A successful list proves a route exists, but does
-                            # not perform an earlier failed propose/adopt action.
-                            unregistered_game_tools.discard((short_name, action))
-                            readonly = short_name.startswith((
-                                "get_", "query_", "read_", "list_", "observe_", "discover_", "work_plan_overview", "autonomy_status"))
-                            readonly |= short_name == "manage_milestones" and action == "list"
-                            game_mutation_succeeded |= not readonly
-                        if name == "mcp__stardew-companion__submit_plan" and call.get("status") == 3:
-                            content = output.get("content") or []
-                            plan_validation_failed |= any("Validation failed for tool" in str(part.get("text", ""))
-                                                          for part in content if isinstance(part, dict))
-                        if name.startswith("mcp__stardew-companion__") and call.get("status") == 2:
-                            payload = ((output.get("details") or {}).get("mcp") or {}).get("structuredContent") or {}
-                            game_job_selected |= (name == "mcp__stardew-companion__submit_plan"
-                                                  and bool(payload.get("tasks") and not payload.get("error"))) or payload.get("status") == "job-selected"
                         if self.progress:
                             self.progress(BackendProgress(self.name, "tool_completed", "正在处理游戏任务",
                                                           self._tool_label(call.get("name"))))
@@ -1255,18 +1221,6 @@ class McodeBackend:
                 return BackendResult(False, "MiniMax Code 的 Token Plan 用量已耗尽；已停止新请求，保留实际进度。",
                                      session_id, usage, {"code": "RESOURCE_EXHAUSTED", "message": failure_message},
                                      self.name, time.monotonic() - start).as_dict()
-            if unregistered_game_tools:
-                message = "游戏工具调用名称失效，本轮未能完成安排。"
-                failed = BackendResult(False, message, session_id, usage,
-                                       {"code": "MCODE_TOOL_BINDING_FAILED", "message": message},
-                                       self.name, time.monotonic() - start).as_dict()
-                failed["retryable_tool_binding"] = not game_mutation_succeeded
-                return failed
-            if plan_validation_failed and not game_job_selected:
-                message = "派工参数未通过校验，本轮没有成功提交游戏作业；请检查参数后再继续。"
-                return BackendResult(False, message, session_id, usage,
-                                     {"code": "MCODE_TOOL_ARGUMENTS_INVALID", "message": message},
-                                     self.name, time.monotonic() - start).as_dict()
             if proc.returncode == 0 and status == "succeeded" and reply:
                 if self.progress:
                     self.progress(BackendProgress(self.name, "completed", "MiniMax Code 已完成回复"))
@@ -1285,7 +1239,7 @@ class McodeBackend:
                 # A rotated or archived session must not strand the game loop.
                 # This is checked before the generic exit-code mapping because
                 # the CLI reports it as an ordinary runtime failure.
-                return BackendResult(False, "mcode 无法恢复这段对话，已改用新会话。", None, usage,
+                return BackendResult(False, "mcode 无法恢复这段对话。", None, usage,
                                      {"code": "MCODE_SESSION_UNAVAILABLE", "message": detail},
                                      self.name, time.monotonic() - start).as_dict()
             if proc.returncode in self.exit_codes:
@@ -1305,13 +1259,6 @@ class McodeBackend:
                     logger.exception("Failed to clean up mcode process")
             active_task.process = None
 
-    def tool_binding_context(self, surface: str) -> str:
-        from .mcp_server import BASE_TOOLS, LIFE_TOOLS
-        registered = LIFE_TOOLS if surface == "life" else BASE_TOOLS
-        return ("【当前工具绑定】规则里的短工具名只是简称；调用必须使用实际注册全名，并按工具 schema 填参。\n"
-                + "\n".join(f"{name} = mcp__{self.server_name}__{name}" for name in sorted(registered))
-                + "\n工具返回未找到时先核对注册名；未成功保存安排不能声称已派工或已经出发。")
-
     def run(self, active_task: ActiveTaskLike, session_id: str | None, prompt: str) -> dict[str, Any]:
         start = time.monotonic()
         try:
@@ -1329,45 +1276,7 @@ class McodeBackend:
                                  error={"code": "MCODE_GAME_PROFILE_FAILED", "message": str(ex)},
                                  provider=self.name, duration=time.monotonic() - start).as_dict()
         try:
-            # The bridge includes bindings in its acknowledged context delivery.
-            # Standalone adapter callers still get a complete initial binding.
-            bootstrap = getattr(active_task, "provider_bootstrap_prompt", None)
-            if not isinstance(bootstrap, str) or not bootstrap:
-                bootstrap = None
-            if bootstrap is None:
-                prompt = self.tool_binding_context(surface) + "\n\n" + prompt
-            result = self._invoke(active_task, session_id, prompt, executable, workspace, start)
-            if (result.get("error") == "MCODE_TOOL_BINDING_FAILED" and result.get("retryable_tool_binding")
-                    and not active_task.cancelled):
-                previous = result
-                correction = (
-                    "当前调用上下文出现了未注册的裸工具名。下面已包含游戏内指导，勿重复加载外部 CLI skill。"
-                    "请仅复制工具表中的完整 mcp__ 注册名称来调用；不要调用简称或自行构造 Compat 名称。"
-                    "前次没有成功修改游戏安排或派工，本次按原玩家要求处理，不能扩大范围。\n"
-                )
-                # A replacement session cannot interpret the old session's delta.
-                result = self._invoke(active_task, None, correction + (bootstrap or prompt), executable, workspace, start)
-                first_usage, second_usage = previous.get("usage"), result.get("usage")
-                if first_usage or second_usage:
-                    combined = {"input_includes_cache": True, "input_context_measured": False,
-                                "source": "mcode_exec_result"}
-                    for key in ("input_tokens", "output_tokens", "cache_read_tokens", "total_tokens"):
-                        if key in (first_usage or {}) and key in (second_usage or {}):
-                            combined[key] = first_usage[key] + second_usage[key]
-                        else:
-                            combined["partial"] = True
-                    if (first_usage or {}).get("partial") or (second_usage or {}).get("partial"):
-                        combined["partial"] = True
-                    result["usage"] = combined
-                result["binding_recovery"] = {"previousSession": previous.get("conversation_id"),
-                                               "newSession": result.get("conversation_id"),
-                                               "reason": "unregistered_game_tool_name"}
-                logger.warning("Recovered mcode tool binding with one fresh invocation; previous=%s new=%s",
-                               previous.get("conversation_id"), result.get("conversation_id"))
-            # MCODE_SESSION_UNAVAILABLE propagates to the bridge, which rotates
-            # the session honestly (old id kept in history) and retries once
-            # with the full instructions.
-            return result
+            return self._invoke(active_task, session_id, prompt, executable, workspace, start)
         except OSError as ex:
             return BackendResult(False, "MiniMax Code 启动失败，请检查 CLI 和 Node.js 安装。", session_id,
                                  error={"code": "MCODE_START_FAILED", "message": str(ex)},

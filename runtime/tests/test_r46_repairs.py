@@ -53,20 +53,20 @@ def test_decision_validation_reasons_and_guidance(tmp_path):
     store.begin_decision("save", "tok-2")
     with pytest.raises(WorkStateError) as exc_missing:
         store.select_direct_job("save", "wrong-tok", "water_auto")
-    assert "决策令牌缺失或不匹配" in str(exc_missing.value)
-    assert guide in str(exc_missing.value)
+    assert "STALE_DECISION" in str(exc_missing.value)
+    assert guide not in str(exc_missing.value)
 
     # 3. Already selected
     store.select_direct_job("save", "tok-2", "water_auto")
     with pytest.raises(WorkStateError) as exc_selected:
         store.select_direct_job("save", "tok-2", "ship_items")
-    assert "当前决策周期已选择过任务" in str(exc_selected.value)
-    assert guide in str(exc_selected.value)
+    assert "JOB_IN_PROGRESS" in str(exc_selected.value)
+    assert guide not in str(exc_selected.value)
 
     with pytest.raises(WorkStateError) as exc_selected_plan:
         store.submit_plan("save", goal_text="g", decision_token="tok-2", tasks=[{"title": "t", "steps": [{"operation": "water_auto"}]}])
-    assert "当前决策周期已选择过任务" in str(exc_selected_plan.value)
-    assert guide in str(exc_selected_plan.value)
+    assert "JOB_IN_PROGRESS" in str(exc_selected_plan.value)
+    assert guide not in str(exc_selected_plan.value)
 
     # 4. Expired token
     store.revoke_decision("save")
@@ -74,8 +74,8 @@ def test_decision_validation_reasons_and_guidance(tmp_path):
     store._mutate("save", lambda s: s.decision.update(expires=time.time() - 10))
     with pytest.raises(WorkStateError) as exc_expired:
         store.select_direct_job("save", "tok-3", "water_auto")
-    assert "决策令牌已过期" in str(exc_expired.value)
-    assert guide in str(exc_expired.value)
+    assert "STALE_DECISION" in str(exc_expired.value)
+    assert guide not in str(exc_expired.value)
 
 
 def test_decision_context_exposes_paused_and_decision(tmp_path):

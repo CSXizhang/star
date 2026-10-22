@@ -19,7 +19,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600; // 60 seconds at 60 fps safety timeout
+    private const long MaxNoProgressTicks = 3600; // 60 seconds without observed progress
     // Bounded search: only this many nearest remaining targets are costed with a
     // real path query per reorder. The rest keep a sentinel cost and stay ordered
     // by connectivity then Manhattan distance. This avoids a global TSP search.
@@ -54,6 +54,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
     private float _staminaUsed;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
     private int? _pauseStartedClock;
     private int _pausedGameMinutes;
@@ -118,6 +119,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             _staminaUsed = 0f;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _toolEffectExecuted = false;
             _avoidTiles.Clear();
@@ -193,12 +195,12 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    "MaxGameMinutes budget must be at least 1.",
+                    "MaxGameMinutes must be non-negative; 0 means no time limit.",
                     "INVALID_PARAMETERS");
                 return false;
             }
@@ -321,7 +323,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             // still report the full observed game-clock duration, including pauses.
             int gameMinutesElapsed = Math.Max(0,
                 IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay) - _pausedGameMinutes);
-            if (gameMinutesElapsed > _currentRequest.MaxGameMinutes)
+            if (_currentRequest.MaxGameMinutes > 0 && gameMinutesElapsed > _currentRequest.MaxGameMinutes)
             {
                 VerifyExecutedEffectBeforeTermination();
                 _actor.Halt();
@@ -332,15 +334,15 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 return;
             }
 
-            // 5. Monotonic timeout guard
-            if (_elapsedTicks > MaxMonotonicTicks)
+            // 5. No-progress timeout guard
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
                 VerifyExecutedEffectBeforeTermination();
                 _actor.Halt();
                 _actor.EndUsingTool();
                 _avatar?.SetAnimation("idle");
                 var terminalState = _wateredTiles.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed;
-                FinishExecution(terminalState, "Execution exceeded monotonic tick timeout limit.", "TIMEOUT");
+                FinishExecution(terminalState, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 

@@ -27,9 +27,10 @@ def _sent_payloads(ws) -> list[dict]:
 
 
 # ---------------------------------------------------------------- life_chat unit
-def test_life_session_key_namespaced() -> None:
-    assert _life_session_key("kimi", "Save1") == "life:kimi:Save1"
-    assert not _life_session_key("kimi", "Save1").startswith("kimi:Save1")
+
+def test_chat_and_work_share_provider_save_key() -> None:
+    assert _life_session_key("kimi", "Save1") == "kimi:Save1"
+    assert _life_session_key("mcode", "Save1") != _life_session_key("kimi", "Save1")
 
 
 def test_make_life_env_injects_surface_and_strips_token(monkeypatch) -> None:
@@ -40,7 +41,7 @@ def test_make_life_env_injects_surface_and_strips_token(monkeypatch) -> None:
     assert "STARDEW_DECISION_TOKEN" not in env
 
 
-def test_life_session_rotation_on_revision_change(tmp_path) -> None:
+def test_life_session_survives_revision_change(tmp_path) -> None:
     sessions: dict[str, str] = {}
     fingerprints: dict[str, str] = {}
     svc = LifeChatService(
@@ -53,9 +54,9 @@ def test_life_session_rotation_on_revision_change(tmp_path) -> None:
     assert svc.rotate_if_needed("Save1", 0, 0) is None
     svc.record_session_id("Save1", "cid-1")
     assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
-    # Any profile/memory revision change rotates the life session (§2/§4).
-    assert svc.rotate_if_needed("Save1", 1, 0) is None
-    assert svc.get_session_id("Save1") is None
+    # Current profile/memory facts refresh without replacing conversation history.
+    assert svc.rotate_if_needed("Save1", 1, 0) == "cid-1"
+    assert svc.get_session_id("Save1") == "cid-1"
 
 
 def test_life_unknown_context_checkpoint_counts_only_consecutive_unknown_turns(tmp_path) -> None:
@@ -66,14 +67,14 @@ def test_life_unknown_context_checkpoint_counts_only_consecutive_unknown_turns(t
         svc.record_context("Save1", "cid-1", 1000)
     svc.record_context("Save1", "cid-1", None)
     assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
-    state = json.loads((tmp_path / "life-context.json").read_text(encoding="utf-8"))["life:agy:Save1"]
+    state = json.loads((tmp_path / "life-context.json").read_text(encoding="utf-8"))["agy:Save1"]
     assert state["turns"] == 20
     assert state["unmeasuredTurns"] == 1
     for _ in range(18):
         svc.record_context("Save1", "cid-1", None)
     assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
     svc.record_context("Save1", "cid-1", None)
-    assert svc.rotate_if_needed("Save1", 0, 0) is None
+    assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
 
 
 def test_life_measured_context_resets_unknown_streak_across_restart_and_session_change(tmp_path) -> None:
@@ -95,7 +96,7 @@ def test_life_measured_context_resets_unknown_streak_across_restart_and_session_
     restarted.record_context("Save1", "cid-2", None)
     assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-2"
     restarted.record_context("Save1", "cid-2", None)
-    assert restarted.rotate_if_needed("Save1", 0, 0) is None
+    assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-2"
 
 
 def test_life_legacy_context_retains_unknown_turn_checkpoint_fallback(tmp_path) -> None:
@@ -110,60 +111,37 @@ def test_life_legacy_context_retains_unknown_turn_checkpoint_fallback(tmp_path) 
     svc.record_session_id("Save1", "cid-1")
     assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
     svc.record_context("Save1", "cid-1", None)
-    assert svc.rotate_if_needed("Save1", 0, 0) is None
+    assert svc.rotate_if_needed("Save1", 0, 0) == "cid-1"
     # A legacy state already at the checkpoint still rotates without a new turn.
     state = json.loads(context_path.read_text(encoding="utf-8"))
-    state["life:agy:Save1"].pop("unmeasuredTurns")
+    state["agy:Save1"].pop("unmeasuredTurns")
     context_path.write_text(json.dumps(state), encoding="utf-8")
     restarted = LifeChatService("agy", sessions, tmp_path / "chat_sessions.json", fingerprints,
                                 tmp_path / "life_fp.json")
     restarted.record_session_id("Save1", "cid-1")
-    assert restarted.rotate_if_needed("Save1", 0, 0) is None
+    assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-1"
+
 
 
 def test_life_system_prompt_contains_profile_memory_and_work() -> None:
-    profile = {"companionName": "小星", "personality": "tsundere", "playStyle": "earn",
-               "careFrequency": "moderate", "onboarded": True, "skipped": False}
-    memory = {"agreements": [{"text": "每天浇水", "gameDate": "1:spring:1"}],
-              "preferences": [], "recentEvents": [{"text": "完成了「浇水」", "gameDate": "1:spring:2"}]}
+    profile = {"companionName": "小星", "personality": "tsundere", "playStyle": "earn"}
+    memory = {"agreements": [{"text": "每天浇水"}], "preferences": []}
     work = {"mode": "free", "goal": "优先赚钱"}
     prompt = LifeChatService.build_system_prompt(profile, memory, work, mode="chat")
-    assert "小星" in prompt
-    assert "嘴硬心软" in prompt
-    assert "每天浇水" in prompt
-    assert "完成了「浇水」" in prompt
-    assert "优先赚钱" in prompt
-    assert "统一伙伴对话" in prompt
-    assert "明确派活直接安排" in prompt
-    assert "无需换入口或再次认可" in prompt
-    assert "manage_companion" in prompt
-    assert "当前工作" in prompt
-    assert "没有显示的状态就是未知" in prompt
-    plan_prompt = LifeChatService.build_system_prompt(profile, memory, work, mode="plan")
-    assert "统一伙伴对话" in plan_prompt
+    facts = json.loads(prompt.split("实时上下文：", 1)[1])
+    assert facts["profile"]["companionName"] == "小星"
+    assert "嘴硬心软" in facts["profile"]["personalityStyle"]
+    assert facts["memory"] == memory and facts["work"] == work
+    assert prompt == LifeChatService.build_system_prompt(profile, memory, work, mode="plan")
 
 
-def test_plan_prompt_injects_milestone_snapshot_and_rules() -> None:
-    profile = {"companionName": "小星", "personality": "gentle", "playStyle": "earn",
-               "careFrequency": "moderate", "onboarded": True, "skipped": False}
-    milestones = [
-        {"id": "spring-egg-festival-strawberry:y1", "title": "蛋蛋节买草莓种子",
-         "status": "suggested", "targetDate": "1:spring:13", "daysUntil": 2,
-         "reservedFunds": None, "pendingGap": "预留购买草莓种子的资金"},
-    ]
-    prompt = LifeChatService.build_system_prompt(
-        profile, None, {"mode": "free"}, mode="plan", milestones=milestones
-    )
-    assert "安排工具" in prompt
-    assert "spring-egg-festival-strawberry:y1" in prompt
-    assert "manage_milestones" in prompt
-    assert "记录安排不等于动作已经完成" in prompt
-    assert "采购按真实资金与目标自行处理" in prompt
-    assert "每日购买上限" not in prompt
-    # Both compatibility wire modes offer the same direct-conversation tools.
-    chat_prompt = LifeChatService.build_system_prompt(profile, None, None, mode="chat")
-    assert "无需换入口或再次认可" in chat_prompt
-    assert "节点快照" not in chat_prompt
+
+def test_plan_prompt_contains_current_milestones_as_data() -> None:
+    milestones = [{"id": "spring-egg-festival-strawberry:y1", "status": "suggested", "daysUntil": 2}]
+    prompt = LifeChatService.build_system_prompt(None, None, {"mode": "free"}, mode="plan", milestones=milestones)
+    facts = json.loads(prompt.split("实时上下文：", 1)[1])
+    assert facts["milestones"] == milestones
+    assert "node_id使用真实节点id" not in prompt
 
 
 def test_milestone_care_prompt_mentions_node_details() -> None:
@@ -294,7 +272,7 @@ def test_life_chat_turn_failed_model_still_reaches_terminal(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_life_session_rotates_when_memory_changes(tmp_path) -> None:
+def test_life_session_keeps_history_when_memory_changes(tmp_path) -> None:
     async def run() -> None:
         bridge = _bridge(tmp_path)
         ws = AsyncMock()
@@ -309,14 +287,14 @@ def test_life_session_rotates_when_memory_changes(tmp_path) -> None:
                 "payload": {"requestId": "r1", "saveId": "Save1", "mode": "chat", "text": "你好"},
             }, "Save1")
             assert seen_cids == [None]
-            # A memory revision bump (e.g. a new agreement) must rotate the session.
+            # A memory revision is current context, not a new provider session.
             bridge._memory_store.add("Save1", kind="agreement", text="晚上八点上线",
                                      source="player", game_date="1:spring:1",
                                      expected_revision=0)
             await bridge._handle_life_chat_submit(ws, {
                 "payload": {"requestId": "r2", "saveId": "Save1", "mode": "chat", "text": "记住啦"},
             }, "Save1")
-            assert seen_cids[1] is None, "life session must rotate on memoryRevision change"
+            assert seen_cids[1] == "cid-1"
 
     asyncio.run(run())
 
@@ -964,8 +942,8 @@ def test_plan_context_exposes_separate_wallets_and_proposal_continuity(tmp_path)
         discussion=bridge._life_chat.discussion_context("S", "plan"),
     )
     assert '"money":500' in prompt and '"spendableMoney":120' in prompt
-    assert "我先把缺水的菜浇一小片" in prompt and "你看着办" in prompt
-    assert "不把预算、数量、保留金额当必填项" in prompt
+    assert "我先把缺水的菜浇一小片" in prompt
+    assert json.loads(prompt.split("实时上下文：", 1)[1])["recentDialogue"][-1]["text"] == "我先把缺水的菜浇一小片。"
     assert bridge._life_chat.discussion_context("S", "chat") == []
     bridge._life_chat.rotate_if_needed("S", 2, 0)
     assert bridge._life_chat.discussion_context("S", "plan") == []
@@ -986,7 +964,7 @@ def test_confirmed_current_preparation_uses_existing_work_path_once(tmp_path):
         await bridge._start_accepted_preparation(None, "S", {})
         bridge.handle_chat_submit.assert_awaited_once()
         prompt = bridge.handle_chat_submit.await_args.args[2]
-        assert "浇水" in prompt and "不取消其他工作" in prompt
+        assert "浇水" in prompt and bridge._milestone_store.list_nodes("S")[0]["goalId"] in prompt
         # An unchanged next conversation does not repeat the work.
         await bridge._start_accepted_preparation(None, "S", before)
         bridge.handle_chat_submit.assert_awaited_once()
@@ -1171,57 +1149,47 @@ def test_life_provider_never_borrows_native_socket_even_on_failure(tmp_path):
     asyncio.run(run())
 
 
-def test_continuation_context_keeps_fresh_facts_without_repeating_persona(tmp_path):
-    bridge = _bridge(tmp_path)
-    svc = bridge._life_chat
-    profile = {"companionName": "小满", "personality": "gentle", "playStyle": "earn"}
-    memory = {"agreements": [{"text": "不卖木材"}]}
-    live = {"date": {"day": 11}, "resources": {"player": {"money": 500},
-            "companion": {"spendableMoney": 100, "inventory": {"items": []}}},
-            "companion": {"name": "小满"}, "agreements": ["不卖木材"],
-            "inventory": {"items": []}, "funds": 100, "paused": False}
-    kwargs = dict(mode="plan", milestones=[{"id": "strawberry", "status": "suggested"}], live_context=live)
-    first = svc.build_turn_prompt("S", None, profile, memory, {"paused": False}, **kwargs)
-    assert "温柔体贴" in first and "不卖木材" in first
-    # Unacknowledged/failed initialization must not cause the lean continuation.
-    unconfirmed = svc.build_turn_prompt("S", "cid", profile, memory, {"paused": False}, **kwargs)
-    assert "温柔体贴" in unconfirmed
-    svc.mark_prompt_delivered("S", "cid", "plan")
+
+def test_continuation_keeps_full_current_facts_and_deduplicates_core(tmp_path):
+    from stardew_ai_runtime.agent_instructions import runtime_instructions
+    from stardew_ai_runtime.prompt_delivery import PromptDelivery
+    svc = _bridge(tmp_path)._life_chat
+    delivery = PromptDelivery(tmp_path / "delivery.json")
+    core = runtime_instructions()
+    profile = {"companionName": "小满", "personality": "gentle"}
+    live = {"resources": {"player": {"money": 500}}, "paused": False}
+    options = dict(mode="chat", milestones=[{"id": "strawberry"}], live_context=live)
+    first = svc.build_turn_prompt("S", None, profile, {"agreements": [{"text": "不卖木材"}]}, {}, **options)
+    sent, pending = delivery.prepare("fake:S", None, first, core)
+    assert core in sent
+    delivery.acknowledge("fake:S", pending, "cid")
+    svc.mark_prompt_delivered("S", "cid", "chat")
     live["resources"]["player"]["money"] = "unknown"
     live["paused"] = True
-    kwargs["milestones"] = []
-    second = svc.build_turn_prompt("S", "cid", profile, memory, {"paused": True}, **kwargs)
-    assert "温柔体贴" not in second and "不卖木材" not in second
-    assert '"money":"unknown"' in second and '"paused":true' in second
-    assert '"milestones":[]' in second and "完整替换" in second
-    assert "node_id" in second and "manage_companion" in second
-    assert len(second) < len(first) / 2
-    # A mode transition needs full boundaries; a new session restores personality.
-    kwargs["mode"] = "chat"
-    switched = svc.build_turn_prompt("S", "cid", profile, memory, {}, **kwargs)
-    assert "温柔体贴" in switched and "统一伙伴对话" in switched
-    assert "温柔体贴" in svc.build_turn_prompt("S", "another-cid", profile, memory, {}, **kwargs)
-    assert "companion" in live and "inventory" in live  # formatter doesn't mutate source facts
+    options.update(mode="plan", milestones=[])
+    second = svc.build_turn_prompt("S", "cid", profile, {"agreements": []}, {"paused": True}, **options)
+    sent, _ = delivery.prepare("fake:S", "cid", second, core)
+    assert core not in sent
+    facts = json.loads(sent.split("实时上下文：", 1)[1])
+    assert facts["live"]["resources"]["player"]["money"] == "unknown"
+    assert facts["work"]["paused"] is True and facts["milestones"] == []
+    assert facts["memory"]["agreements"] == [] and "不卖木材" not in sent
+    assert delivery.prepare("fake:S", "different-session", second, core)[0].count(core) == 1
 
 
-def test_bridge_only_marks_successful_life_prompt_as_delivered(tmp_path):
-    async def run():
-        bridge = _bridge(tmp_path)
-        prompts = []
-        def provider(task, cid, prompt, mode="chat"):
-            prompts.append(prompt)
-            return {"success": len(prompts) != 1, "response": "你好", "conversation_id": "same-cid"}
-        with patch.object(bridge, "_execute_life_turn", side_effect=provider):
-            for i in range(3):
-                await bridge._handle_life_chat_submit(AsyncMock(), {
-                    "payload": {"requestId": f"r{i}", "saveId": "S", "mode": "chat", "text": "你好"},
-                }, "S")
-        assert "你是农场伙伴" in prompts[0]
-        assert "你是农场伙伴" in prompts[1]
-        assert "你是农场伙伴" not in prompts[2]
-        assert "已有adopted安排用revise" in prompts[2]
-        assert "保存失败不能宣称接下新范围" in prompts[2]
-    asyncio.run(run())
+
+def test_only_acknowledged_provider_prompt_suppresses_repeated_guidance(tmp_path):
+    from stardew_ai_runtime.agent_instructions import runtime_instructions
+    bridge = _bridge(tmp_path)
+    task = ActiveChatTask(request_id="turn", save_id="S")
+    core = runtime_instructions()
+    prompt = core + "\n\n玩家说：你好"
+    key, first, pending = bridge._prepare_prompt_delivery(task, None, prompt, None)
+    assert core in first
+    _, retry, pending = bridge._prepare_prompt_delivery(task, "same-cid", prompt, None)
+    assert core in retry
+    bridge._acknowledge_prompt_delivery(key, pending, "S", "same-cid")
+    assert core not in bridge._prepare_prompt_delivery(task, "same-cid", prompt, None)[1]
 
 
 def test_memory_correction_and_deletion_reinitialize_without_old_text(tmp_path):
@@ -1244,7 +1212,7 @@ def test_memory_correction_and_deletion_reinitialize_without_old_text(tmp_path):
             await turn(2)
             bridge._memory_store.delete("S", entry_id, expected_revision=2)
             await turn(3)
-        assert all(cid is None for cid, _ in seen)
+        assert [cid for cid, _ in seen] == [None, "cid-1", "cid-2"]
         assert "旧约定标记" in seen[0][1]
         assert "旧约定标记" not in seen[1][1] and "新约定标记" in seen[1][1]
         assert "旧约定标记" not in seen[2][1] and "新约定标记" not in seen[2][1]

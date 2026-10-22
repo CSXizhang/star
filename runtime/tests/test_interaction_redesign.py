@@ -44,27 +44,20 @@ def test_mcode_aggregate_usage_does_not_rotate_as_one_request():
     assert ChatBridge._request_input_context(usage) is None
 
 
-def test_successful_life_context_survives_restart_and_reload_is_delta_once(tmp_path):
+
+def test_successful_life_context_survives_restart_with_current_full_snapshot(tmp_path):
     bridge = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)
     svc = bridge._life_chat
-    profile = {"personality": "gentle"}
-    live = {"reloadSummary": {"gameSessionId": "loaded-1", "instruction": "重新核实当前世界",
-                              "goals": ["historical-goal-marker"]}}
+    live = {"reloadSummary": {"gameSessionId": "loaded-1", "goals": ["historical-goal-marker"]}}
     args = dict(mode="chat", milestones=[], live_context=live)
-    first = svc.build_turn_prompt("farm", None, profile, {}, {}, **args)
-    assert "historical-goal-marker" in first
+    assert "historical-goal-marker" in svc.build_turn_prompt("farm", None, {}, {}, {}, **args)
     svc.record_context("farm", "cid", None)
     svc.mark_prompt_delivered("farm", "cid", "chat")
     svc = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)._life_chat
-    again = svc.build_turn_prompt("farm", "cid", profile, {}, {}, **args)
-    assert "温柔体贴" not in again and "reloadSummary" not in again
-    live["reloadSummary"]["gameSessionId"] = "loaded-2"
-    delta = svc.build_turn_prompt("farm", "cid", profile, {}, {}, **args)
-    assert "loaded-2" in delta and "historical-goal-marker" not in delta
-    assert "loaded-2" in svc.build_turn_prompt("farm", "cid", profile, {}, {}, **args)  # retry until success
-    svc.mark_prompt_delivered("farm", "cid", "chat")
-    assert "reloadSummary" not in svc.build_turn_prompt("farm", "cid", profile, {}, {}, **args)
-    assert "historical-goal-marker" in svc.build_turn_prompt("farm", None, profile, {}, {}, **args)
+    live["reloadSummary"] = {"gameSessionId": "loaded-2", "goals": []}
+    current = svc.build_turn_prompt("farm", "cid", {}, {}, {}, **args)
+    assert "loaded-2" in current and "historical-goal-marker" not in current
+    assert "recentDialogue" not in current  # resumed history is already in the harness
 
 
 def test_work_reload_delivery_survives_restart(tmp_path):
@@ -300,8 +293,8 @@ def test_life_context_rotation_counts_cached_input_and_survives_restart(tmp_path
     life.rotate_if_needed("farm", 1, 1)
     life.record_session_id("farm", "old")
     life.record_context("farm", "old", ChatBridge._request_input_context({"input_tokens": 1000, "cached_input_tokens": 110000}))
-    assert service().rotate_if_needed("farm", 1, 1) is None
-    assert life.get_session_id("farm") is None
+    assert service().rotate_if_needed("farm", 1, 1) == "old"
+    assert life.get_session_id("farm") == "old"
 
 
 def test_map_response_bounds_details_but_keeps_geometry_and_completeness():

@@ -1,4 +1,4 @@
-﻿using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewAI.Companion.Mod.Adapters;
 using StardewAI.Companion.Mod.Avatar;
@@ -15,8 +15,8 @@ namespace StardewAI.Companion.Mod.Execution;
 /// toggle-animal-door, collect-animal-produce).
 ///
 /// It reuses the standard execution guarantees every other skill has: single-task
-/// dispatch, safe pause/resume/cancel boundaries, measured game-clock budget,
-/// monotonic timeout, per-target verification and native results only. The
+/// dispatch, safe pause/resume/cancel boundaries, optional game-clock budget,
+/// no-progress timeout, per-target verification and native results only. The
 /// action-specific native work lives in <see cref="INativeActionAdapter"/>; this
 /// machine never fabricates an effect.
 /// </summary>
@@ -24,7 +24,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600;
+    private const long MaxNoProgressTicks = 3600;
     private const int ActionDurationTicks = 8;
     private const int MinToolAnimationTicks = 18;
     private const int MaxToolAnimationTicks = 90;
@@ -59,6 +59,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
     private int _totalCost;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
     private bool _playerActionRequired;
 
@@ -146,6 +147,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             _totalCost = 0;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _actionTicks = 0;
             _actionEffectExecuted = false;
@@ -182,11 +184,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be at least 1.", "INVALID_PARAMETERS");
+                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be non-negative; 0 means no time limit.", "INVALID_PARAMETERS");
                 return false;
             }
 
@@ -267,15 +269,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
             _elapsedTicks++;
 
-            if (_elapsedTicks > MaxMonotonicTicks)
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
-                Log($"{_currentRequest?.SkillId} monotonic timeout exceeded ({MaxMonotonicTicks} ticks). Terminating.", LogLevel.Warn);
-                FinishExecution(ExecutionState.Failed, "Monotonic tick limit exceeded.", "TIMEOUT");
+                Log($"{_currentRequest?.SkillId} no-progress timeout exceeded ({MaxNoProgressTicks} ticks). Terminating.", LogLevel.Warn);
+                FinishExecution(ExecutionState.Failed, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
             int elapsedMinutes = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (_currentRequest is not null && elapsedMinutes > _currentRequest.MaxGameMinutes)
+            if (_currentRequest is not null && _currentRequest.MaxGameMinutes > 0 && elapsedMinutes > _currentRequest.MaxGameMinutes)
             {
                 Log($"{_currentRequest.SkillId} budget exceeded: {elapsedMinutes} > {_currentRequest.MaxGameMinutes} minutes.", LogLevel.Warn);
                 FinishExecution(_completed.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed,
@@ -543,6 +545,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             _firstPreconditionMessage ??= result.ErrorMessage;
             _playerActionRequired |= result.PlayerActionRequired;
             EmitProgress("waiting", result.SkipReason);
+            if (_currentRequest!.Kind == NativeActionKind.RefillWateringCan &&
+                string.Equals(result.SkipReason, "already-full", StringComparison.OrdinalIgnoreCase))
+            {
+                // The requested state is already true. Other water sources are
+                // alternatives, so visiting them cannot improve this result.
+                _currentTargetIndex++;
+                FinishExecution(ExecutionState.Succeeded, null, null);
+                return;
+            }
         }
         else if (result.InProgress)
         {

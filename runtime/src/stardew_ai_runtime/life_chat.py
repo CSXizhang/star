@@ -21,17 +21,17 @@ from .decision_policy import decision_policy
 logger = logging.getLogger("stardew_ai_runtime.life_chat")
 
 _PERSONALITY_PROMPTS: dict[str, str] = {
-    "gentle": "温柔体贴：先照顾玩家负担和体力，主动提出自己能分担的小事；给温和明确的建议，不让玩家做一串选择题，不居高临下。",
-    "lively": "活泼开朗：主动发现眼前可做的小机会，愿意试一个适度的小计划；表达轻快具体，不夸大收益或用感叹词代替行动。",
-    "calm": "沉稳可靠：先看真实资源和正在做的事，选一两件最有用的工作，简短说明取舍；资源不足时自然缩小规模。",
-    "tsundere": "嘴硬心软：略带克制的打趣，但实际替玩家省事、照顾负担；不挖苦玩家、不逼问表单，把关心体现在愿意接手的工作里。",
+    "gentle": "温柔体贴",
+    "lively": "活泼开朗",
+    "calm": "沉稳可靠",
+    "tsundere": "嘴硬心软",
 }
 
 _PLAY_STYLE_SUMMARIES: dict[str, str] = {
-    "earn": "优先赚钱：比较收益、收获出货、按需补种，按实际资金安排采购",
-    "workhorse": "任劳任怨：浇水除草收获、喂动物、收机器成品等日常杂务",
-    "community": "献祭：优先收集、保留与种植准备；无法读取的献祭进度说未知，最后提交仍由玩家完成",
-    "decor": "装修：结合地形商量布局，可准备材料和清理玩家明确授权的位置；可按真实背包物品分批摆放和回收家具、地板、围栏与物件；可制造已解锁配方并在原生规则允许时搬迁建筑；新建升级建筑可先观察原生目录与材料费用，按玩家目标与实际资金到服务柜台办理并等待真实工期，不冒充已经完成",
+    "earn": "赚钱：收获、出货、采购与种植经营",
+    "workhorse": "日常农活：作物照料、清理、动物照料与机器收取",
+    "community": "社区中心：收集、种植和保留献祭所需物品",
+    "decor": "装修农场：布局、清理、制作、物件摆放与建筑安排",
 }
 
 def _life_session_key(backend: str, save_id: str) -> str:
@@ -258,14 +258,9 @@ class LifeChatService:
         weather: Any,
         ref_event: str | None,
     ) -> str:
-        """Build a prompt asking the model to generate a care message."""
-        name = profile.get("companionName", "阿星") if profile else "阿星"
-        personality = profile.get("personality", "gentle") if profile else "gentle"
-        personality_desc = _PERSONALITY_PROMPTS.get(personality, _PERSONALITY_PROMPTS["gentle"])
-
+        """Add the event; the shared turn context already carries persona and memory."""
         parts = [
-            f"你是农场伙伴{name}。{personality_desc}",
-            "请根据以下情境生成一条简短的主动关怀消息（不超过100字），让玩家感到温暖。",
+            "结合当前情境和玩家对你的设定，主动与玩家交流。",
             f"当前游戏日期：{game_date}，时段：{'早晨' if kind == 'morning' else '傍晚' if kind == 'evening' else '计划提醒' if kind == 'milestone' else '工作完成后'}。",
         ]
 
@@ -286,13 +281,6 @@ class LifeChatService:
             else:
                 parts.append(f"刚刚完成的事情：{ref_event}。")
 
-        if memory_render:
-            agreements = memory_render.get("agreements", [])
-            if agreements:
-                ag_texts = "；".join(a.get("text", "") for a in agreements[:3])
-                parts.append(f"玩家的约定：{ag_texts}。")
-
-        parts.append("直接输出关怀消息正文，不要加引号或前缀说明。")
         return "\n".join(parts)
 
     # ---------------------------------------------------------------- persistence

@@ -13,7 +13,7 @@
 你需要：
 
 - **Windows 64 位**，已安装《星露谷物语》和 [SMAPI](https://smapi.io/)。本轮验证环境是 **Stardew Valley 1.6.15 / SMAPI 4.2.1**，主要面向单人存档。
-- **任选一个已安装、已登录且能正常对话的模型客户端**：MiniMax Code（`mcode`）、Codex CLI、Kimi CLI、agy 或 dsh。只有网页聊天账号、没有对应客户端，还不能直接使用。
+- **任选一个模型客户端，安装并登录**：MiniMax Code（`mcode`）、Codex CLI、Kimi CLI、agy 或 dsh。
 - 模型所需的网络连接和可用额度。Mod 开源免费，模型服务的订阅或 API 费用由你使用的服务决定；游戏内对话和自动工作都会调用模型。
 
 完整发行包已经包含 Mod 和独立 Python 环境，**不需要克隆源码，也不需要安装 Python、uv 或 .NET SDK**。已有模型客户端就沿用它，后端选择说明见[模型登录与工具信任](docs/release-guide.md#模型登录与工具信任)。

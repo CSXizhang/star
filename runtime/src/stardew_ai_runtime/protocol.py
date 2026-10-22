@@ -16,11 +16,31 @@ class ProtocolError(ValueError):
 # here, schedule, transport, MCP schema and the C# handler all validate the same
 # contract, and an unknown skill/parameter is rejected instead of being forwarded.
 NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
+    "inspect-player-activities": frozenset({"locationId"}),
+    "talk-npc": frozenset({"locationId", "npcName"}),
+    "interact-tile": frozenset({"locationId", "tile"}),
+    "fish": frozenset({"locationId", "facing"}),
+    "attack": frozenset({"locationId", "facing"}),
+    "native-menu-select": frozenset({"locationId", "choiceIndex", "menuText"}),
+    "cut-grass": frozenset({"locationId", "tiles"}),
+    "inspect-building-services": frozenset({"locationId"}),
+    "build-building": frozenset({"locationId", "buildingType", "tile", "budget_limit"}),
+    "upgrade-building": frozenset({"locationId", "buildingName", "buildingType", "budget_limit"}),
+    "purchase-animal": frozenset({"locationId", "buildingName", "animalType", "animalName", "budget_limit"}),
+    "inspect-machines": frozenset({"locationId"}),
+    "inspect-production": frozenset({"locationId"}),
+    "eat-food": frozenset({"locationId", "itemId"}),
     "inspect-crafting": frozenset({"locationId"}),
     "craft-items": frozenset({"locationId", "recipeName", "itemCount"}),
     "move-building": frozenset({"locationId", "buildingName", "tile"}),
     "inspect-map-image": frozenset({"locationId"}),
     "inspect-location": frozenset({"locationId", "region"}),
+    "inspect-planting": frozenset({"locationId", "region"}),
+    "inspect-route": frozenset({"locationId", "tile"}),
+    "inspect-livestock": frozenset({"locationId"}),
+    "open-shop": frozenset({"locationId", "shopId"}),
+    "open-chest": frozenset({"locationId", "chestTile"}),
+    "inspect-shop": frozenset({"locationId", "shopId"}),
     "place-items": frozenset({"locationId", "tiles", "itemId"}),
     "remove-items": frozenset({"locationId", "tiles", "itemId"}),
     "refill-watering-can": frozenset({"locationId", "tiles"}),
@@ -30,10 +50,14 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "chop-tree": frozenset({"locationId", "tiles"}),
     "insert-machine": frozenset({"locationId", "tile", "itemId", "itemCount"}),
     "collect-machine": frozenset({"locationId", "tiles"}),
-    "pet-animal": frozenset({"locationId", "tiles", "animalName"}),
+    "pet-animal": frozenset({"locationId", "tiles", "animalName", "animalId"}),
     "feed-animals": frozenset({"locationId", "buildingName"}),
     "toggle-animal-door": frozenset({"locationId", "tiles"}),
-    "collect-animal-produce": frozenset({"locationId", "tiles", "animalName"}),
+    "collect-animal-produce": frozenset({"locationId", "tiles", "animalName", "animalId"}),
+    # UI continuations act on the actor's current UI. Location labels retain
+    # compatibility with native transport shape validation, never select a map.
+    "native-advance": frozenset({"locationId", "allowSkip"}),
+    "native-answer": frozenset({"locationId", "choiceIndex"}),
 }
 
 NATIVE_ACTION_TASK_PREFIXES: dict[str, str] = {
@@ -51,6 +75,8 @@ NATIVE_ACTION_TASK_PREFIXES: dict[str, str] = {
     "feed-animals": "task-feed-",
     "toggle-animal-door": "task-door-",
     "collect-animal-produce": "task-aprod-",
+    "native-advance": "task-advance-",
+    "native-answer": "task-answer-",
 }
 
 
@@ -64,7 +90,9 @@ def validate_native_action_parameters(skill_id: str, parameters: Mapping[str, An
         raise ProtocolError(
             f"unsupported parameter(s) for '{skill_id}': {', '.join(sorted(unknown))}"
         )
-    if "locationId" not in parameters:
+    # Location-bound skills must name their map; UI-state skills (native-advance,
+    # native-answer) declare no locationId and act on the actor's current UI.
+    if "locationId" in allowed and "locationId" not in parameters:
         raise ProtocolError(f"'locationId' is required for '{skill_id}'")
 
 
@@ -193,13 +221,71 @@ class Envelope:
         parameters: Mapping[str, Any],
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
         policy_decision_id: str = "policy-allow",
     ) -> Envelope:
         """Builds skill.execute for one explicitly allow-listed native action."""
+        validate_native_action_parameters(skill_id, parameters)
+        return cls(
+            protocol_version="0.1",
+            message_type="skill.execute",
+            message_id=f"msg-exec-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id,
+            sequence_number=sequence_number,
+            world_revision=world_revision,
+            sent_at=datetime.now(UTC),
+            save_id=save_id,
+            game_session_id=game_session_id,
+            idempotency_key=idempotency_key,
+            expires_at=expires_at,
+            payload={
+                "commandId": command_id,
+                "taskId": task_id,
+                "skillId": skill_id,
+                "skillVersion": "0.1",
+                "expectedWorldRevision": world_revision,
+                "parameters": dict(parameters),
+                "budgets": {
+                    "maxGameMinutes": max_game_minutes,
+                    "maxStamina": max_stamina,
+                    "maxWater": max_water,
+                },
+                "cancelPolicy": cancel_policy,
+                "policyDecisionId": policy_decision_id,
+            },
+        )
+
+    @classmethod
+    def create_execute_skill(
+        cls,
+        sender_instance_id: str,
+        sequence_number: int,
+        save_id: str,
+        game_session_id: str,
+        world_revision: int,
+        command_id: str,
+        task_id: str,
+        skill_id: str,
+        parameters: Mapping[str, Any],
+        idempotency_key: str,
+        expires_at: datetime,
+        max_game_minutes: int = 0,
+        max_stamina: float = 50.0,
+        max_water: int = 20,
+        cancel_policy: str = "safe-point",
+        policy_decision_id: str = "policy-allow",
+    ) -> Envelope:
+        """Builds skill.execute for any allow-listed skill id and parameter map.
+
+        This is the generic constructor shared by the thin native skills that
+        have no dedicated envelope factory (open-shop/open-chest, the
+        native-advance/native-answer UI continuations). ``skill_id`` and
+        ``parameters`` are first-class here instead of being patched onto an
+        unrelated envelope after construction.
+        """
         validate_native_action_parameters(skill_id, parameters)
         return cls(
             protocol_version="0.1",
@@ -244,11 +330,12 @@ class Envelope:
         tiles: list[dict[str, int]],
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
         policy_decision_id: str = "policy-allow",
+        include_empty_tiles: bool | None = None,
     ) -> Envelope:
         return cls(
             protocol_version="0.1",
@@ -271,6 +358,7 @@ class Envelope:
                 "parameters": {
                     "locationId": location_id,
                     "tiles": tiles,
+                    "includeEmptyTiles": include_empty_tiles is True,
                 },
                 "budgets": {
                     "maxGameMinutes": max_game_minutes,
@@ -296,7 +384,7 @@ class Envelope:
         tiles: list[dict[str, int]],
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
@@ -348,7 +436,7 @@ class Envelope:
         tiles: list[dict[str, int]],
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
@@ -401,7 +489,7 @@ class Envelope:
         seed_item_id: str,
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
@@ -456,11 +544,12 @@ class Envelope:
         idempotency_key: str,
         expires_at: datetime,
         item_ids: list[str] | None = None,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
         policy_decision_id: str = "policy-allow",
+        items: list[dict[str, Any]] | None = None,
     ) -> Envelope:
         parameters: dict[str, Any] = {
             "locationId": location_id,
@@ -468,6 +557,8 @@ class Envelope:
         }
         if item_ids is not None:
             parameters["itemIds"] = item_ids
+        if items is not None:
+            parameters["items"] = items
         return cls(
             protocol_version="0.1",
             message_type="skill.execute",
@@ -512,7 +603,7 @@ class Envelope:
         chest_y: int,
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
@@ -566,7 +657,7 @@ class Envelope:
         items: list[dict[str, Any]],
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
@@ -620,7 +711,7 @@ class Envelope:
         items: list[dict[str, Any]],
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 20,
         cancel_policy: str = "safe-point",
@@ -674,7 +765,7 @@ class Envelope:
         budget_limit: int,
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 60,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 0,
         cancel_policy: str = "safe-point",
@@ -728,7 +819,7 @@ class Envelope:
         tile: dict[str, int],
         idempotency_key: str,
         expires_at: datetime,
-        max_game_minutes: int = 120,
+        max_game_minutes: int = 0,
         max_stamina: float = 50.0,
         max_water: int = 0,
         cancel_policy: str = "safe-point",
@@ -756,6 +847,54 @@ class Envelope:
                     "locationId": location_id,
                     "tile": tile,
                 },
+                "budgets": {
+                    "maxGameMinutes": max_game_minutes,
+                    "maxStamina": max_stamina,
+                    "maxWater": max_water,
+                },
+                "cancelPolicy": cancel_policy,
+                "policyDecisionId": policy_decision_id,
+            },
+        )
+
+    @classmethod
+    def create_execute_sleep(
+        cls,
+        sender_instance_id: str,
+        sequence_number: int,
+        save_id: str,
+        game_session_id: str,
+        world_revision: int,
+        command_id: str,
+        task_id: str,
+        idempotency_key: str,
+        expires_at: datetime,
+        max_game_minutes: int = 0,
+        max_stamina: float = 0.0,
+        max_water: int = 0,
+        cancel_policy: str = "safe-point",
+        policy_decision_id: str = "policy-allow",
+    ) -> Envelope:
+        """Builds skill.execute for the player-mode native sleep (empty parameters)."""
+        return cls(
+            protocol_version="0.1",
+            message_type="skill.execute",
+            message_id=f"msg-exec-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id,
+            sequence_number=sequence_number,
+            world_revision=world_revision,
+            sent_at=datetime.now(UTC),
+            save_id=save_id,
+            game_session_id=game_session_id,
+            idempotency_key=idempotency_key,
+            expires_at=expires_at,
+            payload={
+                "commandId": command_id,
+                "taskId": task_id,
+                "skillId": "sleep",
+                "skillVersion": "0.1",
+                "expectedWorldRevision": world_revision,
+                "parameters": {"locationId": "FarmHouse"},
                 "budgets": {
                     "maxGameMinutes": max_game_minutes,
                     "maxStamina": max_stamina,
@@ -826,6 +965,62 @@ class Envelope:
                 "commandId": command_id,
                 "reason": reason,
             },
+        )
+
+    @classmethod
+    def create_agent_thinking(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        state: str,
+        lease_id: str,
+        save_id: str | None = None,
+        game_session_id: str | None = None,
+    ) -> Envelope:
+        """Pause/release the world clock around one provider model turn (player mode)."""
+        if state not in {"begin", "renew", "end"}:
+            raise ProtocolError("agent.thinking: state must be 'begin', 'renew' or 'end'")
+        return cls(
+            protocol_version="0.1", message_type="agent.thinking",
+            message_id=f"msg-thinking-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id, game_session_id=game_session_id,
+            payload={"requestId": request_id, "saveId": save_id,
+                     "state": state, "leaseId": lease_id},
+        )
+
+    @classmethod
+    def create_player_control(
+        cls,
+        sender_instance_id: str,
+        request_id: str,
+        action: str,
+        save_id: str | None = None,
+        game_session_id: str | None = None,
+    ) -> Envelope:
+        """Claim or release native player control (player mode only)."""
+        if action not in {"claim", "release"}:
+            raise ProtocolError("player.control: action must be 'claim' or 'release'")
+        return cls(
+            protocol_version="0.1", message_type="player.control",
+            message_id=f"msg-player-control-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=0,
+            world_revision=0, sent_at=datetime.now(UTC), save_id=save_id, game_session_id=game_session_id,
+            payload={"requestId": request_id, "saveId": save_id, "action": action},
+        )
+
+    @classmethod
+    def create_result_query(
+        cls, sender_instance_id: str, sequence_number: int, save_id: str,
+        game_session_id: str, world_revision: int, command_id: str,
+    ) -> Envelope:
+        return cls(
+            protocol_version="0.1", message_type="skill.result.query",
+            message_id=f"msg-result-query-{uuid.uuid4().hex[:8]}",
+            sender_instance_id=sender_instance_id, sequence_number=sequence_number,
+            save_id=save_id, game_session_id=game_session_id,
+            world_revision=world_revision, sent_at=datetime.now(UTC),
+            payload={"commandId": command_id},
         )
 
     @classmethod
@@ -1026,6 +1221,7 @@ class Envelope:
         proposal_ready: bool | None = None,
         proposal_node_id: str | None = None,
         activity: Mapping[str, Any] | None = None,
+        answered_notice_id: str | None = None,
     ) -> Envelope:
         """life.chat.reply: no token/session fields (contract §1.2)."""
         payload: dict[str, Any] = {
@@ -1047,6 +1243,8 @@ class Envelope:
             payload["proposalNodeId"] = proposal_node_id
         if activity is not None:
             payload["activity"] = dict(activity)
+        if answered_notice_id is not None:
+            payload["answeredNoticeId"] = answered_notice_id
         return cls(
             protocol_version="0.1", message_type="life.chat.reply",
             message_id=f"msg-life-reply-{uuid.uuid4().hex[:8]}",
@@ -1314,6 +1512,10 @@ class LifeChatSubmitPayload:
     text: str
     source: str = "life-menu"
     accepted_node_id: str | None = None
+    reply_to_notice_id: str | None = None
+    resolve_notice: bool = False
+    notice_action: str | None = None
+    notice_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatSubmitPayload:
@@ -1333,8 +1535,25 @@ class LifeChatSubmitPayload:
         accepted = value.get("acceptedNodeId")
         if accepted is not None and (mode != "plan" or not isinstance(accepted, str) or not accepted.strip()):
             raise ProtocolError("acceptedNodeId requires plan mode and a non-empty proposal id")
+        notice = value.get("replyToNoticeId")
+        if notice is not None and (not isinstance(notice, str) or not notice.strip()):
+            raise ProtocolError("replyToNoticeId requires a non-empty notice id")
+        resolve = value.get("resolveNotice", False)
+        if not isinstance(resolve, bool) or resolve and not notice:
+            raise ProtocolError("resolveNotice requires boolean and a pending notice id")
+        notice_action = value.get("noticeAction")
+        notice_ids = value.get("noticeIds", [])
+        if not isinstance(notice_ids, list):
+            raise ProtocolError("noticeIds must be an array")
+        if notice_action is not None and (notice_action not in {"dismiss", "restore"} or
+                not isinstance(notice_ids, list) or not 1 <= len(notice_ids) <= 200 or
+                any(not isinstance(i, str) or not i.strip() for i in notice_ids) or notice or accepted or resolve):
+            raise ProtocolError("Invalid notice visibility action")
+        if notice_action is None and notice_ids:
+            raise ProtocolError("noticeIds requires noticeAction")
         return cls(request_id=request_id, save_id=save_id, mode=mode, text=text, source=source,
-                   accepted_node_id=accepted)
+                   accepted_node_id=accepted, reply_to_notice_id=notice, resolve_notice=resolve,
+                   notice_action=notice_action, notice_ids=tuple(notice_ids))
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -1344,6 +1563,9 @@ class LifeChatSubmitPayload:
             "text": self.text,
             "source": self.source,
             **({"acceptedNodeId": self.accepted_node_id} if self.accepted_node_id else {}),
+            **({"replyToNoticeId": self.reply_to_notice_id} if self.reply_to_notice_id else {}),
+            **({"resolveNotice": True} if self.resolve_notice else {}),
+            **({"noticeAction": self.notice_action, "noticeIds": list(self.notice_ids)} if self.notice_action else {}),
         }
 
 
@@ -1362,6 +1584,7 @@ class LifeChatReplyPayload:
     proposal_ready: bool | None = None
     proposal_node_id: str | None = None
     activity: dict[str, Any] | None = None
+    answered_notice_id: str | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> LifeChatReplyPayload:
@@ -1377,6 +1600,7 @@ class LifeChatReplyPayload:
             proposal_ready=value.get("proposalReady"),
             proposal_node_id=value.get("proposalNodeId"),
             activity=value.get("activity"),
+            answered_notice_id=value.get("answeredNoticeId"),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -1399,6 +1623,8 @@ class LifeChatReplyPayload:
             res["proposalNodeId"] = self.proposal_node_id
         if self.activity is not None:
             res["activity"] = dict(self.activity)
+        if self.answered_notice_id is not None:
+            res["answeredNoticeId"] = self.answered_notice_id
         return res
 
 
@@ -1452,6 +1678,13 @@ class LifeProfileSetPayload:
             raise ProtocolError(f"life.profile.set: invalid personality '{patch['personality']}'")
         if "careFrequency" in patch and patch["careFrequency"] not in _LIFE_CARE_FREQUENCIES:
             raise ProtocolError(f"life.profile.set: invalid careFrequency '{patch['careFrequency']}'")
+        if "bedtime" in patch:
+            bedtime = patch["bedtime"]
+            if isinstance(bedtime, bool) or not isinstance(bedtime, int):
+                raise ProtocolError("life.profile.set: bedtime must be a game HHMM integer")
+            bedtime = bedtime + 2400 if 0 <= bedtime <= 100 else bedtime
+            if not 1800 <= bedtime <= 2500 or bedtime % 100 >= 60 or bedtime % 10:
+                raise ProtocolError("life.profile.set: bedtime must be 18:00..01:00 in ten-minute steps")
         if "companionName" in patch:
             name = str(patch["companionName"]).strip()
             if not (1 <= len(name) <= 12):
@@ -1559,7 +1792,7 @@ class LifeMemoryEditPayload:
 # life.milestones.* (contract §2): milestone planning nodes on the life channel.
 # ---------------------------------------------------------------------------
 
-_MILESTONE_STATUSES = frozenset({"suggested", "adopted", "deferred", "completed", "missed"})
+_MILESTONE_STATUSES = frozenset({"suggested", "adopted", "deferred", "completed", "missed", "cancelled"})
 _MILESTONE_VERIFICATIONS = frozenset({"verified", "unverified"})
 _MILESTONE_SUPPORTS = frozenset({"manual", "capability"})
 _MILESTONE_PREP_STATUSES = frozenset({"pending", "done", "unknown"})

@@ -17,8 +17,10 @@ public sealed class CompanionSpeechInputMenu : IClickableMenu
     private readonly string? _prompt;
     private readonly Rectangle _sendBounds;
     private readonly Rectangle _cancelBounds;
+    private readonly Action<string>? _saveDraft;
 
-    public CompanionSpeechInputMenu(string name, Action<string> send, Action cancel, string? prompt = null, int textLimit = 500)
+    public CompanionSpeechInputMenu(string name, Action<string> send, Action cancel, string? prompt = null, int textLimit = 500,
+        string? initialText = null, Action<string>? saveDraft = null)
         : base(Math.Max(16, (Game1.uiViewport.Width - 680) / 2),
                Math.Max(16, Game1.uiViewport.Height - 240),
                Math.Min(680, Game1.uiViewport.Width - 32), 192)
@@ -27,12 +29,14 @@ public sealed class CompanionSpeechInputMenu : IClickableMenu
         _prompt = prompt;
         _send = send;
         _cancel = cancel;
+        _saveDraft = saveDraft;
         _input = new TextBox(Game1.content.Load<Texture2D>(@"LooseSprites\textBox"), null, Game1.smallFont, Game1.textColor)
         {
             X = xPositionOnScreen + 24, Y = yPositionOnScreen + 64,
             // Native Draw shows the trailing text that fits without changing Text.
             // limitWidth=true instead destroys characters in the native setter.
             Width = width - 48, Height = 44, textLimit = textLimit, limitWidth = false,
+            Text = initialText ?? string.Empty,
         };
         _sendBounds = new Rectangle(xPositionOnScreen + width - 184, yPositionOnScreen + 124, 72, 40);
         _cancelBounds = new Rectangle(xPositionOnScreen + width - 96, yPositionOnScreen + 124, 72, 40);
@@ -53,6 +57,7 @@ public sealed class CompanionSpeechInputMenu : IClickableMenu
 
     protected override void cleanupBeforeExit()
     {
+        _saveDraft?.Invoke(_input.Text);
         _input.Selected = false;
         if (ReferenceEquals(Game1.keyboardDispatcher.Subscriber, _input))
             Game1.keyboardDispatcher.Subscriber = null;
@@ -62,7 +67,7 @@ public sealed class CompanionSpeechInputMenu : IClickableMenu
     public override void receiveKeyPress(Keys key)
     {
         if (key == Keys.Enter) Finish(true);
-        else if (key == Keys.Escape) Finish(false);
+        else if (key is Keys.Escape or Keys.F8) Finish(false);
         else base.receiveKeyPress(key);
     }
 

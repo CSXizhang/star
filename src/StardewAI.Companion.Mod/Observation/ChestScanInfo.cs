@@ -22,6 +22,7 @@ public sealed record ChestSlotInfo(
 public sealed record ChestScanInfo(
     TileCoordinate Tile,
     int Capacity,
-    int FreeSlots,
-    IReadOnlyList<ChestSlotInfo> Contents
+    int? FreeSlots,
+    IReadOnlyList<ChestSlotInfo> Contents,
+    bool ContentsObserved = true
 );

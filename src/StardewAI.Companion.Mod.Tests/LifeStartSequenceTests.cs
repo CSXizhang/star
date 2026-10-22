@@ -240,7 +240,7 @@ public class LifeStartSequenceTests
     [Fact]
     public void MapGoal_EarnAndWorkhorse_ReturnsDistinctTexts()
     {
-        Assert.Equal("优先赚钱：收获出货、按需补种，遵守每日购买上限", LifeStartSequence.MapGoal("earn"));
+        Assert.Equal("优先赚钱：收获出货、按需补种", LifeStartSequence.MapGoal("earn"));
         Assert.Equal("任劳任怨：浇水除草收获、喂动物、收机器成品等日常杂务", LifeStartSequence.MapGoal("workhorse"));
     }
 
@@ -291,7 +291,7 @@ public class LifeStartSequenceTests
             onboarded: true, skipped: false, companionName: "阿星",
             playStyle: "earn", personality: "gentle", careFrequency: "moderate",
             profileRevision: 1, workMode: "free", workPaused: false,
-            dailySpendLimit: 500, memoryRevision: 0);
+            memoryRevision: 0);
 
         Assert.False(state.HasProfileState, "a payload apply must not count as the reply-arrival marker");
     }

@@ -1,0 +1,77 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "world.snapshot",
+  "messageId": "contract-fixture",
+  "senderInstanceId": "mod-fixture",
+  "sequenceNumber": 1,
+  "worldRevision": 42,
+  "sentAt": "2026-10-01T00:00:00+00:00",
+  "payload": {
+    "capturedRevision": 42,
+    "companion": {
+      "locationId": "Farm",
+      "tileX": 1,
+      "tileY": 2,
+      "facingDirection": 2,
+      "stamina": 210.5,
+      "maxStamina": 270,
+      "waterCanLevel": 20,
+      "maxWaterCanLevel": 40,
+      "hasWateringCan": true,
+      "activity": "idle",
+      "availableMoney": 300,
+      "moneyStatus": "observed"
+    },
+    "world": {
+      "currentLocation": "Town",
+      "timeOfDay": 610,
+      "season": "spring",
+      "dayOfMonth": 1,
+      "isRaining": false,
+      "farmWork": null,
+      "year": 1
+    },
+    "farmWork": {
+      "tilledUnwateredTiles": [],
+      "tilledUnwateredCount": 0,
+      "isTruncated": false,
+      "matureCropCount": 0,
+      "matureCrops": null,
+      "matureCropsTruncated": false,
+      "cropUnwateredTiles": null,
+      "cropUnwateredCount": null,
+      "cropUnwateredTruncated": false,
+      "deadCropCount": 0,
+      "locationId": "Town",
+      "observationStatus": "not-observed",
+      "truncated": false
+    },
+    "livestock": {
+      "buildingsTruncated": false,
+      "animalsTruncated": false,
+      "buildings": [],
+      "roamingAnimals": [
+        {
+          "name": "Hen",
+          "animalType": "White Chicken",
+          "displayType": "Chicken",
+          "age": 4,
+          "happiness": 100,
+          "fullness": 255,
+          "friendship": 50,
+          "produceReady": false,
+          "wasPetToday": false,
+          "wasAutoPetToday": false,
+          "animalId": null,
+          "homeBuildingId": null
+        }
+      ],
+      "roamingScopeLocationId": null
+    }
+  },
+  "correlationId": null,
+  "saveId": "S",
+  "gameSessionId": "fixture-session",
+  "expiresAt": null,
+  "idempotencyKey": null
+}

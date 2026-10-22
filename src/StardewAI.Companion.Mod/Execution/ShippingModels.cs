@@ -9,7 +9,7 @@ public sealed record ShippingRequest(
     IReadOnlyList<ShippingItemRequest> Items,
     float MaxStamina = 50f,
     int MaxWater = 0,
-    int MaxGameMinutes = 60,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
     long ExpectedWorldRevision = 1

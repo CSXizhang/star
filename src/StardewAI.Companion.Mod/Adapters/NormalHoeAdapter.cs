@@ -38,6 +38,12 @@ public sealed class NormalHoeAdapter : IHoeAdapter
         string locationName,
         TileCoordinate targetTile)
     {
+        if (actor is PlayerActor player) {
+            var playerLocation = Game1.getLocationFromName(locationName);
+            bool hoed = playerLocation?.terrainFeatures.TryGetValue(new Vector2(targetTile.X,targetTile.Y),out var terrain) == true && terrain is StardewValley.TerrainFeatures.HoeDirt;
+            return hoed ? HoeTileResult.Succeeded(Math.Max(0,player.ToolStartStamina-player.Stamina)) : HoeTileResult.Failed("Native tool lifecycle completed without tilling the target.");
+        }
+
         ArgumentNullException.ThrowIfNull(actor);
 
         // 1. Thread safety invariant
@@ -46,11 +52,16 @@ public sealed class NormalHoeAdapter : IHoeAdapter
             return HoeTileResult.Failed("Hoe operation rejected: must execute on the game main thread.");
         }
 
-        // 2. Current map invariant
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        // 2. The companion can work outside the human player's active map, including
+        // the morning when the player wakes indoors. Verify its own loaded location.
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return HoeTileResult.Failed(
-                $"Hoe target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Hoe target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return HoeTileResult.Failed($"Hoe target map '{locationName}' is not loaded or does not exist.");
         }
 
         // 3. Adjacency check
@@ -89,7 +100,7 @@ public sealed class NormalHoeAdapter : IHoeAdapter
                 $"Tile {targetTile} is already tilled soil.", skipReason: "already-tilled");
         }
 
-        var location = Game1.getLocationFromName(locationName) ?? Game1.currentLocation;
+        var location = Game1.getLocationFromName(locationName);
         if (location is null)
         {
             return HoeTileResult.Failed($"Game location '{locationName}' not found.");
@@ -128,8 +139,15 @@ public sealed class NormalHoeAdapter : IHoeAdapter
         }
 
         // 7. Verify human player baseline isolation BEFORE tool use
-        var playerBefore = _observer.GetPlayerSnapshot();
-        var originalPlayerRef = Game1.player;
+        // (skipped entirely in player mode: the actor IS Game1.player).
+        bool playerBound = ActorGuards.IsPlayerBound(actor);
+        PlayerResourceSnapshot? playerBefore = null;
+        Farmer? originalPlayerRef = null;
+        if (!playerBound)
+        {
+            playerBefore = _observer.GetPlayerSnapshot();
+            originalPlayerRef = Game1.player;
+        }
 
         try
         {
@@ -153,17 +171,21 @@ public sealed class NormalHoeAdapter : IHoeAdapter
         }
         finally
         {
-            // 8. Strict Invariant Checks:
-            if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+            // 8. Strict Invariant Checks (companion mode only; skipped for player-bound
+            // actors, where the stamina/water spend above is the intended effect):
+            if (!playerBound)
             {
-                throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during hoe action!");
-            }
+                if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+                {
+                    throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during hoe action!");
+                }
 
-            var playerAfter = _observer.GetPlayerSnapshot();
-            if (!playerBefore.EqualsPlayerResources(playerAfter))
-            {
-                throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion hoe action! Before: {playerBefore}, After: {playerAfter}");
+                var playerAfter = _observer.GetPlayerSnapshot();
+                if (!playerBefore!.EqualsPlayerResources(playerAfter))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion hoe action! Before: {playerBefore}, After: {playerAfter}");
+                }
             }
         }
     }

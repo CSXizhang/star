@@ -118,16 +118,19 @@ def test_life_profile_state_work_projection_matches_contract(tmp_path) -> None:
     )
     work = bridge._life_work_projection(SAVE)
     assert len(work["waitingConditions"]) <= 5
+    assert work["waitingConditions"], "the real task wait must reach the player projection"
+    assert any("WateringCan" in row for row in work["waitingConditions"])
     assert all(isinstance(c, str) for c in work["waitingConditions"]), (
         "contract §1.3 declares work.waitingConditions as [str]; "
         "objects break the C# List<string> DTO"
     )
-    assert all(set(g.keys()) == {"id", "text", "status"} for g in work["activeGoals"])
+    assert all(set(g.keys()) == {"id", "text", "status", "summary"} for g in work["activeGoals"])
     assert all(set(t.keys()) == {"id", "intent", "status"} for t in work["recentTodos"])
     assert set(work.keys()) == {
-        "mode", "paused", "goal", "dailySpendLimit", "boxPreference", "dailySpend",
+        "mode", "paused", "goal", "boxPreference", "dailySpend",
         "hasExecutableWork", "lastPlanAction", "planWaitReason", "lastSettledDay",
         "activeGoals", "recentTodos", "recentExecutions", "waitingConditions", "activity",
+        "currentGoalId", "pauseReason", "updatedAt", "playerDecisions",
     }
 
 

@@ -3,7 +3,7 @@ using StardewAI.Companion.Mod.Domain;
 namespace StardewAI.Companion.Mod.Adapters;
 
 /// <summary>
-/// Result of an atomic hand-harvest operation on a single crop tile.
+/// Result of an atomic harvest operation on a single crop tile.
 /// </summary>
 public sealed class HarvestTileResult
 {
@@ -13,7 +13,7 @@ public sealed class HarvestTileResult
 
     /// <summary>
     /// Set when the tile must be skipped rather than failed:
-    /// "not-ready", "scythe-required", or "inventory-full".
+    /// "not-ready", "missing-tool:Scythe", or "inventory-full".
     /// </summary>
     public string? SkipReason { get; }
 
@@ -64,7 +64,7 @@ public sealed class HarvestTileResult
 }
 
 /// <summary>
-/// Adapter contract for executing a single-tile hand harvest through normal game mechanics.
+/// Adapter contract for executing a single-tile harvest through normal game mechanics.
 /// </summary>
 public interface IHarvestAdapter
 {
@@ -73,10 +73,10 @@ public interface IHarvestAdapter
     /// Enforces:
     /// - Current-map and main-thread execution.
     /// - Maturity judged only by HoeDirt.readyForHarvest() (via observer state).
-    /// - Scythe-harvest crops are rejected (skip reason "scythe-required").
+    /// - Scythe crops use the companion's real scythe and the native crop callback.
     /// - Conservative capacity precheck: no empty inventory slot -> skip "inventory-full".
     /// - Game1.player is swapped to the companion farmer only for the duration of
-    ///   crop.harvest and restored in a finally block with reference verification.
+    ///   native harvest and restored in a finally block with reference verification.
     /// - Human player resources are verified unchanged after the operation.
     /// </summary>
     HarvestTileResult HarvestTile(

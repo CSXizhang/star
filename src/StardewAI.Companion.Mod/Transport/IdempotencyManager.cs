@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace StardewAI.Companion.Mod.Transport;
 
@@ -15,7 +16,8 @@ public enum IdempotencyCheck
     InFlightDuplicate,
     CompletedReplay,
     Conflict,
-    CapacityExceeded
+    CapacityExceeded,
+    ReceiptUnavailable
 }
 
 public sealed class IdempotencyRecord
@@ -46,6 +48,16 @@ public sealed class IdempotencyManager
     private readonly object _lock = new();
     private readonly Dictionary<string, IdempotencyRecord> _records = new(StringComparer.Ordinal);
     private readonly int _maxCapacity;
+    private string? _completedArchiveDirectory;
+    private bool _archiveUnavailable;
+    private readonly Dictionary<string, ArchivedIdentity> _archived = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _archivedCommands = new(StringComparer.Ordinal);
+    private sealed record ArchivedIdentity(string CommandId, string SemanticFingerprint, string Path);
+    private sealed record CompletedReceipt(string IdempotencyKey, string CommandId,
+        string SemanticFingerprint, DateTimeOffset CreatedAt, SkillResultPayload Result);
+    // Match the live transport, including typed objects nested in result details.
+    private static readonly JsonSerializerOptions ReceiptJson = new()
+        { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, MaxDepth = 128 };
 
     public int Count
     {
@@ -60,9 +72,98 @@ public sealed class IdempotencyManager
 
     public int MaxCapacity => _maxCapacity;
 
-    public IdempotencyManager(int maxCapacity = 256)
+    public IdempotencyManager(int maxCapacity = 256, string? completedArchiveDirectory = null)
     {
         _maxCapacity = maxCapacity > 0 ? maxCapacity : 256;
+        if (completedArchiveDirectory is null) return;
+        _completedArchiveDirectory = Path.GetFullPath(completedArchiveDirectory);
+        try
+        {
+            Directory.CreateDirectory(_completedArchiveDirectory);
+            foreach (string path in Directory.EnumerateFiles(_completedArchiveDirectory, "*.json"))
+            {
+                var receipt = ReadReceipt(path);
+                if (!string.Equals(Path.GetFileName(path), ReceiptFileName(receipt.IdempotencyKey), StringComparison.Ordinal))
+                    throw new InvalidDataException("Receipt identity does not match its archive path.");
+                _archived.Add(receipt.IdempotencyKey, new(receipt.CommandId, receipt.SemanticFingerprint, path));
+                _archivedCommands.TryAdd(receipt.CommandId, receipt.IdempotencyKey);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException or ArgumentException)
+        {
+            // Missing/corrupt receipts must never make an old command executable again.
+            _archiveUnavailable = true;
+        }
+    }
+
+    public bool ReceiptStorageUnavailable { get { lock (_lock) return _archiveUnavailable; } }
+
+    private static string ReceiptFileName(string key) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))) + ".json";
+
+    private static CompletedReceipt ReadReceipt(string path)
+    {
+        var receipt = JsonSerializer.Deserialize<CompletedReceipt>(File.ReadAllText(path), ReceiptJson);
+        if (receipt is null || receipt.IdempotencyKey is null || receipt.CommandId is null
+            || receipt.SemanticFingerprint is null || receipt.Result is null
+            || receipt.Result.CommandId != receipt.CommandId)
+            throw new InvalidDataException("Completed receipt has invalid identity or result.");
+        return receipt;
+    }
+
+    private bool TryReadArchived(string key, ArchivedIdentity identity, out SkillResultPayload? result)
+    {
+        result = null;
+        try
+        {
+            var receipt = ReadReceipt(identity.Path);
+            if (receipt.IdempotencyKey != key || receipt.CommandId != identity.CommandId
+                || receipt.SemanticFingerprint != identity.SemanticFingerprint)
+                throw new InvalidDataException("Completed receipt identity changed.");
+            result = receipt.Result;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException)
+        {
+            _archiveUnavailable = true;
+            return false;
+        }
+    }
+
+    private bool MakeRoom()
+    {
+        if (_archiveUnavailable) return false;
+        if (_records.Count < _maxCapacity) return true;
+        if (_completedArchiveDirectory is null) return false;
+        var record = _records.Values.FirstOrDefault(r => r.Status == IdempotencyStatus.Completed && r.CachedResult is not null);
+        if (record is null) return false; // Never remove an in-flight command.
+        string path = Path.Combine(_completedArchiveDirectory, ReceiptFileName(record.IdempotencyKey));
+        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            var receipt = new CompletedReceipt(record.IdempotencyKey, record.CommandId,
+                record.SemanticFingerprint, record.CreatedAt, record.CachedResult!);
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(stream, receipt, ReceiptJson);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temporary, path); // Publish atomically before freeing the hot slot.
+            _archived.Add(record.IdempotencyKey, new(record.CommandId, record.SemanticFingerprint, path));
+            _archivedCommands.TryAdd(record.CommandId, record.IdempotencyKey);
+            _records.Remove(record.IdempotencyKey);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException)
+        {
+            _archiveUnavailable = true;
+            return false; // Keep the original cached result if persistence failed.
+        }
+        finally
+        {
+            try { if (File.Exists(temporary)) File.Delete(temporary); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
     }
 
     /// <summary>
@@ -140,7 +241,8 @@ public sealed class IdempotencyManager
 
     /// <summary>
     /// Checks the given idempotency key against session history.
-    /// Never evicts used keys in the same session; rejects new keys if capacity is exhausted.
+    /// Completed receipts may leave the hot cache only after durable archival.
+    /// Their identities and original results remain available for the whole session.
     /// </summary>
     public IdempotencyCheck Check(
         string idempotencyKey,
@@ -156,10 +258,18 @@ public sealed class IdempotencyManager
         {
             if (!_records.TryGetValue(idempotencyKey, out var existing))
             {
-                if (_records.Count >= _maxCapacity)
+                if (_archived.TryGetValue(idempotencyKey, out var archived))
                 {
                     cachedResult = null;
-                    return IdempotencyCheck.CapacityExceeded;
+                    if (archived.CommandId != commandId || archived.SemanticFingerprint != semanticFingerprint)
+                        return IdempotencyCheck.Conflict;
+                    return TryReadArchived(idempotencyKey, archived, out cachedResult)
+                        ? IdempotencyCheck.CompletedReplay : IdempotencyCheck.ReceiptUnavailable;
+                }
+                if (!MakeRoom())
+                {
+                    cachedResult = null;
+                    return _archiveUnavailable ? IdempotencyCheck.ReceiptUnavailable : IdempotencyCheck.CapacityExceeded;
                 }
 
                 cachedResult = null;
@@ -187,18 +297,18 @@ public sealed class IdempotencyManager
 
     /// <summary>
     /// Registers an idempotency key as currently in-flight.
-    /// Rejects silently if capacity is full without eviction.
+    /// Rejects if all hot entries are in flight or completed receipts cannot be preserved.
     /// </summary>
     public bool TryMarkInFlight(string idempotencyKey, string commandId, string semanticFingerprint)
     {
         lock (_lock)
         {
-            if (_records.ContainsKey(idempotencyKey))
+            if (_records.ContainsKey(idempotencyKey) || _archived.ContainsKey(idempotencyKey))
             {
                 return true;
             }
 
-            if (_records.Count >= _maxCapacity)
+            if (!MakeRoom())
             {
                 return false;
             }
@@ -222,7 +332,7 @@ public sealed class IdempotencyManager
                 record.Status = IdempotencyStatus.Completed;
                 record.CachedResult = result;
             }
-            else if (_records.Count < _maxCapacity)
+            else if (!_archived.ContainsKey(idempotencyKey) && MakeRoom())
             {
                 var newRecord = new IdempotencyRecord(idempotencyKey, result.CommandId, string.Empty, IdempotencyStatus.Completed)
                 {
@@ -230,6 +340,19 @@ public sealed class IdempotencyManager
                 };
                 _records[idempotencyKey] = newRecord;
             }
+        }
+    }
+
+    /// <summary>Reads a cached terminal by command identity without registering or executing work.</summary>
+    public bool TryGetCompletedResult(string commandId, out SkillResultPayload? result)
+    {
+        lock (_lock)
+        {
+            result = _records.Values.FirstOrDefault(record => record.CommandId == commandId
+                && record.Status == IdempotencyStatus.Completed)?.CachedResult;
+            if (result is null && _archivedCommands.TryGetValue(commandId, out var key))
+                return TryReadArchived(key, _archived[key], out result);
+            return result is not null;
         }
     }
 
@@ -241,6 +364,15 @@ public sealed class IdempotencyManager
         lock (_lock)
         {
             _records.Clear();
+            _archived.Clear();
+            _archivedCommands.Clear();
+            if (_completedArchiveDirectory is not null)
+            {
+                // An explicit session reset gets a new directory; retain prior evidence.
+                _completedArchiveDirectory = Path.Combine(_completedArchiveDirectory, "reset-" + Guid.NewGuid().ToString("N"));
+                try { Directory.CreateDirectory(_completedArchiveDirectory); _archiveUnavailable = false; }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { _archiveUnavailable = true; }
+            }
         }
     }
 }

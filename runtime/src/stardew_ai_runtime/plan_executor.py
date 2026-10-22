@@ -25,13 +25,20 @@ import asyncio
 import logging
 import os
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 
-from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+from stardew_ai_runtime.job_feedback import compact_job_feedback
+from stardew_ai_runtime.work_state import (
+    READ_ONLY_OPERATIONS,
+    WorkStateError,
+    WorkStore,
+    bind_execution_scope_params,
+)
 
 logger = logging.getLogger("stardew_ai_runtime.plan_executor")
 
@@ -146,7 +153,7 @@ class StepExecution:
         return payload
 
 
-def classify_step_outcome(result: Any) -> tuple[str, str | None]:
+def classify_step_outcome(result: Any, operation: str | None = None) -> tuple[str, str | None]:
     """Map a real operation result to the unified outcome enum."""
     if not isinstance(result, dict) or not result:
         return "unknown", "INVALID_TOOL_RESULT"
@@ -169,12 +176,71 @@ def classify_step_outcome(result: Any) -> tuple[str, str | None]:
         return "cancelled", reason or "CANCELLED"
     if status in {"executing", "running"} or terminal == "running":
         return "unknown", "STEP_IN_PROGRESS"
+    if terminal == "succeeded" and result.get("scopeObservationIncomplete"):
+        return "partial", "OBSERVATION_TRUNCATED"
+    if (terminal == "succeeded" and type(result.get("completedCount")) is int
+            and result["completedCount"] == 0 and type(result.get("skippedCount")) is int
+            and result["skippedCount"] > 0):
+        # A terminal success with zero completed targets is not business success:
+        # every tile was skipped. The C# side now reports the same case as Failed
+        # (ALL_TILES_SKIPPED); keep the two sides consistent instead of storing a
+        # phantom completion. Reason aggregates the observed skip reasons.
+        details = result.get("details")
+        rows = details.get("skippedTiles") if isinstance(details, dict) else None
+        if not isinstance(rows, list):
+            rows = [effect for effect in (result.get("effects") or [])
+                    if isinstance(effect, dict) and effect.get("state") == "skipped"]
+        counts = Counter(str(row.get("reason") or "unspecified")[:80]
+                         for row in rows if isinstance(row, dict))
+        if operation == "refill_watering_can" and counts.get("already-full") and not result.get("failedCount"):
+            # This service requests a full can, not a water increase. The native
+            # success confirms that state without inventing a refill effect.
+            return "completed", None
+        summary = ", ".join(f"{reason}={count}" for reason, count in counts.most_common(4)) or "unspecified"
+        return "partial", f"ALL_TILES_SKIPPED: 0 completed, {result['skippedCount']} skipped: {summary}"
     if outcome in {"completed", "partial", "unknown"}:
         return outcome, reason or ("STEP_OUTCOME_UNKNOWN" if outcome == "unknown" else None)
     if status == "no-work":
         return "completed", "NO_WORK"
     if terminal == "succeeded" or status == "completed":
         return "completed", reason
+    if operation in READ_ONLY_OPERATIONS:
+        if result.get("error") or status in {"error", "missing", "unknown", "unavailable"} or terminal:
+            return "unknown", reason or "OBSERVATION_UNAVAILABLE"
+        if status == "ok":
+            return "completed", None
+        # Snapshot and wiki readers return data without an action terminal/status.
+        # Require their documented payload, rather than accepting arbitrary dicts.
+        payloads = {
+            "get_status": ("companion", dict),
+            "query_farm_work": ("farmWork", dict),
+            "query_inventory": ("inventory", dict),
+            "query_chests": ("chests", list),
+            "query_planting_options": ("regions", list),
+            "query_route": ("reachable", bool),
+            "get_work_overview": ("tasks", list),
+            "query_wiki": ("results", list),
+            "observe_building_services": ("animalService", dict),
+            "observe_production": ("groundItems", list),
+            "observe_farming_helpers": ("groundItems", list),
+            "observe_crafting": ("recipes", list),
+            "observe_farm_space": ("rows", list),
+            "observe_machines": ("machines", list),
+            "observe_livestock": ("buildings", list),
+        }
+        field_name, field_type = payloads.get(operation, ("", dict))
+        if not status and isinstance(result.get(field_name), field_type):
+            return "completed", None
+        if (not status and operation == "get_work_overview"
+                and isinstance(result.get("farmWork"), dict)
+                and isinstance(result.get("companion"), dict)
+                and isinstance(result.get("saveId"), str)):
+            # Scheduler overview is the native farm/backpack observation;
+            # the internal ledger overview instead has tasks. Both are
+            # documented reads, not business effects or proof of empty work.
+            return "completed", None
+        if not status and operation == "query_planting_options" and isinstance(result.get("candidateTiles"), (dict, list)):
+            return "completed", None
     return "unknown", reason or "UNRECOGNIZED_TOOL_RESULT"
 
 
@@ -185,7 +251,7 @@ def is_transient_transport_error(ex: Exception) -> bool:
     text = str(ex).lower()
     return any(marker in text for marker in (
         "connection refused", "connection reset", "connectionclosed", "connection closed",
-        "winerror 1225", "winerror 10061", "winerror 10054", "broken pipe",
+        "winerror 64", "winerror 1225", "winerror 10061", "winerror 10054", "broken pipe",
         "transport disconnected", "endofstream",
     ))
 
@@ -199,23 +265,92 @@ def normalise_native_result(
     terminal = native.get("terminalState")
     if not terminal:
         return None, None, [], None
+    error = native.get("error")
+    native_reason = native.get("reasonCode") or (error.get("code") if isinstance(error, dict) else None)
     if terminal == "succeeded":
-        outcome, reason = "completed", None
+        if native.get("scopeObservationIncomplete"):
+            outcome, reason = "partial", "OBSERVATION_TRUNCATED"
+        elif native.get("outcome") in {"completed", "partial", "unknown"}:
+            outcome, reason = native["outcome"], native_reason
+        else:
+            outcome, reason = "completed", None
     elif terminal in {"partially-succeeded", "partial"}:
-        outcome, reason = "partial", "RECONCILED_PARTIAL"
+        outcome, reason = "partial", native_reason or "RECONCILED_PARTIAL"
     elif terminal in {"failed", "rejected"}:
-        outcome, reason = "partial", "RECONCILED_FAILED"
+        outcome, reason = "partial", native_reason or "RECONCILED_FAILED"
     elif terminal in {"cancelled", "canceled"}:
-        outcome, reason = "cancelled", "RECONCILED_CANCELLED"
+        outcome, reason = "cancelled", native_reason or "RECONCILED_CANCELLED"
     else:
         return None, None, [], None
     effects = native.get("effects")
     if not isinstance(effects, list):
         effects = []
-    revision = native.get("worldRevision")
+    revision = native.get("finalWorldRevision", native.get("worldRevision"))
     if not isinstance(revision, int):
         revision = None
     return outcome, reason, effects, revision
+
+
+def merge_reconciled_operation_result(
+    operation: str | None, context: Any, native: Any, *, params: dict[str, Any] | None = None,
+) -> Any:
+    """Settle auto work against its original observation, retaining the real receipt."""
+    fields = {
+        "water_auto": ("unwateredTiles", "observedUnwateredTiles", "remainingUnwateredCount"),
+        "harvest_auto": ("matureCrops", "observedMatureCrops", "remainingMatureCount"),
+    }
+    if operation not in fields or not isinstance(native, dict):
+        return native
+    context = context if isinstance(context, dict) else {}
+    observed_remaining = context.get("remaining")
+    if not isinstance(observed_remaining, dict):
+        # Old/crashed workers may have persisted the command before receiving
+        # the auto observation. A subset receipt cannot prove the saved scope.
+        targets = (params or {}).get("target_tiles")
+        if native.get("terminalState") == "succeeded" and isinstance(targets, list):
+            required = {(tile["x"], tile["y"]) for tile in targets}
+            effect_state = "watered" if operation == "water_auto" else "harvested"
+            confirmed = {(effect["tile"].get("x"), effect["tile"].get("y"))
+                         for effect in (native.get("effects") or []) if isinstance(effect, dict)
+                         and effect.get("state") == effect_state and isinstance(effect.get("tile"), dict)}
+            if required - confirmed:
+                return {**native, "outcome": "unknown", "goalSatisfied": False,
+                        "reasonCode": "SCOPE_OBSERVATION_UNCONFIRMED"}
+        return native
+    remaining_key, observed_key, count_key = fields[operation]
+    incomplete = bool(context.get("scopeObservationIncomplete"))
+    before_remaining = observed_remaining.get(observed_key if incomplete else remaining_key)
+    before_completed, completed = context.get("completedCount"), native.get("completedCount")
+    # Running progress is unknown. Keep the observation made before dispatch
+    # separately so a later native receipt can settle it without inventing zero
+    # progress or mistaking a historical observation for current work remaining.
+    observed_count = context.get("preDispatchObservedCount")
+    if type(observed_count) is not int and all(type(count) is int for count in (before_remaining, before_completed)):
+        observed_count = before_remaining + before_completed  # Legacy receipts.
+    remaining = max(0, observed_count - completed) if all(type(count) is int for count in (observed_count, completed)) else None
+    result = {**{key: context[key] for key in (
+        "targetTiles", "targetCount", "remainingCountSource", "preDispatchObservedCount", "isTruncated", "scopeObservationIncomplete",
+    ) if key in context}, **native}
+    result.update(goalSatisfied=False,
+                  remaining={remaining_key: None, observed_key: remaining} if incomplete else {remaining_key: remaining})
+    result[count_key] = None if incomplete else remaining
+    if remaining is not None and result.get("remainingCountSource") == "awaiting_native_terminal":
+        result["remainingCountSource"] = ("pre_dispatch_scoped_observation_minus_native_completed"
+                                         if isinstance((params or {}).get("target_tiles"), list)
+                                         else "pre_dispatch_observation_minus_native_completed")
+    revision = native.get("finalWorldRevision", native.get("worldRevision"))
+    if isinstance(revision, int):
+        result["snapshotRevision"] = revision
+    if native.get("terminalState") == "succeeded":
+        if incomplete:
+            result.update(outcome="partial", reasonCode="OBSERVATION_TRUNCATED")
+        elif remaining is None:
+            result.update(outcome="unknown", reasonCode="NATIVE_COUNTS_UNCONFIRMED")
+        else:
+            # Native success completes the selected batch. Remaining farm work
+            # is objective progress, not a failure of this bounded plan step.
+            result.update(outcome="completed", goalSatisfied=remaining == 0, reasonCode="OK")
+    return result
 
 
 class PlanExecutor:
@@ -303,17 +438,25 @@ class PlanExecutor:
         # have a terminal native result. Reconcile that persisted id before
         # dispatching anything new; a disconnected id is not de-duplication proof.
         previous_id = claim.get("previousCommandId")
+        reconciliation_params = claim.get("params") or {}
         if claim.get("releasedWait") and claim.get("waitType") != "transportRetry":
             # A named native precondition returned without performing the action;
             # after that condition changes, this is an authorized new attempt.
             previous_id = None
         native = None
         if previous_id and self.reconcile is not None:
+            state = self.store.state(save_id)
+            goal = next((goal for goal in state.goals if goal.id == claim.get("goalId")), None)
+            reconciliation_params = bind_execution_scope_params(
+                step.operation, reconciliation_params, goal.constraints if goal else {},
+            )
             try:
                 native = await self.reconcile(previous_id)
             except Exception as ex:
                 logger.debug("Reconcile of %s failed: %s", previous_id, ex)
                 native = None
+            native = merge_reconciled_operation_result(step.operation, claim.get("feedback"), native,
+                                                        params=reconciliation_params)
             outcome, reason, effects, revision = normalise_native_result(native)
             if outcome is not None:
                 committed = self.store.commit_step_result(
@@ -325,6 +468,7 @@ class PlanExecutor:
                     reason_code=reason,
                     snapshot_revision=revision,
                     command_id=previous_id,
+                    feedback=compact_job_feedback(native, operation=step.operation, status=outcome, params=claim.get("params") or {}),
                 )
                 step.command_id = previous_id
                 step.outcome = outcome
@@ -338,7 +482,8 @@ class PlanExecutor:
             # is safe.  Wait for the same native id, then report explicit unknown
             # if the bounded reconcile period ends without a terminal.
             if isinstance(native, dict) and native.get("terminalState") == "running":
-                native = await self._await_native_terminal(save_id, previous_id, native)
+                native = await self._await_native_terminal(save_id, previous_id, native,
+                    operation=step.operation, context=claim.get("feedback"), params=reconciliation_params)
             outcome, reason, effects, revision = normalise_native_result(native)
             if outcome is None:
                 outcome, reason = "unknown", "NATIVE_TERMINAL_UNCONFIRMED"
@@ -347,6 +492,7 @@ class PlanExecutor:
                 save_id, task_id=claim["taskId"], step_id=claim["stepId"],
                 outcome=outcome, effects=effects, reason_code=reason,
                 snapshot_revision=revision, command_id=previous_id,
+                feedback=compact_job_feedback(native, operation=step.operation, status=outcome, params=claim.get("params") or {}),
             )
             step.command_id, step.outcome, step.reason_code = previous_id, outcome, reason
             step.effects, step.snapshot_revision = effects, revision
@@ -365,7 +511,11 @@ class PlanExecutor:
             return StepExecution(status="idle", recovery_decisions=decisions)
 
         try:
-            result = await self.dispatch(claim["operation"], claim.get("params") or {}, command_id)
+            goal = next((goal for goal in state.goals if goal.id == claim.get("goalId")), None)
+            dispatch_params = bind_execution_scope_params(
+                claim["operation"], claim.get("params") or {}, goal.constraints if goal else {},
+            )
+            result = await self.dispatch(claim["operation"], dispatch_params, command_id)
         except DispatchDeferred:
             self.store.release_unstarted_claim(save_id, claim["taskId"], claim["stepId"], worker_id, command_id)
             return StepExecution(status="idle", recovery_decisions=decisions)
@@ -377,7 +527,11 @@ class PlanExecutor:
         # reconcile that exact command before committing or selecting new work.
         if isinstance(result, dict) and (result.get("status") in {"executing", "running"}
                                          or result.get("terminalState") == "running"):
-            result = await self._await_native_terminal(save_id, command_id, result)
+            if step.operation in {"water_auto", "harvest_auto"}:
+                self.store.record_step_feedback(save_id, claim["taskId"], claim["stepId"], command_id,
+                    compact_job_feedback(result, operation=step.operation, status="unknown"))
+            result = await self._await_native_terminal(save_id, command_id, result,
+                                                       operation=step.operation, params=dispatch_params)
 
         # A native result may name an explicit, checkable precondition (e.g. the
         # shop is closed, the player is standing on the tile, seeds are missing).
@@ -385,13 +539,19 @@ class PlanExecutor:
         # every model turn; only supported native conditions are accepted.
         wait_condition = extract_wait_condition(result)
         if wait_condition is not None:
+            if isinstance(result, dict) and result.get("nativeDispatched") is False:
+                # A clock gate never sent this planned native id. Do not retain
+                # it as an unknown receipt when the next real day releases wait.
+                self.store.release_unstarted_claim(save_id, claim["taskId"], claim["stepId"], worker_id, command_id)
+                step.command_id = None
+                result = {**result, "plannedCommandId": command_id, "commandId": None}
             return self._park_for_wait(save_id, step, command_id, wait_condition, result)
 
-        outcome, reason = classify_step_outcome(result)
+        outcome, reason = classify_step_outcome(result, step.operation)
         effects = result.get("effects") if isinstance(result, dict) else None
-        revision = result.get("snapshotRevision") if isinstance(result, dict) else None
-        if revision is None and isinstance(result, dict) and isinstance(result.get("worldRevision"), int):
-            revision = result.get("worldRevision")
+        revision = next((result[key] for key in (
+            "finalWorldRevision", "worldRevision", "snapshotRevision",
+        ) if isinstance(result.get(key), int)), None) if isinstance(result, dict) else None
         native_command_id = result.get("commandId") if isinstance(result, dict) else None
 
         committed = self.store.commit_step_result(
@@ -404,6 +564,7 @@ class PlanExecutor:
             snapshot_revision=revision,
             command_id=native_command_id or command_id,
             game_date=self._fresh_state()[1],
+            feedback=compact_job_feedback(result, operation=step.operation, status=outcome, params=claim.get("params") or {}),
         )
         step.outcome = outcome
         step.reason_code = reason
@@ -414,7 +575,9 @@ class PlanExecutor:
         return step
 
     async def _await_native_terminal(
-        self, save_id: str, command_id: str, initial: dict[str, Any]
+        self, save_id: str, command_id: str, initial: dict[str, Any],
+        *, operation: str | None = None, context: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
             timeout = max(1.0, float(os.getenv("STARDEW_NATIVE_RECONCILE_TIMEOUT_SECONDS", "300")))
@@ -440,7 +603,7 @@ class PlanExecutor:
                     "succeeded", "partially-succeeded", "partial", "failed",
                     "rejected", "cancelled", "canceled",
                 }:
-                    return native
+                    return merge_reconciled_operation_result(operation, context or initial, native, params=params)
         return {**initial, "status": "unknown", "terminalState": "unknown",
                 "reasonCode": "NATIVE_TERMINAL_UNCONFIRMED",
                 "message": f"Native command {command_id} did not return a terminal result"}
@@ -516,6 +679,11 @@ class PlanExecutor:
                 outcome="unknown" if transient else "partial",
                 reason_code=reason,
                 command_id=command_id,
+                game_date=self._fresh_state()[1],
+                feedback=compact_job_feedback(
+                    {"commandId": command_id, "reasonCode": reason, "message": message},
+                    operation=step.operation, status="unknown" if transient else "partial",
+                ),
             )
         except WorkStateError as commit_ex:
             logger.warning("Could not commit failed dispatch for %s: %s", step.step_id, commit_ex)
@@ -523,4 +691,6 @@ class PlanExecutor:
         step.reason_code = reason
         step.status = "deferred"
         step.message = message
+        step.result = {"commandId": command_id, "reasonCode": reason, "message": message,
+                       "status": step.outcome}
         return step

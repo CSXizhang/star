@@ -91,6 +91,44 @@ public sealed class ChestWithdrawTests
         Assert.Equal(3, payload.Effects[0]["stack"]);
     }
 
+    [Theory]
+    [InlineData(2, 2, 77, ExecutionState.Succeeded)]
+    [InlineData(77, 77, 2, ExecutionState.Succeeded)]
+    [InlineData(80, 79, 0, ExecutionState.PartiallySucceeded)]
+    public void ExactDeposit_ConservesQuantityAcrossQualityStacks(int requested, int actual, int remaining, ExecutionState state)
+    {
+        var chest = new TileCoordinate(11, 10);
+        var (machine, actor, _, adapter) = CreateTestContext(new TileCoordinate(10, 10), chest);
+        actor.TryAddItemToInventory(new InventoryItem("(T)WateringCan", "Watering Can", 1) { IsTool = true });
+        actor.TryAddItemToInventory(new InventoryItem("(O)24", "Parsnip", 76) { Quality = 0 });
+        actor.TryAddItemToInventory(new InventoryItem("(O)24", "Parsnip", 2) { Quality = 1 });
+        actor.TryAddItemToInventory(new InventoryItem("(O)24", "Parsnip", 1) { Quality = 2 });
+        Assert.True(machine.Start(new ChestActionRequest("deposit", "deposit-task", ChestActionKind.Deposit,
+            "Farm", chest, DepositItems: new[] { new DepositItemSpec("24", requested) }), out _));
+        machine.StepTicks(100);
+        Assert.Equal(state, machine.CurrentState);
+        Assert.Equal(actual, adapter.StoredItems["(O)24"]);
+        Assert.Equal(remaining, actor.GetItemCount("(O)24"));
+        var payload = machine.FinalResult!.ToTransportPayload();
+        Assert.Equal(requested, payload.Details!["requestedQuantity"]);
+        Assert.Equal(0, payload.SkippedCount);
+        Assert.Equal(actual, payload.Details["actualQuantity"]);
+        Assert.Equal(Math.Max(0, requested - actual), payload.Details["remainingQuantity"]);
+        Assert.Equal(requested == 2 ? new[] { 0 } : requested == 77 ? new[] { 0, 1 } : new[] { 0, 1, 2 },
+            machine.FinalResult.DepositedItems.Select(x => x.Quality).ToArray());
+    }
+
+    [Fact]
+    public void ExactDeposit_MissingItemCannotCompleteSuccessfully()
+    {
+        var chest = new TileCoordinate(11, 10);
+        var (machine, _, _, _) = CreateTestContext(new TileCoordinate(10, 10), chest);
+        Assert.True(machine.Start(new ChestActionRequest("missing", "missing-task", ChestActionKind.Deposit,
+            "Farm", chest, DepositItems: new[] { new DepositItemSpec("24", 2) }), out var result));
+        Assert.Equal(ExecutionState.Failed, result!.FinalState);
+        Assert.Equal(2, result.ToTransportPayload().Details!["remainingQuantity"]);
+    }
+
     [Fact]
     public void ChestActionStateMachine_Withdraw_SucceedsAndTransfersItems()
     {
@@ -154,6 +192,43 @@ public sealed class ChestWithdrawTests
         Assert.Equal(ExecutionState.Failed, machine.CurrentState);
         Assert.Single(machine.FinalResult!.FailedItems);
         Assert.Equal("item-not-found", machine.FinalResult.FailedItems[0].Reason);
+    }
+
+    [Fact]
+    public void WithdrawalShortage_IsPartialAndReportsUnfulfilledQuantity()
+    {
+        var chest = new TileCoordinate(11, 10);
+        var (machine, actor, _, adapter) = CreateTestContext(new TileCoordinate(10, 10), chest);
+        adapter.StoredItems["(O)24"] = 76;
+        Assert.True(machine.Start(new ChestActionRequest("short", "short-task", ChestActionKind.Withdraw,
+            "Farm", chest, WithdrawItems: new[] { new WithdrawItemSpec("(O)24", 77) }), out _));
+        machine.StepTicks(20);
+        Assert.Equal(ExecutionState.PartiallySucceeded, machine.CurrentState);
+        Assert.Equal(76, actor.GetItemCount("(O)24"));
+        var payload = machine.FinalResult!.ToTransportPayload();
+        Assert.Equal(77, payload.Details!["requestedQuantity"]);
+        Assert.Equal(76, payload.Details["actualQuantity"]);
+        Assert.Equal(1, payload.Details["remainingQuantity"]);
+    }
+
+    [Fact]
+    public void Withdrawal_ContinuesIntoNextStackUntilRequestedQuantityIsMet()
+    {
+        var chest = new TileCoordinate(11, 10);
+        var (machine, actor, _, adapter) = CreateTestContext(new TileCoordinate(10, 10), chest);
+        adapter.StoredItems["(O)24"] = 79;
+        adapter.MaximumTransferPerCall = 76;
+        Assert.True(machine.Start(new ChestActionRequest("multi-stack", "multi-stack-task", ChestActionKind.Withdraw,
+            "Farm", chest, WithdrawItems: new[] { new WithdrawItemSpec("(O)24", 77) }), out _));
+        machine.StepTicks(20);
+        Assert.Equal(ExecutionState.Succeeded, machine.CurrentState);
+        Assert.Equal(77, actor.GetItemCount("(O)24"));
+        Assert.Equal(2, adapter.StoredItems["(O)24"]);
+        Assert.Equal(new[] { 76, 1 }, machine.FinalResult!.WithdrawnItems.Select(x => x.Stack));
+        var payload = machine.FinalResult.ToTransportPayload();
+        Assert.Equal(77, payload.Details!["requestedQuantity"]);
+        Assert.Equal(77, payload.Details["actualQuantity"]);
+        Assert.Equal(0, payload.Details["remainingQuantity"]);
     }
 
     [Fact]

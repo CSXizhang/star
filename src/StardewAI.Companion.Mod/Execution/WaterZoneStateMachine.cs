@@ -19,7 +19,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600; // 60 seconds at 60 fps safety timeout
+    private const long MaxNoProgressTicks = 3600; // 60 seconds without observed progress
     // Bounded search: only this many nearest remaining targets are costed with a
     // real path query per reorder. The rest keep a sentinel cost and stay ordered
     // by connectivity then Manhattan distance. This avoids a global TSP search.
@@ -54,7 +54,10 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
     private float _staminaUsed;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
+    private int? _pauseStartedClock;
+    private int _pausedGameMinutes;
 
     // Signals
     private volatile bool _cancelRequested;
@@ -116,10 +119,13 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             _staminaUsed = 0f;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _toolEffectExecuted = false;
             _avoidTiles.Clear();
             _startClock = _observer.TimeOfDay;
+            _pauseStartedClock = null;
+            _pausedGameMinutes = 0;
             _cancelRequested = false;
             _cancelReason = null;
             _pauseRequested = false;
@@ -189,12 +195,12 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    "MaxGameMinutes budget must be at least 1.",
+                    "MaxGameMinutes must be non-negative; 0 means no time limit.",
                     "INVALID_PARAMETERS");
                 return false;
             }
@@ -210,6 +216,14 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 if (!dirt.IsTilled)
                 {
                     _skippedTiles.Add(new SkippedTileInfo(tile, "NotTilled"));
+                }
+                else if (dirt.IsDead)
+                {
+                    _skippedTiles.Add(new SkippedTileInfo(tile, "DeadCrop"));
+                }
+                else if (!request.IncludeEmptyTiles && !dirt.HasCrop)
+                {
+                    _skippedTiles.Add(new SkippedTileInfo(tile, "NoCrop"));
                 }
                 else if (dirt.IsWatered)
                 {
@@ -259,16 +273,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             {
                 _cancelRequested = false;
 
-                // Safe in-progress swing resolution:
-                // If the tool effect already executed on the current tile, verify it before halting
-                if (CurrentState == ExecutionState.Watering && _toolEffectExecuted && !_wateredTiles.Contains(_currentTargetTile))
-                {
-                    var dirt = _observer.GetDirtState(_currentRequest.LocationId, _currentTargetTile);
-                    if (dirt.IsWatered)
-                    {
-                        _wateredTiles.Add(_currentTargetTile);
-                    }
-                }
+                VerifyExecutedEffectBeforeTermination();
 
                 _actor.Halt();
                 _actor.EndUsingTool();
@@ -284,6 +289,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             {
                 _pauseRequested = false;
                 CurrentState = ExecutionState.Paused;
+                _pauseStartedClock = _observer.TimeOfDay;
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
                 NotifyPlayer("AI Companion: Task paused.");
@@ -294,9 +300,11 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             // 3. Game-level pause, open menus, saving, world not ready
             try
             {
-                if (Game1.paused || Game1.activeClickableMenu != null || !Context.IsWorldReady)
+                if (Game1.paused || StardewAI.Companion.Mod.Menus.CompanionMenuClock.HasBlockingMenu || !Context.IsWorldReady)
                 {
-                    _actor.Halt();
+                    // Halt ends the native tool lifecycle. Freeze an in-flight
+                    // swing in place so it can resume after the menu closes.
+                    if (!_actor.IsUsingTool) _actor.Halt();
                     return;
                 }
             }
@@ -311,9 +319,13 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             _elapsedTicks++;
 
             // 4. Actual game clock delta measurement & budget check
-            int gameMinutesElapsed = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (gameMinutesElapsed > _currentRequest.MaxGameMinutes)
+            // Explicit player pauses do not spend the work budget. Result resources
+            // still report the full observed game-clock duration, including pauses.
+            int gameMinutesElapsed = Math.Max(0,
+                IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay) - _pausedGameMinutes);
+            if (_currentRequest.MaxGameMinutes > 0 && gameMinutesElapsed > _currentRequest.MaxGameMinutes)
             {
+                VerifyExecutedEffectBeforeTermination();
                 _actor.Halt();
                 _actor.EndUsingTool();
                 _avatar?.SetAnimation("idle");
@@ -322,14 +334,15 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
                 return;
             }
 
-            // 5. Monotonic timeout guard
-            if (_elapsedTicks > MaxMonotonicTicks)
+            // 5. No-progress timeout guard
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
+                VerifyExecutedEffectBeforeTermination();
                 _actor.Halt();
                 _actor.EndUsingTool();
                 _avatar?.SetAnimation("idle");
                 var terminalState = _wateredTiles.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed;
-                FinishExecution(terminalState, "Execution exceeded monotonic tick timeout limit.", "TIMEOUT");
+                FinishExecution(terminalState, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
@@ -456,6 +469,9 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         }
 
         var step = _currentPath[_currentPathIndex];
+        if (ActorGuards.HasReachedWalkingTile(_actor, step.Tile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
 
         // Dynamic collision check BEFORE stepping towards destination tile.
         // This uses exactly the same obstacle set as SameMapNavigator planning:
@@ -494,14 +510,20 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
             return;
         }
 
-        var targetPixelX = step.Tile.X * 64f + 32f;
-        var targetPixelY = step.Tile.Y * 64f + 32f;
+        var walkingTarget = ActorGuards.WalkingTargetPixel(_actor, step.Tile);
 
         var currentPos = _actor.PixelPosition;
-        float dx = targetPixelX - (currentPos.X + 32f);
-        float dy = targetPixelY - (currentPos.Y + 32f);
+        float dx = walkingTarget.X - currentPos.X;
+        float dy = walkingTarget.Y - currentPos.Y;
 
         float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            // The native actor ignores position setters. Keep driving its held
+            // movement until the measured standing center actually reaches the tile.
+            _actor.MovePixels(dx, dy);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             // Arrived at step tile
@@ -537,6 +559,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         {
             _pauseRequested = false;
             CurrentState = ExecutionState.Paused;
+            _pauseStartedClock = _observer.TimeOfDay;
             _actor.Halt();
             _avatar?.SetAnimation("idle");
             return;
@@ -550,6 +573,12 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
 
         // Pre-tool re-observation: check if tile was watered concurrently
         var dirt = _observer.GetDirtState(_currentRequest!.LocationId, _currentTargetTile);
+        if (!_currentRequest.IncludeEmptyTiles && (!dirt.HasCrop || dirt.IsDead))
+        {
+            _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, dirt.IsDead ? "DeadCrop" : "NoCrop"));
+            AdvanceToNextTarget();
+            return;
+        }
         if (dirt.IsWatered)
         {
             _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "ConcurrentlyWatered"));
@@ -624,6 +653,17 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         }
     }
 
+    private void VerifyExecutedEffectBeforeTermination()
+    {
+        // A clock/cancel boundary can arrive after the native effect and before
+        // the animation's final verification tick. Preserve only observed dirt
+        // changes; never repeat the tool action to settle that pending result.
+        if (CurrentState is not (ExecutionState.Watering or ExecutionState.Verifying) ||
+            !_toolEffectExecuted || _currentRequest is null || _wateredTiles.Contains(_currentTargetTile)) return;
+        if (_observer.GetDirtState(_currentRequest.LocationId, _currentTargetTile).IsWatered)
+            _wateredTiles.Add(_currentTargetTile);
+    }
+
     private void TickVerifying()
     {
         if (!_toolEffectExecuted)
@@ -673,6 +713,7 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         {
             _pauseRequested = false;
             CurrentState = ExecutionState.Paused;
+            _pauseStartedClock = _observer.TimeOfDay;
             _actor.Halt();
             _avatar?.SetAnimation("idle");
             return;
@@ -822,6 +863,9 @@ public sealed class WaterZoneStateMachine : ISkillExecutionMachine
         {
             if (IsPaused && _currentRequest != null)
             {
+                if (_pauseStartedClock is { } pauseClock)
+                    _pausedGameMinutes += IWorldObserver.CalculateGameMinutesElapsed(pauseClock, _observer.TimeOfDay);
+                _pauseStartedClock = null;
                 CurrentState = ExecutionState.Navigating;
                 _avoidTiles.Clear();
                 ReorderRemainingTargets();

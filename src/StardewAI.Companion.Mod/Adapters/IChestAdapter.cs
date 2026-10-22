@@ -114,7 +114,8 @@ public interface IChestAdapter
         IFarmerActor actor,
         string locationName,
         TileCoordinate chestTile,
-        int inventorySlotIndex);
+        int inventorySlotIndex,
+        int? count = null);
 
     /// <summary>
     /// Merges same (QualifiedItemId, quality) stacks inside the chest at the target tile into

@@ -8,12 +8,12 @@ from stardew_ai_runtime.protocol import ChatReplyPayload, Envelope
 @pytest.mark.parametrize("complete", [False, True, None])
 def test_command_completion_roundtrip(complete):
     envelope = Envelope.create_chat_reply(
-        "bridge", "chain-turn-2", "job-completed", "这一项已完成",
+        "bridge", "delivery-turn-2", "job-completed", "这一项已完成",
         save_id="farm", command_id="player-command", command_complete=complete,
     )
     restored = Envelope.from_mapping(envelope.to_mapping())
     reply = ChatReplyPayload.from_mapping(restored.payload)
-    assert reply.request_id == "chain-turn-2"
+    assert reply.request_id == "delivery-turn-2"
     assert reply.command_id == "player-command"
     assert reply.command_complete is complete
     if complete is None:

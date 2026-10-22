@@ -28,6 +28,8 @@ public interface IWorldObserver
         throw new NotSupportedException("Map images are unavailable in this observer.");
     Dictionary<string, object> InspectCrafting(IFarmerActor actor) =>
         throw new NotSupportedException("Crafting observation is unavailable in this observer.");
+    IReadOnlyList<Dictionary<string, object>> ScanInteractables(string locationName, int maxItems = 32) =>
+        Array.Empty<Dictionary<string, object>>();
     /// <summary>
     /// Monotonically increasing revision counter incremented when observable world changes.
     /// </summary>
@@ -138,6 +140,15 @@ public interface IWorldObserver
     /// Scans real-time stock, pricing, operating status, and available companion funds for the given shop.
     /// Read-only inspection; unknown shops report missing/unknown status.
     /// </summary>
+    Dictionary<string, object> InspectMachines(string locationName) => throw new NotSupportedException("Production observation unavailable.");
+    Dictionary<string, object> InspectProduction(string locationName, IFarmerActor actor) => throw new NotSupportedException("Production observation unavailable.");
+    IReadOnlyList<StardewAI.Companion.Mod.Transport.ProductionSignal> GetProductionSignals() => Array.Empty<StardewAI.Companion.Mod.Transport.ProductionSignal>();
+    bool ProductionSignalsTruncated => false;
+    void TrackProductionMachine(string locationName, TileCoordinate tile) { }
+
+    Dictionary<string, object> InspectPlanting(string locationName, IFarmerActor actor, Rectangle? region = null) =>
+        throw new NotSupportedException("Farm region planning unavailable.");
+
     ShopScanInfo ScanShop(string shopId, IFarmerActor actor);
 
     /// <summary>

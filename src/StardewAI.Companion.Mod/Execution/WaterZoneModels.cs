@@ -30,10 +30,11 @@ public sealed record WaterZoneRequest(
     IReadOnlyList<TileCoordinate> TargetTiles,
     float MaxStamina,
     int MaxWater,
-    int MaxGameMinutes,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
-    long ExpectedWorldRevision = 1
+    long ExpectedWorldRevision = 1,
+    bool IncludeEmptyTiles = true
 );
 
 public sealed record SkippedTileInfo(TileCoordinate Tile, string Reason);
@@ -125,7 +126,18 @@ public sealed class WaterZoneResult
             Resources: resources,
             Error: error,
             RetryRecommended: RetryRecommended,
-            PlayerActionRequired: PlayerActionRequired
+            PlayerActionRequired: PlayerActionRequired,
+            Details: new Dictionary<string, object>
+            {
+                ["skippedTiles"] = SkippedTiles.Select(item => new
+                {
+                    tile = new { x = item.Tile.X, y = item.Tile.Y }, reason = item.Reason
+                }).ToArray(),
+                ["failedTiles"] = FailedTiles.Select(item => new
+                {
+                    tile = new { x = item.Tile.X, y = item.Tile.Y }, reason = item.Reason
+                }).ToArray()
+            }
         );
     }
 }

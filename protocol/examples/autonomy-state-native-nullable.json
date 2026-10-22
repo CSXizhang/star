@@ -1,0 +1,32 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "autonomy.state",
+  "messageId": "contract-fixture",
+  "senderInstanceId": "mod-fixture",
+  "sequenceNumber": 1,
+  "worldRevision": 42,
+  "sentAt": "2026-10-01T00:00:00+00:00",
+  "payload": {
+    "requestId": "req-fixture",
+    "saveId": "S",
+    "mode": "command",
+    "paused": false,
+    "preferences": null,
+    "dailySpend": 0,
+    "status": "confirmed",
+    "reason": null,
+    "preferencesRevision": null,
+    "decisionEpoch": null,
+    "gameDate": null,
+    "lastPlanAction": null,
+    "planWaitReason": null,
+    "waitingConditions": null,
+    "hasExecutableWork": null,
+    "usageTodayText": null
+  },
+  "correlationId": null,
+  "saveId": "S",
+  "gameSessionId": "fixture-session",
+  "expiresAt": null,
+  "idempotencyKey": null
+}

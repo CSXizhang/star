@@ -1,0 +1,31 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "chat.reply",
+  "messageId": "contract-fixture",
+  "senderInstanceId": "mod-fixture",
+  "sequenceNumber": 1,
+  "worldRevision": 42,
+  "sentAt": "2026-10-01T00:00:00+00:00",
+  "payload": {
+    "requestId": "req-fixture",
+    "status": "completed",
+    "replyText": "\u7EE7\u7EED\u5DE5\u4F5C",
+    "tokensUsed": null,
+    "promptTokens": null,
+    "outputTokens": null,
+    "cachedTokens": null,
+    "conversationId": null,
+    "error": null,
+    "usageSource": null,
+    "saveId": "S",
+    "cacheReadTokens": null,
+    "cacheWriteTokens": null,
+    "modelCalls": null,
+    "resumeWorkRequested": true
+  },
+  "correlationId": null,
+  "saveId": "S",
+  "gameSessionId": "fixture-session",
+  "expiresAt": null,
+  "idempotencyKey": null
+}

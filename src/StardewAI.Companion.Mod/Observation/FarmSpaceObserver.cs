@@ -7,6 +7,24 @@ namespace StardewAI.Companion.Mod.Observation;
 /// <summary>Read-only, uncropped map facts. Placement remains item-specific and is checked at execution.</summary>
 internal static class FarmSpaceObserver
 {
+    // Native warp landing coordinates may themselves be triggers or occupied.
+    // Report a nearby checked standing point; this is geometry, not an unlock
+    // claim. Execution still validates the entire native route and actual arrival.
+    public static Domain.TileCoordinate? FindStandingTile(IWorldObserver observer, string location, Domain.TileCoordinate landing)
+    {
+        if (!observer.LocationExists(location)) return null;
+        for (int radius = 0; radius <= 2; radius++)
+            for (int dy = -radius; dy <= radius; dy++)
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    if (Math.Abs(dx) + Math.Abs(dy) != radius) continue;
+                    var tile = new Domain.TileCoordinate(landing.X + dx, landing.Y + dy);
+                    if (tile.X >= 0 && tile.Y >= 0 && !observer.IsWarpOrDoorTile(location, tile)
+                        && observer.IsTilePassable(location, tile)) return tile;
+                }
+        return null;
+    }
+
     public static Dictionary<string, object> Capture(GameLocation location, IWorldObserver observer, Rectangle? requestedRegion = null)
     {
         var layer = location.Map?.Layers.FirstOrDefault()
@@ -21,7 +39,8 @@ internal static class FarmSpaceObserver
             throw new InvalidOperationException("Map exceeds the spatial observation limit (65536 tiles); no truncated map returned.");
         var occupants = new List<object>();
         foreach (var pair in location.objects.Pairs)
-            occupants.Add(new { kind = "object", itemId = pair.Value.QualifiedItemId, name = pair.Value.DisplayName,
+            occupants.Add(new { kind = pair.Value is StardewValley.Objects.Chest { giftbox.Value: true } ? "giftbox" : "object", itemId = pair.Value.QualifiedItemId, name = pair.Value.DisplayName,
+                nativeAction = pair.Value is StardewValley.Objects.Chest { giftbox.Value: true } ? "navigate adjacent, open_chest transfers native gift to inventory; advance ordinary dialogue, check inventory. pickup_items only if actual dropped items remain; not clear_debris" : null,
                 x = (int)pair.Key.X, y = (int)pair.Key.Y, width = 1, height = 1 });
         foreach (var pair in location.terrainFeatures.Pairs)
             occupants.Add(new { kind = pair.Value.GetType().Name,
@@ -78,7 +97,14 @@ internal static class FarmSpaceObserver
                 return region.Intersects(new Rectangle(data.GetProperty("x").GetInt32(), data.GetProperty("y").GetInt32(),
                     data.GetProperty("width").GetInt32(), data.GetProperty("height").GetInt32()));
             }).ToList(),
-            ["warps"] = location.warps.Where(w => region.Contains(w.X, w.Y)).Select(w => new { x = w.X, y = w.Y, targetLocation = w.TargetName, targetX = w.TargetX, targetY = w.TargetY }).ToList(),
+            // Native exits can sit just beyond the last drawable map tile.
+            // A clipped tile grid must not erase public cross-map connectivity.
+            ["warps"] = location.warps.Where(w => !w.npcOnly.Value).Select(w => {
+                var standing = FindStandingTile(observer, w.TargetName, new Domain.TileCoordinate(w.TargetX,w.TargetY));
+                return new { x=w.X,y=w.Y,targetLocation=w.TargetName,targetX=w.TargetX,targetY=w.TargetY,
+                    standingX=standing?.X,standingY=standing?.Y,standingTileAvailable=standing.HasValue,
+                    standingEvidence="native collision/trigger geometry; not an unlock or route-success claim" };
+            }).ToList(),
             ["placementGuaranteed"] = false
         };
     }

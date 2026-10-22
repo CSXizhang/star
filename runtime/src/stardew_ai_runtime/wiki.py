@@ -45,10 +45,14 @@ class WikiLookup:
         except (OSError, ValueError):
             return {}
 
-    def lookup(self, query: str) -> dict[str, Any]:
+    def lookup(self, query: str, exact_page: bool = False, section: str | None = None) -> dict[str, Any]:
         query = query.strip()
         if not query or len(query) > 120:
             raise ValueError("query must contain 1-120 characters")
+        if exact_page:
+            return self._lookup_page(query, section)
+        if section is not None:
+            raise ValueError("section requires exact_page=True")
         key = query.casefold()
         cache = self._load()
         cached = cache.get(key)
@@ -111,3 +115,52 @@ class WikiLookup:
         temp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(self.cache_path)
         return result
+
+    def _lookup_page(self, title: str, section: str | None) -> dict[str, Any]:
+        """One page read, reused across section requests and redirected titles."""
+        if section is not None and (not section.strip() or len(section) > 120):
+            raise ValueError("section must contain 1-120 characters")
+        cache = self._load()
+        pages = cache.setdefault("_pages", {})
+        key = title.replace("_", " ").casefold()
+        page = pages.get(key)
+        cached = isinstance(page, dict) and time.time() - page.get("fetchedAt", 0) < self.ttl_seconds
+        if not cached:
+            params = urllib.parse.urlencode({"action": "parse", "page": title,
+                "prop": "wikitext", "format": "json", "redirects": 1})
+            request = urllib.request.Request(_WIKI_BASE_URL + "mediawiki/api.php?" + params,
+                headers={"User-Agent": "StardewAICompanion/0.1 (on-demand wiki lookup)"})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read(512 * 1024).decode("utf-8"))
+            parsed = data.get("parse") or {}
+            body = (parsed.get("wikitext") or {}).get("*")
+            if not isinstance(body, str) or not body.strip():
+                raise ValueError("Wiki page unavailable: " + title)
+            page = {"title": parsed.get("title") or title, "body": body, "fetchedAt": time.time()}
+            pages[key] = page
+            pages[str(page["title"]).replace("_", " ").casefold()] = page
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
+            temp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            temp.replace(self.cache_path)
+        body = page["body"]
+        headings = list(re.finditer(r"^(={2,6})\s*(.*?)\s*\1\s*$", body, re.M))
+        available = [m.group(2).strip() for m in headings]
+        excerpt = body
+        found = section is None
+        if section is not None:
+            for i, heading in enumerate(headings):
+                if heading.group(2).strip().casefold() != section.strip().casefold():
+                    continue
+                end = next((m.start() for m in headings[i+1:] if len(m.group(1)) <= len(heading.group(1))), len(body))
+                excerpt = body[heading.start():end]
+                found = True
+                break
+            if not found:
+                excerpt = body[:headings[0].start()] if headings else body
+        return {"query": title, "source": "Stardew Valley Wiki", "cached": cached,
+                "queriedAt": time.time(), "contentLanguage": "en", "versionNote": _VERSION_NOTE,
+                "results": [{"title": page["title"], "url": _page_url(page["title"]),
+                    "section": section, "sectionFound": found, "availableSections": available,
+                    "pageExcerpt": excerpt[:12000], "excerptTruncated": len(excerpt) > 12000,
+                    "evidenceType": "page-excerpt", "fetchedAt": page["fetchedAt"]}]}

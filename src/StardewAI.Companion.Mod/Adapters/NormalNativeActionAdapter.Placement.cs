@@ -29,13 +29,34 @@ public sealed partial class NormalNativeActionAdapter
             return NativeActionStepResult.Precondition("Empty stored contents before placing this item.", "protected-contents");
         // Native predicates distinguish placeable construction from consumables (e.g. bombs and totems).
         if (!(source is Furniture || source.bigCraftable.Value || source.IsFloorPathItem() || source.IsFenceItem()
-            || source.IsWildTreeSapling() || source.IsFruitTreeSapling() || source.IsTeaSapling() || source.IsSprinkler()))
+            || source.IsWildTreeSapling() || source.IsFruitTreeSapling() || source.IsTeaSapling() || source.IsSprinkler() || source.QualifiedItemId is "(O)297" or "(O)BlueGrassStarter"))
             return NativeActionStepResult.Precondition("This item is not a supported construction item.", "unsupported-placement-item");
         var tile = new Vector2(target.Tile.X, target.Tile.Y);
         if (_observer.IsWarpOrDoorTile(request.LocationId, target.Tile))
             return NativeActionStepResult.Precondition("Entrance/warp tiles must stay clear.", "protected-entrance");
         if (loc.objects.ContainsKey(tile) || loc.terrainFeatures.ContainsKey(tile) || loc.GetFurnitureAt(tile) is not null)
             return NativeActionStepResult.Precondition("Target already contains an object or terrain feature; inspect before changing it.", "occupied");
+        if (ActorGuards.IsPlayerBound(actor))
+        {
+            int previous = farmer.CurrentToolIndex;
+            int quantityBefore = actor.GetItemCount(source.QualifiedItemId);
+            bool accepted;
+            try
+            {
+                farmer.CurrentToolIndex = farmer.Items.IndexOf(source);
+                // The real caller owns placement predicates, source identity,
+                // furniture cursor handling and reduceActiveItemByOne.
+                accepted = Utility.tryToPlaceItem(loc, source, target.Tile.X * 64, target.Tile.Y * 64);
+            }
+            finally { farmer.CurrentToolIndex = previous; }
+            bool changed = loc.objects.TryGetValue(tile, out var nativeObject) && SameItem(nativeObject.QualifiedItemId, source.QualifiedItemId)
+                || loc.furniture.Any(f => f.TileLocation == tile && SameItem(f.QualifiedItemId, source.QualifiedItemId))
+                || loc.terrainFeatures.TryGetValue(tile, out var nativeFeature) && nativeFeature is Flooring or Tree or FruitTree or Bush or Grass;
+            int consumed = quantityBefore - actor.GetItemCount(source.QualifiedItemId);
+            if (!accepted || !changed || consumed != 1)
+                return NativeActionStepResult.Failed($"Native placement result={accepted}, placed entity={changed}, consumed={consumed}. Reobserve; no depletion or recovery was fabricated.");
+            return NativeActionStepResult.Succeeded("placed", itemId: source.QualifiedItemId, itemCount: 1);
+        }
         var placed = (StardewValley.Object)source.getOne();
         if (!placed.canBePlacedHere(loc, tile))
             return NativeActionStepResult.Precondition("Native placement rules refuse this item at the requested tile.", "native-placement-refused");
@@ -46,7 +67,7 @@ public sealed partial class NormalNativeActionAdapter
                 || loc.furniture.Any(f => f.TileLocation == tile && SameItem(f.QualifiedItemId, source.QualifiedItemId))
                 || loc.terrainFeatures.TryGetValue(tile, out var feature) && (feature is Flooring floor
                     ? SameItem(floor.GetData()?.ItemId, source.QualifiedItemId)
-                    : feature is Tree or FruitTree or Bush);
+                    : feature is Tree or FruitTree or Bush or Grass);
             // placementAction creates the placed entity; the native caller consumes the inventory unit.
             // Consume on observed mutation even when a mod's return value disagrees, preventing duplication.
             if (accepted || changed)

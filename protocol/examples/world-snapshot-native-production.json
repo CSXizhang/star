@@ -1,0 +1,406 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "world.snapshot",
+  "messageId": "contract-fixture",
+  "senderInstanceId": "mod-fixture",
+  "sequenceNumber": 1,
+  "worldRevision": 42,
+  "sentAt": "2026-10-01T00:00:00+00:00",
+  "payload": {
+    "capturedRevision": 42,
+    "companion": {
+      "locationId": "Farm",
+      "tileX": 1,
+      "tileY": 2,
+      "facingDirection": 2,
+      "stamina": 210.5,
+      "maxStamina": 270,
+      "waterCanLevel": 20,
+      "maxWaterCanLevel": 40,
+      "hasWateringCan": true,
+      "activity": "idle",
+      "availableMoney": 300,
+      "moneyStatus": "observed"
+    },
+    "world": {
+      "currentLocation": "Farm",
+      "timeOfDay": 610,
+      "season": "spring",
+      "dayOfMonth": 1,
+      "isRaining": false,
+      "farmWork": {
+        "tilledUnwateredTiles": [
+          {
+            "x": 1,
+            "y": 2
+          }
+        ],
+        "tilledUnwateredCount": 1,
+        "isTruncated": false,
+        "matureCropCount": 1,
+        "matureCrops": [
+          {
+            "x": 2,
+            "y": 2,
+            "cropId": "(O)24"
+          }
+        ],
+        "matureCropsTruncated": false,
+        "cropUnwateredTiles": [
+          {
+            "x": 1,
+            "y": 2
+          }
+        ],
+        "cropUnwateredCount": 1,
+        "cropUnwateredTruncated": false,
+        "deadCropCount": 2,
+        "locationId": "Farm",
+        "observationStatus": "observed",
+        "truncated": false
+      },
+      "year": 1,
+      "weatherIcon": "0",
+      "playerItems": [
+        {
+          "name": "Parsnip",
+          "quantity": 2
+        }
+      ],
+      "playerMoney": 500,
+      "playerStamina": 220.5,
+      "playerMaxStamina": 270
+    },
+    "farmWork": {
+      "tilledUnwateredTiles": [
+        {
+          "x": 1,
+          "y": 2
+        }
+      ],
+      "tilledUnwateredCount": 1,
+      "isTruncated": false,
+      "matureCropCount": 1,
+      "matureCrops": [
+        {
+          "x": 2,
+          "y": 2,
+          "cropId": "(O)24"
+        }
+      ],
+      "matureCropsTruncated": false,
+      "cropUnwateredTiles": [
+        {
+          "x": 1,
+          "y": 2
+        }
+      ],
+      "cropUnwateredCount": 1,
+      "cropUnwateredTruncated": false,
+      "deadCropCount": 2,
+      "locationId": "Farm",
+      "observationStatus": "observed",
+      "truncated": false
+    },
+    "inventory": {
+      "capacity": 12,
+      "freeSlots": 10,
+      "slots": [
+        {
+          "index": 0,
+          "itemId": "(O)24",
+          "name": "Parsnip",
+          "displayName": "Parsnip",
+          "stack": 2,
+          "quality": 1
+        },
+        {
+          "index": 1,
+          "itemId": "(T)WateringCan",
+          "name": "Watering Can",
+          "stack": 1,
+          "quality": 0,
+          "isTool": true
+        }
+      ]
+    },
+    "chests": {
+      "truncated": false,
+      "items": [
+        {
+          "tile": {
+            "x": 8,
+            "y": 8
+          },
+          "capacity": 36,
+          "freeSlots": 35,
+          "contents": [
+            {
+              "slot": 0,
+              "itemId": "(O)472",
+              "name": "Parsnip Seeds",
+              "displayName": "Parsnip Seeds",
+              "stack": 2,
+              "quality": 0,
+              "isSeed": true,
+              "seasons": [
+                "spring"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "planting": {
+      "season": "spring",
+      "dayOfMonth": 1,
+      "companionHasHoe": true,
+      "seeds": [
+        {
+          "itemId": "(O)472",
+          "name": "Parsnip Seeds",
+          "stack": 2,
+          "canPlantCurrentSeason": true,
+          "seasons": [
+            "spring"
+          ],
+          "growthDays": 4,
+          "regrows": false,
+          "isRaised": false
+        }
+      ],
+      "candidateTiles": {
+        "tilledEmptyCount": 1,
+        "tilledEmptyTiles": [
+          {
+            "x": 1,
+            "y": 2
+          }
+        ],
+        "tilledEmptyTruncated": false,
+        "tillableCount": 1,
+        "tillableTiles": [
+          {
+            "x": 1,
+            "y": 3
+          }
+        ],
+        "tillableTruncated": false
+      },
+      "searchBounds": {
+        "center": {
+          "x": 1,
+          "y": 2
+        },
+        "radius": 8
+      }
+    },
+    "shop": {
+      "shopId": "SeedShop",
+      "status": "open",
+      "isOpen": true,
+      "ownerPresent": true,
+      "owners": [
+        "Pierre"
+      ],
+      "currency": 0,
+      "availableMoney": 300,
+      "moneyStatus": "observed",
+      "itemsCount": 1,
+      "items": [
+        {
+          "itemId": "(O)472",
+          "name": "Parsnip Seeds",
+          "price": 20,
+          "stock": 10,
+          "isInfiniteStock": false,
+          "tradeItem": "(O)390",
+          "tradeItemCount": 1,
+          "limitedStockMode": "none",
+          "actionsOnPurchase": [
+            "seed"
+          ],
+          "category": -74,
+          "isSeed": true
+        }
+      ],
+      "locationId": "SeedShop",
+      "interactionTile": {
+        "x": 4,
+        "y": 5
+      }
+    },
+    "machines": {
+      "truncated": false,
+      "items": [
+        {
+          "tile": {
+            "x": 6,
+            "y": 6
+          },
+          "itemId": "(BC)12",
+          "name": "Keg",
+          "isReady": true,
+          "minutesUntilReady": 0,
+          "outputItemId": "(O)348",
+          "outputName": "Wine",
+          "outputStack": 1,
+          "outputQuality": 0,
+          "lastInputItemId": "(O)24",
+          "hasInput": true
+        }
+      ]
+    },
+    "livestock": {
+      "buildingsTruncated": false,
+      "animalsTruncated": false,
+      "buildings": [
+        {
+          "buildingType": "Coop",
+          "indoorsName": "Coop",
+          "location": "Farm",
+          "tile": {
+            "x": 3,
+            "y": 3
+          },
+          "doorTile": {
+            "x": 4,
+            "y": 4
+          },
+          "animalDoorOpen": true,
+          "doorStateKnown": true,
+          "animalCount": 1,
+          "animalLimit": 4,
+          "hayCount": 2,
+          "hayCapacity": 4,
+          "siloHayCount": 80,
+          "animals": [
+            {
+              "name": "Hen",
+              "animalType": "White Chicken",
+              "displayType": "Chicken",
+              "age": 4,
+              "happiness": 100,
+              "fullness": 255,
+              "friendship": 50,
+              "produceReady": true,
+              "currentProduceId": "(O)176",
+              "harvestType": "grab",
+              "buildingType": "Coop",
+              "location": "Farm",
+              "tile": {
+                "x": 4,
+                "y": 5
+              },
+              "wasPetToday": false,
+              "wasAutoPetToday": true,
+              "animalId": "animal-1",
+              "homeBuildingId": "coop-1",
+              "sleepingBlocksPetting": false
+            }
+          ],
+          "buildingId": "coop-1",
+          "residentCount": 1,
+          "residentAnimalIds": [
+            "animal-1"
+          ]
+        }
+      ],
+      "roamingAnimals": [
+        {
+          "name": "Hen",
+          "animalType": "White Chicken",
+          "displayType": "Chicken",
+          "age": 4,
+          "happiness": 100,
+          "fullness": 255,
+          "friendship": 50,
+          "produceReady": true,
+          "currentProduceId": "(O)176",
+          "harvestType": "grab",
+          "buildingType": "Coop",
+          "location": "Farm",
+          "tile": {
+            "x": 4,
+            "y": 5
+          },
+          "wasPetToday": false,
+          "wasAutoPetToday": true,
+          "animalId": "animal-1",
+          "homeBuildingId": "coop-1",
+          "sleepingBlocksPetting": false
+        }
+      ],
+      "roamingScopeLocationId": "Farm"
+    },
+    "farming": {
+      "location": "Farm",
+      "refillWaterTiles": [
+        {
+          "x": 1,
+          "y": 1
+        }
+      ],
+      "groundItems": [
+        {
+          "tile": {
+            "x": 4,
+            "y": 5
+          },
+          "kind": "object",
+          "itemId": "(O)176",
+          "name": "Egg",
+          "stack": 1,
+          "isDropped": false,
+          "isWeed": false,
+          "canBeGrabbed": true,
+          "clearTool": "Scythe",
+          "isStone": false,
+          "isTwig": false,
+          "quality": 2
+        }
+      ],
+      "groundItemsTruncated": false,
+      "fertilizedTiles": [
+        {
+          "x": 1,
+          "y": 2
+        }
+      ],
+      "companionTools": [
+        "WateringCan",
+        "Hoe"
+      ],
+      "choppableTrees": [
+        {
+          "tile": {
+            "x": 7,
+            "y": 7
+          },
+          "kind": "Tree",
+          "growthStage": 5,
+          "tapped": false,
+          "width": 1,
+          "height": 1
+        }
+      ],
+      "choppableTreesTruncated": false
+    },
+    "productionSignals": [
+      {
+        "locationId": "Shed",
+        "tile": {
+          "x": 6,
+          "y": 6
+        },
+        "isReady": true
+      }
+    ],
+    "productionSignalsTruncated": true
+  },
+  "correlationId": null,
+  "saveId": "S",
+  "gameSessionId": "fixture-session",
+  "expiresAt": null,
+  "idempotencyKey": null
+}

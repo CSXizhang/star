@@ -1,0 +1,42 @@
+{
+  "protocolVersion": "0.1",
+  "messageType": "skill.result",
+  "messageId": "contract-fixture",
+  "senderInstanceId": "mod-fixture",
+  "sequenceNumber": 1,
+  "worldRevision": 42,
+  "sentAt": "2026-10-01T00:00:00+00:00",
+  "payload": {
+    "commandId": "cmd-1",
+    "taskId": "t-1",
+    "terminalState": "succeeded",
+    "completedCount": 1,
+    "skippedCount": 0,
+    "failedCount": 0,
+    "finalWorldRevision": 42,
+    "effects": [
+      {
+        "state": "watered",
+        "tile": {
+          "x": 1,
+          "y": 2
+        }
+      }
+    ],
+    "resources": null,
+    "error": null,
+    "retryRecommended": false,
+    "playerActionRequired": false,
+    "skillId": "water-zone",
+    "targetAdjusted": false,
+    "requestedTile": {
+      "x": 1,
+      "y": 2
+    }
+  },
+  "correlationId": "msg-exec-1",
+  "saveId": "S",
+  "gameSessionId": "fixture-session",
+  "expiresAt": null,
+  "idempotencyKey": null
+}

@@ -72,22 +72,22 @@ public class CompanionCommandMenuPauseStateTests
         CompanionCommandMenu.ModeChangePending = false;
         CompanionCommandMenu.AutonomyPaused = false;
 
-        Assert.Equal("开启自由模式", CompanionCommandMenu.ModeButtonText);
+        Assert.Equal("主动帮忙：关", CompanionCommandMenu.ModeButtonText);
         Assert.False(CompanionCommandMenu.IsPausedBadgeVisible);
 
         // Pausing autonomy preserves mode button text
         CompanionCommandMenu.AutonomyPaused = true;
-        Assert.Equal("开启自由模式", CompanionCommandMenu.ModeButtonText);
+        Assert.Equal("主动帮忙：关", CompanionCommandMenu.ModeButtonText);
         Assert.True(CompanionCommandMenu.IsPausedBadgeVisible);
 
         // Switching to free mode preserves pause state
         CompanionCommandMenu.AutonomyMode = "free";
-        Assert.Equal("退出自由模式", CompanionCommandMenu.ModeButtonText);
+        Assert.Equal("主动帮忙：开", CompanionCommandMenu.ModeButtonText);
         Assert.True(CompanionCommandMenu.IsPausedBadgeVisible);
 
         // Unpausing autonomy preserves mode
         CompanionCommandMenu.AutonomyPaused = false;
-        Assert.Equal("退出自由模式", CompanionCommandMenu.ModeButtonText);
+        Assert.Equal("主动帮忙：开", CompanionCommandMenu.ModeButtonText);
         Assert.False(CompanionCommandMenu.IsPausedBadgeVisible);
 
         // Cleanup

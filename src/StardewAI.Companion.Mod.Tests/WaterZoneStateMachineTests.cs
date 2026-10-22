@@ -3,12 +3,66 @@ using StardewAI.Companion.Mod.Domain;
 using StardewAI.Companion.Mod.Execution;
 using StardewAI.Companion.Mod.Navigation;
 using StardewAI.Companion.Mod.Observation;
+using HarmonyLib;
+using StardewValley;
+using StardewValley.Menus;
+using System.Runtime.Serialization;
 using Xunit;
 
 namespace StardewAI.Companion.Mod.Tests;
 
 public class WaterZoneStateMachineTests
 {
+    [Fact]
+    public void DefaultTimeBudgetAllowsWateringAfterMoreThanAnHourOfGameTime()
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var tile = new TileCoordinate(10, 12);
+        observer.SetDirt(tile, TileDirtState.DryDirt(hasCrop: true));
+        Assert.True(machine.Start(new WaterZoneRequest("long-water", "long-water-task", "Farm",
+            new[] { tile }, 50f, 20), out _));
+        observer.TimeOfDay = 1900;
+        machine.StepTicks(200);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Single(machine.FinalResult.WateredTiles);
+        Assert.Equal(39, actor.WaterLeft);
+        Assert.True(machine.FinalResult.GameMinutesElapsed > 60);
+    }
+
+    [Fact]
+    public void PartialWateringReceiptKeepsFailedTileReasons()
+    {
+        var result = new WaterZoneResult("partial", "partial-task", ExecutionState.PartiallySucceeded,
+            new[] { new TileCoordinate(10, 12) }, Array.Empty<SkippedTileInfo>(),
+            new[] { new FailedTileInfo(new TileCoordinate(11, 12), "Dirt remained unwatered.") },
+            2f, 1, 50, 3);
+        var json = System.Text.Json.JsonSerializer.SerializeToElement(result.ToTransportPayload());
+        Assert.Equal("Dirt remained unwatered.", json.GetProperty("details").GetProperty("failedTiles")[0].GetProperty("reason").GetString());
+        Assert.Equal(11, json.GetProperty("details").GetProperty("failedTiles")[0].GetProperty("tile").GetProperty("x").GetInt32());
+        Assert.Single(json.GetProperty("effects").EnumerateArray());
+    }
+
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 2)]
+    public void CropOnlySelectionDoesNotSpendWaterOnEmptySoil(bool includeEmpty, int expectedWatered)
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var crop = new TileCoordinate(10, 12);
+        var empty = new TileCoordinate(11, 12);
+        observer.SetDirt(crop, TileDirtState.DryDirt(hasCrop: true));
+        observer.SetDirt(empty, TileDirtState.DryDirt());
+        Assert.True(machine.Start(new WaterZoneRequest("crop-filter", "crop-filter-task", "Farm",
+            new[] { crop, empty }, 20, 20, 60, IncludeEmptyTiles: includeEmpty), out _));
+        machine.StepTicks(200);
+        var result = machine.FinalResult!;
+        Assert.Equal(expectedWatered, result.WateredTiles.Count);
+        Assert.Equal(40 - expectedWatered, actor.WaterLeft);
+        Assert.Equal(270f - 2f * expectedWatered, actor.Stamina);
+        Assert.True(observer.GetDirtState("Farm", crop).IsWatered);
+        Assert.Equal(includeEmpty, observer.GetDirtState("Farm", empty).IsWatered);
+    }
+
     private (WaterZoneStateMachine machine, MechanicsActor actor, SimulatedWorldObserver observer, TestWateringCanAdapter adapter) CreateHarness(
         float initialStamina = 270f,
         int initialWater = 40,
@@ -25,6 +79,19 @@ public class WaterZoneStateMachineTests
 
         var machine = new WaterZoneStateMachine(actor, observer, navigator, adapter, avatar);
         return (machine, actor, observer, adapter);
+    }
+
+    [Fact]
+    public void DeadCropsAreSkippedWithoutWaterOrStaminaConsumption()
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var tile = new TileCoordinate(10, 12);
+        observer.SetDirt(tile, TileDirtState.DryDirt(hasCrop: true) with { IsDead = true });
+        Assert.True(machine.Start(new WaterZoneRequest("dead", "dead-task", "Farm", new[] { tile }, 20, 20, 60), out var result));
+        Assert.NotNull(result);
+        Assert.Equal(270f, actor.Stamina);
+        Assert.Equal(40, actor.WaterLeft);
+        Assert.False(observer.GetDirtState("Farm", tile).IsWatered);
     }
 
     [Fact]
@@ -254,6 +321,43 @@ public class WaterZoneStateMachineTests
         machine.StepTicks(100);
         Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
         Assert.Single(machine.FinalResult.WateredTiles);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PausedClockDoesNotSpendWorkBudgetAndResumeDoesNotResetActiveTime(bool exhaustActiveBudget)
+    {
+        var (machine, actor, observer, _) = CreateHarness();
+        var tile = new TileCoordinate(10, 12);
+        observer.SetDirt(tile, TileDirtState.DryDirt());
+        Assert.True(machine.Start(new WaterZoneRequest("clock-pause", "clock-task", "Farm",
+            new[] { tile }, 50, 20, 60), out _));
+        machine.StepTicks(2);
+        observer.TimeOfDay = 610;
+        machine.RequestPause();
+        machine.StepTicks(1);
+        Assert.True(machine.IsPaused);
+        observer.TimeOfDay = 800;
+        machine.StepTicks(5);
+        Assert.Equal(40, actor.WaterLeft);
+        machine.Resume();
+        observer.TimeOfDay = 810;
+        machine.RequestPause();
+        machine.StepTicks(1);
+        Assert.True(machine.IsPaused);
+        observer.TimeOfDay = 1000;
+        machine.Resume();
+        observer.TimeOfDay = exhaustActiveBudget ? 1050 : 1010;
+        machine.Resume(); // An extra resume while running cannot reset the budget.
+        machine.StepTicks(100);
+
+        var result = machine.FinalResult!;
+        Assert.Equal(exhaustActiveBudget ? ExecutionState.Failed : ExecutionState.Succeeded, result.FinalState);
+        Assert.Equal(exhaustActiveBudget ? "BUDGET_EXHAUSTED" : null, result.ErrorCode);
+        Assert.Equal(exhaustActiveBudget ? 0 : 1, result.WateredTiles.Count);
+        Assert.Equal(exhaustActiveBudget ? 40 : 39, actor.WaterLeft);
+        Assert.Equal(exhaustActiveBudget ? 290 : 250, result.GameMinutesElapsed);
     }
 
     [Fact]
@@ -489,6 +593,42 @@ public class WaterZoneStateMachineTests
         Assert.False(machine.IsExecuting);
         Assert.NotNull(machine.FinalResult);
         Assert.Equal("BUDGET_EXHAUSTED", machine.FinalResult.ErrorCode);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ClockBudgetAfterEffectPreservesWateredTileDuringSwingOrVerification(bool waitForVerification)
+    {
+        int effects = 0;
+        var (machine, actor, observer, _) = CreateHarness(onWatered: (_, _) => effects++);
+        var first = new TileCoordinate(10, 11);
+        var second = new TileCoordinate(11, 12);
+        observer.SetDirt(first, TileDirtState.DryDirt());
+        observer.SetDirt(second, TileDirtState.DryDirt());
+        observer.TimeOfDay = 600;
+        Assert.True(machine.Start(new WaterZoneRequest("clock-after-effect", "clock-task", "Farm",
+            new[] { first, second }, 50f, 20, MaxGameMinutes: 10), out _));
+        for (int tick = 0; tick < 100 && effects == 0; tick++) machine.StepTicks(1);
+        Assert.Equal(1, effects);
+        if (waitForVerification)
+            for (int tick = 0; tick < 100 && machine.CurrentState != ExecutionState.Verifying; tick++) machine.StepTicks(1);
+        Assert.Equal(waitForVerification ? ExecutionState.Verifying : ExecutionState.Watering, machine.CurrentState);
+        Assert.Empty(machine.FinalResult?.WateredTiles ?? Array.Empty<TileCoordinate>());
+        observer.TimeOfDay = 620;
+        machine.StepTicks(1);
+        var result = machine.FinalResult!;
+        Assert.Equal(ExecutionState.PartiallySucceeded, result.FinalState);
+        Assert.Equal("BUDGET_EXHAUSTED", result.ErrorCode);
+        Assert.Equal(first, Assert.Single(result.WateredTiles));
+        Assert.Equal(2f, result.StaminaUsed);
+        Assert.Equal(1, result.WaterUsed);
+        Assert.Equal(39, actor.WaterLeft);
+        Assert.False(actor.IsUsingTool);
+        Assert.False(observer.GetDirtState("Farm", second).IsWatered);
+        machine.StepTicks(100);
+        Assert.Same(result, machine.FinalResult);
+        Assert.Equal(1, effects);
     }
 
     private class FaultyToolActor : MechanicsActor
@@ -986,6 +1126,72 @@ public class WaterZoneStateMachineTests
             Assert.NotNull(early);
             Assert.Equal(ExecutionState.Rejected, early!.FinalState);
             Assert.Equal("LOCATION_MISMATCH", early.ErrorCode);
+        }
+    }
+}
+
+// This regression manipulates the real game's global menu reference, so it
+// shares the nonparallel collection used by the native rest boundary tests.
+[Collection("Companion rest globals")]
+public class WaterZoneMenuPauseTests
+{
+    [Fact]
+    public void BlockingMenuFreezesNativeSwingThenResumesWithExactlyOneWateringEffect()
+    {
+        var menuField = AccessTools.Field(typeof(Game1), "_activeClickableMenu");
+        var previousMenu = menuField.GetValue(null);
+        bool previousPause = Game1.paused;
+        try
+        {
+            menuField.SetValue(null, null);
+            Game1.paused = false;
+            var actor = new MechanicsActor("menu-pause", initialPose:
+                new AuthoritativePose("Farm", new TileCoordinate(10, 10), FacingDirection.Down));
+            var observer = new SimulatedWorldObserver { CurrentLocationName = "Farm" };
+            var tile = new TileCoordinate(10, 11);
+            observer.SetDirt(tile, TileDirtState.DryDirt());
+            int effects = 0;
+            var adapter = new TestWateringCanAdapter(observer, (_, _) => effects++);
+            var machine = new WaterZoneStateMachine(actor, observer, new SameMapNavigator(observer), adapter);
+            Assert.True(machine.Start(new WaterZoneRequest("menu-pause", "menu-pause-task", "Farm",
+                new[] { tile }, 50f, 20, 60), out _));
+            for (int tick = 0; tick < 100 && machine.CurrentState != ExecutionState.Watering; tick++) machine.StepTicks(1);
+            Assert.Equal(ExecutionState.Watering, machine.CurrentState);
+            Assert.True(actor.IsUsingTool);
+            Assert.Equal(0, effects);
+
+            void OpenMenu() => menuField.SetValue(null, FormatterServices.GetUninitializedObject(typeof(InventoryMenu)));
+            OpenMenu();
+            var phase = actor.AnimationPhase;
+            machine.StepTicks(100);
+            Assert.Equal(ExecutionState.Watering, machine.CurrentState);
+            Assert.True(actor.IsUsingTool);
+            Assert.Equal(phase, actor.AnimationPhase);
+            Assert.Equal(0, effects);
+
+            menuField.SetValue(null, null);
+            for (int tick = 0; tick < 100 && effects == 0; tick++) machine.StepTicks(1);
+            Assert.Equal(1, effects);
+            OpenMenu();
+            machine.StepTicks(100);
+            Assert.True(actor.IsUsingTool);
+            Assert.Equal(1, effects);
+            menuField.SetValue(null, null);
+            machine.StepTicks(100);
+            Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+            Assert.Equal(tile, Assert.Single(machine.FinalResult.WateredTiles));
+            Assert.Equal(1, effects);
+            Assert.Equal(1, machine.FinalResult.WaterUsed);
+            Assert.Equal(2f, machine.FinalResult.StaminaUsed);
+            Assert.Equal(39, actor.WaterLeft);
+            Assert.False(actor.IsUsingTool);
+            machine.StepTicks(100);
+            Assert.Equal(1, effects);
+        }
+        finally
+        {
+            menuField.SetValue(null, previousMenu);
+            Game1.paused = previousPause;
         }
     }
 }

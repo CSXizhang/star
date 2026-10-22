@@ -15,7 +15,7 @@ def test_autonomy_state_is_partitioned_by_save_and_day(tmp_path: Path):
     path = tmp_path / "autonomy.json"
     ctl = AutonomyController(path)
     ctl.set_enabled("save-a", True)
-    ctl.set_preferences("save-a", goal="种植", budget_limit=100)
+    ctl.set_preferences("save-a", goal="种植")
     ctl.on_day_started("save-a", 2)
     ctl.record_completion("save-a", "water")
     reloaded = AutonomyController(path)
@@ -69,14 +69,14 @@ def test_free_mode_controls_and_new_day_epoch_are_persisted(tmp_path: Path):
     ctl.on_day_started("save-a", 2)
     state = AutonomyController(path).state("save-a")
     assert state.mode == "free" and state.paused is False
-    assert state.budget_limit == 25 and state.box_preference == "Chest A"
+    assert state.box_preference == "Chest A" and "budget_limit" not in state.__dict__
     assert state.decision_epoch > epoch and state.daily_spend == 0
 
 
 def test_spend_reservation_is_idempotent_and_unknown_stays_reserved(tmp_path: Path):
     ctl = AutonomyController(tmp_path / "autonomy.json")
     ctl.set_enabled("save-a", True)
-    ctl.set_preferences("save-a", budget_limit=10)
+    ctl.set_preferences("save-a")
     assert ctl.reserve_spend("save-a", "cmd-1", 7) == 7
     assert ctl.reserve_spend("save-a", "cmd-1", 7) == 7
     ctl.settle_spend("save-a", "cmd-1", None, unknown=True)

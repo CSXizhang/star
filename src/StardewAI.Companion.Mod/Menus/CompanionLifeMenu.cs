@@ -29,6 +29,18 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     private Panel _activePanel = Panel.Main;
     private bool _memoryOnly;
+    private bool _chatOnly;
+    private int _suggestionIndex;
+    private static readonly string[] Suggestions = { "今天先做什么？", "帮我照料农场。", "我想调整一下安排。" };
+    public void OpenChatOnly()
+    {
+        _chatOnly = true;
+        _activePanel = Panel.Chat;
+        _chatMode = "chat";
+        ActivateChatInput();
+        _scrollBack = MaxChatScroll();
+        _state.MarkConversationRead();
+    }
 
     public void OpenMemoryOnly()
     {
@@ -50,6 +62,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     /// <summary>Opens the CompanionSetupMenu.</summary>
     private readonly Action _onOpenSetup;
+    private readonly Action? _onOpenDirections;
 
     /// <summary>Refreshes the confirmed work plan when the plan panel opens.</summary>
     private readonly Action _onRefreshWork;
@@ -75,7 +88,9 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     private string _chatMode = "chat"; // "chat" | "plan"
     private TextBox _chatInput = null!;
-    private readonly List<(string Speaker, string Text, Color Color)> _chatHistory = new();
+    private IReadOnlyList<CompanionConversationEntry> ChatHistory => _state.Conversation;
+    private int _seenConversationRevision = -1;
+    public bool IsChatVisible => _activePanel == Panel.Chat;
     private int _scrollBack;
 
     // -----------------------------------------------------------------------
@@ -88,6 +103,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
     private string? _memoryCorrectPendingId;  // correct loads the entry text into the input box
     private string? _memorySelectedId;        // entry shown full-text in the detail strip
     private int _memoryScroll;
+    private int _memoryDetailScroll;
     private int _careScroll;
 
     // -----------------------------------------------------------------------
@@ -123,7 +139,10 @@ public sealed class CompanionLifeMenu : IClickableMenu
     private Rectangle _memDetailDeleteRect;
 
     /// <summary>Height of the detail strip that shows the selected entry's full text.</summary>
-    private const int MemDetailStripHeight = 96;
+    private int MemDetailStripHeight => Math.Min(180, _memViewport.Height / 2);
+    private int MemoryRowHeight => Game1.smallFont.LineSpacing * 2 + 20;
+    private Rectangle MemoryListViewport => new(_memViewport.X, _memViewport.Y, _memViewport.Width, _memViewport.Height - (_memorySelectedId != null ? MemDetailStripHeight + 8 : 0));
+    private Rectangle MemoryDetailTextViewport => new(MemDetailStripRect.X + 12, MemDetailStripRect.Y + 48, MemDetailStripRect.Width - 24, MemDetailStripRect.Height - 60);
 
     private int _layoutWidth;
     private int _layoutHeight;
@@ -141,7 +160,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
         Action onRefreshWork,
         Action onRefreshMemory,
         Action onRefreshMilestones,
-        Func<string, string?, string?, string?, bool> onMemoryEdit)
+        Func<string, string?, string?, string?, bool> onMemoryEdit, Action? onOpenDirections = null)
         : base(
             Math.Max(0, (Game1.uiViewport.Width - 640) / 2),
             Math.Max(0, (Game1.uiViewport.Height - 500) / 2),
@@ -151,6 +170,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _onSubmitLifeChat = onSubmitLifeChat ?? throw new ArgumentNullException(nameof(onSubmitLifeChat));
         _onOpenCommandMenu = onOpenCommandMenu ?? throw new ArgumentNullException(nameof(onOpenCommandMenu));
+        _onOpenDirections = onOpenDirections;
         _onOpenSetup = onOpenSetup ?? throw new ArgumentNullException(nameof(onOpenSetup));
         _onRefreshWork = onRefreshWork ?? throw new ArgumentNullException(nameof(onRefreshWork));
         _onRefreshMemory = onRefreshMemory ?? throw new ArgumentNullException(nameof(onRefreshMemory));
@@ -261,7 +281,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
                         return;
                     }
                 }
-                if (_memoryOnly) exitThisMenu(playSound: false);
+                if (_memoryOnly || _chatOnly) exitThisMenu(playSound: false);
                 else _activePanel = Panel.Main;
                 return;
             }
@@ -279,9 +299,14 @@ public sealed class CompanionLifeMenu : IClickableMenu
     public override void receiveScrollWheelAction(int direction)
     {
         if (_activePanel == Panel.Chat)
-            _scrollBack = Math.Clamp(_scrollBack + (direction > 0 ? 48 : -48), 0, MaxChatScroll());
+            _scrollBack = Math.Clamp(_scrollBack + (direction > 0 ? -48 : 48), 0, MaxChatScroll());
         else if (_activePanel == Panel.Memory)
-            _memoryScroll = Math.Clamp(_memoryScroll + (direction > 0 ? 48 : -48), 0, MaxMemScroll());
+        {
+            int delta = direction > 0 ? -48 : 48;
+            if (_memorySelectedId != null && MemDetailStripRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()))
+                _memoryDetailScroll = Math.Clamp(_memoryDetailScroll + delta, 0, MaxMemoryDetailScroll());
+            else _memoryScroll = Math.Clamp(_memoryScroll + delta, 0, MaxMemScroll());
+        }
         else if (_activePanel == Panel.Care)
             _careScroll = Math.Clamp(_careScroll + (direction > 0 ? 48 : -48), 0, MaxCareScroll());
         base.receiveScrollWheelAction(direction);
@@ -329,19 +354,14 @@ public sealed class CompanionLifeMenu : IClickableMenu
         }
         if (_planButtonRect.Contains(x, y))
         {
-            _chatMode = "plan";
-            _activePanel = Panel.Chat;
-            _onRefreshWork();
-            _onRefreshMilestones();
-            ActivateChatInput();
+            exitThisMenu(false);
+            _onOpenCommandMenu(string.Empty);
             return;
         }
         if (_taskButtonRect.Contains(x, y))
         {
-            // Close life menu, open command menu with prefill if any.
-            string prefill = _chatInput?.Text.Trim() ?? string.Empty;
-            exitThisMenu(playSound: false);
-            _onOpenCommandMenu(prefill);
+            exitThisMenu(false);
+            _onOpenDirections?.Invoke();
             return;
         }
         if (_memoryButtonRect.Contains(x, y))
@@ -379,16 +399,12 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     private void HandleChatClick(int x, int y)
     {
+        if (_chatOnly && _chatBackRect.Contains(x, y)) { exitThisMenu(false); return; }
         if (_chatBackRect.Contains(x, y)) { _activePanel = Panel.Main; return; }
 
         if (_chatModeToggleRect.Contains(x, y))
         {
-            _chatMode = _chatMode == "chat" ? "plan" : "chat";
-            if (_chatMode == "plan")
-            {
-                _onRefreshWork();
-                _onRefreshMilestones();
-            }
+            _chatInput.Text = Suggestions[_suggestionIndex++ % Suggestions.Length];
             return;
         }
         if (_chatSendRect.Contains(x, y)) { SubmitChat(); return; }
@@ -412,11 +428,12 @@ public sealed class CompanionLifeMenu : IClickableMenu
         if (ok)
         {
             bool followBottom = _scrollBack >= MaxChatScroll() - 24;
-            _chatHistory.Add(("你", text, Color.DarkBlue));
             _chatInput!.Text = string.Empty;
             if (followBottom) _scrollBack = MaxChatScroll();
         }
     }
+
+    private static string ConversationText(CompanionConversationEntry entry) => $"{FormatGameDate(entry.GameDate)}\n{entry.Text}";
 
     private int ChatEntryHeight(string speaker, string text)
     {
@@ -426,7 +443,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     private int MaxChatScroll()
     {
-        int total = _chatHistory.Sum(m => ChatEntryHeight(m.Speaker, m.Text));
+        int total = ChatHistory.Sum(m => ChatEntryHeight(m.Speaker, ConversationText(m)));
         int height = _chatViewport.Height - PlanInfoBandHeight();
         return Math.Max(0, total - height);
     }
@@ -533,7 +550,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
     {
         if (_memBackRect.Contains(x, y))
         {
-            if (_memoryOnly) exitThisMenu(playSound: false);
+            if (_memoryOnly || _chatOnly) exitThisMenu(playSound: false);
             else _activePanel = Panel.Main;
             return;
         }
@@ -622,43 +639,14 @@ public sealed class CompanionLifeMenu : IClickableMenu
             return;
         }
 
-        // Entry-level correct/delete buttons (two-step, explicitly confirmed) and row selection
-        var entries = _state.MemoryEntries;
-        int entryY = _memViewport.Y - _memoryScroll;
-        foreach (var entry in entries)
+        // The list selects; editing lives in the separate detail panel.
+        if (!MemoryListViewport.Contains(x, y)) return;
+        int index = (y - MemoryListViewport.Y + _memoryScroll) / MemoryRowHeight;
+        if (index >= 0 && index < _state.MemoryEntries.Count)
         {
-            if (entry.Source != "system")
-            {
-                var correctRect = new Rectangle(_memViewport.Right - 160, entryY, 76, 24);
-                if (correctRect.Contains(x, y))
-                {
-                    _memoryCorrectPendingId = entry.Id;
-                    _memoryDeletePendingId = null;
-                    _memoryAddInput!.Text = entry.Text;
-                    _memoryAddInput.SelectMe();
-                    if (Game1.keyboardDispatcher != null)
-                        Game1.keyboardDispatcher.Subscriber = _memoryAddInput;
-                    return;
-                }
-                var delRect = new Rectangle(_memViewport.Right - 80, entryY, 76, 24);
-                if (delRect.Contains(x, y))
-                {
-                    _memoryDeletePendingId = entry.Id;
-                    _memoryCorrectPendingId = null;
-                    return;
-                }
-            }
-
-            // Clicking the row itself selects the entry for the full-text detail strip.
-            var rowRect = new Rectangle(_memViewport.X, entryY, _memViewport.Width, 52);
-            if (rowRect.Contains(x, y))
-            {
-                _memorySelectedId = entry.Id;
-                return;
-            }
-
-            entryY += 52;
-            if (entryY > _memViewport.Bottom) break;
+            _memorySelectedId = _state.MemoryEntries[index].Id;
+            _memoryDetailScroll = 0;
+            _memoryScroll = Math.Clamp(_memoryScroll, 0, MaxMemScroll());
         }
     }
 
@@ -668,8 +656,16 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     private int MaxMemScroll()
     {
-        int total = _state.MemoryEntries.Count * 52;
-        return Math.Max(0, total - _memViewport.Height);
+        int total = _state.MemoryEntries.Count * MemoryRowHeight;
+        return Math.Max(0, total - MemoryListViewport.Height);
+    }
+
+    private int MaxMemoryDetailScroll()
+    {
+        var entry = _state.MemoryEntries.FirstOrDefault(e => e.Id == _memorySelectedId);
+        if (entry == null) return 0;
+        string text = Game1.parseText(entry.Text, Game1.smallFont, MemoryDetailTextViewport.Width);
+        return Math.Max(0, (int)Game1.smallFont.MeasureString(text).Y - MemoryDetailTextViewport.Height);
     }
 
     // -----------------------------------------------------------------------
@@ -681,19 +677,12 @@ public sealed class CompanionLifeMenu : IClickableMenu
         if (_layoutWidth != Game1.uiViewport.Width || _layoutHeight != Game1.uiViewport.Height)
             BuildLayout();
 
-        // Apply incoming chat reply to history
-        if (_state.ChatStatus == LifeChatStatus.Completed && !string.IsNullOrEmpty(_state.ReplyText))
+        if (_seenConversationRevision != _state.ConversationRevision)
         {
-            string companion = _state.CompanionName;
-            // Check if already added to avoid duplicates
-            if (_chatHistory.Count == 0 || _chatHistory[^1].Speaker != companion ||
-                _chatHistory[^1].Text != _state.ReplyText)
-            {
-                bool followBottom = _scrollBack >= MaxChatScroll() - 24;
-                _chatHistory.Add((companion, _state.ReplyText, Color.DarkGreen));
-                if (followBottom) _scrollBack = MaxChatScroll();
-            }
+            _seenConversationRevision = _state.ConversationRevision;
+            _scrollBack = MaxChatScroll();
         }
+        if (IsChatVisible) _state.MarkConversationRead();
 
         b.Draw(Game1.fadeToBlackRect, Game1.graphics.GraphicsDevice.Viewport.Bounds, Color.Black * 0.45f);
         drawTextureBox(b, xPositionOnScreen, yPositionOnScreen, width, height, Color.White);
@@ -729,9 +718,9 @@ public sealed class CompanionLifeMenu : IClickableMenu
         }
 
         int mx = Game1.getOldMouseX(), my = Game1.getOldMouseY();
-        DrawButton(b, _chatButtonRect, "随便聊聊", Color.SteelBlue, _chatButtonRect.Contains(mx, my));
-        DrawButton(b, _planButtonRect, "商量计划", Color.SaddleBrown, _planButtonRect.Contains(mx, my));
-        DrawButton(b, _taskButtonRect, "帮我做件事", Color.ForestGreen, _taskButtonRect.Contains(mx, my));
+        DrawButton(b, _chatButtonRect, "直接对话", Color.SteelBlue, _chatButtonRect.Contains(mx, my));
+        DrawButton(b, _planButtonRect, "查看当前计划", Color.SaddleBrown, _planButtonRect.Contains(mx, my));
+        DrawButton(b, _taskButtonRect, "确定大方向", Color.ForestGreen, _taskButtonRect.Contains(mx, my));
 
         DrawButton(b, _memoryButtonRect, "查看记忆", Color.DarkOrchid, _memoryButtonRect.Contains(mx, my));
         DrawButton(b, _setupButtonRect, "伙伴设置", Color.SlateGray, _setupButtonRect.Contains(mx, my));
@@ -742,7 +731,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
 
     private void DrawChatPanel(SpriteBatch b)
     {
-        string modeLabel = _chatMode == "plan" ? "商量计划模式" : "随便聊聊模式";
+        string modeLabel = "和" + _state.CompanionName + "对话";
         b.DrawString(Game1.dialogueFont, modeLabel,
             new Vector2(xPositionOnScreen + 24, yPositionOnScreen + 12), Game1.textColor);
 
@@ -771,11 +760,15 @@ public sealed class CompanionLifeMenu : IClickableMenu
         Rectangle historyViewport = _chatMode == "plan"
             ? new Rectangle(_chatViewport.X, _chatViewport.Y + infoBandHeight, _chatViewport.Width, _chatViewport.Height - infoBandHeight)
             : _chatViewport;
+        if (ChatHistory.Count == 0)
+            b.DrawString(Game1.smallFont, "聊聊近况、安排农活，或告诉我你的想法。",
+                new Vector2(historyViewport.X + 4, historyViewport.Y + 8), Color.DimGray);
         // Chat history
         float cy = historyViewport.Y - _scrollBack;
-        foreach (var (speaker, text, color) in _chatHistory)
+        foreach (var message in ChatHistory)
         {
-            string line = $"[{speaker}]: {text}";
+            Color color = message.IsPlayer ? Color.DarkBlue : Color.DarkGreen;
+            string line = $"[{message.Speaker}]: {ConversationText(message)}";
             string wrapped = Game1.parseText(line, Game1.smallFont, historyViewport.Width - 8);
             int entryHeight = (int)Game1.smallFont.MeasureString(wrapped).Y + 8;
             if (cy + entryHeight > historyViewport.Top && cy < historyViewport.Bottom)
@@ -798,14 +791,14 @@ public sealed class CompanionLifeMenu : IClickableMenu
         }
 
         int mx = Game1.getOldMouseX(), my = Game1.getOldMouseY();
-        string toggleLabel = _chatMode == "chat" ? "切换：计划" : "切换：聊天";
+        string toggleLabel = "聊什么？";
         DrawButton(b, _chatModeToggleRect, toggleLabel, Color.SaddleBrown, _chatModeToggleRect.Contains(mx, my));
         DrawButton(b, _chatSendRect, "发送", _state.IsChatPending ? Color.Gray : Color.ForestGreen,
             _chatSendRect.Contains(mx, my));
         _chatInput.Draw(b);
 
         if (_chatMode == "plan")
-            b.DrawString(Game1.smallFont, "只读建议，不自动派发任务",
+            b.DrawString(Game1.smallFont, "直接说出你的想法或安排",
                 new Vector2(xPositionOnScreen + 112, yPositionOnScreen + 50), Color.DimGray);
 
     }
@@ -851,78 +844,44 @@ public sealed class CompanionLifeMenu : IClickableMenu
         b.DrawString(Game1.smallFont, "点击条目查看全文",
             new Vector2(_memBackRect.Right + 24, yPositionOnScreen + 52), Color.DimGray);
 
-        // Memory entries
         var entries = _state.MemoryEntries;
-        int ey = _memViewport.Y - _memoryScroll;
+        Rectangle list = MemoryListViewport;
+        _memoryScroll = Math.Clamp(_memoryScroll, 0, MaxMemScroll());
+        int ey = list.Y - _memoryScroll;
         foreach (var entry in entries)
         {
-            if (ey + 52 > _memViewport.Top && ey < _memViewport.Bottom)
+            if (ey + MemoryRowHeight > list.Top && ey < list.Bottom)
             {
-                string kindLabel = entry.Kind switch
-                {
-                    "preference" => "偏好",
-                    "agreement" => "约定",
-                    "event" => "共同经历",
-                    _ => entry.Kind
-                };
-                string srcLabel = entry.Source switch
-                {
-                    "player" => "玩家",
-                    "companion" => "伙伴",
-                    "system" => "系统",
-                    _ => entry.Source
-                };
-                string dateLabel = FormatGameDate(entry.GameDate);
-
-                // Selected-row highlight behind the entry.
-                if (entry.Id == _memorySelectedId)
-                    b.Draw(Game1.fadeToBlackRect,
-                        new Rectangle(_memViewport.X, ey, _memViewport.Width, 52),
-                        Color.LightSteelBlue * 0.20f);
-
-                b.DrawString(Game1.smallFont, $"[{kindLabel}·{srcLabel}·{dateLabel}]",
-                    new Vector2(_memViewport.X + 4, ey), Color.DimGray);
-
-                // Clip the body to the row's visible width so long entries (up to 200
-                // chars) never spill over the buttons or the next row; the full text is
-                // readable via the selected-entry detail strip below.
-                float textMaxWidth = entry.Source == "system"
-                    ? _memViewport.Width - 12
-                    : _memViewport.Width - 172;
-                b.DrawString(Game1.smallFont,
-                    ClipToWidth(Game1.smallFont, entry.Text, textMaxWidth),
-                    new Vector2(_memViewport.X + 4, ey + 20), Game1.textColor);
-
-                // Correct / delete buttons for player/companion-sourced entries
-                if (entry.Source != "system")
-                {
-                    var correctRect = new Rectangle(_memViewport.Right - 160, ey, 76, 24);
-                    DrawButton(b, correctRect, "纠正", Color.SaddleBrown,
-                        correctRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
-                    var delRect = new Rectangle(_memViewport.Right - 80, ey, 76, 24);
-                    DrawButton(b, delRect, "删除", Color.Firebrick,
-                        delRect.Contains(Game1.getOldMouseX(), Game1.getOldMouseY()));
-                }
+                string kind = entry.Kind switch { "preference" => "偏好", "agreement" => "约定", "event" => "共同经历", _ => entry.Kind };
+                string source = entry.Source switch { "player" => "玩家", "companion" => "伙伴", "system" => "系统", _ => entry.Source };
+                string selected = entry.Id == _memorySelectedId ? "▶ " : "";
+                ClippedSpriteText.Draw(b, Game1.smallFont,
+                    ClipToWidth(Game1.smallFont, $"{selected}{kind} · {source} · {FormatGameDate(entry.GameDate)}", list.Width - 16),
+                    new Vector2(list.X + 8, ey + 4), Color.DarkSlateGray, list);
+                ClippedSpriteText.Draw(b, Game1.smallFont,
+                    ClipToWidth(Game1.smallFont, entry.Text, list.Width - 16),
+                    new Vector2(list.X + 8, ey + Game1.smallFont.LineSpacing + 10), Game1.textColor, list);
             }
-            ey += 52;
+            ey += MemoryRowHeight;
         }
 
-        // Selected-entry detail strip: full text, wrapped, with correct/delete actions.
         var selectedEntry = entries.FirstOrDefault(e => e.Id == _memorySelectedId);
         if (selectedEntry != null)
         {
-            var strip = MemDetailStripRect;
-            b.Draw(Game1.fadeToBlackRect, strip, Color.Black * 0.78f);
-            b.DrawString(Game1.smallFont,
-                Game1.parseText(selectedEntry.Text, Game1.smallFont, strip.Width - 188),
-                new Vector2(strip.X + 8, strip.Y + 8), Game1.textColor);
+            Rectangle strip = MemDetailStripRect;
+            drawTextureBox(b, strip.X, strip.Y, strip.Width, strip.Height, Color.White);
+            b.DrawString(Game1.smallFont, ClipToWidth(Game1.smallFont, "全文 · 滚轮查看 · Esc 收起", strip.Width - 172),
+                new Vector2(strip.X + 12, strip.Y + 10), Color.DarkSlateGray);
+            _memoryDetailScroll = Math.Clamp(_memoryDetailScroll, 0, MaxMemoryDetailScroll());
+            Rectangle textViewport = MemoryDetailTextViewport;
+            ClippedSpriteText.Draw(b, Game1.smallFont,
+                Game1.parseText(selectedEntry.Text, Game1.smallFont, textViewport.Width),
+                new Vector2(textViewport.X, textViewport.Y - _memoryDetailScroll), Game1.textColor, textViewport);
             if (selectedEntry.Source != "system")
             {
                 int mx1 = Game1.getOldMouseX(), my1 = Game1.getOldMouseY();
-                DrawButton(b, _memDetailCorrectRect, "纠正", Color.SaddleBrown,
-                    _memDetailCorrectRect.Contains(mx1, my1));
-                DrawButton(b, _memDetailDeleteRect, "删除", Color.Firebrick,
-                    _memDetailDeleteRect.Contains(mx1, my1));
+                DrawButton(b, _memDetailCorrectRect, "纠正", Color.SaddleBrown, _memDetailCorrectRect.Contains(mx1, my1));
+                DrawButton(b, _memDetailDeleteRect, "删除", Color.Firebrick, _memDetailDeleteRect.Contains(mx1, my1));
             }
         }
 
@@ -939,7 +898,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
                 new Rectangle(_memViewport.X, _memConfirmYesRect.Y - 2, _memViewport.Width, 36),
                 Color.Black * 0.75f);
             b.DrawString(Game1.smallFont, "确定删除这条记忆？此操作不可撤销。",
-                new Vector2(_memViewport.X + 4, _memConfirmYesRect.Y + 4), Color.DarkOrange);
+                new Vector2(_memViewport.X + 4, _memConfirmYesRect.Y + 4), Color.White);
             int mx0 = Game1.getOldMouseX(), my0 = Game1.getOldMouseY();
             DrawButton(b, _memConfirmYesRect, "确认删除", Color.Firebrick,
                 _memConfirmYesRect.Contains(mx0, my0));

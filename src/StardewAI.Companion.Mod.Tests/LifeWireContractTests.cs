@@ -152,8 +152,9 @@ public class LifeWireContractTests
         var work = state.Work;
         Assert.Equal("command", work.Mode);
         Assert.False(work.Paused);
-        Assert.Equal("优先赚钱：收获出货", work.Goal);
-        Assert.Equal(500, work.DailySpendLimit);
+        // The selected job's project stays current when an unrelated goal is added.
+        Assert.Equal("离线线契约作业", work.Goal);
+        Assert.Equal(work.ActiveGoals![0].Id, work.CurrentGoalId);
         Assert.Equal("shipping", work.BoxPreference);
         Assert.NotNull(work.DailySpend);
         Assert.NotNull(work.ActiveGoals);
@@ -430,5 +431,12 @@ public class LifeWireContractTests
         Assert.Equal(10, items[0].Quantity);
         Assert.Equal("Parsnip", items[1].Name);
         Assert.Equal(3, items[1].Quantity);
+
+        // An absent legacy flag means false without expanding the legacy wire surface.
+        Assert.False(payload.ProductionSignalsTruncated);
+        Assert.DoesNotContain("productionSignalsTruncated", JsonSerializer.Serialize(payload));
+        string truncated = JsonSerializer.Serialize(payload with { ProductionSignalsTruncated = true });
+        Assert.True(JsonNode.Parse(truncated)!["productionSignalsTruncated"]!.GetValue<bool>());
+        Assert.True(JsonSerializer.Deserialize<WorldSnapshotPayload>(truncated)!.ProductionSignalsTruncated);
     }
 }

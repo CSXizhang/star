@@ -173,7 +173,13 @@ public sealed class PurchaseStateMachine : ISkillExecutionMachine
     {
         lock (_stateLock)
         {
-            if (!IsExecuting || IsPaused) return;
+            if (!IsExecuting) return;
+            if (IsPaused && _cancelRequested)
+            {
+                FinishExecution(ExecutionState.Cancelled, _cancelReason ?? "Purchase cancelled by user.", "CANCELLED");
+                return;
+            }
+            if (IsPaused) return;
 
             _elapsedTicks++;
 
@@ -211,9 +217,48 @@ public sealed class PurchaseStateMachine : ISkillExecutionMachine
         }
     }
 
+    private void ExecuteNativePurchaseTransaction()
+    {
+        if (_currentRequest == null) return;
+        var stock = _adapter.GetRawShopStock(_currentRequest.ShopId,_actor);
+        if (stock == null) { FinishExecution(ExecutionState.Rejected,"The native counter did not open a shop menu; inspect the native dialogue/owner/hours, not missing stock as an empty shop.","SHOP_UNAVAILABLE"); return; }
+        int plannedCost=0;
+        foreach(var requested in _currentRequest.Items) {
+            var match=stock?.FirstOrDefault(p => p.Key is Item nativeItem && FarmerMechanicsActor.ItemMatchesId(nativeItem,requested.ItemId));
+            if (match == null || match.Value.Key == null) { FinishExecution(ExecutionState.Rejected,"Requested item unavailable.","ITEM_UNAVAILABLE"); return; }
+            plannedCost += match.Value.Value.Price * requested.Count;
+        }
+        if (plannedCost > _currentRequest.BudgetLimit) { FinishExecution(ExecutionState.Rejected,"Native transaction exceeds requested budget.","BUDGET_EXCEEDED"); return; }
+        int before = _adapter.GetCompanionMoney(_actor) ?? 0;
+        var purchased = new List<PurchasedItemInfo>();
+        foreach (var item in _currentRequest.Items)
+        {
+            int balance = _adapter.GetCompanionMoney(_actor) ?? 0;
+            if (before - balance >= _currentRequest.BudgetLimit) break;
+            if (!_adapter.TryPurchaseNative(_actor, _currentRequest.ShopId, item.ItemId, item.Count, out var error))
+            {
+                FinishExecution(purchased.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed,
+                    error, "NATIVE_PURCHASE_FAILED", purchasedItems: purchased, totalCost: before - (_adapter.GetCompanionMoney(_actor) ?? 0));
+                return;
+            }
+            int cost = balance - (_adapter.GetCompanionMoney(_actor) ?? 0);
+            purchased.Add(new PurchasedItemInfo(item.ItemId, item.Count, cost / Math.Max(1,item.Count), cost));
+        }
+        FinishExecution(ExecutionState.Succeeded, purchasedItems: purchased,
+            totalCost: before - (_adapter.GetCompanionMoney(_actor) ?? 0), availableMoneyAfter: _adapter.GetCompanionMoney(_actor));
+    }
+
     private void ExecutePurchaseTransaction()
     {
         if (_currentRequest == null) return;
+
+        // Player mode: the actor IS Game1.player; each line item is bought through the
+        // real ShopMenu natively (finite stock supported by the game's own bookkeeping).
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            ExecuteNativePurchaseTransaction();
+            return;
+        }
 
         // 1. Re-evaluate shop opening threshold at this exact moment (do not cache)
         var shopScan = _adapter.ReevaluateShop(_currentRequest.ShopId, _actor);

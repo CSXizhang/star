@@ -15,13 +15,14 @@ namespace StardewAI.Companion.Mod.Observation;
 /// Production read-only observer implementation integrating with Stardew Valley game APIs.
 /// Does not write or mutate any game state.
 /// </summary>
-public sealed class GameWorldObserver : IWorldObserver
+public sealed partial class GameWorldObserver : IWorldObserver
 {
     private readonly IMonitor _monitor;
     private readonly int _mainThreadId;
     private int _worldRevision = 1;
 
     public int WorldRevision => _worldRevision;
+    public Func<Farmer?>? NativeCollisionActor { get; set; }
 
     public string? CurrentLocationName =>
         !string.IsNullOrWhiteSpace(Game1.currentLocation?.NameOrUniqueName)
@@ -49,7 +50,9 @@ public sealed class GameWorldObserver : IWorldObserver
         if (!IsMainThread) throw new InvalidOperationException("Spatial observation requires the game thread.");
         var location = Game1.getLocationFromName(locationName)
             ?? throw new InvalidOperationException($"Location '{locationName}' is not loaded.");
-        return FarmSpaceObserver.Capture(location, this, region);
+        var observation = FarmSpaceObserver.Capture(location, this, region);
+        observation["interactables"] = ScanInteractables(locationName);
+        return observation;
     }
 
     public Dictionary<string, object> InspectMapImage(string locationName)
@@ -86,8 +89,8 @@ public sealed class GameWorldObserver : IWorldObserver
                 countPerCraft = recipe.numberProducedPerCraft, ingredients = recipe.recipeList.Select(p => new { itemId = p.Key, count = p.Value }).ToList(),
                 craftableCount = count });
         }
-        return new Dictionary<string, object> { ["recipes"] = recipes, ["recipeKnowledge"] = "player-unlocked", ["inventoryOwner"] = "companion",
-            ["note"] = "Counts use companion ingredients only; overlapping modded ingredient categories are revalidated transactionally at execution." };
+        return new Dictionary<string, object> { ["recipes"] = recipes, ["recipeKnowledge"] = "player-unlocked", ["inventoryOwner"] = ActorGuards.IsPlayerBound(actor) ? "player" : "companion",
+            ["note"] = "Counts use only the bound actor's backpack; native ingredient matching is revalidated at execution. No chest materials are consumed implicitly." };
     }
 
     public bool IsTilePassable(string locationName, TileCoordinate tile)
@@ -123,7 +126,19 @@ public sealed class GameWorldObserver : IWorldObserver
 
         // Check map tile impassability
         var tileLoc = new xTile.Dimensions.Location(tile.X, tile.Y);
-        return loc.isTilePassable(tileLoc, Game1.viewport);
+        if (!loc.isTilePassable(tileLoc, Game1.viewport)) return false;
+        var collisionActor=NativeCollisionActor?.Invoke();
+        if (collisionActor!=null && ReferenceEquals(loc,collisionActor.currentLocation))
+        {
+            // Match the native standing-center path geometry. This is a pure
+            // collision query: pathfinding and skipCollisionEffects prevent
+            // damage/doors/other collision side effects. No actor is moved.
+            var body=collisionActor.GetBoundingBox();
+            var probe=new Rectangle(tile.X*64+32-body.Width/2,tile.Y*64+32-body.Height/2,body.Width,body.Height);
+            if(loc.isCollidingPosition(probe,Game1.viewport,true,0,false,collisionActor,
+                pathfinding:true,projectile:false,ignoreCharacterRequirement:false,skipCollisionEffects:true))return false;
+        }
+        return true;
     }
 
     public bool IsWarpOrDoorTile(string locationName, TileCoordinate tile)
@@ -262,7 +277,7 @@ public sealed class GameWorldObserver : IWorldObserver
             bool isWatered = dirt.isWatered();
             bool hasCrop = dirt.crop != null;
             string? cropId = dirt.crop?.indexOfHarvest?.Value;
-            bool isHarvestable = dirt.crop != null && dirt.readyForHarvest();
+            bool isHarvestable = dirt.crop != null && !dirt.crop.dead.Value && dirt.readyForHarvest();
             bool requiresScythe = dirt.crop != null &&
                 dirt.crop.GetHarvestMethod() == StardewValley.GameData.Crops.HarvestMethod.Scythe;
             return new TileDirtState
@@ -270,6 +285,7 @@ public sealed class GameWorldObserver : IWorldObserver
                 IsTilled = true,
                 IsWatered = isWatered,
                 HasCrop = hasCrop,
+                IsDead = dirt.crop?.dead.Value == true,
                 CropId = cropId,
                 IsHarvestable = isHarvestable,
                 RequiresScythe = requiresScythe
@@ -296,14 +312,17 @@ public sealed class GameWorldObserver : IWorldObserver
                     bool isWatered = dirt.isWatered();
                     bool hasCrop = dirt.crop != null;
                     string? cropId = dirt.crop?.indexOfHarvest?.Value;
-                    bool isHarvestable = dirt.crop != null && dirt.readyForHarvest();
+                    bool isHarvestable = dirt.crop != null && !dirt.crop.dead.Value && dirt.readyForHarvest();
 
                     items.Add(new FarmDirtWorkItem(
                         Tile: tile,
                         IsWatered: isWatered,
                         HasCrop: hasCrop,
                         CropId: cropId,
-                        IsHarvestable: isHarvestable
+                        IsHarvestable: isHarvestable,
+                        IsDead: dirt.crop?.dead.Value == true,
+                        RequiresScythe: dirt.crop is null ? null :
+                            dirt.crop.GetHarvestMethod() == StardewValley.GameData.Crops.HarvestMethod.Scythe
                     ));
                 }
             }
@@ -700,7 +719,8 @@ public sealed class GameWorldObserver : IWorldObserver
     /// </summary>
     public static bool TryFindBuyActionCounters(
         GameLocation location,
-        out IReadOnlyList<TileCoordinate> counterTiles)
+        out IReadOnlyList<TileCoordinate> counterTiles,
+        string actionVerb = "Buy")
     {
         var tiles = new List<TileCoordinate>();
         if (location?.Map?.Layers != null)
@@ -738,7 +758,7 @@ public sealed class GameWorldObserver : IWorldObserver
                             continue;
 
                         string[] args = ArgUtility.SplitBySpaceQuoteAware(actionStr);
-                        if (args.Length > 0 && string.Equals(args[0], "Buy", StringComparison.OrdinalIgnoreCase))
+                        if (args.Length > 0 && string.Equals(args[0], actionVerb, StringComparison.OrdinalIgnoreCase))
                         {
                             tiles.Add(new TileCoordinate(x, y));
                         }
@@ -932,13 +952,15 @@ public sealed class GameWorldObserver : IWorldObserver
         {
             try
             {
+                string actionVerb = string.Equals(shopId, "AnimalShop", StringComparison.OrdinalIgnoreCase)
+                    ? "AnimalShop" : "Buy";
                 // 1. Try preferredLocation if specified
                 if (!string.IsNullOrWhiteSpace(preferredLocation))
                 {
                     shopLocation = SafeGetLocationFromName(preferredLocation);
                     if (shopLocation != null)
                     {
-                        actionFound = TryFindBuyActionCounters(shopLocation, out counterTiles);
+                        actionFound = TryFindBuyActionCounters(shopLocation, out counterTiles, actionVerb);
                     }
                 }
 
@@ -951,24 +973,11 @@ public sealed class GameWorldObserver : IWorldObserver
 
                     if (shopLocation != null)
                     {
-                        actionFound = TryFindBuyActionCounters(shopLocation, out counterTiles);
+                        actionFound = TryFindBuyActionCounters(shopLocation, out counterTiles, actionVerb);
                     }
                 }
 
-                // 3. Fallback across all loaded game locations
-                if (!actionFound && ShopLocationResolver == null && Game1.game1 != null && Game1.locations != null)
-                {
-                    foreach (var loc in Game1.locations)
-                    {
-                        if (loc?.Map == null) continue;
-                        if (TryFindBuyActionCounters(loc, out counterTiles))
-                        {
-                            shopLocation = loc;
-                            actionFound = true;
-                            break;
-                        }
-                    }
-                }
+                // A different location's Buy tile is not evidence for this shop.
 
                 if (CounterTilesResolver != null)
                 {
@@ -991,6 +1000,16 @@ public sealed class GameWorldObserver : IWorldObserver
                         counterTiles = new[] { new TileCoordinate(4, 18), new TileCoordinate(5, 18) };
                     }
                     actionFound = true;
+                }
+                else if (string.Equals(shopId, "AnimalShop", StringComparison.OrdinalIgnoreCase)
+                    && actionFound && counterTiles.Count > 0)
+                {
+                    // Native GameLocation.animalShop accepts Marnie at (x,y-1)
+                    // or (x-1,y-1); Marnie_Supplies opens Data/Shops AnimalShop.
+                    var counter = counterTiles[0];
+                    ownerArea = new Rectangle(counter.X - 1, counter.Y - 1, 2, 1);
+                    openTime = 900;
+                    closeTime = 1800;
                 }
                 else if (actionFound)
                 {
@@ -1342,7 +1361,7 @@ public sealed class GameWorldObserver : IWorldObserver
                         }
                         else
                         {
-                            closedMessage = "Come back when Pierre's tending the shop.";
+                            closedMessage = "The shop owner is away from the counter.";
                         }
 
                         var candidates = npcs != null ? string.Join(", ", npcs.Select(n => $"{n.Name}@({n.TilePoint.X},{n.TilePoint.Y})")) : "none";
@@ -1384,7 +1403,8 @@ public sealed class GameWorldObserver : IWorldObserver
                     {
                         string cropId = SeedIdNormalizer.ToCropDataId(salable.QualifiedItemId);
                         string resolved = Crop.ResolveSeedId(cropId, null);
-                        isSeed = !string.IsNullOrEmpty(resolved) && Crop.TryGetData(resolved, out var cropData) && cropData != null;
+                        if (string.IsNullOrEmpty(resolved)) resolved = cropId;
+                        isSeed = Crop.TryGetData(resolved, out var cropData) && cropData != null;
                     }
                     catch { }
 
@@ -1480,7 +1500,7 @@ public sealed class GameWorldObserver : IWorldObserver
                     OutputStack: held?.Stack ?? 0,
                     OutputQuality: held?.Quality ?? 0,
                     LastInputItemId: obj.lastInputItem?.Value?.QualifiedItemId,
-                    HasInput: obj.lastInputItem?.Value is not null,
+                    HasInput: HasActiveMachineInput(obj),
                     LocationName: locationName
                 ));
 
@@ -1567,7 +1587,10 @@ public sealed class GameWorldObserver : IWorldObserver
                     HayCount: hay,
                     HayCapacity: hayCapacity,
                     SiloHayCount: siloHay,
-                    Animals: animals
+                    Animals: animals,
+                    BuildingId: parent?.id.Value.ToString(),
+                    ResidentCount: house.animalsThatLiveHere.Count,
+                    ResidentAnimalIds: house.animalsThatLiveHere.Select(id=>id.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToList()
                 ));
             }
 
@@ -1694,7 +1717,10 @@ public sealed class GameWorldObserver : IWorldObserver
             LocationName: locationName,
             Tile: new TileCoordinate((int)animal.Tile.X, (int)animal.Tile.Y),
             WasPetToday: animal.wasPet?.Value == true,
-            WasAutoPetToday: animal.wasAutoPet?.Value == true
+            WasAutoPetToday: animal.wasAutoPet?.Value == true,
+            AnimalId: animal.myID.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            HomeBuildingId: animal.home?.id.Value.ToString(),
+            SleepingBlocksPetting: AnimalPettingConditions.SleepingBlocksPetting(Game1.timeOfDay, animal.isMoving())
         );
     }
 
@@ -1771,7 +1797,7 @@ public sealed class GameWorldObserver : IWorldObserver
         if (loc is null)
             return Array.Empty<TileCoordinate>();
 
-        radius = Math.Clamp(radius, 0, 64);
+        radius = Math.Clamp(radius, 0, 256);
         var result = new List<TileCoordinate>();
         try
         {
@@ -1781,7 +1807,7 @@ public sealed class GameWorldObserver : IWorldObserver
                 {
                     int tx = center.X + dx;
                     int ty = center.Y + dy;
-                    if (tx < 0 || ty < 0)
+                    if (tx < 0 || ty < 0 || loc.Map?.Layers.FirstOrDefault() is not { } layer || tx >= layer.LayerWidth || ty >= layer.LayerHeight)
                         continue;
                     bool canRefill;
                     try { canRefill = loc.CanRefillWateringCanOnTile(tx, ty); }
@@ -1832,7 +1858,7 @@ public sealed class GameWorldObserver : IWorldObserver
         if (loc is null)
             return Array.Empty<GroundItemScanInfo>();
 
-        radius = Math.Clamp(radius, 0, 64);
+        radius = Math.Clamp(radius, 0, 256);
         var items = new List<GroundItemScanInfo>();
 
         bool InRange(int x, int y) =>
@@ -1867,21 +1893,26 @@ public sealed class GameWorldObserver : IWorldObserver
                 }
                 catch { isStone = false; isTwig = false; }
 
-                bool canGrab = obj.CanBeGrabbed;
-                string kind = isWeed ? "weed" : (isStone ? "stone" : (isTwig ? "twig" : (canGrab ? "object" : "obstacle")));
+                bool parcel = obj is StardewValley.Objects.Chest { giftbox.Value: true };
+                // These identities are the installed game's native Hoe branch
+                // (Object.performToolAction); CanBeGrabbed alone is not pickup eligibility.
+                bool digSpot = obj.QualifiedItemId is "(O)590" or "(O)SeedSpot";
+                bool canGrab = !parcel && !digSpot && !isWeed && !isStone && !isTwig && obj.CanBeGrabbed;
+                string kind = parcel ? "giftbox" : digSpot ? "dig-spot" : isWeed ? "weed" : (isStone ? "stone" : (isTwig ? "twig" : (canGrab ? "object" : "obstacle")));
                 string? clearTool = isWeed ? "hoe" : (isStone ? "pickaxe" : (isTwig ? "axe" : null));
                 items.Add(new GroundItemScanInfo(
                     Tile: new TileCoordinate(ox, oy),
                     Kind: kind,
                     ItemId: obj.QualifiedItemId ?? obj.ItemId ?? "",
-                    Name: obj.DisplayName ?? obj.Name ?? "",
+                    Name: parcel ? "原生礼包（按所观测地图open_chest开启；不是杂物，不用clear_debris；动画后核对原生入包和实际掉落，不凭空重复拾取）" : digSpot ? (obj.DisplayName ?? obj.Name) + "（原生需锄头交互；不是普通拾取）" : obj.DisplayName ?? obj.Name ?? "",
                     Stack: obj.Stack,
                     IsDropped: false,
                     IsWeed: isWeed,
                     CanBeGrabbed: canGrab,
                     ClearTool: clearTool,
                     IsStone: isStone,
-                    IsTwig: isTwig
+                    IsTwig: isTwig,
+                    Quality: obj.Quality
                 ));
             }
 
@@ -1896,7 +1927,8 @@ public sealed class GameWorldObserver : IWorldObserver
                         ItemId: debris.item?.QualifiedItemId ?? debris.itemId.Value,
                         Name: debris.item?.DisplayName ?? "Dropped item",
                         Stack: debris.item?.Stack ?? group.Count(), IsDropped: true,
-                        IsWeed: false, CanBeGrabbed: true, ClearTool: null));
+                        IsWeed: false, CanBeGrabbed: true, ClearTool: null,
+                        Quality: debris.item?.Quality));
                 }
             }
         }
@@ -1919,7 +1951,7 @@ public sealed class GameWorldObserver : IWorldObserver
         if (loc is null)
             return Array.Empty<ChoppableTreeScanInfo>();
 
-        radius = Math.Clamp(radius, 0, 64);
+        radius = Math.Clamp(radius, 0, 256);
         var items = new List<ChoppableTreeScanInfo>();
 
         bool InRange(int x, int y) =>

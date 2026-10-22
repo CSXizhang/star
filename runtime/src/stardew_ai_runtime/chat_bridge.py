@@ -36,9 +36,18 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from stardew_ai_runtime.agent_backends import AgyBackend, CodexBackend, KimiBackend
+from stardew_ai_runtime.agent_backends import (
+    AgyBackend,
+    CodexBackend,
+    DshBackend,
+    KimiBackend,
+    McodeBackend,
+)
+from stardew_ai_runtime.agent_instructions import instructions_revision, load_instruction_bundle
+from stardew_ai_runtime.agy_process import run_agy_process, terminate_agy_process
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
+from stardew_ai_runtime.codex_game_profile import CODEX_GAME_TOOL_PROFILE_VERSION
 from stardew_ai_runtime.companion_care import CompanionCareService
 from stardew_ai_runtime.companion_memory import CompanionMemoryStore
 from stardew_ai_runtime.companion_milestones import (
@@ -46,11 +55,30 @@ from stardew_ai_runtime.companion_milestones import (
     wire_node,
 )
 from stardew_ai_runtime.companion_profile import CompanionProfileStore
-from stardew_ai_runtime.decision_context import build_decision_context, render_decision_context
-from stardew_ai_runtime.job_feedback import compact_job_feedback
+from stardew_ai_runtime.decision_context import (
+    build_decision_context,
+    goal_context,
+    model_decision_context,
+    objective_scope,
+    render_decision_context,
+)
+from stardew_ai_runtime.decision_policy import decision_policy
+from stardew_ai_runtime.job_feedback import (
+    compact_job_feedback,
+    compact_task_feedback,
+    project_task_feedback_state,
+)
 from stardew_ai_runtime.kimi_wire_usage import read_usage_since, wire_offset
 from stardew_ai_runtime.life_chat import LifeChatService
-from stardew_ai_runtime.plan_executor import DispatchDeferred, PlanExecutor, StepExecution
+from stardew_ai_runtime.owner_process import OwnerProcessGuard
+from stardew_ai_runtime.plan_executor import (
+    DispatchDeferred,
+    PlanExecutor,
+    StepExecution,
+    merge_reconciled_operation_result,
+    normalise_native_result,
+)
+from stardew_ai_runtime.prompt_delivery import PromptDelivery
 from stardew_ai_runtime.protocol import (
     Envelope,
     LifeChatSubmitPayload,
@@ -67,12 +95,20 @@ from stardew_ai_runtime.scheduler import (
     get_candidate_discovery_paths,
     resolve_discovery,
 )
+from stardew_ai_runtime.snapshot_cache import cache_lock, write_cache
+from stardew_ai_runtime.usage_display import UsageDisplay
+from stardew_ai_runtime.usage_meter import normalize_usage
 from stardew_ai_runtime.websocket_client import (
     ConnectionClosed,
     WebSocketClient,
     WebSocketError,
 )
-from stardew_ai_runtime.work_state import WorkStore
+from stardew_ai_runtime.work_controls import explicit_cancel_scope
+from stardew_ai_runtime.work_state import (
+    WorkStateError,
+    WorkStore,
+    bind_execution_scope_params,
+)
 
 logger = logging.getLogger("stardew_ai_runtime.chat_bridge")
 
@@ -286,6 +322,7 @@ def _parse_usage_from_gen_metadata(data: bytes) -> dict[str, int]:
     usage["cache_read_tokens"] = u.get(5, [(0, 0)])[0][1]
     usage["thinking_tokens"] = u.get(9, [(0, 0)])[0][1]
     usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    usage["input_context_measured"] = any(key in u for key in (2, 5))
     return usage
 
 
@@ -348,6 +385,8 @@ def get_command_usage_delta(conversation_id: str | None, start_idx: int) -> dict
             cache += u.get("cache_read_tokens", 0)
             thinking += u.get("thinking_tokens", 0)
 
+        latest = _parse_usage_from_gen_metadata(rows[-1][1])
+        measured = latest.get("input_context_measured", False)
         return {
             "input_tokens": inp,
             "output_tokens": out,
@@ -358,6 +397,9 @@ def get_command_usage_delta(conversation_id: str | None, start_idx: int) -> dict
             "start_idx": start_idx + 1,
             "end_idx": rows[-1][0],
             "source": "db_gen_metadata_delta",
+            "input_includes_cache": False,
+            "input_context_measured": measured,
+            "latestRequestInputContext": latest["input_tokens"] + latest["cache_read_tokens"] if measured else None,
         }
     except Exception as ex:
         logger.warning(
@@ -477,25 +519,35 @@ class InternalMcpPlanClient:
         ]
 
     async def open(self) -> None:
-        if self._task is not None and not self._task.done():
-            return
-        self._loop = asyncio.get_running_loop()
-        self._requests = asyncio.Queue()
-        self._ready = self._loop.create_future()
-        self._closed = False
-        self._task = self._loop.create_task(self._session_loop())
+        # An idle worker may be closing the old session while a player control
+        # needs a new one. Never let that close clear the new session's state.
+        async with self._close_lock:
+            await self._open_session()
+
+    async def _open_session(self) -> None:
+        """Open while holding the lifecycle lock, including native control calls."""
+        if self._task is None or self._task.done():
+            self._loop = asyncio.get_running_loop()
+            self._requests = asyncio.Queue()
+            self._ready = self._loop.create_future()
+            self._closed = False
+            self._task = self._loop.create_task(self._session_loop())
         await asyncio.wait_for(asyncio.shield(self._ready), timeout=self.timeout_seconds)
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
-        if self._task is None or self._task.done():
-            await self.open()
         # Native controls must reach the existing scheduler while a long native
-        # operation is awaiting its terminal result, not queue behind that job.
-        if name == "dispatch_plan_operation" and (arguments or {}).get("operation") in {"cancel_task", "pause_task", "resume_task"} and self._live_session is not None:
-            result = await asyncio.wait_for(self._live_session.call_tool(name, arguments or {}), timeout=10)
-            if getattr(result, "isError", False):
-                raise RuntimeError(f"Native control rejected: {_tool_result_payload(result)}")
-            return _tool_result_payload(result)
+        # operation is awaiting its terminal result. The read that determines
+        # whether cancellation is needed must not queue behind that job either.
+        if name in {"cancel_plan_command", "reconcile_plan_command"} or name == "dispatch_plan_operation" and (arguments or {}).get("operation") in {"cancel_task", "pause_task", "resume_task"}:
+            # Receiving a terminal can make the worker idle while this read is
+            # still pending. Keep that idle close from interrupting the reply.
+            async with self._close_lock:
+                await self._open_session()
+                result = await asyncio.wait_for(self._live_session.call_tool(name, arguments or {}), timeout=10)
+                if getattr(result, "isError", False):
+                    raise RuntimeError(f"Native control rejected: {_tool_result_payload(result)}")
+                return _tool_result_payload(result)
+        await self.open()
         return await self._command(("call", name, arguments or {}))
 
     async def current_save_id(self) -> str | None:
@@ -539,7 +591,7 @@ class InternalMcpPlanClient:
 
     # ------------------------------------------------------------- internals
     async def _command(self, command: tuple[str, Any, Any]) -> Any:
-        if self._requests is None or self._loop is None:
+        if self._requests is None or self._loop is None or self._closed:
             raise RuntimeError("internal MCP client is not open")
         future: asyncio.Future = self._loop.create_future()
         self._requests.put_nowait((command, future))
@@ -568,6 +620,18 @@ class InternalMcpPlanClient:
             self._resolve_ready(ex)
             if not isinstance(ex, (asyncio.CancelledError, GeneratorExit)):
                 logger.warning("Internal MCP session ended: %s", ex)
+        finally:
+            self._closed = True
+            self._fail_queued_requests()
+
+    def _fail_queued_requests(self) -> None:
+        queue = self._requests
+        if queue is None:
+            return
+        while not queue.empty():
+            _, future = queue.get_nowait()
+            if not future.done():
+                future.set_exception(RuntimeError("Internal MCP session closed before request completed; native outcome is unknown."))
 
     def _resolve_ready(self, error: BaseException | None) -> None:
         ready = self._ready
@@ -598,9 +662,14 @@ class InternalMcpPlanClient:
                         f"internal MCP tool '{name}' failed: {_tool_result_payload(result)}"
                     )
                 payload = _tool_result_payload(result)
-            except Exception as ex:
+            except BaseException as ex:  # noqa: BLE001 - release caller even on cancellation
                 if not future.done():
-                    future.set_exception(ex)
+                    future.set_exception(
+                        RuntimeError("Internal MCP session interrupted; native outcome is unknown.")
+                        if isinstance(ex, (asyncio.CancelledError, GeneratorExit)) else ex
+                    )
+                if not isinstance(ex, Exception):
+                    raise
             else:
                 if not future.done():
                     future.set_result(payload)
@@ -661,6 +730,7 @@ class PlanWorker:
         self._dirty = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._provider_active = False
+        self._executing = False
         self.supplied_save_id: str | None = None
         self.last_result: StepExecution | None = None
         self.progress_callback = None
@@ -672,6 +742,7 @@ class PlanWorker:
         # Latest native snapshot used to gate explicit waiting conditions. The
         # bridge refreshes it on every world.snapshot; the worker never invents it.
         self.snapshot_provider: Any | None = None
+        self.business_gate: Any | None = None
 
     def _fresh_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         if self.snapshot_provider is None:
@@ -732,13 +803,17 @@ class PlanWorker:
 
     async def evaluate(self) -> list[StepExecution]:
         """Own the native socket only for this execution batch, never while idle."""
+        self._executing = True
         try:
             return await self._evaluate_ready_steps()
         finally:
             # External Codex/observation turns do not pass through the bridge's
             # _claim_execution. Release here after native reconciliation settles,
             # so a finished worker cannot monopolize the sole command socket.
-            await self._release_idle_session()
+            try:
+                await self._release_idle_session()
+            finally:
+                self._executing = False
 
     async def _release_idle_session(self) -> None:
         close = getattr(self.client, "close", None)
@@ -757,6 +832,17 @@ class PlanWorker:
                 break
             save_id = await self._resolve_save_id()
             if not save_id:
+                break
+            # A day rollover can close the native socket after it accepts a
+            # command but before the worker receives its terminal.  An expired
+            # running lease is otherwise invisible to has_ready_step forever.
+            if await self._recover_expired_step(save_id):
+                break
+            # Receipt reconciliation is read-only and must remain possible under
+            # a disconnect hold or human pause. The gate still blocks dispatch;
+            # otherwise a stale running lease can prevent the recovery decision
+            # that would release a program hold from ever becoming eligible.
+            if self.business_gate is not None and not self.business_gate(save_id):
                 break
             # Read-only readiness check against the shared store; it never touches
             # the Mod, so an idle plan costs no provider and no LLM call. Waiting
@@ -791,10 +877,12 @@ class PlanWorker:
                 self.pending_decisions.extend(execution.recovery_decisions)
             if execution.task_status == "completed" or execution.needs_model or execution.outcome in {"failed", "partial", "unknown", "rejected", "cancelled"} or (execution.outcome == "waiting" and (execution.result or {}).get("waitCondition", {}).get("type") != "transportRetry"):
                 completed_task = next((t for t in self.store.state(save_id).tasks if t.id == execution.task_id), None)
-                all_effects = [effect for step in completed_task.steps for effect in step.effects] if completed_task else execution.effects
-                feedback = compact_job_feedback({**(execution.result or {}), "effects": all_effects, "reasonCode": execution.reason_code, "commandId": execution.command_id, "message": execution.message}, operation=execution.operation or "", status=execution.outcome)
-                feedback["effectCount"] = len(all_effects)
-                feedback["stepsCompleted"] = sum(step.status == "completed" for step in completed_task.steps) if completed_task else 0
+                feedback = compact_task_feedback(completed_task,
+                    {**(execution.result or {}), "effects": execution.effects,
+                     "reasonCode": execution.reason_code, "commandId": execution.command_id,
+                     "message": execution.message},
+                    operation=execution.operation or "", status=execution.outcome)
+                feedback["effectCount"] = sum(len(step.effects) for step in completed_task.steps) if completed_task else len(execution.effects)
                 # Publish finished only after releasing the native owner: an
                 # external client may immediately observe upon seeing this flag.
                 await self._release_idle_session()
@@ -824,6 +912,69 @@ class PlanWorker:
             self._dirty = True
         return executions
 
+    async def _recover_expired_step(self, save_id: str) -> bool:
+        now = time.monotonic()
+        state = self.store.state(save_id)
+        for task in state.tasks:
+            for step in task.steps:
+                if step.status != "running" or step.lease_until > now:
+                    continue
+                native = None
+                if step.command_id:
+                    try:
+                        native = await asyncio.wait_for(self._reconcile(step.command_id), timeout=10.0)
+                    except Exception:
+                        logger.warning("Could not reconcile expired native command %s", step.command_id, exc_info=True)
+                goal = next((goal for goal in state.goals if goal.id == task.goal_id), None)
+                native = merge_reconciled_operation_result(step.operation, step.feedback, native,
+                    params=bind_execution_scope_params(step.operation, step.params, goal.constraints if goal else {}))
+                outcome, reason, effects, revision = normalise_native_result(native)
+                if outcome is None:
+                    # The existing store recovery records an explicit unknown
+                    # once; it never re-dispatches the unconfirmed command.
+                    decisions = self.store.recover(save_id, now=now)
+                    if not any(item.get("stepId") == step.id for item in decisions):
+                        return True
+                    outcome, reason, effects = "unknown", "NATIVE_TERMINAL_UNCONFIRMED", []
+                else:
+                    self.store.commit_step_result(
+                        save_id, task_id=task.id, step_id=step.id,
+                        outcome=outcome, effects=effects, reason_code=reason,
+                        snapshot_revision=revision, command_id=step.command_id,
+                        game_date=self._fresh_state()[1],
+                        feedback=compact_job_feedback(native, operation=step.operation, status=outcome, params=step.params),
+                    )
+                recovered_task = next((item for item in self.store.state(save_id).tasks if item.id == task.id), None)
+                execution = StepExecution(
+                    status="executed", task_id=task.id, goal_id=task.goal_id,
+                    step_id=step.id, operation=step.operation,
+                    command_id=step.command_id, outcome=outcome,
+                    task_status=recovered_task.status if recovered_task else "unknown",
+                    reason_code=reason, effects=effects, result=native,
+                )
+                if outcome == "completed" and execution.task_status == "pending":
+                    # This receipt closes one step; the same decision still owns
+                    # the remaining serial work. Do not send a job terminal.
+                    self._dirty = True
+                    return True
+                feedback = compact_task_feedback(recovered_task,
+                    {**(native if isinstance(native, dict) else {}), "commandId": step.command_id, "reasonCode": reason,
+                     "terminalState": native.get("terminalState", "unknown") if isinstance(native, dict) else "unknown",
+                     "effects": effects}, operation=step.operation, status=outcome,
+                )
+                await self._release_idle_session()
+                self.store.finish_job(save_id, feedback, task_id=task.id)
+                self.pending_reasons.append(reason or "NATIVE_RECOVERED")
+                if self.terminal_callback:
+                    try:
+                        callback = self.terminal_callback(save_id, execution, reason or "NATIVE_RECOVERED")
+                        if asyncio.iscoroutine(callback):
+                            await callback
+                    except Exception:
+                        logger.warning("Plan worker recovery callback failed", exc_info=True)
+                return True
+        return False
+
     async def _dispatch(self, operation: str, params: dict[str, Any], command_id: str) -> Any:
         # The harness-only internal tool runs the identical validated plan
         # operation implementation ``run_next_step`` uses and forwards the stable
@@ -838,8 +989,45 @@ class PlanWorker:
         save_id = self.supplied_save_id or await self._resolve_save_id()
         state = self.store.state(save_id)
         task = next((t for t in state.tasks if any(s.command_id == command_id for s in t.steps)), None)
+        snapshot, _ = self.snapshot_provider() if self.snapshot_provider else (None, None)
+        companion = (snapshot or {}).get("companion") or {}
+        world = (snapshot or {}).get("world") or {}
+        bedtime = companion.get("bedtime", 2400)
+        clock = world.get("timeOfDay", 600)
+        if (snapshot or {}).get("actorMode") == "player":
+            # Player mode: no companion profile bedtime. Late gates only steer
+            # new dispatches toward native sleep so the player is not idled
+            # into collapse (≥00:30 non-sleep defers, ≥01:30 sleep only).
+            gate = ChatBridge._player_mode_clock_gate(operation, clock, params)
+            if gate:
+                # No native send has occurred. Park this exact unfinished step
+                # until the next real day and return the model slot for sleep.
+                # DispatchDeferred is for human/revoked authority only: retrying
+                # a clock-gated selection each snapshot deadlocks recovery.
+                year, season, day = world.get("year"), world.get("season"), world.get("dayOfMonth")
+                seasons = ("spring", "summer", "fall", "winter")
+                if type(year) is not int or type(day) is not int or season not in seasons or not 1 <= day <= 28:
+                    raise RuntimeError("Late action deferred; native calendar unavailable. Re-observe before selecting recovery.")
+                if day < 28:
+                    next_date = {"year": year, "season": season, "day": day + 1}
+                else:
+                    index = seasons.index(season)
+                    next_date = {"year": year + (index == 3), "season": seasons[(index + 1) % 4], "day": 1}
+                return {"status": "waiting", "commandId": command_id,
+                        "reasonCode": "PLAYER_LATE_ACTION_DEFERRED", "message": gate,
+                        "nativeDispatched": False,
+                        "waitCondition": {"type": "gameDay", "params": next_date,
+                                          "reasonCode": "PLAYER_LATE_ACTION_DEFERRED"}, "effects": []}
+        else:
+            resting = companion.get("restState") in {"winding-down", "returning-home", "waiting-for-bed", "sleeping"}
+            if resting or (isinstance(clock, int) and isinstance(bedtime, int)
+                    and clock // 100 * 60 + clock % 100 >= bedtime // 100 * 60 + bedtime % 100 - 60):
+                raise DispatchDeferred("bedtime: keep this step for tomorrow")
         if (state.paused or task is None or state.decision.get("taskId") != task.id
                 or state.decision.get("finished")):
+            logger.warning("Native dispatch authority deferred: save=%s command=%s task=%s decisionTask=%s paused=%s finished=%s",
+                           save_id, command_id, task.id if task else None,
+                           state.decision.get("taskId"), state.paused, state.decision.get("finished"))
             raise DispatchDeferred("paused or decision revoked before native send")
         try:
             return await self.client.call_tool(
@@ -848,7 +1036,10 @@ class PlanWorker:
             )
         except Exception as ex:
             if "UNAUTHORIZED_JOB_COMMAND" in str(ex):
-                raise DispatchDeferred(str(ex)) from ex
+                # A rejected persisted claim is a real fault, not an idle wait.
+                # Commit it so the model can recover instead of silently
+                # reattempting the same unauthorized command forever.
+                raise RuntimeError(str(ex)) from ex
             raise
 
     async def _reconcile(self, command_id: str) -> Any:
@@ -886,21 +1077,19 @@ class ActiveChatTask:
     abort_reason: str | None = None
     start_time: float = field(default_factory=time.monotonic)
     recorded: bool = False
-
-
-@dataclass
-class CommandChain:
-    instruction: str
-    save_id: str
-    started_at: float
-    root_request_id: str = ""
-    chain_count: int = 0
-    generation: int = 0
-    ws: WebSocketClient | None = None
-    # Task whose terminal may advance this chain; set when the owning turn
-    # selects a job, consumed on the matching terminal.
-    waiting_task_id: str | None = None
-    pending_continuation: bool = False
+    decision_token: str | None = None
+    decision_day: str | None = None
+    provider_conversation_id: str | None = None
+    instructions_text: str | None = None
+    # Full original context is retained only for a provider's fresh-session recovery.
+    provider_bootstrap_prompt: str | None = None
+    read_only: bool = False
+    # In-game read-only turns retain conversation history while the life tool
+    # surface independently removes execution authority.
+    preserve_session: bool = False
+    goal_scope: str | None = None
+    goal_default: str | None = None
+    work_request_ids: list[str] = field(default_factory=list)
 
 
 class ChatBridge:
@@ -918,17 +1107,19 @@ class ChatBridge:
         backend: str | None = None,
         backend_model: str | None = None,
         kimi_cmd: str | None = None,
+        mcode_cmd: str | None = None,
         internal_plan_client: Any | None = None,
         enable_plan_worker: bool = True,
     ):
         self.run_dir = Path(run_dir) if run_dir else None
         configured = load_chat_backend_config()
         self.backend_name = backend or configured["backend"]
-        self.model = backend_model or model or (configured["model"] if self.backend_name == configured["backend"] else ("kimi-code/k3" if self.backend_name == "kimi" else "" if self.backend_name == "codex" else "gemini-3.8-flash"))
-        self.effort = effort or configured.get("effort", "default")
+        self.model = backend_model or model or (configured["model"] if self.backend_name == configured["backend"] else ("kimi-code/k3" if self.backend_name == "kimi" else "" if self.backend_name in {"codex", "mcode"} else "deepseek-flash" if self.backend_name == "dsh" else "gemini-3.8-flash"))
+        self.effort = effort or configured.get("effort") or ("low" if self.backend_name in {"codex", "dsh"} else "default")
         self.instance_id = instance_id or f"chat-bridge-{uuid.uuid4().hex[:8]}"
         self.agy_cmd = agy_cmd or "agy.exe"
         self.kimi_cmd = kimi_cmd or "kimi.exe"
+        self.mcode_cmd = mcode_cmd or "mcode"
         # Game-only Kimi agent profile (new sessions only; resumed sessions keep theirs).
         self.agent = configured.get("agent")
         configured_agent_file = configured.get("agentFile")
@@ -946,6 +1137,14 @@ class ChatBridge:
         self._active_task: ActiveChatTask | None = None
         self._sessions_file = sessions_file or self._default_sessions_file()
         self._commands_file = commands_file or self._default_commands_file()
+        self._usage_display = UsageDisplay(self._commands_file, project_root() / "config" / "usage-prices.json",
+                                           self._commands_file.parent / "data" / "model-usage.jsonl")
+        if self.backend_name == "dsh":
+            from stardew_ai_runtime.usage_meter import recover_dsh_receipts
+            recover_dsh_receipts(self._commands_file.parent, self._commands_file)
+        elif self.backend_name == "agy":
+            from stardew_ai_runtime.usage_meter import recover_agy_receipts
+            recover_agy_receipts(self._commands_file.parent)
         self._sessions: dict[str, str] = self._load_sessions()
         self._autonomy: AutonomyController | None = None
         self._autonomy_requests: dict[str, str] = {}
@@ -953,53 +1152,43 @@ class ChatBridge:
         # Latest native snapshot the chat channel received; the compact decision
         # context is rebuilt from it for every model decision.
         self._latest_snapshot_payload: dict[str, Any] | None = None
+        self._latest_snapshot_observed_at: float | None = None
         self._latest_snapshot_revision: int | None = None
-        # Provider-session rotation bookkeeping (day change / context budget).
+        # Keep recovery history and usage diagnostics; the harness owns compaction.
         self._session_history: dict[str, list[str]] = {}
-        self._session_token_totals: dict[str, int] = {}
-        # Input-context policy: the game value is the *latest single request's*
-        # input context (inputOther + cacheRead + cacheCreation), never the sum
-        # across requests. 100k is a configurable engineering policy ceiling, not
-        # a claim about the provider's physical window.
         self._session_requests: dict[str, int] = {}
         self._session_context_state: dict[str, dict[str, Any]] = {}
-        # Set when the provider session was rotated because the configured
-        # profile/tool surface changed; surfaced to F8 and then cleared.
-        self._profile_rotation_note: str | None = None
-        try:
-            self._session_token_budget = int(
-                os.getenv("STARDEW_SESSION_CONTEXT_BUDGET")
-                # Legacy name from the first round; still honoured so an existing
-                # deployment keeps working, but it now means input context, not a
-                # cumulative token sum.
-                or os.getenv("STARDEW_SESSION_TOKEN_BUDGET")
-                or "100000"
-            )
-        except ValueError:
-            self._session_token_budget = 100000
-        try:
-            self._session_request_checkpoint = int(
-                os.getenv("STARDEW_SESSION_REQUEST_CHECKPOINT", "20") or 0
-            )
-        except ValueError:
-            self._session_request_checkpoint = 20
         self._last_day_settlement: dict[str, Any] | None = None
+        self._last_native_ui_recovery_signal: tuple[Any, ...] | None = None
         self._autonomy_generation = 0
         self._autonomy_last_snapshot_at: dict[str, float] = {}
         self._autonomy_pending_snapshot: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
         self._autonomy_debounce_tasks: dict[str, asyncio.Task] = {}
+        self._autonomy_wakeup_tasks: dict[str, asyncio.Task] = {}
+        self._autonomy_wakeup_snapshots: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
         self._autonomy_pending_task_fingerprints: dict[str, tuple[str, str]] = {}
         self._bind_autonomy_store()
         # Durable per-save goals/tasks/todos; bound once a run dir is known
         # (explicit --run-dir or discovered from the running Mod).
         self._work_store: WorkStore | None = None
         self._plan_worker: PlanWorker | None = None
-        self._command_chains: dict[str, CommandChain] = {}
+        self._last_work_projection: dict[str, str] = {}
+        self._work_projection_times: dict[str, tuple[str, str]] = {}
         # One unresolved native cancellation per save; cleared on confirmation.
         self._pending_native_cancels: dict[str, tuple[str, str]] = {}
-        self._chain_requests: set[str] = set()
-        self._chain_generation = 0
-        self._chain_tasks: set[asyncio.Task] = set()
+        # Latest accepted player root request per save (UI command attribution).
+        self._active_player_requests: dict[str, str] = {}
+        # Independent autostart test runs, keyed by save id. Each entry tracks the
+        # stable preset request id, the bound goal id and whether the terminal
+        # completion was already reported back to the Mod (exactly-once done signal).
+        self._preset_runs: dict[str, dict[str, Any]] = {}
+        from .preset_day_boundary import PresetDayBoundary
+        self._preset_day_boundary = PresetDayBoundary(self.run_dir)
+        # Persistent-outbox delivery: one delivery task per save, plus one
+        # completion future per in-flight delivery request id.
+        self._delivery_tasks: dict[str, asyncio.Task] = {}
+        self._delivery_pending: dict[str, asyncio.Future] = {}
+        self._life_drain_tasks: set[asyncio.Task] = set()
         # Serializes native command-socket ownership between the provider turn and
         # the internal plan worker (the Mod transport accepts one command client).
         self._execution_lock = asyncio.Lock()
@@ -1021,10 +1210,26 @@ class ChatBridge:
         self._life_chat: LifeChatService | None = None
         self._life_fingerprints: dict[str, str] = {}
         self._life_queue: list[dict[str, Any]] = []
+        self._pending_life_preparation: dict[str, dict[str, dict[str, Any]]] = {}
         self._life_draining = False
+        self._life_control_generation: dict[str, int] = {}
         self._evening_care_fired_day: str | None = None
         self._deferred_care_tasks: set[asyncio.Task[None]] = set()
         self._chat_ws: WebSocketClient | None = None
+        # Player-mode control state. The /chat channel never receives
+        # mod.welcome, so these facts are learned from the additive
+        # world.snapshot fields (actorMode/controlOwner). A mod that never
+        # sends them behaves exactly like today's companion mode.
+        self.actor_mode: str = "companion"
+        self.control_owner: str | None = None
+        self.supports_thinking_pause: bool | None = None
+        self._player_claim_attempted = False
+        # Explicit F9 human takeover per save: while set, a (re)connect never
+        # auto-claims player control; only an explicit re-handoff (the mod
+        # reporting owner=agent again) clears it. In-memory on purpose: a full
+        # game+bridge restart is a fresh launcher session whose bootstrap claim
+        # is the designed entry point.
+        self._manual_takeover: dict[str, bool] = {}
         self._bind_companion_stores()
 
     @property
@@ -1042,11 +1247,27 @@ class ChatBridge:
                     progress=getattr(self, "_backend_progress_callback", None),
                     agent=self.agent, agent_file=self.agent_file,
                 )
+            elif self.backend_name == "dsh":
+                if self.run_dir is None:
+                    raise ValueError("dsh backend requires a game run directory")
+                self._backend = DshBackend(self.run_dir, model=self.model or "deepseek-flash", effort=self.effort,
+                    progress=getattr(self, "_backend_progress_callback", None))
             elif self.backend_name == "codex":
                 if self.run_dir is None:
                     raise ValueError("Codex backend requires a game run directory")
                 self._backend = CodexBackend(
                     run_dir=self.run_dir, model=self.model or "",
+                    effort=self.effort,
+                    http_provider=os.environ.get("STARDEW_CODEX_HTTP_PROVIDER") or load_chat_backend_config().get("httpProvider") or None,
+                    progress=getattr(self, "_backend_progress_callback", None),
+                )
+            elif self.backend_name == "mcode":
+                if self.run_dir is None:
+                    raise ValueError("mcode backend requires a game run directory")
+                self._backend = McodeBackend(
+                    run_dir=self.run_dir, model=self.model or "",
+                    command=self.mcode_cmd,
+                    effort=self.effort,
                     progress=getattr(self, "_backend_progress_callback", None),
                 )
             else:
@@ -1159,6 +1380,7 @@ class ChatBridge:
             return
         if self._plan_worker is not None:
             self._plan_worker.store = store
+            self._plan_worker.business_gate = self._plan_dispatch_allowed
             self._plan_worker.snapshot_provider = self._plan_snapshot_state
             self._plan_worker.terminal_callback = self._on_job_terminal
             return
@@ -1167,8 +1389,17 @@ class ChatBridge:
             client = InternalMcpPlanClient(self.run_dir)
         self._plan_worker = PlanWorker(store, client)
         self._plan_worker.progress_callback = self._publish_job_progress
+        self._plan_worker.business_gate = self._plan_dispatch_allowed
         self._plan_worker.snapshot_provider = self._plan_snapshot_state
         self._plan_worker.terminal_callback = self._on_job_terminal
+
+    def _plan_dispatch_allowed(self, save_id: str) -> bool:
+        # Finish/reconcile an already dispatched native step, but do not start
+        # another step from the old plan while a player message is waiting to
+        # revise it. Life chat uses cached observations and needs no native slot.
+        return (not self._preset_business_blocked(save_id)
+                and not self._busy_lock.locked()
+                and not self._life_queue and not self._life_draining)
 
     def _plan_snapshot_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """(latest world.snapshot payload, native game date) for wait evaluation."""
@@ -1180,6 +1411,7 @@ class ChatBridge:
             "year": world.get("year"),
             "season": world.get("season"),
             "day": world.get("dayOfMonth"),
+            "timeOfDay": world.get("timeOfDay"),
         }
         if all(value is None for value in game_date.values()):
             game_date = None
@@ -1199,19 +1431,29 @@ class ChatBridge:
         if worker is None:
             return False
         worker.set_provider_active(True)
-        await self._execution_lock.acquire()
-        client = getattr(worker, "client", None)
-        close = getattr(client, "close", None)
-        if callable(close):
-            try:
-                await close()
-            except Exception:
-                logger.warning("Could not release internal MCP session", exc_info=True)
-        if recover and save_id and self._work_store is not None:
-            try:
-                await asyncio.to_thread(self._work_store.recover, save_id)
-            except Exception:
-                logger.debug("Work store recovery before provider turn failed", exc_info=True)
+        acquired = False
+        try:
+            await self._execution_lock.acquire()
+            acquired = True
+            client = getattr(worker, "client", None)
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:
+                    logger.warning("Could not release internal MCP session", exc_info=True)
+            if recover and save_id and self._work_store is not None:
+                try:
+                    await asyncio.to_thread(self._work_store.recover, save_id)
+                except Exception:
+                    logger.debug("Work store recovery before provider turn failed", exc_info=True)
+        except BaseException:
+            # Startup preset can supersede autonomy while MCP close is awaiting.
+            # A cancelled claim must unwind its own partially acquired lease.
+            if acquired:
+                self._execution_lock.release()
+            worker.set_provider_active(False)
+            raise
         return True
 
     async def _release_execution(self, save_id: str | None = None) -> None:
@@ -1224,9 +1466,45 @@ class ChatBridge:
         if save_id:
             worker.supplied_save_id = save_id
         worker.set_provider_active(False)
-        worker.notify()
+        if not self._preset_business_blocked(save_id):
+            worker.notify()
+
+    def _restore_accepted_preset_scope(self, save_id: str) -> tuple[str, str] | None:
+        """Recover an accepted goal-less preset, including a first wait-only turn.
+
+        Use only its exact persisted player request and configured native marker.
+        Never revive a cancelled preset or change human pause/control state.
+        """
+        policy = getattr(self, "_preset_day_boundary", None)
+        if not policy or not policy.enabled or not self._work_store or not self._autonomy:
+            return None
+        preset = json.loads(Path(policy.preset_path).read_text(encoding="utf-8-sig"))
+        import hashlib
+        rid = "preset-" + hashlib.sha256((str(preset["runId"]) + "\n" + save_id).encode()).hexdigest()[:12]
+        marker_path = Path(self.run_dir) / "data/preset-goal-state.json"
+        if not marker_path.is_file():
+            return None
+        marker = json.loads(marker_path.read_text(encoding="utf-8-sig")).get(rid, {})
+        if not marker or marker.get("completed") or marker.get("cancelled"):
+            return None
+        root = next((r for r in self._work_store.state(save_id).requests if r.get("id") == rid), None)
+        if not root or root.get("goalId") or root.get("workStopped") or root.get("text") != preset.get("goalText"):
+            return None
+        self._work_store.reconcile_verified_preset_history(save_id, policy.native_day(self._latest_snapshot_payload))
+        bound = self._work_store.ensure_preset_main_goal(save_id, rid, str(preset["goalText"]))
+        self._autonomy.set_goal_scope(save_id, bound.id)
+        self._autonomy.request_job_decision(save_id)
+        self._preset_runs[save_id] = {"request_id": rid, "goal_id": bound.id, "notified": False}
+        logger.info("Recovered accepted wait-only preset [%s] into main goal %s", rid, bound.id)
+        return rid, bound.id
+
+    def _preset_business_blocked(self, save_id: str | None) -> bool:
+        policy = getattr(self, "_preset_day_boundary", None)
+        return bool(policy and policy.blocked(save_id, self._work_store, self._latest_snapshot_payload))
 
     def _notify_plan_worker(self, save_id: str | None = None) -> None:
+        if self._preset_business_blocked(save_id):
+            return
         worker = self._plan_worker
         if worker is None:
             return
@@ -1270,6 +1548,21 @@ class ChatBridge:
         except Exception as ex:
             logger.warning("Failed to save chat sessions to %s: %s", self._sessions_file, ex)
 
+    @staticmethod
+    def _codex_turn_usage(result: dict[str, Any]) -> dict[str, Any] | None:
+        raw = result.get("usage")
+        latest = result.get("usage_latest_request_input_context")
+        measured = isinstance(latest, int) and not isinstance(latest, bool) and latest >= 0
+        if not isinstance(raw, dict) and not measured:
+            return None
+        context = {"latestRequestInputContext": latest} if measured else {}
+        return {**(raw if isinstance(raw, dict) else {}), **context,
+                "input_context_measured": measured,
+                "source": result.get("usage_source", "unknown"),
+                "status": result.get("usage_status", "unknown"),
+                "requestCount": result.get("usage_request_count"),
+                "limits": result.get("usage_limits")}
+
     def _record_command(
         self,
         request_id: str,
@@ -1305,6 +1598,7 @@ class ChatBridge:
             "source": "test" if is_test_env else "production",
             "provider": self.backend_name,
             "model": self.model,
+            "channel": "autonomy" if request_id.startswith("autonomy-") else "conversation",
         }
         targets = [self._commands_file]
         central_override = os.getenv("STARDEW_CENTRAL_COMMANDS_FILE")
@@ -1335,8 +1629,13 @@ class ChatBridge:
         # Provider-qualified keys prevent sessions from crossing CLI backends.
         # The unqualified key is retained solely for legacy agy files.
         if self.backend_name != "agy":
-            return self._sessions.get(f"{self.backend_name}:{save_id}")
-        return self._sessions.get(save_id) or self._sessions.get(f"agy:{save_id}")
+            key = f"{self.backend_name}:{save_id}"
+            if key not in self._sessions and self._sessions.get(f"life:{key}"):
+                self._sessions[key] = self._sessions[f"life:{key}"]
+                self._save_sessions()
+            return self._sessions.get(key)
+        return (self._sessions.get(f"agy:{save_id}") or self._sessions.get(save_id)
+                or self._sessions.get(f"life:agy:{save_id}"))
 
     def record_conversation_id(self, save_id: str | None, conversation_id: str) -> None:
         if not save_id or not conversation_id:
@@ -1358,7 +1657,9 @@ class ChatBridge:
                 try:
                     backend = self._backend
                     terminate = getattr(backend, "terminate", None)
-                    if callable(terminate):
+                    if self.backend_name == "agy":
+                        terminate_agy_process(proc)
+                    elif callable(terminate):
                         terminate(proc)
                     else:
                         proc.kill()
@@ -1428,13 +1729,6 @@ class ChatBridge:
                 logger.info("Found game endpoint ws://%s:%d/chat (saveId=%s)", host, port, save_id)
                 if self._plan_worker is None and self.run_dir is not None:
                     self._bind_work_store()
-                if self._plan_worker is not None:
-                    if save_id and self._work_store is not None:
-                        self._work_store.revoke_decision(str(save_id))
-                    self._plan_worker.supplied_save_id = str(save_id) if save_id else None
-                    self._plan_worker.start()
-                    self._notify_plan_worker(str(save_id) if save_id else None)
-
                 headers = {"Authorization": f"Bearer {token}"}
                 ws = await WebSocketClient.connect(
                     host=host,
@@ -1448,13 +1742,24 @@ class ChatBridge:
                 last_wait_log = 0.0
 
                 try:
+                    await self._prepare_game_load(save_id, disc.get("gameSessionId"))
+                    # A stale discovery file is not a live game session. Only
+                    # invalidate decisions and wake work after authentication
+                    # succeeds, so offline retries cannot mutate saved work.
+                    if self._plan_worker is not None:
+                        # _prepare_game_load handles real native reloads. A
+                        # bridge reconnect in the same game session retains its
+                        # persisted authorized selection and reconciles claims.
+                        self._plan_worker.supplied_save_id = str(save_id) if save_id else None
+                        self._plan_worker.start()
+                        self._notify_plan_worker(str(save_id) if save_id else None)
                     await self._receive_loop(ws, save_id, stop_event)
                 finally:
                     self.abort_active_task("WebSocket disconnected")
                     await ws.close()
 
             except (WebSocketError, ConnectionClosed, OSError) as ex:
-                logger.debug("Chat WebSocket connection lost: %s. Reconnecting in 2s...", ex)
+                logger.warning("Chat WebSocket connection lost (%s): %s. Reconnecting in 2s...", type(ex).__name__, ex)
                 self.abort_active_task("Connection lost")
                 await asyncio.sleep(2.0)
             except asyncio.CancelledError:
@@ -1468,6 +1773,51 @@ class ChatBridge:
         if self._plan_worker is not None:
             await self._plan_worker.stop()
 
+    async def _prepare_game_load(self, save_id: str | None, session_id: str | None) -> None:
+        from .game_reload import mark_game_load_applied, pending_game_load, restore_game_load
+
+        if self.run_dir is None or not save_id:
+            return
+        request = pending_game_load(self.run_dir, save_id, session_id)
+        if request is None:
+            return
+        self.abort_active_task("Game save reloaded")
+        self._autonomy_generation += 1
+        self._active_player_requests.pop(save_id, None)
+        delivery = self._delivery_tasks.pop(save_id, None)
+        if delivery is not None and not delivery.done():
+            delivery.cancel()
+        wakeup = self._autonomy_wakeup_tasks.pop(save_id, None)
+        if wakeup is not None and wakeup is not asyncio.current_task():
+            wakeup.cancel()
+            await asyncio.gather(wakeup, return_exceptions=True)
+        self._autonomy_wakeup_snapshots.pop(save_id, None)
+        if self._plan_worker is not None:
+            await self._plan_worker.stop()
+        active = self._active_task.async_task if self._active_task else None
+        if active is not None and active is not asyncio.current_task():
+            await asyncio.gather(active, return_exceptions=True)
+        restore_game_load(self.run_dir, request)
+        self._latest_snapshot_payload = None
+        self._latest_snapshot_observed_at = None
+        self._latest_snapshot_revision = None
+        self._current_game_day_key = None
+        self._last_day_settlement = None
+        self._last_native_ui_recovery_signal = None
+        self._evening_care_fired_day = None
+        for mapping in (self._last_work_projection, self._work_projection_times,
+                        self._pending_native_cancels, self._autonomy_last_snapshot_at,
+                        self._autonomy_pending_snapshot, self._autonomy_pending_task_fingerprints):
+            mapping.pop(save_id, None)
+        self._life_proposals.pop(save_id, None)
+        self._bind_autonomy_store()
+        self._bind_work_store()
+        self._bind_companion_stores()
+        if self._life_chat is not None:
+            self._life_chat.record_fingerprint(save_id, self._profile_revision(save_id), self._memory_instruction_revision(save_id))
+        mark_game_load_applied(self.run_dir, request)
+        logger.info("Restored game-save facts with retained player-intent summary for %s", save_id)
+
     async def _receive_loop(
         self,
         ws: WebSocketClient | None,
@@ -1476,7 +1826,13 @@ class ChatBridge:
     ) -> None:
         tracked_tasks: set[asyncio.Task] = set()
         latest_snapshot: Envelope | None = None
+        last_work_push_at = float("-inf")
         self._chat_ws = ws
+        self._player_claim_attempted = False
+        # Reconnect must first learn the current native actor and authority.
+        # Delivery is scheduled after a snapshot/claim acknowledgement, never
+        # under the constructor's companion defaults.
+        self._latest_snapshot_payload = None
 
         async def run_submit(request_id: str, text: str, save_id: str) -> None:
             generation = self._autonomy_generation
@@ -1493,7 +1849,8 @@ class ChatBridge:
                 try:
                     raw_text = await ws.receive_text(timeout=2.0)
                 except TimeoutError:
-                    tracked_tasks = {t for t in tracked_tasks if not t.done()}
+                    self._maybe_deliver_outbox(active_save_id)
+                    self._schedule_life_drain(ws)
                     await self._stop_autonomy_if_disabled(ws, active_save_id)
                     if latest_snapshot is not None:
                         await self._maybe_schedule_autonomy(latest_snapshot, active_save_id, tracked_tasks, ws)
@@ -1506,18 +1863,50 @@ class ChatBridge:
                     continue
 
                 msg_type = data.get("messageType")
+                if msg_type == "chat.delivery.ack":
+                    payload = data.get("payload") or {}
+                    if self._work_store and payload.get("saveId") == active_save_id:
+                        self._work_store.acknowledge_outbox_notification(
+                            active_save_id, str(payload.get("requestId") or ""),
+                            payload.get("outboxIds") or [])
+                    continue
                 await self._stop_autonomy_if_disabled(ws, active_save_id)
                 if msg_type == "world.snapshot":
                     envelope = Envelope.from_mapping(data)
                     if envelope.save_id and active_save_id and envelope.save_id != active_save_id:
+                        logger.warning("Chat snapshot save boundary changed: active=%s received=%s",
+                                       active_save_id, envelope.save_id)
                         self.abort_active_task("Save switched while chat connection was open")
                         break
                     latest_snapshot = envelope
+                    self._player_session_id = envelope.game_session_id
                     self._latest_snapshot_payload = (
                         envelope.payload if isinstance(envelope.payload, dict) else None
                     )
                     self._latest_snapshot_revision = envelope.world_revision
+                    self._latest_snapshot_observed_at = (
+                        self._latest_snapshot_payload.get("observedAt", envelope.sent_at.timestamp())
+                        if self._latest_snapshot_payload is not None else None
+                    )
+                    self._track_actor_mode(envelope.payload)
+                    if self.actor_mode == "player" and not self._player_claim_attempted:
+                        await self._maybe_claim_player_control(ws, active_save_id)
+                    try:
+                        self._write_life_snapshot(active_save_id)
+                    except OSError as ex:
+                        # A failed local publication leaves the previous cache
+                        # available with its original age. It must not tear down
+                        # the socket, cancel the model, or drop player controls.
+                        logger.warning("Life snapshot cache publication failed (%s): %s", type(ex).__name__, ex)
                     world = envelope.payload.get("world") if isinstance(envelope.payload.get("world"), dict) else {}
+                    native = envelope.payload.get("native") or world.get("native")
+                    if self.actor_mode == "player" and self._work_store and isinstance(native, dict):
+                        signal = (envelope.game_session_id, native.get("eventUp"), native.get("eventIsFestival"),
+                                  native.get("activeMenu"), native.get("dialogueUp"), native.get("isQuestionDialogue"))
+                        if signal != self._last_native_ui_recovery_signal:
+                            self._work_store.observe_native_ui_recovery(active_save_id, native,
+                                world_revision=envelope.world_revision, game_session_id=envelope.game_session_id)
+                            self._last_native_ui_recovery_signal = signal
                     day_key: str | None = None
                     previous_day_key: str | None = None
                     if world.get("dayOfMonth") is not None:
@@ -1531,12 +1920,27 @@ class ChatBridge:
                         # next advance can settle.
                         if day_key != previous_day_key:
                             await self._settle_day_advance(active_save_id, world)
-                    await self._snapshot_care_hooks(active_save_id, world, day_key, previous_day_key)
+                    # Care can also generate a model reply. Keep the wire reader
+                    # draining snapshots and controls while that reply is pending.
+                    task = asyncio.create_task(self._snapshot_care_hooks(
+                        active_save_id, world, day_key, previous_day_key,
+                    ))
+                    tracked_tasks.add(task)
+                    task.add_done_callback(tracked_tasks.discard)
                     # A fresh native snapshot is also the trigger for the plan
                     # worker to advance ready steps (and to re-evaluate waiting
                     # todos) without any model turn.
                     self._notify_plan_worker(active_save_id)
+                    self._schedule_life_drain(ws)
                     await self._maybe_schedule_autonomy(envelope, active_save_id, tracked_tasks, ws)
+                    if active_save_id:
+                        # Native observations arrive twice per second. Keep
+                        # draining every observation/control, but do not rebuild
+                        # the ledger-heavy UI projection for every packet.
+                        if time.monotonic() - last_work_push_at >= 2.0:
+                            await self._push_work_state(ws, active_save_id)
+                            last_work_push_at = time.monotonic()
+                        await self._maybe_notify_preset_terminal(ws, active_save_id)
                     continue
 
                 if msg_type == "autonomy.control":
@@ -1554,8 +1958,22 @@ class ChatBridge:
                     await self.handle_chat_cancel(ws, req_id, reason, active_save_id)
                     continue
 
+                if msg_type == "player.authority":
+                    await self._handle_player_authority(
+                        ws, data.get("payload") or {}, active_save_id)
+                    continue
+
+                if msg_type == "life.chat.submit":
+                    # The single-model lock and FIFO queue remain in the handler;
+                    # awaiting its whole model turn here stalls the WebSocket.
+                    task = asyncio.create_task(
+                        self._handle_life_message(ws, msg_type, data, active_save_id)
+                    )
+                    tracked_tasks.add(task)
+                    task.add_done_callback(tracked_tasks.discard)
+                    continue
+
                 if msg_type in {
-                    "life.chat.submit",
                     "life.profile.get",
                     "life.profile.set",
                     "life.memory.list",
@@ -1579,9 +1997,14 @@ class ChatBridge:
                 if req_id and text.strip():
                     task = asyncio.create_task(run_submit(req_id, text, save_id))
                     tracked_tasks.add(task)
+                    task.add_done_callback(tracked_tasks.discard)
         finally:
             self.abort_active_task("Chat channel stopped")
-            self._break_command_chain()
+            delivery_cleanup = set(self._delivery_tasks.values())
+            for delivery in delivery_cleanup:
+                if not delivery.done() and not delivery.cancelling():
+                    delivery.cancel()
+            self._delivery_tasks.clear()
             # Queued life-chat submits must never vanish silently (contract §1.2):
             # anything still waiting when the channel closes gets a failed terminal.
             for item in list(self._life_queue):
@@ -1595,16 +2018,22 @@ class ChatBridge:
                     error="CHAT_CHANNEL_CLOSED",
                 ))
             self._life_queue.clear()
+            self._pending_life_preparation.clear()
             self._life_draining = False
             for debounce in list(self._autonomy_debounce_tasks.values()):
                 debounce.cancel()
             self._autonomy_debounce_tasks.clear()
             self._autonomy_pending_snapshot.clear()
-            for task in list(tracked_tasks):
-                if task is not asyncio.current_task() and not task.done():
+            self._autonomy_wakeup_snapshots.clear()
+            cleanup_tasks = tracked_tasks | self._deferred_care_tasks | self._life_drain_tasks | delivery_cleanup
+            for task in list(cleanup_tasks):
+                if task is not asyncio.current_task() and not task.done() and not task.cancelling():
                     task.cancel()
-            if tracked_tasks:
-                await asyncio.gather(*tracked_tasks, return_exceptions=True)
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            self._autonomy_wakeup_tasks.clear()
+            if self._chat_ws is ws:
+                self._chat_ws = None
 
     async def _maybe_schedule_autonomy(
         self, envelope: Envelope, save_id: str | None, tracked_tasks: set[asyncio.Task], ws: WebSocketClient | None,
@@ -1613,6 +2042,13 @@ class ChatBridge:
         """Evaluate the latest native snapshot through the chat channel only."""
         if not save_id or self._autonomy is None or envelope.message_type != "world.snapshot":
             return
+        restored = self._restore_accepted_preset_scope(save_id)
+        if restored:
+            rid, goal_id = restored
+            reply = Envelope.create_chat_reply(self.instance_id, rid, "selected", "继续已授权的预设目标。",
+                save_id=save_id, command_id=rid, command_complete=False)
+            reply.payload["presetGoalId"] = goal_id
+            await self._send_reply(ws, reply)
         if self._work_store is not None and ws is not None:
             notice = self._work_store.pending_player_notice(save_id)
             if notice:
@@ -1620,6 +2056,28 @@ class ChatBridge:
                     self.instance_id, notice["id"], "player-decision", notice["message"], save_id=save_id))
                 if delivered:
                     self._work_store.acknowledge_player_notice(save_id, notice["id"])
+        if self._preset_business_blocked(save_id):
+            await self._maybe_notify_preset_terminal(ws, save_id)
+            return
+        rest_state = ((envelope.payload or {}).get("companion") or {}).get("restState")
+        self._autonomy.observe_rest_state(save_id, rest_state)
+        self._maybe_arm_hold_recovery(save_id, envelope.payload)
+        if self._life_queue or self._life_draining:
+            # A player has already been promised a reply. The next snapshot can
+            # re-evaluate autonomous work after their queued correction is read.
+            return
+        # A single queued wakeup owns the latest snapshot until the shared model
+        # slot is available. In particular, care cannot consume the morning
+        # decision merely by reaching the lock before a created submit task.
+        if save_id in self._autonomy_wakeup_tasks:
+            self._autonomy_wakeup_snapshots[save_id] = (envelope, tracked_tasks, ws)
+            return
+        state = self._autonomy.state(save_id)
+        if ((not state.enabled and not state.goal_scope) or state.paused
+                or self._autonomy.is_cooling_down(save_id)
+                or rest_state == "resting"
+                or self._bedtime_winding_down(save_id, envelope.payload)):
+            return
         now = time.monotonic()
         previous = self._autonomy_last_snapshot_at.get(save_id)
         self._autonomy_last_snapshot_at[save_id] = now
@@ -1634,26 +2092,222 @@ class ChatBridge:
                         await self._maybe_schedule_autonomy(pending[0], save_id, pending[1], pending[2], force=True)
                 self._autonomy_debounce_tasks[save_id] = asyncio.create_task(flush())
             return
+        self._autonomy_wakeup_snapshots[save_id] = (envelope, tracked_tasks, ws)
+        generation = self._autonomy_generation
+
+        async def dispatch() -> None:
+            request_id = None
+            consumed = None
+            try:
+                async with self._busy_lock:
+                    if generation != self._autonomy_generation:
+                        return
+                    if self._life_queue or self._life_draining:
+                        return
+                    consumed = self._autonomy_wakeup_snapshots.pop(save_id, None)
+                    if consumed is None:
+                        return
+                    current, _, current_ws = consumed
+                    prepared = self._prepare_autonomy_decision(current, save_id)
+                    if prepared is None:
+                        return
+                    fingerprint, prompt = prepared
+                    if not self._autonomy.record_world_event(save_id, fingerprint, current.world_revision):
+                        return
+                    request_id = f"autonomy-{uuid.uuid4().hex}"
+                    self._autonomy_requests[request_id] = fingerprint
+                    # Keep the claimed slot through submit: queued life waiters
+                    # cannot intervene after the wakeup fingerprint is consumed.
+                    await self.handle_chat_submit(current_ws, request_id, prompt, save_id, _slot_owned=True)
+            finally:
+                if request_id:
+                    self._autonomy_requests.pop(request_id, None)
+                self._autonomy_wakeup_tasks.pop(save_id, None)
+                pending = self._autonomy_wakeup_snapshots.pop(save_id, None)
+                if pending and generation == self._autonomy_generation:
+                    await self._maybe_schedule_autonomy(pending[0], save_id, pending[1], pending[2], force=True)
+
+        task = asyncio.create_task(dispatch())
+        self._autonomy_wakeup_tasks[save_id] = task
+        tracked_tasks.add(task)
+        task.add_done_callback(tracked_tasks.discard)
+
+    def _rearm_after_standby_turn(self, save_id: str) -> None:
+        """Re-arm one bounded follow-up decision after a no-dispatch autonomy turn.
+
+        A player-mode turn that ends without selecting native work often carries an
+        explicit "next cycle I will ..." intent (one semantic job per decision), so
+        consuming the wakeup fingerprint without re-arming dead-ends the run: no
+        world change means no new wakeup, and the unattended clock would only be
+        stopped by the late-night passout guard. Bumping the decision epoch lets the
+        next snapshot evaluation fire a fresh turn. The per-day streak bound stops a
+        model that never dispatches from hot-looping; dispatched jobs, day changes,
+        pause and breaker cooldown still gate every follow-up independently.
+        """
+        if getattr(self, "actor_mode", None) != "player" or self._autonomy is None:
+            return
+        # An explicit future todo is a deliberate world wait, not a planner
+        # which forgot to dispatch. Respect it instead of consuming six extra
+        # model turns while the decision pause prevents the clock reaching it.
+        if self._work_store is not None:
+            scoped = self._autonomy.state(save_id).goal_scope
+            waiting = [t for t in self._work_store.state(save_id).todos
+                       if t.status == "pending" and (not scoped or t.goal_id == scoped)]
+            if waiting:
+                snapshot, date = self._plan_snapshot_state()
+                due = self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date=date)
+                if not any(t.get("id") in {todo.id for todo in waiting} for t in due):
+                    logger.info("Standby for %s parked until its native todo condition changes.", save_id)
+                    return
+        streaks = getattr(self, "_standby_rearm_streak", None)
+        if streaks is None:
+            streaks = self._standby_rearm_streak = {}
+        day_key = self._current_game_day_key or "unknown"
+        key = f"{save_id}:{day_key}"
+        count = streaks.get(key, 0) + 1
+        streaks[key] = count
+        if count > 6:
+            logger.info(
+                "Standby follow-up streak exhausted for %s day %s (%d); waiting for world events.",
+                save_id, day_key, count,
+            )
+            return
+        self._autonomy.request_job_decision(save_id)
+
+    @staticmethod
+    def _native_recovery_fingerprint(payload: dict[str, Any]) -> str:
+        world = payload.get("world") if isinstance(payload.get("world"), dict) else {}
+        native = payload.get("native") or world.get("native") or {}
+        actor = payload.get("companion") or {}
+        return json.dumps({
+            "revision": payload.get("capturedRevision"),
+            "world": {k: world.get(k) for k in ("year", "season", "dayOfMonth", "timeOfDay", "currentLocation")},
+            "actor": {k: actor.get(k) for k in ("locationId", "tileX", "tileY", "stamina", "currentStamina",
+                "availableMoney", "waterCanLevel", "water", "waterLeft", "health")},
+            "inventory": payload.get("inventory"),
+            "ui": {k: native.get(k) for k in ("eventUp", "eventSkippable", "dialogueUp", "dialogueSpeaker",
+                "dialogueText", "isQuestionDialogue", "questionResponses", "activeMenu", "endOfNight")},
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _maybe_arm_hold_recovery(self, save_id: str | None, payload: dict[str, Any] | None) -> None:
+        """Bound protective recovery by native progress, independently of hold IDs."""
+        if not save_id or self._autonomy is None or not isinstance(payload, dict):
+            return
+        if getattr(self, "actor_mode", None) != "player":
+            return
+        world = payload.get("world") if isinstance(payload.get("world"), dict) else {}
+        native = payload.get("native") or world.get("native")
+        hold = native.get("programHold") if isinstance(native, dict) else None
+        if not isinstance(hold, dict) or not hold.get("active"):
+            return
+        hold_id = str(hold.get("holdId") or "")
+        if not hold_id:
+            return
+        seen = getattr(self, "_program_hold_recovery_seen", None)
+        if seen is None:
+            seen = self._program_hold_recovery_seen = {}
+        key = f"{save_id}:{hold_id}"
+        if seen.get(key) == "armed":
+            return
+        if getattr(self, "control_owner", None) == "human":
+            if key not in seen:
+                seen[key] = "blocked"
+                logger.info("Program hold %s for %s observed under human control; no recovery turn armed.", hold_id, save_id)
+            return
+        state = self._autonomy.state(save_id)
+        if (not state.enabled and not state.goal_scope) or state.paused:
+            if key not in seen:
+                seen[key] = "blocked"
+                logger.info("Program hold %s for %s observed while paused/disabled; no recovery turn armed.", hold_id, save_id)
+            return
+        if self._work_store is not None and self._work_store.state(save_id).paused:
+            return
+        # Fresh model turns clear a hold, and the night guard creates another.
+        # A new hold ID therefore cannot be evidence of native progress. Ignore
+        # thinking leases, timestamps, notes and request IDs in this budget.
+        progress = self._native_recovery_fingerprint(payload)
+        budgets = getattr(self, "_program_hold_progress", None)
+        if budgets is None:
+            budgets = self._program_hold_progress = {}
+        prior = budgets.get(save_id)
+        count = prior[1] if prior and prior[0] == progress else 0
+        if count >= 3:
+            seen[key] = "exhausted"
+            self._pause_native_recovery(save_id, "NO_NATIVE_RECOVERY_PROGRESS")
+            return
+        budgets[save_id] = (progress, count + 1)
+        if len(seen) >= 128:
+            seen.clear()
+        seen[key] = "armed"
+        logger.info(
+            "Program hold %s for %s active (%s); recovery %d/3 for this native state.",
+            hold_id, save_id, hold.get("reason"), count + 1,
+        )
+        self._autonomy.request_job_decision(save_id)
+        # Failed delivery leaves confirmed facts pending, which intentionally
+        # blocks fresh autonomy. Recover that delivery first. Regular snapshots
+        # can keep receive_text from ever timing out, so its timeout retry is
+        # not a reliable recovery boundary. The hold-id gate bounds this retry.
+        delivery = self._delivery_tasks.get(save_id)
+        if delivery is not None and not delivery.done():
+            # The native failure reply can arrive before its delivery coroutine
+            # releases the slot. Retry after that coroutine's cleanup callback.
+            delivery.add_done_callback(lambda _: self._maybe_deliver_outbox(save_id))
+        else:
+            self._maybe_deliver_outbox(save_id)
+
+    def _pause_native_recovery(self, save_id: str, reason: str) -> None:
+        """Persist a stop for executor faults or repeated recovery without progress."""
+        if self._autonomy is not None:
+            self._autonomy.control(save_id, "pause")
+        if self._work_store is not None:
+            self._work_store.set_paused(save_id, True)
+            self._work_store.set_outbox_retry_block(save_id, reason)
+        logger.error("Native recovery paused for %s: %s; no further automatic model retries.", save_id, reason)
+
+    def _prepare_autonomy_decision(self, envelope: Envelope, save_id: str) -> tuple[str, str] | None:
+        """Re-evaluate the latest wakeup while owning the single model slot."""
         state = self._autonomy.state(save_id)
         if (
-            not state.enabled
+            (not state.enabled and not state.goal_scope)
             or state.paused
             or self._active_task is not None
-            or self._busy_lock.locked()
-            or save_id in self._command_chains
+            or self._work_settling(save_id)
             or self._autonomy.is_cooling_down(save_id)
         ):
             return
         snapshot = envelope.payload or {}
+        if (snapshot.get("companion") or {}).get("restState") == "resting":
+            return None  # Daytime recovery wakes again when the native actor is awake.
+        if self._bedtime_winding_down(save_id, snapshot):
+            return
         if self._work_store is not None:
             job_state = self._work_store.state(save_id)
             if state.goal_scope and not any(g.id == state.goal_scope and g.status == "active" for g in job_state.goals):
-                return
+                # Finished explicit work must not strand later accepted tasks or
+                # prevent idle help from resuming when that preference is on.
+                pending_goals = {todo.goal_id for todo in job_state.todos if todo.status in {"pending", "due"}}
+                next_goal = next((goal.id for goal in job_state.goals
+                                  if goal.status == "active" and goal.source == "user" and goal.id in pending_goals), None)
+                self._autonomy.set_goal_scope(save_id, next_goal)
+                state = self._autonomy.state(save_id)
+                if not state.enabled and not state.goal_scope:
+                    return
             decision = job_state.decision
             if decision.get("selected") and not decision.get("finished"):
-                return
+                selected_task = next((t for t in job_state.tasks if t.id == decision.get("taskId")), None)
+                never_dispatched = selected_task is not None and all(
+                    s.attempts == 0 and not s.command_id and not s.effects for s in selected_task.steps)
+                if decision.get("expires", 0) <= time.time() and never_dispatched:
+                    # Expired, unexecuted post-save selections need a fresh choice.
+                    # A dispatched/unknown command must retain its reconciliation gate.
+                    self._work_store.revoke_decision(save_id)
+                else:
+                    return
             last_job = job_state.last_job
-            if last_job.get("decisionId"):
+            # Keep confirmed empty selections parked until native resources,
+            # world facts or the accepted objective change their fingerprint.
+            if last_job.get("decisionId") and last_job.get("knownNoWork") is not True:
                 self._autonomy.request_job_decision(save_id, str(last_job["decisionId"]))
         work_signal = ""
         if self._work_store is not None:
@@ -1664,26 +2318,32 @@ class ChatBridge:
                 # Advisory project notes increment the store epoch but are not
                 # new work. Wake only for changed objectives/authorization/state,
                 # otherwise a blocked planner could wake itself by editing notes.
-                "goals": [(g.id, g.text, g.priority, g.status,
-                           {k: v for k, v in g.constraints.items() if k != "milestoneSpec"})
+                "goals": [(g.id, g.text if g.source == "user" else None, g.priority, g.status,
+                           {k: v for k, v in g.constraints.items() if k not in {"milestoneSpec", "objectiveScope"}},
+                           objective_scope({"constraints": g.constraints}))
                           for g in job_state.goals if g.status == "active"
                           and (not state.goal_scope or g.id == state.goal_scope)],
                 "due": sorted(t["id"] for t in due if not state.goal_scope or t.get("goal_id") == state.goal_scope),
+                # Accepted player work needs bounded planning opportunities even
+                # after a truthful NO_WORK result with no changed resources.
+                # This wakes the model, never selects a business action.
+                "planningWindow": (int(world.get("timeOfDay") or 0) // 200
+                    if getattr(self, "actor_mode", None) == "player" and state.goal_scope else None),
             }, sort_keys=True)
         candidate = self._autonomy.next_candidate(save_id, snapshot, work_signal=work_signal)
         if candidate is None:
             return
         fingerprint = self._autonomy.fingerprint(save_id, snapshot, candidate, state)
-        if not self._autonomy.record_world_event(save_id, fingerprint, envelope.world_revision):
-            return
-        remaining_budget = max(0, (state.budget_limit or 0) - state.daily_spend - sum(state.spend_reservations.values()))
         compact = build_decision_context(
             {"payload": snapshot, "worldRevision": envelope.world_revision},
             work=self._work_context(save_id),
-            origin="free-mode",
+            origin="free-mode" if state.enabled else "accepted-work",
+            actor_mode=getattr(self, "actor_mode", None),
         )
-        compact["remainingBudget"] = remaining_budget
         compact["boxRange"] = state.box_preference or "none"
+        compact["idlePreference"] = state.idle_preference
+        compact["idleHelpEnabled"] = state.enabled
+        compact["autonomyMode"] = state.mode
         compact["lastResult"] = self._work_store.state(save_id).last_job if self._work_store else state.last_event_key or "none"
         compact["wakeReason"] = candidate.get("reason", "state-change")
         compact["objective"] = state.goal or "由当前状态决定"
@@ -1691,24 +2351,19 @@ class ChatBridge:
             compact["projectScope"] = state.goal_scope
             scoped = next((g for g in job_state.goals if g.id == state.goal_scope), None)
             if scoped:
-                compact["goals"] = [{"id": scoped.id, "text": scoped.text, "source": scoped.source,
-                                     "constraints": {k: v for k, v in scoped.constraints.items() if k != "milestoneSpec"},
-                                     "project": {k: v for k, v in scoped.project.items() if k in {"phase", "summary", "openQuestions"}}}]
+                compact["goals"] = [goal_context({"id": scoped.id, "text": scoped.text, "source": scoped.source,
+                                                  "constraints": scoped.constraints, "epoch": scoped.epoch,
+                                                  "project": scoped.project})]
+            accepted_node = next((node for node in self._milestone_store.list_nodes(save_id)
+                                  if node.get("goalId") == state.goal_scope and node.get("status") == "adopted"), None) if self._milestone_store else None
+            if accepted_node:
+                compact["acceptedArrangement"] = {"nodeId": accepted_node["id"], "goalId": state.goal_scope,
+                    "status": "adopted", "paused": state.paused}
         prompt = (
-            "自由模式自主安排。观察当前状态，自主选择值得推进的目标与一项短任务，也可以安静待命："
-            f"{render_decision_context(compact)}。"
-            "人格与记忆是参考，不替代实际授权与任务事实。需要玩家决定或重要商量时调用request_player_decision(goal_id,message)，普通完成文字不会打扰玩家。若有projectScope只能推进该项目，不能借机执行其他旧目标。项目设计与阶段用manage_goal的project保存，阻塞条件用todo保存。常规结果进入日志，不逐步播报。固定规则：原子动作只能经 MCP；遵守预算与箱子范围；不保存睡觉；"
-            "原生事实优先，知识不足才 query_wiki；无合适工作就说明待命，不为待命查 wiki。"
-            "长期目标或待办用remember_intent，它们不是执行授权；本次用submit_plan选择一个语义短作业，允许内部导航和同一业务范围的多步操作。完成后信任工具精简终态，不重复查询。下一业务由下一次模型决策选择，不预排存箱或出售。"
-            f"已保存目标：{state.goal or '由当前状态决定'}。"
-            "始终用中文回复玩家。"
+            "结合当前目标和游戏状态安排下一步。\n"
+            f"实时上下文：{render_decision_context(model_decision_context(compact))}"
         )
-        # Unique per-request identity: a worldRevision may repeat (revision reset /
-        # same-revision decisions) and must never collide across epochs.
-        request_id = f"autonomy-{uuid.uuid4().hex}"
-        self._autonomy_requests[request_id] = fingerprint
-        task = asyncio.create_task(self.handle_chat_submit(ws, request_id, prompt, save_id))
-        tracked_tasks.add(task)
+        return fingerprint, prompt
 
     def _apply_work_control(self, save_id: str, action: str, params: dict[str, Any]) -> None:
         """Keep durable work scheduling in step with F8 pause/resume/cancel controls."""
@@ -1716,16 +2371,18 @@ class ChatBridge:
         if store is None:
             return
         try:
-            if action in {"cancel", "set_mode"}:
-                self._break_command_chain(save_id)
+            if action == "cancel":
+                self._active_player_requests.pop(save_id, None)
             if action == "pause":
                 store.set_paused(save_id, True)
             elif action == "resume":
+                getattr(self, "_program_hold_progress", {}).pop(save_id, None)
+                getattr(self, "_preset_resume_progress", {}).pop(save_id, None)
                 store.set_paused(save_id, False)
             elif action == "cancel":
-                store.set_paused(save_id, True)
+                pass  # Cancel the arrangement; preserve the player's pause and mode.
             elif action == "set_mode":
-                store.set_paused(save_id, str(params.get("mode")) != "free")
+                pass  # Idle initiative is independent of accepted work and pause.
             elif action == "set_preferences":
                 goal = str(params.get("goal") or "").strip()
                 already = any(
@@ -1743,32 +2400,37 @@ class ChatBridge:
             return None
         try:
             snapshot, game_date = self._plan_snapshot_state()
-            overview = self._work_store.overview(
-                save_id, snapshot=snapshot, game_date=game_date
-            )
+            overview = self._latest_work_overview(save_id)
+            if overview is None:
+                return None
         except Exception:
             return None
         return {
             "goals": [
-                {key: g.get(key) for key in ("id", "text", "source", "constraints", "project")}
+                {key: g.get(key) for key in ("id", "text", "source", "constraints", "project", "epoch")}
                 for g in overview.get("goals", [])[:3]
             ],
             "duePreparation": [
-                {"id": t["id"], "intent": t["intent"], "goalId": t.get("goal_id")}
-                for t in self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date=game_date)
+                {"id": t["id"], "intent": t["intent"], "goalId": t.get("goal_id"), "trigger": t.get("trigger")}
+                for t in reversed(self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date=game_date))
             ][:6],
             "nextStep": overview.get("nextStep"),
             "anomalies": overview.get("anomalies", [])[:3],
-            "waitingFor": [
-                {"taskId": t.get("id"), "title": t.get("title")}
+            "blockedBranches": overview.get("blockedBranches", [])[-5:],
+            "tasks": [
+                {"id": t.get("id"), "title": t.get("title"), "status": "waiting"}
                 for t in overview.get("tasks", [])
                 if isinstance(t, dict) and t.get("status") == "waiting"
             ][:3],
             "waitingConditions": overview.get("waitingConditions", [])[:3],
             "lastSettledDay": overview.get("lastSettledDay"),
             "lastJob": overview.get("lastJob"),
+            "confirmedExecutionTotals": overview.get("confirmedExecutionTotals"),
+            "confirmedRequestTotals": overview.get("confirmedRequestTotals"),
+            "plantingEvidence": overview.get("plantingEvidence"),
             "paused": overview.get("paused", False),
             "decision": overview.get("decision", {}),
+            "continuity": overview.get("continuity", {}),
         }
 
     def _decision_context(self, save_id: str | None, *, origin: str = "chat") -> dict[str, Any]:
@@ -1782,6 +2444,7 @@ class ChatBridge:
             snapshot = {
                 "payload": self._latest_snapshot_payload,
                 "worldRevision": self._latest_snapshot_revision,
+                "capturedAt": self._latest_snapshot_observed_at,
             }
         work = self._latest_work_overview(save_id)
         companion: dict[str, Any] | None = None
@@ -1798,16 +2461,74 @@ class ChatBridge:
                     }
             if self._memory_store is not None:
                 memory = self._memory_store.render_for_context(save_id)
-        return build_decision_context(
-            snapshot, work=work, origin=origin, companion=companion, memory=memory
+        context = build_decision_context(
+            snapshot, work=work, origin=origin, companion=companion, memory=memory,
+            actor_mode=getattr(self, "actor_mode", None),
         )
+        boundary=getattr(self,"_preset_day_boundary",None)
+        if boundary and boundary.enabled and save_id:
+            budget=boundary.record(save_id,self._work_store)
+            if budget:
+                context["presetBudget"]={
+                    "runId":budget["runId"],"startDay":budget.get("startDay"),
+                    "currentNativeDay":boundary.native_day(self._latest_snapshot_payload),
+                    "maxGameDays":budget["maxGameDays"],"phase":budget.get("phase"),
+                    "dayBudgetAllowsBusiness":not boundary.blocked(save_id,self._work_store,self._latest_snapshot_payload),
+                    "meaning":"External test STOP boundary only, not a business strategy, crop quota or instruction to sleep early. Choose worthwhile daily activities from actual state. This persisted budget supersedes old inferred PRESET_DAY_LIMIT failures; native control and UI admission still apply."}
+        from .game_reload import reload_context
+        summary = (self._work_reload_context(save_id, self.get_conversation_id(save_id))
+                   if self.actor_mode == "player" else reload_context(self.run_dir, save_id))
+        if summary:
+            context["reloadSummary"] = summary
+        return context
 
     def _latest_work_overview(self, save_id: str | None) -> dict[str, Any] | None:
         if self._work_store is None or not save_id:
             return None
         try:
             snapshot, game_date = self._plan_snapshot_state()
-            return self._work_store.overview(save_id, snapshot=snapshot, game_date=game_date)
+            self._work_store.reconcile_closed_goal_children(save_id)
+            overview = self._work_store.overview(save_id, snapshot=snapshot, game_date=game_date)
+            state = self._work_store.state(save_id)
+            public_intent = []
+            if self.actor_mode == "player" and self.run_dir:
+                # The game's own save-scoped public replies survive provider
+                # rotation. Retain a small fallback even when the model did not
+                # explicitly write a decision note; never treat narration as a
+                # native receipt or as new player authorization.
+                import hashlib
+                history_path = self.run_dir / "data/conversations" / (
+                    hashlib.sha256(save_id.encode("utf-8")).hexdigest().upper() + ".json")
+                try:
+                    if history_path.stat().st_size <= 2_000_000:
+                        history = json.loads(history_path.read_text(encoding="utf-8"))
+                        if history.get("SaveId") == save_id:
+                            public_intent = [{"gameDate": row.get("GameDate"),
+                                "text": str(row.get("Text") or "").split("\n计划状态：", 1)[0][:600],
+                                "source": "public-model-reply", "isVerifiedFact": False}
+                                for row in history.get("Entries", [])
+                                if not row.get("IsPlayer") and not row.get("RolledBack")
+                                and str(row.get("Id") or "").startswith("work:")][-6:]
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+            # Provider rotation is a transport concern, not an erasure of intent.
+            # Keep bounded source-labelled design/discovery notes independent of
+            # active authorization; closed stage goals must not authorize work.
+            overview["continuity"] = {
+                "recentPublicIntent": public_intent,
+                "historicalDesignNotes": [{"goalId": g.id, "parentId": g.parent_id,
+                    "status": g.status, "source": g.source, "recordedAt": g.updated_at,
+                    "text": g.text[:900], "requiresWorldRevalidation": True}
+                    for g in state.goals if g.kind != "main"][-4:],
+                "recentIntent": [{"goalId": g.id, "phase": g.project.get("phase"),
+                    "nextAction": g.project.get("nextAction"),
+                    "progress": (g.project.get("progressLog") or [])[-3:],
+                    "decisionNotes": (g.project.get("decisionNotes") or [])[-8:]}
+                    for g in state.goals if g.kind == "main" and g.status == "active"][:1],
+                "failedBranches": overview.get("blockedBranches", [])[-6:],
+                "meaning": "Retained notes are dated observations/design hypotheses, not active permission or proof of current world. Current native observations override them. Preserve useful siting/discoveries and avoid repeating a failed branch without new relevant evidence."
+            }
+            return overview
         except Exception:
             return None
 
@@ -1828,36 +2549,64 @@ class ChatBridge:
         except Exception:
             return 0
 
+    def _memory_instruction_revision(self, save_id: str | None) -> int:
+        """Only corrections to agreements/preferences invalidate provider history."""
+        if self._memory_store is None or not save_id:
+            return 0
+        return self._memory_store.instruction_revision(save_id)
+
     def _life_work_projection(self, save_id: str) -> dict[str, Any]:
         """Read-only autonomy + WorkStore projection for life.profile.state (§1.3)."""
         payload: dict[str, Any] = {}
+        overview = self._latest_work_overview(save_id) or {}
         if self._autonomy is not None:
             try:
-                payload = self._autonomy_state_payload(save_id, self._autonomy.state(save_id))
+                payload = self._autonomy_state_payload(save_id, self._autonomy.state(save_id), overview=overview)
             except Exception:
                 payload = {}
-        overview = self._latest_work_overview(save_id) or {}
         preferences = payload.get("preferences") if isinstance(payload.get("preferences"), dict) else {}
+        autonomy_state = self._autonomy.state(save_id) if self._autonomy else None
+        current_goal_id = autonomy_state.goal_scope if autonomy_state else None
+        active_goals = [g for g in overview.get("goals", []) if isinstance(g, dict) and g.get("status") == "active"]
+        if current_goal_id not in {g.get("id") for g in active_goals}:
+            current_goal_id = (overview.get("decision") or {}).get("goalId")
+        if current_goal_id not in {g.get("id") for g in active_goals}:
+            current_goal_id = None
+        active_goals.sort(key=lambda g: (
+            g.get("id") == current_goal_id,
+            bool(g.get("source") == "user" and g.get("project")),
+            str(g.get("updated_at") or g.get("created_at") or "")), reverse=True)
+        current_goal = next((g for g in active_goals if g.get("id") == current_goal_id), None)
         goals = [
-            {"id": g.get("id"), "text": g.get("text"), "status": g.get("status")}
-            for g in overview.get("goals", [])
-            if isinstance(g, dict)
-        ][:5]
+            {"id": g.get("id"), "text": g.get("text"),
+             "summary": (g.get("project") or {}).get("summary") if isinstance(g.get("project"), dict) else None,
+             "status": g.get("status")}
+            for g in active_goals
+        ][:8]
         todos: list[dict[str, Any]] = []
         if self._work_store is not None:
             try:
                 todos = [
                     {"id": t.get("id"), "intent": t.get("intent"), "status": t.get("status")}
                     for t in self._work_store.list_todos(save_id)
-                    if isinstance(t, dict)
+                    if isinstance(t, dict) and t.get("status") == "pending"
                 ][:5]
             except Exception:
                 todos = []
-        return {
+        pause_reason = None
+        if autonomy_state and autonomy_state.breaker_tripped:
+            code = autonomy_state.breaker_reason or "PROVIDER_FAILED"
+            pause_reason = "模型服务连续失败，安排已保留；恢复服务后可继续。原因：" + str(code)
+        elif overview.get("paused"):
+            pause_reason = "工作已暂停，等待你继续。"
+        elif payload.get("planWaitReason"):
+            pause_reason = str(payload["planWaitReason"])
+        projection = {
             "mode": payload.get("mode", "command"),
             "paused": bool(overview.get("paused", False)),
-            "goal": preferences.get("goal"),
-            "dailySpendLimit": preferences.get("dailySpendLimit"),
+            "goal": current_goal.get("text") if current_goal else preferences.get("goal"),
+            "currentGoalId": current_goal_id,
+            "pauseReason": pause_reason,
             "boxPreference": preferences.get("boxPreference"),
             "dailySpend": payload.get("dailySpend"),
             "hasExecutableWork": bool(overview.get("hasExecutableWork", False)),
@@ -1867,15 +2616,25 @@ class ChatBridge:
             "activeGoals": goals,
             "recentTodos": todos,
             "recentExecutions": self._work_store.recent_execution_summary(save_id) if self._work_store else [],
+            "playerDecisions": [{"id": n["id"], "message": n["message"], "goalId": n.get("goalId"),
+                                 "status": "answered" if n.get("answeredAt") else "dismissed" if n.get("dismissedAt") else "pending"}
+                                for n in (self._work_store.state(save_id).notices if self._work_store else [])],
             # Contract §1.3 declares [str]; rows from WorkStore.wait_conditions()
             # carry objects, so surface only the display description.
             "waitingConditions": [
-                row["waitDescription"]
+                str(row.get("waitDescription") or row.get("reasonCode") or "等待条件变化")
                 for row in (overview.get("waitingConditions") or [])[:5]
-                if isinstance(row, dict) and isinstance(row.get("waitDescription"), str)
+                if isinstance(row, dict)
             ],
             "activity": self._player_activity(save_id),
         }
+        signature = json.dumps(projection, sort_keys=True, ensure_ascii=False)
+        previous = self._work_projection_times.get(save_id)
+        if previous is None or previous[0] != signature:
+            previous = (signature, datetime.datetime.now(datetime.UTC).isoformat())
+            self._work_projection_times[save_id] = previous
+        projection["updatedAt"] = previous[1]
+        return projection
 
     def _current_life_proposal(self, save_id: str) -> dict[str, Any] | None:
         binding = self._life_proposals.get(save_id)
@@ -1892,6 +2651,69 @@ class ChatBridge:
 
         state = self._work_store.state(save_id) if self._work_store else None
         autonomy = self._autonomy.state(save_id) if self._autonomy else None
+        def task_title(task_id: str | None) -> str | None:
+            if not state or not task_id:
+                return None
+            current = next((task.title for task in state.tasks if task.id == task_id), None)
+            if current:
+                return current
+            return next((entry["task"].get("title") for entry in reversed(state.archive)
+                         if isinstance(entry.get("task"), dict) and entry["task"].get("id") == task_id), None)
+
+        def saved_next_step() -> str:
+            if not state:
+                return "暂无可用的后续任务记录。"
+            goals = [goal for goal in state.goals if goal.status == "active"
+                     and (not autonomy or not autonomy.goal_scope or goal.id == autonomy.goal_scope)]
+            last = state.last_job
+            last_task = next((task for task in state.tasks if task.id == last.get("taskId")), None)
+            last_record = next((entry["task"] for entry in reversed(state.archive)
+                                if isinstance(entry.get("task"), dict) and entry["task"].get("id") == last.get("taskId")), {})
+            last_goal = last_task.goal_id if last_task else last_record.get("goal_id")
+            result_at = last_task.updated_at if last_task else last_record.get("updated_at")
+            for goal in goals:
+                next_action = goal.project.get("nextAction")
+                # A pre-execution intention stops being a next step when its
+                # job completes. Use it again only after a fresh plan revision.
+                stale = (last.get("status") == "completed" and last_goal == goal.id
+                         and result_at and goal.updated_at <= result_at)
+                if not stale and isinstance(next_action, str) and next_action.strip():
+                    return next_action.strip()[:160]
+            pending = [todo for todo in state.todos if todo.status == "pending"
+                       and (not autonomy or not autonomy.goal_scope or todo.goal_id == autonomy.goal_scope)]
+            if not pending:
+                return "依据这次实际结果安排下一步，新的动作确定后会在这里显示。"
+            _, current_date = self._plan_snapshot_state()
+            seasons = {"spring": 0, "summer": 1, "fall": 2, "winter": 3}
+            def calendar_key(value: dict[str, Any] | None) -> tuple[int, int, int] | None:
+                if isinstance(value, dict) and type(value.get("year")) is int and type(value.get("day")) is int and value.get("season") in seasons:
+                    return value["year"], seasons[value["season"]], value["day"]
+                return None
+            today = calendar_key(current_date)
+            # An old unfinished reminder is retained for the agent, but a
+            # current/future appointment is more useful in the player's next step.
+            dated = [(key, todo) for todo in pending if (key := calendar_key(todo.trigger)) is not None
+                     and today is not None and key >= today]
+            todo = min(dated, key=lambda row: row[0])[1] if dated else pending[0]
+            trigger = todo.trigger
+            date = ""
+            if trigger.get("type") in {"calendar", "gameDay", "gameTime"}:
+                season = {"spring": "春", "summer": "夏", "fall": "秋", "winter": "冬"}.get(trigger.get("season"), "")
+                date = f"{season}{trigger.get('day')}日"
+                # An unfinished old reminder stays a pending fact, but its
+                # original date must not appear as an upcoming appointment.
+                due_date = calendar_key(trigger)
+                if due_date is not None and today is not None and due_date < today:
+                    date = ""
+            if "鸡舍" in todo.intent or "养鸡" in todo.intent:
+                return f"{date or '接下来'}核对鸡舍进度，再继续养鸡安排。"
+            if trigger.get("type") == "machineReady":
+                return "加工完成后收取成品，继续已约定的入箱安排。"
+            if any(word in todo.intent for word in ("种植", "播种", "浇水", "作物", "种子")):
+                return f"{date + '：' if date else '接下来：'}照料菜地，继续未完成的种植安排。"
+            intent = re.split(r"[。；;，,]", todo.intent, maxsplit=1)[0][:65]
+            return f"{date + '：' if date else '接下来：'}{intent}。"
+
         if (state and state.paused) or (autonomy and autonomy.paused):
             return activity("paused", "伙伴工作已暂停，已保存的安排仍保留。", "准备好后点继续；不会自行解除暂停。")
         decision = state.decision if state else {}
@@ -1900,26 +2722,48 @@ class ChatBridge:
             waits = self._work_store.wait_conditions(save_id)
             reason = next((row.get("waitDescription") for row in waits if row.get("taskId") == selected.id), None)
             return activity("waiting", f"{selected.title}：{reason or '正在等待执行条件'}", "条件满足后继续；可以暂停或取消。")
-        if (decision.get("selected") and not decision.get("finished")) or save_id in self._command_chains:
-            return activity("working", f"正在处理：{selected.title if selected else '已认可的工作安排'}", "完成后会按实际结果更新。")
-        if self._active_task and not self._active_task.cancelled:
-            return activity("working", "伙伴正在处理已有工作。", "新安排会保留，不抢占当前任务。")
+        live_selected = selected if selected and selected.status in {"pending", "running", "waiting"} and not decision.get("finished") else None
+        native_running = next((task for task in state.tasks if task.status == "running"
+                               and any(step.command_id and step.status == "running" for step in task.steps)), None) if state else None
+        current_work = native_running or live_selected
+        if current_work:
+            title = current_work.title
+            if title:
+                return activity("working", f"正在处理：{title}", saved_next_step())
+        if decision.get("selected") and not decision.get("finished"):
+            return activity("working", "已接手当前安排，暂无可用的任务名称记录。", saved_next_step())
+        if self._active_task and self._active_task.save_id == save_id and not self._active_task.cancelled:
+            return activity("planning", "正在根据农场情况安排下一步，暂未开始新的动作。", saved_next_step())
         proposal = self._current_life_proposal(save_id)
         if proposal:
             return activity("proposed", proposal.get("summary") or proposal["title"], "认可后接手可做的准备；也可以继续商量。")
         nodes = self._milestone_store.list_nodes(save_id) if self._milestone_store else []
-        adopted = max((node for node in nodes if node.get("status") == "adopted"),
+        terminal_goals = {goal.id for goal in state.goals if goal.status in {"completed", "cancelled"}} if state else set()
+        adopted = max((node for node in nodes if node.get("status") == "adopted"
+                       and node.get("goalId") not in terminal_goals),
                       key=lambda node: node.get("updatedAt", 0), default=None)
         last = state.last_job if state else {}
-        last_task_id = last.get("taskId") or decision.get("taskId")
+        last_task_id = last.get("taskId")
         last_task = next((task for task in state.tasks if task.id == last_task_id), None) if state else None
-        if last and (adopted is None or (last_task and last_task.goal_id == adopted.get("goalId"))):
-            title = last_task.title if last_task else "上一项工作"
+        archived_task = next((entry["task"] for entry in reversed(state.archive)
+                              if isinstance(entry.get("task"), dict) and entry["task"].get("id") == last_task_id), {}) if state else {}
+        last_goal_id = last.get("goalId") or (last_task.goal_id if last_task else archived_task.get("goal_id"))
+        if last and (adopted is None or last_goal_id == adopted.get("goalId")):
+            title = last.get("taskTitle") or task_title(last_task_id)
+            if not title:
+                return activity("idle", "暂无可用的任务名称记录。", saved_next_step())
             if last.get("status") == "completed":
-                return activity("completed", f"已完成：{title}。", "这是实际完成的一项；其余安排仍按约定进行。")
+                effects = ([effect for step in last_task.steps for effect in step.effects] if last_task else
+                           [effect for step in archived_task.get("steps", []) for effect in step.get("effects", [])]) or last.get("effects") or []
+                result = self._work_store.effect_summary(effects) if effects else "已完成"
+                return activity("completed", f"{title}：{result}。", saved_next_step())
             if last.get("status") in {"failed", "partial", "unknown", "rejected", "cancelled"}:
-                detail = str(last.get("message") or last.get("error") or "尚未确认全部完成")
-                return activity("failed", f"{title}：{detail}", "保留实际进度，可调整安排后重试。")
+                reason_code = last.get("reasonCode")
+                if not reason_code and state:
+                    reason_code = next((entry.reason_code for entry in reversed(state.executions)
+                                        if entry.task_id == last_task_id and entry.reason_code), None)
+                detail = WorkStore.reason_summary(reason_code, last.get("message") or last.get("error"))
+                return activity("failed", f"{title}：{detail}", f"重新核对「{title}」的执行条件，再决定是否重试。")
             if last.get("status") == "waiting":
                 return activity("waiting", str(last.get("message") or "当前工作在等待条件满足。"), "不会把等待当成完成。")
         if adopted:
@@ -1937,10 +2781,12 @@ class ChatBridge:
         if not save_id or self._work_store is None:
             return None
         projection = self._life_work_projection(save_id)
-        if mode == "plan":
+        if mode in {"chat", "plan"}:
             # Plan discussions see the full read-only projection; it never
             # dispatches anything.
-            return projection
+            # Resolved notice history stays in the UI projection, while the
+            # provider only needs still-pending questions in its live context.
+            return {**projection, "playerDecisions": [n for n in projection.get("playerDecisions", []) if n["status"] == "pending"]}
         return {
             "mode": projection["mode"],
             "paused": projection["paused"],
@@ -1997,8 +2843,8 @@ class ChatBridge:
         )
 
     def _life_milestone_summary(self, save_id: str, mode: str) -> list[dict[str, Any]] | None:
-        """Compact milestone snapshot injected into the plan-mode prompt (§3.4)."""
-        if mode != "plan" or self._milestone_store is None or not save_id:
+        """Compact milestone snapshot shared by life conversation prompts."""
+        if mode not in {"chat", "plan"} or self._milestone_store is None or not save_id:
             return None
         game_date, play_style = self._life_game_date_playstyle(save_id)
         summary: list[dict[str, Any]] = []
@@ -2061,6 +2907,7 @@ class ChatBridge:
                     int(profile_res.get("profileRevision") or 0),
                     work=self._life_work_projection(save_id),
                 ))
+                await self._push_usage_state(ws, save_id)
             elif msg_type == "life.profile.set":
                 payload = LifeProfileSetPayload.from_mapping(payload_data)
                 save_id = payload.save_id or str(active_save_id or "")
@@ -2170,9 +3017,15 @@ class ChatBridge:
             if not payload.text:
                 entries, revision = _state()
                 return "rejected", {"reason": "MISSING_TEXT"}, entries, revision
+            # Layering fields arrive from the MCP/life wire when the caller
+            # supplies them; absent means "default by kind" (event→fact,
+            # agreement/preference→constraint).
             status, result = self._memory_store.add(
                 save_id, kind=payload.kind, text=payload.text, source="player",
                 game_date=game_date, expected_revision=payload.expected_revision,
+                category=getattr(payload, "category", None),
+                valid_from=getattr(payload, "valid_from", None),
+                valid_to=getattr(payload, "valid_to", None),
             )
         elif payload.op == "correct":
             if not payload.entry_id:
@@ -2191,6 +3044,141 @@ class ChatBridge:
         entries, revision = _state()
         return status, result if isinstance(result, dict) else {}, entries, revision
 
+    # Player-mode late-night dispatch policy (game clock, HHMM):
+    # the companion profile bedtime does not apply to the native player; the
+    # player ends the day natively with the sleep tool, so late gates only
+    # steer new dispatches toward getting home instead of idling into collapse.
+    PLAYER_NEAR_MIDNIGHT = 2330
+    PLAYER_DEFER_NON_SLEEP = 2330
+    PLAYER_SLEEP_ONLY = 2530
+
+    @staticmethod
+    def _player_mode_clock_gate(operation: str, clock: Any, params: dict[str, Any] | None = None) -> str | None:
+        """Reserve the remaining native night for rest, never freeze an action."""
+        if type(clock) is not int or clock < ChatBridge.PLAYER_DEFER_NON_SLEEP:
+            return None
+        if operation in {"sleep", "native_advance", "native_answer"} or operation.startswith(("observe_", "query_", "inspect_", "get_")):
+            return None
+        if operation == "navigate_to" and (params or {}).get("location_id") in {"Farm", "FarmHouse"}:
+            return None
+        return ("late-night: from 23:30 new unrelated work/travel waits until tomorrow. "
+                "Use sleep for the native route to the player's own bed, confirmation and save; "
+                "another NPC's bed/tent is not the player's sleep destination. "
+                "Read-only observations and returning to Farm/FarmHouse remain available. "
+                "Actions still consume normal game time; waiting until 01:30 can cause collapse en route.")
+
+    def _bedtime_winding_down(self, save_id: str, snapshot: dict[str, Any] | None = None) -> bool:
+        # Player mode has no companion profile bedtime (and the player-mode
+        # snapshot omits restState/bedtime entirely): winding-down gates stay
+        # companion-only so the agent can keep steering the player home.
+        if getattr(self, "actor_mode", None) == "player":
+            return False
+        snapshot = snapshot or self._latest_snapshot_payload or {}
+        companion = snapshot.get("companion") or {}
+        if companion.get("restState") in {"winding-down", "returning-home", "waiting-for-bed", "sleeping"}:
+            return True
+        profile = self._profile_store.get(save_id).get("profile") if self._profile_store else None
+        bedtime = (profile or {}).get("bedtime", 2400)
+        now = (snapshot.get("world") or {}).get("timeOfDay", 600)
+        # Reserve an hour for the current safe action and the actual route home.
+        return isinstance(now, int) and now // 100 * 60 + now % 100 >= bedtime // 100 * 60 + bedtime % 100 - 60
+
+    def _near_midnight_hint(self, snapshot: dict[str, Any] | None = None) -> str | None:
+        """Player-mode 'approaching midnight' context note (≥ 23:30)."""
+        if getattr(self, "actor_mode", None) != "player":
+            return None
+        snapshot = snapshot or self._latest_snapshot_payload or {}
+        clock = (snapshot.get("world") or {}).get("timeOfDay")
+        if isinstance(clock, int) and not isinstance(clock, bool) and clock >= self.PLAYER_NEAR_MIDNIGHT:
+            return "临近午夜：优先安排回屋用 sleep 工具原生睡觉结束当天，避免在外昏倒。"
+        return None
+
+    def _write_life_snapshot(self, save_id: str | None) -> None:
+        if self.run_dir is None or not save_id or self._latest_snapshot_payload is None:
+            return
+        path = self.run_dir / "data" / "life-snapshot.json"
+        if self._latest_snapshot_payload.get("observedAt") is not None:
+            self._latest_snapshot_observed_at = self._latest_snapshot_payload["observedAt"]
+        elif self._latest_snapshot_observed_at is None:
+            # Older native packages omit observedAt. Retain their first observed
+            # time; ordinary cache writes cannot renew the observation's age.
+            self._latest_snapshot_observed_at = self._latest_snapshot_payload.get("observedAt", time.time())
+        write_cache(path, {"saveId": save_id, "capturedAt": self._latest_snapshot_observed_at,
+            "worldRevision": self._latest_snapshot_revision,
+            "payload": self._latest_snapshot_payload})
+
+    def _life_turn_lease(self, request_id: str | None, save_id: str, *, player_text: str | None = None) -> None:
+        if self.run_dir is None:
+            return
+        path = self.run_dir / "data" / "life-turn.json"
+        write_cache(path, {"requestId": request_id, "saveId": save_id, "playerText": player_text})
+
+    async def _apply_life_intent(self, ws: WebSocketClient | None, request_id: str, save_id: str) -> None:
+        if self.run_dir is None or not re.fullmatch(r"[A-Za-z0-9_-]+", request_id):
+            return
+        directory = self.run_dir / "data" / "life-controls"
+        # Each tool commit owns a file; consuming one can never delete a newer
+        # action. Nanosecond prefixes preserve the sequential MCP call order.
+        paths = sorted(directory.glob(request_id + "--*.json"))
+        legacy = directory / (request_id + ".json")
+        if legacy.is_file():
+            paths.insert(0, legacy)
+        for path in paths:
+            try:
+                intent = json.loads(path.read_text(encoding="utf-8"))
+                lease_path = self.run_dir / "data" / "life-turn.json"
+                with cache_lock(lease_path):
+                    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+                    if (intent.get("action") in {"pause", "cancel"} and intent.get("saveId") == save_id
+                            and lease.get("saveId") == save_id and lease.get("requestId") == request_id):
+                        lease["workBlocked"] = True
+                        temp = lease_path.with_suffix(".tmp")
+                        temp.write_text(json.dumps(lease), encoding="utf-8")
+                        temp.replace(lease_path)
+            finally:
+                path.unlink(missing_ok=True)
+            if (intent.get("saveId") != save_id or lease.get("requestId") != request_id
+                    or lease.get("saveId") != save_id):
+                continue  # A newer player control invalidated this delayed response.
+            action = intent.get("action")
+            if action == "bedtime" and self._profile_store is not None:
+                self._profile_store.set(save_id, {"bedtime": intent.get("bedtime")}, self._profile_revision(save_id))
+                profile = self._profile_store.get(save_id)
+                await self._send_reply(ws, Envelope.create_life_profile_state(
+                    self.instance_id, "", save_id, profile.get("profile"), profile["profileRevision"],
+                    work=self._life_work_projection(save_id)))
+            elif action in {"pause", "resume", "cancel"}:
+                envelope = Envelope.create_autonomy_control(self.instance_id, request_id, save_id, action,
+                    goalId=intent.get("goalId"), allArrangements=bool(intent.get("allArrangements")))
+                await self._handle_autonomy_control(ws, envelope, save_id, preserve_life_request_id=request_id)
+                # Own controls may be followed by another preference/control in
+                # the same sentence; stopped work still cannot be re-adopted.
+                # Sending the acknowledgement can yield to a newer player
+                # control. Never resurrect that invalidated conversation lease.
+                lease_path = self.run_dir / "data" / "life-turn.json"
+                with cache_lock(lease_path):
+                    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+                    if lease.get("requestId") == request_id and lease.get("saveId") == save_id:
+                        lease["workBlocked"] = action != "resume"
+                        temp = lease_path.with_suffix(".tmp")
+                        temp.write_text(json.dumps(lease), encoding="utf-8")
+                        temp.replace(lease_path)
+
+    async def _replay_answered_decision(self, ws, save_id: str, notice_id: str | None,
+                                        request_id: str, resolve: bool) -> bool:
+        """A receipt retry must never re-enter controls or the model slot."""
+        if not notice_id or not resolve or self._work_store is None:
+            return False
+        notice = next((n for n in self._work_store.state(save_id).notices
+                       if n.get("id") == notice_id and n.get("answeredAt")), None)
+        if notice is None:
+            return False
+        await self._send_reply(ws, Envelope.create_life_chat_reply(
+            self.instance_id, request_id, save_id, status="completed", answered_notice_id=notice_id,
+            reply_text="这件事已经确认，保留原来的选择：" + str(notice.get("answer", "")),
+            profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
+        return True
+
     async def _handle_life_chat_submit(
         self,
         ws: WebSocketClient | None,
@@ -2205,6 +3193,53 @@ class ChatBridge:
             await self._send_life_error(ws, "life.chat.submit", data, active_save_id, str(ex))
             return
         save_id = payload.save_id or str(active_save_id or "")
+        if active_save_id and save_id != active_save_id:
+            await self._send_life_error(ws, "life.chat.submit", data, active_save_id, "SAVE_MISMATCH")
+            return
+        if payload.notice_action:
+            try:
+                if self._work_store is None:
+                    raise ValueError("Work store is unavailable")
+                self._work_store.set_notice_visibility(save_id, list(payload.notice_ids), payload.notice_action == "dismiss")
+                await self._send_reply(ws, Envelope.create_life_chat_reply(
+                    self.instance_id, payload.request_id, save_id, status="completed",
+                    reply_text="已隐藏这些事项。" if payload.notice_action == "dismiss" else "已恢复这些事项。",
+                    profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
+                await self._handle_life_message(ws, "life.profile.get", {"requestId": payload.request_id, "saveId": save_id}, save_id)
+            except (ValueError, WorkStateError) as ex:
+                await self._send_life_error(ws, "life.chat.submit", data, save_id, str(ex))
+            return
+        if await self._replay_answered_decision(ws, save_id, payload.reply_to_notice_id, payload.request_id, payload.resolve_notice):
+            return
+        if payload.reply_to_notice_id:
+            pending = self._work_store.unresolved_player_notices(save_id) if self._work_store else []
+            if not any(n.get("id") == payload.reply_to_notice_id for n in pending):
+                await self._send_life_error(ws, "life.chat.submit", data, save_id, "DECISION_NO_LONGER_PENDING")
+                return
+        control = self._control_utterance(payload.text)
+        if control:
+            if self._work_store is not None:
+                self._work_store.record_request(save_id, payload.request_id, payload.text, origin="player-midflight")
+            params = {"allArrangements": True} if explicit_cancel_scope(payload.text) == "all" else {}
+            envelope = Envelope.create_autonomy_control(self.instance_id, payload.request_id, save_id, control, **params)
+            confirmed = await self._handle_autonomy_control(ws, envelope, save_id)
+            if confirmed is False:
+                await self._send_life_error(ws, "life.chat.submit", data, save_id, "CONTROL_NOT_CONFIRMED")
+                return
+            if payload.reply_to_notice_id and payload.resolve_notice and self._work_store:
+                self._work_store.answer_player_notice(save_id, payload.reply_to_notice_id, payload.text, payload.request_id)
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                self.instance_id, payload.request_id, save_id, status="completed",
+                answered_notice_id=payload.reply_to_notice_id if payload.resolve_notice else None,
+                reply_text={"resume": "好，接着做。", "pause": "好，先停下来。", "cancel": "好，取消这项安排。"}[control],
+                profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
+            return
+        # Record before a queued life turn can outlive the native job that was
+        # in progress when the player spoke. Both UI and legacy chat use this ledger.
+        midflight = self._job_in_flight(save_id)
+        if self._work_store is not None and payload.text.strip():
+            self._work_store.record_request(save_id, payload.request_id, payload.text,
+                                            origin="player-midflight" if midflight else "player")
         item = {
             "ws": ws,
             "request_id": payload.request_id,
@@ -2212,6 +3247,10 @@ class ChatBridge:
             "mode": payload.mode,
             "text": payload.text,
             "accepted_node_id": payload.accepted_node_id,
+            "midflight": midflight,
+            "reply_to_notice_id": payload.reply_to_notice_id,
+            "resolve_notice": payload.resolve_notice,
+            "control_generation": self._life_control_generation.get(save_id, 0),
         }
         if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
             # A work turn/decision owns the single model slot: acknowledge with a
@@ -2232,22 +3271,63 @@ class ChatBridge:
         await self._run_life_chat_turn(ws, item)
         await self._drain_life_queue(ws)
 
+    def _schedule_life_drain(self, ws: WebSocketClient | None) -> None:
+        """Wake deferred dialogue/work without tying up the snapshot reader."""
+        if (not (self._life_queue or self._pending_life_preparation)
+                or self._life_draining or self._busy_lock.locked() or self._active_task
+                or any(not task.done() for task in self._life_drain_tasks)):
+            return
+        task = asyncio.create_task(self._drain_life_queue(ws))
+        self._life_drain_tasks.add(task)
+        task.add_done_callback(self._life_drain_tasks.discard)
+
     async def _drain_life_queue(self, ws: WebSocketClient | None) -> None:
         """Process queued life submits FIFO once the model slot is free."""
         if self._life_draining:
             return
         self._life_draining = True
         try:
-            while self._life_queue:
+            while self._life_queue or self._pending_life_preparation:
                 if self._busy_lock.locked() or (
                     self._active_task and not self._active_task.cancelled
                 ):
                     # Still busy: leave the queue for the next turn's drain trigger.
                     return
-                item = self._life_queue.pop(0)
-                await self._run_life_chat_turn(ws or item.get("ws"), item)
+                if self._life_queue:
+                    item = self._life_queue.pop(0)
+                    await self._run_life_chat_turn(ws or item.get("ws"), item)
+                else:
+                    save_id = next(iter(self._pending_life_preparation))
+                    before = self._pending_life_preparation.pop(save_id)
+                    try:
+                        await self._start_accepted_preparation(ws, save_id, before)
+                        if save_id in self._pending_life_preparation and not self._life_queue:
+                            # A native result, resume, or a new day will wake us.
+                            # Release this gate so the worker/outbox can progress.
+                            return
+                    except Exception:
+                        logger.exception("Accepted preparation failed for %s", save_id)
+                        await self._send_reply(ws, Envelope.create_chat_reply(
+                            self.instance_id, f"preparation-error-{uuid.uuid4().hex}", "failed",
+                            "安排已保存，但准备工作时出错了，尚未确认开始执行。", save_id=save_id,
+                            command_complete=True))
         finally:
             self._life_draining = False
+
+    def _prepare_prompt_delivery(self, active_task: ActiveChatTask, conversation_id: str | None,
+                                prompt: str, backend: Any) -> tuple[str, str, dict[str, Any]]:
+        if not hasattr(self, "_prompt_delivery"):
+            delivery_root = Path(self.run_dir) if self.run_dir else Path(self._sessions_file).parent
+            self._prompt_delivery = PromptDelivery(delivery_root / "prompt-delivery.json")
+        key = f"{self.backend_name}:{active_task.save_id}:{getattr(self, 'actor_mode', '')}:{(self._latest_snapshot_payload or {}).get('actorMultiplayerId', 'unknown')}"
+        sent, pending = self._prompt_delivery.prepare(
+            key, conversation_id, prompt,
+            load_instruction_bundle(getattr(self, "actor_mode", None)).text)
+        return key, sent, pending
+
+    def _acknowledge_prompt_delivery(self, key: str, pending: dict[str, Any],
+                                     save_id: str, session: str) -> None:
+        self._prompt_delivery.acknowledge(key, pending, session)
 
     def _execute_life_turn(
         self,
@@ -2256,16 +3336,14 @@ class ChatBridge:
         prompt: str,
         mode: str = "chat",
     ) -> dict[str, Any]:
-        """Dispatch one life-chat turn to the provider.
+        """Run one conversation with cached reads and durable intent tools.
 
-        Hard boundaries (contract §2, enforced here not by prompt): never calls
-        ``begin_decision``, never injects ``STARDEW_DECISION_TOKEN``, always
-        exposes the read-only ``STARDEW_MCP_SURFACE=life`` tool surface, and the
-        scheduler/autonomy state is never touched. ``STARDEW_LIFE_MODE`` is set to
-        the current life mode (chat/plan) so gated tools such as
-        ``manage_milestones`` can tell plan discussions from casual chat, and is
-        restored afterwards.
+        It receives no decision token and cannot dispatch native actions. Legacy
+        chat/plan mode names remain wire-compatible but have identical authority.
+        Player intent determines whether to discuss, commit work, or control it.
         """
+        if active_task.cancelled:
+            return {"success": False, "response": "对话已中断。", "error": "CHAT_CHANNEL_CLOSED"}
         if self.backend_name == "kimi" and type(self._execute_agy_turn).__module__.startswith("unittest.mock"):
             return self._execute_agy_turn(active_task, conversation_id, prompt)
         from stardew_ai_runtime.compatibility import assert_native_compatible
@@ -2275,6 +3353,10 @@ class ChatBridge:
         previous_surface = env.get("STARDEW_MCP_SURFACE")
         previous_mode = env.get("STARDEW_LIFE_MODE")
         previous_proposal = env.get("STARDEW_LIFE_PROPOSAL_ID")
+        previous_save = env.get("STARDEW_LIFE_SAVE_ID")
+        env["STARDEW_LIFE_SAVE_ID"] = active_task.save_id or ""
+        previous_turn = env.get("STARDEW_LIFE_TURN_ID")
+        env["STARDEW_LIFE_TURN_ID"] = active_task.request_id
         env.pop("STARDEW_DECISION_TOKEN", None)
         env["STARDEW_MCP_SURFACE"] = "life"
         env["STARDEW_LIFE_MODE"] = mode if mode in {"chat", "plan"} else "chat"
@@ -2282,10 +3364,52 @@ class ChatBridge:
         env["STARDEW_LIFE_PROPOSAL_ID"] = proposal["id"] if proposal else ""
         try:
             backend = self._get_backend()
-            if isinstance(backend, (KimiBackend, CodexBackend)):
+            if isinstance(backend, (KimiBackend, CodexBackend, DshBackend, McodeBackend)):
                 backend.progress = getattr(self, "_backend_progress_callback", None)
-            return backend.run(active_task, conversation_id, prompt)
+            start_idx = get_max_gen_idx(conversation_id) if self.backend_name == "agy" else -1
+            active_task.start_max_idx = start_idx
+            active_task.start_max_step_idx = get_max_step_idx(conversation_id) if self.backend_name == "agy" else -1
+            offset = wire_offset(conversation_id, cwd=project_root()) if self.backend_name == "kimi" else 0
+            delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
+                active_task, conversation_id, prompt, backend)
+            turn_native_session = getattr(self, "_player_session_id", None)
+            result = backend.run(active_task, conversation_id, sent_prompt)
+            if (conversation_id and result.get("error") == "MCODE_SESSION_UNAVAILABLE"
+                    and not active_task.cancelled):
+                # The provider confirmed that no turn started on this session.
+                # Rebuild from the complete current context, not an old delta.
+                self._rotate_provider_session(active_task.save_id, reason="MCODE_SESSION_UNAVAILABLE")
+                conversation_id = None
+                delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
+                    active_task, None, prompt, backend)
+                result = backend.run(active_task, None, sent_prompt)
+            delivered_session = result.get("conversation_id")
+            if delivered_session and not active_task.cancelled and not result.get("error"):
+                self._acknowledge_prompt_delivery(delivery_key, pending_prompt, active_task.save_id, str(delivered_session))
+                if self.actor_mode == "player":
+                    self._work_reload_context(active_task.save_id, str(delivered_session), delivered=True,
+                                              expected_game_session_id=turn_native_session)
+            logger.info("Prompt delivery save=%s session=%s version=%s originalBytes=%s newBytes=%s",
+                        active_task.save_id, delivered_session, pending_prompt["version"],
+                        pending_prompt["originalPromptBytes"], pending_prompt["newPromptBytes"])
+            cid = result.get("conversation_id") or conversation_id
+            if cid != conversation_id:
+                start_idx = -1
+            if self.backend_name == "kimi":
+                result["usage"] = read_usage_since(cid, offset, cwd=project_root())
+            elif self.backend_name == "agy":
+                result["usage"] = (get_command_usage_delta(cid, start_idx) if cid else None) or (
+                    result.get("usage") if conversation_id is None else None)
+            return result
         finally:
+            if previous_save is None:
+                env.pop("STARDEW_LIFE_SAVE_ID", None)
+            else:
+                env["STARDEW_LIFE_SAVE_ID"] = previous_save
+            if previous_turn is None:
+                env.pop("STARDEW_LIFE_TURN_ID", None)
+            else:
+                env["STARDEW_LIFE_TURN_ID"] = previous_turn
             if previous_token is None:
                 env.pop("STARDEW_DECISION_TOKEN", None)
             else:
@@ -2303,6 +3427,69 @@ class ChatBridge:
             else:
                 env["STARDEW_LIFE_PROPOSAL_ID"] = previous_proposal
 
+    async def _join_interrupted_provider(self, active_task: ActiveChatTask, future: asyncio.Future) -> None:
+        """Keep the model slot until its executor has restored turn-local state."""
+        active_task.cancelled = True
+        active_task.abort_reason = active_task.abort_reason or "Chat channel closed"
+        proc = active_task.process
+        if proc is not None and proc.poll() is None:
+            try:
+                terminate = getattr(self._backend, "terminate", None)
+                if self.backend_name == "agy":
+                    terminate_agy_process(proc)
+                elif callable(terminate):
+                    terminate(proc)
+                else:
+                    proc.kill()
+            except Exception:
+                logger.warning("Could not stop interrupted provider", exc_info=True)
+        while True:
+            try:
+                await asyncio.shield(future)
+                break
+            except asyncio.CancelledError:
+                # Repeated cancel/disconnect requests still cannot abandon an
+                # executor which owns process-global turn environment variables.
+                if future.cancelled():
+                    break
+            except Exception:
+                logger.debug("Interrupted provider exited with an error", exc_info=True)
+                break
+
+    async def _await_work_provider(
+        self, active_task: ActiveChatTask, conversation_id: str | None, prompt: str,
+    ) -> dict[str, Any]:
+        future = asyncio.get_running_loop().run_in_executor(
+            None, self._execute_turn, active_task, conversation_id, prompt)
+        try:
+            async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
+                return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await self._join_interrupted_provider(active_task, future)
+            raise
+
+    async def _await_life_provider(
+        self, active_task: ActiveChatTask, conversation_id: str | None,
+        prompt: str, mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Keep provider ownership until its thread has restored turn-local state."""
+        args = (active_task, conversation_id, prompt)
+        if mode is not None:
+            args += (mode,)
+        future = asyncio.get_running_loop().run_in_executor(None, self._execute_life_turn, *args)
+        try:
+            async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
+                while not future.done():
+                    await asyncio.wait({future}, timeout=0.1)
+                    await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
+                return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Cancelling an executor await does not stop the executor thread.
+            # Wait for this owned turn before releasing the model/native slot.
+            await self._join_interrupted_provider(active_task, future)
+            logger.info("Life provider [%s] interrupted by channel shutdown", active_task.request_id)
+            raise
+
     async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
         """Run one life-chat turn under the shared single-model-turn lock."""
         request_id = str(item.get("request_id") or "")
@@ -2310,10 +3497,23 @@ class ChatBridge:
         mode = str(item.get("mode") or "chat")
         text = str(item.get("text") or "")
         try:
+            generation = item.get("control_generation", self._life_control_generation.get(save_id, 0))
+            if generation != self._life_control_generation.get(save_id, 0):
+                await self._send_reply(ws, Envelope.create_life_chat_reply(
+                    self.instance_id, request_id, save_id, status="completed", reply_text="这条旧请求已被新的工作控制撤销。",
+                    profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
+                return
             if item.get("accepted_node_id"):
                 await self._accept_life_proposal(ws, item)
                 return
             async with self._busy_lock:
+                if generation != self._life_control_generation.get(save_id, 0):
+                    await self._send_reply(ws, Envelope.create_life_chat_reply(
+                        self.instance_id, request_id, save_id, status="completed", reply_text="这条旧请求已被新的工作控制撤销。",
+                        profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
+                    return
+                if await self._replay_answered_decision(ws, save_id, item.get("reply_to_notice_id"), request_id, bool(item.get("resolve_notice"))):
+                    return
                 profile = None
                 if self._profile_store is not None and save_id:
                     profile = (self._profile_store.get(save_id) or {}).get("profile")
@@ -2323,17 +3523,15 @@ class ChatBridge:
                     else None
                 )
                 existing_cid = None
+                session_profile_revision = self._profile_revision(save_id)
+                session_instruction_revision = self._memory_instruction_revision(save_id)
                 if self._life_chat is not None and save_id:
                     existing_cid = self._life_chat.rotate_if_needed(
                         save_id,
-                        self._profile_revision(save_id),
-                        self._memory_revision(save_id),
+                        session_profile_revision,
+                        session_instruction_revision,
                     )
-                preparation_before = {
-                    n["id"]: dict(n.get("todoIds") or {})
-                    for n in (self._milestone_store.list_nodes(save_id)
-                              if self._milestone_store is not None and save_id else [])
-                }
+                preparation_before = self._accepted_preparation_state(save_id)
                 proposals_before = {node["id"]: node.get("updatedAt") for node in
                                     (self._milestone_store.list_nodes(save_id) if self._milestone_store else [])}
                 milestone_revision_before = (
@@ -2355,13 +3553,30 @@ class ChatBridge:
                 }
                 system_prompt = (prompt_builder(save_id, existing_cid, *prompt_args, **prompt_options)
                                  if prompt_builder else LifeChatService.build_system_prompt(*prompt_args, **prompt_options))
-                prompt = f"{system_prompt}\n\n玩家说：{text}"
+                message_context = {"replyToDecision": None}
+                notice_id = item.get("reply_to_notice_id")
+                if notice_id:
+                    notices = self._work_store.unresolved_player_notices(save_id) if self._work_store else []
+                    notice = next((n for n in notices if n.get("id") == notice_id), None)
+                    if notice is None:
+                        await self._send_life_error(ws, "life.chat.submit", {"requestId": request_id}, save_id, "DECISION_NO_LONGER_PENDING")
+                        return
+                    # Factual linkage is JSON-escaped; question and player text
+                    # remain content, never instructions or an execution grant.
+                    message_context["replyToDecision"] = {
+                        "noticeId": notice_id, "goalId": notice.get("goalId"),
+                        "question": notice["message"],
+                        "playerConfirmedDecision": bool(item.get("resolve_notice")),
+                    }
+                prompt = (system_prompt + "\n消息上下文：" + json.dumps(message_context, ensure_ascii=False)
+                          + "\n\n玩家说：" + text)
                 active_task = ActiveChatTask(
                     request_id=request_id,
                     save_id=save_id,
                     command_id=request_id,
                     prompt=text,
                     async_task=asyncio.current_task(),
+                    read_only=bool(item.get("midflight")),
                 )
                 self._configure_backend_progress(ws, request_id, save_id)
                 await self._send_reply(ws, Envelope.create_life_chat_reply(
@@ -2371,22 +3586,39 @@ class ChatBridge:
                     status="processing",
                     profile_revision=self._profile_revision(save_id),
                     memory_revision=self._memory_revision(save_id),
-                    activity={"phase": "planning", "summary": "伙伴正在结合眼前情况想下一步。", "nextStep": "先商量，认可后才接手工作。"} if mode == "plan" else None,
+                    activity={"phase": "planning", "summary": "伙伴正在结合眼前情况想下一步。", "nextStep": "已有工作照常进行。"} if mode == "plan" else None,
                 ))
-                # Life read/plan tools use the same single native MCP socket
-                # as work turns. Park the worker and release its connection;
-                # recover=False keeps a casual conversation from changing work.
-                claimed = await self._claim_execution(save_id, recover=False)
-                try:
-                    loop = asyncio.get_running_loop()
-                    result = await loop.run_in_executor(
-                        None, self._execute_life_turn, active_task, existing_cid, prompt, mode
-                    )
-                finally:
-                    if claimed:
-                        await self._release_execution(save_id)
+                self._write_life_snapshot(save_id)
+                self._life_turn_lease(request_id, save_id, player_text=text)
+                result = await self._await_life_provider(active_task, existing_cid, prompt, mode)
+                if generation != self._life_control_generation.get(save_id, 0):
+                    await self._send_reply(ws, Envelope.create_life_chat_reply(
+                        self.instance_id, request_id, save_id, status="completed", reply_text="这条旧请求已被新的工作控制撤销。",
+                        profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
+                    return
+                if result.get("success"):
+                    await self._apply_life_intent(ws, request_id, save_id)
                 success = bool(result.get("success"))
-                if success and mode == "plan" and self._milestone_store:
+                if success and notice_id and item.get("resolve_notice") and self._work_store is not None:
+                    self._work_store.answer_player_notice(save_id, notice_id, text, request_id)
+                self._record_command(
+                    request_id=request_id, save_id=save_id,
+                    conversation_id=result.get("conversation_id") or existing_cid,
+                    prompt=text, status="completed" if success else "failed",
+                    start_idx=-1, end_idx=-1,
+                    usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
+                    error=result.get("error"), duration=time.monotonic() - active_task.start_time,
+                )
+                if success and self._milestone_store:
+                    changed_arrangements = [node for node in self._milestone_store.list_nodes(save_id)
+                                            if node.get("status") in {"suggested", "adopted"}
+                                            and node.get("updatedAt") != proposals_before.get(node["id"])]
+                    if changed_arrangements and self._work_store is not None:
+                        self._work_store.record_request(save_id, request_id, text)
+                        for node in changed_arrangements:
+                            self._milestone_store.bind_player_request(save_id, node["id"], request_id)
+                            if node.get("goalId"):
+                                self._work_store.bind_goal_request(save_id, node["goalId"], request_id)
                     changed = [node for node in self._milestone_store.list_nodes(save_id)
                                if node.get("status") == "suggested" and
                                node.get("updatedAt") != proposals_before.get(node["id"])]
@@ -2396,11 +3628,9 @@ class ChatBridge:
                 cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat is not None and save_id:
                     self._life_chat.record_session_id(save_id, str(cid))
-                    self._life_chat.record_fingerprint(
-                        save_id,
-                        self._profile_revision(save_id),
-                        self._memory_revision(save_id),
-                    )
+                    self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
+                    # rotate_if_needed bound the context actually delivered at
+                    # turn start. Edits during generation must rotate next time.
                 if success and self._life_chat is not None:
                     if cid:
                         self._life_chat.mark_prompt_delivered(save_id, str(cid), mode)
@@ -2412,6 +3642,7 @@ class ChatBridge:
                         save_id=save_id,
                         status="completed",
                         reply_text=str(result.get("response") or "")[:2000] or None,
+                        answered_notice_id=notice_id if item.get("resolve_notice") else None,
                         profile_revision=self._profile_revision(save_id),
                         memory_revision=self._memory_revision(save_id),
                     )
@@ -2426,15 +3657,8 @@ class ChatBridge:
                         memory_revision=self._memory_revision(save_id),
                         error=str(result.get("error") or "TURN_FAILED"),
                     )
-                if mode != "plan" or not success:
+                if not success:
                     await self._send_reply(ws, reply)
-                else:
-                    await self._send_reply(ws, Envelope.create_life_chat_reply(
-                        self.instance_id, request_id, save_id, status="processing",
-                        reply_text=str(result.get("response") or "")[:2000] or None,
-                        profile_revision=self._profile_revision(save_id),
-                        memory_revision=self._memory_revision(save_id),
-                    ))
                 if (
                     self._milestone_store is not None
                     and save_id
@@ -2447,19 +3671,19 @@ class ChatBridge:
                     await self._send_reply(
                         self._chat_ws, self._build_milestones_state(save_id, "")
                     )
-            # After releasing the life lock, consume only newly accepted due
-            # preparation. Never promote casual chat or reopen into authority.
-            if mode == "plan" and success:
-                execution_note = await self._start_accepted_preparation(ws, save_id, preparation_before)
-                if execution_note:
-                    reply.payload["replyText"] = (str(reply.payload.get("replyText") or "")
-                                                  + "\n" + execution_note)[:2000]
+            # Deliver the conversation before another model turn prepares work.
+            # The queue drains player messages first, then rechecks the saved
+            # arrangements so new instructions can change or revoke that work.
+            if success:
+                if not await self._retire_invalidated_native_jobs(save_id):
+                    raise RuntimeError("NATIVE_SCOPE_CHANGE_UNCONFIRMED: 旧动作尚未确认停止，保持暂停")
                 proposal = self._current_life_proposal(save_id)
                 reply.payload["proposalReady"] = proposal is not None
                 if proposal:
                     reply.payload["proposalNodeId"] = proposal["id"]
                 reply.payload["activity"] = self._player_activity(save_id)
                 await self._send_reply(ws, reply)
+                self._pending_life_preparation.setdefault(save_id, preparation_before)
         except Exception as ex:
             logger.error("Life chat turn [%s] failed: %s", request_id, ex, exc_info=True)
             await self._send_reply(ws, Envelope.create_life_chat_reply(
@@ -2480,12 +3704,13 @@ class ChatBridge:
             proposal = self._current_life_proposal(save_id)
             if item.get("mode") != "plan" or not proposal or proposal["id"] != item["accepted_node_id"]:
                 raise ValueError("建议已更新、暂缓或方向已改变，请先重新商量；没有派发工作。")
-            before = {node["id"]: dict(node.get("todoIds") or {})
-                      for node in self._milestone_store.list_nodes(save_id)}
+            before = self._accepted_preparation_state(save_id)
             _, game_date = self._plan_snapshot_state()
             adopted = self._milestone_store.adopt(
                 save_id, proposal["id"], work_store=self._work_store, game_date=game_date,
             )
+            if adopted.get("playerRequestId"):
+                self._work_store.bind_goal_request(save_id, adopted["goalId"], adopted["playerRequestId"])
             self._life_proposals.pop(save_id, None)
             await self._send_reply(ws, Envelope.create_life_chat_reply(
                 self.instance_id, request_id, save_id, "processing",
@@ -2493,72 +3718,92 @@ class ChatBridge:
                 reply_text=f"已记下：{adopted['title']}。我看看眼前能接手哪一步。",
                 proposal_ready=False, activity=self._player_activity(save_id)))
             await self._send_reply(ws, self._build_milestones_state(save_id, ""))
-        note = await self._start_accepted_preparation(ws, save_id, before)
         await self._send_reply(ws, Envelope.create_life_chat_reply(
             self.instance_id, request_id, save_id, "completed",
             self._profile_revision(save_id), self._memory_revision(save_id),
-            reply_text=note or "已保留这个安排。需要玩家完成的部分，我会和你继续商量可接手的准备。",
+            reply_text="安排已记好。",
             proposal_ready=False, activity=self._player_activity(save_id)))
+        self._pending_life_preparation.setdefault(save_id, before)
+
+    def _accepted_preparation_state(self, save_id: str) -> dict[str, dict[str, Any]]:
+        if self._milestone_store is None or self._work_store is None:
+            return {}
+        goals = {goal.id: goal for goal in self._work_store.state(save_id).goals}
+        return {node["id"]: {"todoIds": dict(node.get("todoIds") or {}),
+                "scope": objective_scope({"constraints": goals[node["goalId"]].constraints})
+                if node.get("goalId") in goals else None}
+                for node in self._milestone_store.list_nodes(save_id)}
 
     async def _start_accepted_preparation(
-        self, ws: WebSocketClient | None, save_id: str, before: dict[str, dict[str, str]]
+        self, ws: WebSocketClient | None, save_id: str, before: dict[str, dict[str, Any]]
+    ) -> str | None:
+        # A queued autonomy turn can select work while this caller awaits the
+        # model slot. Recheck under the same lock before starting preparation.
+        async with self._busy_lock:
+            return await self._start_accepted_preparation_locked(ws, save_id, before)
+
+    async def _start_accepted_preparation_locked(
+        self, ws: WebSocketClient | None, save_id: str, before: dict[str, dict[str, Any]]
     ) -> str | None:
         """One normal work turn for newly authorized, currently due preparation."""
+        if self._life_queue:
+            self._pending_life_preparation.setdefault(save_id, before)
+            return
         if self._milestone_store is None or self._work_store is None:
             return
         new_todo_ids: set[str] = set()
         layout_project = False
         layout_goal_id = None
+        current = self._accepted_preparation_state(save_id)
         for node in self._milestone_store.list_nodes(save_id):
             todos = node.get("todoIds") or {}
-            if node.get("status") == "adopted" and todos != before.get(node["id"], {}):
+            previous = before.get(node["id"], {})
+            previous_todos = previous.get("todoIds", previous)
+            scope_changed = "scope" in previous and previous["scope"] != current[node["id"]]["scope"]
+            if node.get("status") == "adopted" and (todos != previous_todos or scope_changed):
                 new_todo_ids.update(todos.values())
-                layout_project = layout_project or "layout" in todos
-                if "layout" in todos:
-                    layout_goal_id = node.get("goalId")
+                layout_project = layout_project or bool({"layout", "production"} & todos.keys())
+                layout_goal_id = node.get("goalId")
         if not new_todo_ids:
             return
         state = self._work_store.state(save_id)
         autonomy = self._autonomy.state(save_id) if self._autonomy is not None else None
-        if layout_project and autonomy is not None and not autonomy.enabled:
-            was_paused = autonomy.paused or state.paused
-            self._autonomy.set_enabled(save_id, True)
-            if was_paused:
-                self._autonomy.set_paused(save_id, True)
-            autonomy = self._autonomy.state(save_id)
         if layout_goal_id and self._autonomy is not None:
             self._autonomy.set_goal_scope(save_id, layout_goal_id)
-        if (state.paused or (autonomy is not None and autonomy.paused)
-                or self._active_task is not None or self._busy_lock.locked()
-                or save_id in self._command_chains
-                or (state.decision.get("selected") and not state.decision.get("finished"))):
-            return "准备安排已保存。我会保留这些后续安排；当前暂停或已有工作时，不抢着另开一件事。"
+        if (self._bedtime_winding_down(save_id) or state.paused or (autonomy is not None and autonomy.paused)
+                or self._active_task is not None
+                or self._work_settling(save_id)):
+            self._pending_life_preparation.setdefault(save_id, before)
+            return f"准备安排已保存。{self._player_activity(save_id)['summary']}"
         snapshot, game_date = self._plan_snapshot_state()
         due = [t for t in self._work_store.evaluate_todos(save_id, snapshot=snapshot, game_date=game_date)
                if t["id"] in new_todo_ids]
         if not due:
             return "安排已保存，眼前还没到这项准备的时间。"
-        if autonomy is not None and autonomy.enabled:
+        if autonomy is not None and (autonomy.enabled or layout_project):
             self._autonomy.request_job_decision(save_id)
-            return ("已接手这个持续项目。我会观察全场、保存设计并分批推进，跨天继续；常规进度留在日志，遇到需要你决定的事再告诉你。"
+            return ("已接手这个持续项目。我会观察实际需要、保留安排并分批推进，跨天继续；常规进度留在日志，遇到需要你决定的事再告诉你。"
                     if layout_project else "已把眼前可做的准备交给日常工作安排；常规进度会记入日志。")
+        # One short job belongs to one accepted goal. Other due preparations
+        # remain saved for their own decisions.
+        preparation_goal_id = due[0].get("goal_id")
+        due = [todo for todo in due if todo.get("goal_id") == preparation_goal_id]
         prompt = (
-            "玩家刚在商量计划中明确认可了以下准备安排，现交给你执行一个当前可做的短作业。"
-            "这是本次具体安排的执行授权，不开启全局自由模式；不要再问预算/数量或重复确认。"
-            "只处理以下范围，先看真实状态，遵守现有资金/体力/暂停保护，不取消其他工作。"
-            "从中选择一个有用短作业，用现有submit_plan和执行器完成；没有可做工作就自然说明待命。"
-            "保存不等于完成，结果只依据原生终态；用自然中文反馈，不提goal/todo或内部参数。"
-            + json.dumps([{"intent": t["intent"], "goalId": t.get("goal_id")} for t in due], ensure_ascii=False)
+            "推进以下已保存安排："
+            + json.dumps([{"intent": t["intent"], "goalId": t.get("goal_id"),
+                "objectiveScope": objective_scope({"constraints": next((g.constraints for g in state.goals if g.id == t.get("goal_id")), {})})}
+                for t in due], ensure_ascii=False)
         )
         # Reuse the existing command path; its ownership and busy checks still
         # apply. Await it so the turn remains tracked by the life queue task.
         previous_job = state.last_job
-        await self.handle_chat_submit(ws, f"preparation-{uuid.uuid4().hex}", prompt, save_id)
+        await self.handle_chat_submit(ws, f"preparation-{uuid.uuid4().hex}", prompt, save_id,
+                                      _goal_scope=preparation_goal_id, _slot_owned=True)
         after = self._work_store.state(save_id)
         if after.last_job and after.last_job != previous_job:
             outcome = after.last_job.get("status") or after.last_job.get("outcome")
             if outcome == "completed":
-                return "刚才接手的这一小项已经完成，后续准备仍按约定保留。"
+                return f"这次执行的实际结果：{after.last_job.get('progressSummary') or after.last_job.get('actualSummary') or '执行器已结束，具体变化尚未确认'}。后续准备仍按约定保留。"
             if outcome in {"partial", "failed", "cancelled", "unknown", "rejected"}:
                 return "安排已经保存，但刚才这项工作没有确认全部完成；我会保留实际进度，不把它算作做完。"
         if after.decision.get("selected") and not after.decision.get("finished"):
@@ -2591,7 +3836,12 @@ class ChatBridge:
     def _record_memory_event(
         self, save_id: str | None, text: str, command_id: str | None
     ) -> None:
-        """Write a system event memory for a real successful terminal (§2)."""
+        """Write a system event memory for a real successful terminal (§2).
+
+        System-recorded terminals are layer-``fact`` entries tagged with the
+        current game date; they render under 【事实】 and are never user
+        constraints.
+        """
         if self._memory_store is None or not save_id:
             return
         try:
@@ -2599,6 +3849,7 @@ class ChatBridge:
                 save_id, kind="event", text=text[:200], source="system",
                 game_date=self._current_game_day_key or "unknown",
                 expected_revision=0, command_id=command_id,
+                category="fact",
             )
             if status == "confirmed":
                 logger.info("Memory event recorded for %s: %s", save_id, text[:80])
@@ -2669,6 +3920,11 @@ class ChatBridge:
             ))
         except Exception:
             logger.warning("Deferred care failed for %s/%s", save_id, kind, exc_info=True)
+        finally:
+            # A player message can now queue while care is being generated.
+            # Once the model slot is free it needs the same FIFO drain as work.
+            if self._chat_ws is not None:
+                await self._drain_life_queue(self._chat_ws)
 
     async def _generate_care_text(
         self,
@@ -2680,31 +3936,59 @@ class ChatBridge:
         world: dict[str, Any] | None = None,
     ) -> str | None:
         """Ask the life-session model for one short care message (§2)."""
-        memory_render = (
-            self._memory_store.render_for_context(save_id)
-            if self._memory_store is not None
-            else None
-        )
         if world is None:
             world = {}
             if isinstance(self._latest_snapshot_payload, dict):
                 world = self._latest_snapshot_payload.get("world") or {}
         weather = world.get("weather") or world.get("weatherIcon")
-        prompt = LifeChatService.build_care_prompt(
-            profile, memory_render, kind, game_date, weather, ref_event
-        )
-        active_task = ActiveChatTask(
-            request_id=f"care-{uuid.uuid4().hex[:8]}",
-            save_id=save_id,
-            command_id="",
-            prompt=prompt,
-        )
         try:
+            # Snapshot work has priority even when its created task has not yet
+            # reached the lock. Waiting is event driven, never a model poll.
+            while (wakeup := self._autonomy_wakeup_tasks.get(save_id)) is not None:
+                await asyncio.shield(wakeup)
+            if self._life_queue or self._pending_life_preparation:
+                await self._drain_life_queue(self._chat_ws)
             async with self._busy_lock:
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    None, self._execute_life_turn, active_task, None, prompt
-                )
+                # Deferred care uses the current profile/memory after any player
+                # edits, and skips a greeting queued for a now obsolete day.
+                if self._current_game_day_key and self._current_game_day_key != game_date:
+                    return None
+                current_profile = self._profile_store.get(save_id).get("profile") if self._profile_store else None
+                profile = current_profile or profile
+                if profile.get("careFrequency") == "quiet":
+                    return None
+                memory_render = self._memory_store.render_for_context(save_id) if self._memory_store else None
+                existing_cid = None
+                session_profile_revision = self._profile_revision(save_id)
+                session_instruction_revision = self._memory_instruction_revision(save_id)
+                if self._life_chat:
+                    existing_cid = self._life_chat.rotate_if_needed(
+                        save_id, session_profile_revision, session_instruction_revision)
+                    system_prompt = self._life_chat.build_turn_prompt(
+                        save_id, existing_cid, profile, memory_render, self._life_work_summary(save_id, "chat"),
+                        mode="chat", milestones=self._life_milestone_summary(save_id, "chat"),
+                        live_context=self._decision_context(save_id, origin="care"))
+                else:
+                    system_prompt = LifeChatService.build_system_prompt(profile, memory_render, None)
+                prompt = system_prompt + "\n\n" + LifeChatService.build_care_prompt(
+                    profile, memory_render, kind, game_date, weather, ref_event)
+                prompt += "\n触发来源：游戏事件。结合当前状态自然交流。"
+                active_task = ActiveChatTask(
+                    request_id=f"care-{uuid.uuid4().hex[:8]}", save_id=save_id,
+                    command_id="", prompt=prompt, async_task=asyncio.current_task())
+                result = await self._await_life_provider(active_task, existing_cid, prompt)
+                cid = result.get("conversation_id") or existing_cid
+                if cid and self._life_chat:
+                    self._life_chat.record_session_id(save_id, str(cid))
+                    self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
+                    if result.get("success"):
+                        self._life_chat.mark_prompt_delivered(save_id, str(cid), "chat")
+                self._record_command(
+                    request_id=active_task.request_id, save_id=save_id, conversation_id=cid,
+                    prompt=f"[主动关怀:{kind}] {game_date}",
+                    status="completed" if result.get("success") else "failed", start_idx=-1, end_idx=-1,
+                    usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
+                    error=result.get("error"), duration=time.monotonic() - active_task.start_time)
         except Exception:
             logger.warning("Care text generation raised", exc_info=True)
             return None
@@ -2730,18 +4014,8 @@ class ChatBridge:
         # dirs) persist and read the same record.
         return Path(self._sessions_file).parent / "chat_profile_fingerprints.json"
 
-    def profile_fingerprint(self, save_id: str | None = None) -> str:
-        """Fingerprint of the provider profile + tool surface bound to a session.
-
-        A resumed provider session keeps whatever profile/tool surface it was
-        created with, so reconfiguring the agent file (or the game tool surface)
-        must start a fresh session instead of silently continuing the old one.
-        The companion profile/memory revisions are part of the fingerprint too:
-        after an agreement is deleted/corrected or the profile changes, the next
-        work turn must not keep treating the old session (with the stale
-        agreement in its visible history) as authoritative — it rotates like any
-        other profile change, keeping history and WorkStore intact.
-        """
+    def profile_fingerprint(self, save_id: str | None = None, *, instruction_revision: str | None = None) -> str:
+        """Revision metadata for the instructions and current environment."""
         import hashlib
 
         agent_file_digest: str | None = None
@@ -2757,8 +4031,14 @@ class ChatBridge:
                 "agent": self.agent,
                 "agentFile": agent_file_digest,
                 "surface": os.getenv("STARDEW_MCP_SURFACE", ""),
+                "instructionsRevision": instruction_revision or instructions_revision(),
+                "gameToolProfile": CODEX_GAME_TOOL_PROFILE_VERSION,
+                "actorMode": getattr(self, "actor_mode", None),
                 "profileRevision": self._profile_revision(save_id),
-                "memoryRevision": self._memory_revision(save_id),
+                "memoryInstructionRevision": (
+                    self._memory_store.instruction_revision(save_id)
+                    if self._memory_store is not None and save_id else 0
+                ),
             },
             sort_keys=True,
         )
@@ -2788,51 +4068,23 @@ class ChatBridge:
             logger.debug("Failed to save profile fingerprints", exc_info=True)
 
     def _ensure_session_matches_profile(
-        self, save_id: str | None, conversation_id: str | None
+        self, save_id: str | None, conversation_id: str | None, *, instruction_revision: str | None = None
     ) -> str | None:
-        """Return the session to resume, or None when a fresh one must start.
+        """Refresh configuration metadata without replacing the conversation.
 
-        Rotation happens when the profile fingerprint changed since the session
-        was created — the fingerprint covers the provider profile, the tool
-        surface, and the companion profile/memory revisions, so deleting or
-        correcting an agreement (or editing the companion profile) invalidates
-        the current work session exactly like any other profile change — and
-        also for a legacy session that has no fingerprint at all (its tool
-        surface cannot be verified, so it is not resumed). The previous session
-        id is always kept in ``chat_session_history.json`` and durable
-        goals/tasks/todos stay in WorkStore, so nothing is deleted and no
-        in-progress work is lost.
+        Current instructions and preferences travel with the next turn. Only an
+        explicit provider resume failure requires a replacement session.
         """
-        if not save_id:
-            return conversation_id
-        fingerprints = self._load_profile_fingerprints()
-        key = f"{self.backend_name}:{save_id}"
-        current = self.profile_fingerprint(save_id)
-        recorded = fingerprints.get(key)
-        self._profile_rotation_note: str | None = None
-        if conversation_id and recorded != current:
-            reason = "profile-changed" if recorded else "missing-fingerprint"
-            self._rotate_provider_session(save_id, reason=reason)
-            self._profile_rotation_note = (
-                "伙伴配置或工具范围已变化，已安全新建会话（旧会话与历史记录保留，"
-                f"原因：{reason}）。"
-            )
-            logger.info(
-                "Profile fingerprint changed for save %s (recorded=%s current=%s); "
-                "started a new session and kept the old one in history.",
-                save_id,
-                recorded,
-                current,
-            )
-            conversation_id = None
-        fingerprints[key] = current
-        self._save_profile_fingerprints(fingerprints)
+        if save_id:
+            fingerprints = self._load_profile_fingerprints()
+            fingerprints[f"{self.backend_name}:{save_id}"] = self.profile_fingerprint(
+                save_id, instruction_revision=instruction_revision)
+            self._save_profile_fingerprints(fingerprints)
         return conversation_id
 
-    def consume_profile_rotation_note(self) -> str | None:
-        note = getattr(self, "_profile_rotation_note", None)
-        self._profile_rotation_note = None
-        return note
+    def consume_profile_rotation_note(self) -> None:
+        """Compatibility hook: preference changes no longer rotate sessions."""
+        return None
 
     def _load_session_history(self) -> None:
         if self._session_history:
@@ -2882,11 +4134,11 @@ class ChatBridge:
             history.append(cid)
         self._session_history[key] = history[-20:]
         self._sessions.pop(key, None)
+        self._sessions.pop(f"life:{key}", None)
         if self.backend_name == "agy":
             self._sessions.pop(save_id, None)
         self._save_sessions()
         self._save_session_history()
-        self._session_token_totals[save_id] = 0
         self._session_requests[save_id] = 0
         self._session_context_state[save_id] = {
             "latestInputContext": None,
@@ -2907,13 +4159,16 @@ class ChatBridge:
         if not isinstance(usage, dict):
             return None
         latest = usage.get("latestRequestInputContext")
-        if isinstance(latest, int) and latest >= 0:
+        if isinstance(latest, int) and not isinstance(latest, bool) and latest >= 0:
             return latest
         if usage.get("input_context_measured") is False:
             return None
-        # Non-Kimi sources (agy DB delta) have no per-request split; fall back to
-        # that request's input-side counters when the source is a single request.
-        generations = usage.get("generations_count")
+        if usage.get("input_includes_cache"):
+            value = usage.get("input_tokens")
+            return value if usage.get("generations_count", 1) == 1 and isinstance(value, int) else None
+        # A legacy single-generation receipt can still supply its input-side
+        # counters. Never interpret a multi-generation aggregate as context.
+        generations = usage.get("generations_count", usage.get("requestCount"))
         if generations not in (1, None):
             return None
         input_other = usage.get("inputOther")
@@ -2921,10 +4176,10 @@ class ChatBridge:
             input_other = usage.get("input_tokens")
         cache_read = usage.get("inputCacheRead")
         if cache_read is None:
-            cache_read = usage.get("cache_read_tokens")
+            cache_read = usage.get("cache_read_tokens", usage.get("cache_read_input_tokens", usage.get("cached_input_tokens")))
         cache_creation = usage.get("inputCacheCreation")
         if cache_creation is None:
-            cache_creation = usage.get("cache_creation_tokens")
+            cache_creation = usage.get("cache_creation_tokens", usage.get("cache_write_input_tokens"))
         parts = [value for value in (input_other, cache_read, cache_creation) if isinstance(value, int)]
         if not parts:
             return None
@@ -2937,75 +4192,42 @@ class ChatBridge:
         *,
         request_count: int | None = None,
     ) -> str | None:
-        """Track this session's input context; return a rotation reason or None.
-
-        Two independent gates:
-
-        * the measured latest-request input context reaching the configured
-          budget (default 100000 tokens, an engineering policy, not a provider
-          claim) — ``SESSION_CONTEXT_BUDGET``;
-        * a bounded request-count checkpoint (default 20) used only while the
-          provider gives no usable per-request measurement, and clearly labelled
-          as a fallback — ``SESSION_REQUEST_CHECKPOINT``.
-
-        The game-day rotation is separate and unchanged.
-        """
+        """Record measured context for diagnostics; let the harness maintain it."""
         if not save_id:
             return None
-        state = self._session_context_state.setdefault(
-            save_id,
-            {"latestInputContext": None, "maxInputContext": None, "measured": False},
-        )
-        if request_count is not None and request_count > 0:
-            self._session_requests[save_id] = self._session_requests.get(save_id, 0) + request_count
-        else:
-            generations = usage.get("generations_count") if isinstance(usage, dict) else None
-            self._session_requests[save_id] = self._session_requests.get(save_id, 0) + (
-                generations if isinstance(generations, int) and generations > 0 else 1
-            )
-
-        # Codex manages compaction in the resumed thread. Its turn usage is not
-        # a reliable measurement of the latest request's context window, so do
-        # not apply the generic token/request-count rotation to it.
-        if self.provider == "codex":
-            return None
         context_tokens = self._request_input_context(usage)
-        if context_tokens is None:
-            # Unknown measurement: never invent a context length, use the bounded
-            # request-count checkpoint instead (explicitly labelled by reason).
-            if self._session_request_checkpoint and (
-                self._session_requests.get(save_id, 0) >= self._session_request_checkpoint
-            ):
-                return "SESSION_REQUEST_CHECKPOINT"
-            return None
-
-        state["measured"] = True
+        self._session_requests[save_id] = self._session_requests.get(save_id, 0) + (request_count or 1)
+        state = self._session_context_state.setdefault(save_id, {})
         state["latestInputContext"] = context_tokens
-        previous_max = state.get("maxInputContext")
-        state["maxInputContext"] = (
-            context_tokens if not isinstance(previous_max, int) else max(previous_max, context_tokens)
-        )
-        if self._session_token_budget and context_tokens >= self._session_token_budget:
-            return "SESSION_CONTEXT_BUDGET"
+        state["measured"] = context_tokens is not None
+        state["unmeasuredRequests"] = 0 if context_tokens is not None else state.get("unmeasuredRequests", 0) + 1
+        if context_tokens is not None:
+            state["maxInputContext"] = max(state.get("maxInputContext") or 0, context_tokens)
         return None
 
     def _note_session_tokens(self, save_id: str | None, usage: dict[str, Any] | None) -> bool:
-        """Backwards-compatible wrapper: True when the context policy says rotate."""
+        """Compatibility diagnostic; the harness owns context maintenance."""
         return self._note_session_context(save_id, usage) is not None
 
     async def _settle_day_advance(self, save_id: str | None, world: dict[str, Any]) -> None:
-        """Settle a real native day advance, then rotate the provider session."""
+        """Settle current game progress at the native day boundary."""
         if not save_id:
             return
         settlement: dict[str, Any] | None = None
         if self._work_store is not None:
             try:
+                funds = None
+                payload = self._latest_snapshot_payload
+                companion_payload = payload.get("companion") if isinstance(payload, dict) else None
+                if isinstance(companion_payload, dict):
+                    funds = companion_payload.get("availableMoney")
                 settlement = await asyncio.to_thread(
                     self._work_store.settle_game_day,
                     save_id,
                     year=world.get("year"),
                     season=world.get("season"),
                     day=world.get("dayOfMonth"),
+                    funds=funds,
                 )
             except Exception:
                 logger.warning("Day settlement failed for %s", save_id, exc_info=True)
@@ -3019,16 +4241,14 @@ class ChatBridge:
                 len(settlement.get("carriedTaskIds") or []),
             )
         self._last_day_settlement = settlement
-        # Rotate only after a real settlement; a first observation, a reloaded old
-        # save or a repeated day must not churn the provider session.
-        if settlement and settlement.get("settled") and self.provider != "codex":
-            self._rotate_provider_session(save_id, reason="game-day-advanced")
         if self._milestone_store is not None:
             await self._settle_milestone_nodes(
                 save_id, world, allow_reminders=bool(settlement and settlement.get("settled"))
             )
         if self._autonomy is not None and save_id:
             self._autonomy.reset_breaker(save_id)
+        if settlement and settlement.get("settled"):
+            self._maybe_deliver_outbox(save_id)
 
     async def _settle_milestone_nodes(
         self, save_id: str, world: dict[str, Any], *, allow_reminders: bool = True
@@ -3080,16 +4300,22 @@ class ChatBridge:
             "job-waiting" if execution.outcome == "waiting" else
             "job-completed" if execution.task_status == "completed" and execution.outcome == "completed" else
             "job-failed" if execution.outcome in {"failed", "partial", "unknown", "cancelled", "rejected"} or execution.status == "deferred" else "job-running")
-        labels = {"job-running": "正在处理", "job-waiting": "正在等待", "job-completed": "已完成", "job-failed": "未能完成"}
+        labels = {"job-running": "正在处理", "job-waiting": "正在等待", "job-completed": "本次执行结束", "job-failed": "本次执行中止"}
         task = next((task for task in self._work_store.state(save_id).tasks if task.id == execution.task_id), None) if self._work_store else None
         title = task.title if task else "这项农场工作"
         detail = execution.message or execution.reason_code or ""
         if execution.result and isinstance(execution.result, dict):
             detail = detail or str(execution.result.get("error") or execution.result.get("message") or "")
-        chain = self._command_chains.get(save_id)
-        command_complete = phase in {"job-completed", "job-failed"} and not (
-            chain is not None and chain.root_request_id == command_id
-        )
+        if execution.status == "executed":
+            feedback = compact_task_feedback(task,
+                {**(execution.result or {}), "effects": execution.effects,
+                 "reasonCode": execution.reason_code, "commandId": execution.command_id},
+                operation=execution.operation or "", status=execution.outcome)
+            detail = feedback["progressSummary"] + (f"；{detail}" if detail and not feedback.get("reason") else "")
+        # Player-bound jobs are followed by an outbox delivery turn carrying
+        # the confirmed facts, so progress never closes the player's command.
+        command_complete = phase in {"job-completed", "job-failed"} and str(
+            binding[0]).startswith("autonomy-")
         await self._send_reply(ws, Envelope.create_chat_reply(self.instance_id, request_id,
             status=phase, reply_text=f"{labels[phase]}：{title}。{detail[:400]}", save_id=save_id,
             command_id=command_id, command_complete=command_complete))
@@ -3113,11 +4339,11 @@ class ChatBridge:
             return None
         return "计划状态：" + "；".join(parts)
 
-    def _autonomy_state_payload(self, save_id: str, state: Any) -> dict[str, Any]:
+    def _autonomy_state_payload(self, save_id: str, state: Any, *, overview: dict[str, Any] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "mode": state.mode, "paused": state.paused,
-            "preferences": {"goal": state.goal, "dailySpendLimit": state.budget_limit or 0,
-                             "boxPreference": state.box_preference or "none"},
+            "preferences": {"goal": state.goal,
+                             "boxPreference": state.box_preference or "none", "idlePreference": state.idle_preference},
             "preferencesRevision": state.preferences_revision,
             "decisionEpoch": state.decision_epoch,
             "gameDate": state.game_date, "dailySpend": state.daily_spend,
@@ -3129,6 +4355,9 @@ class ChatBridge:
             "breaker_cooldown_until": state.breaker_cooldown_until,
             "breakerReason": state.breaker_reason,
             "breaker_reason": state.breaker_reason,
+            "usageTodayText": self._usage_display.today_text(),
+            "usageSaveTodayText": self._usage_display.today_text(save_id=save_id),
+            "usageSaveTotalText": self._usage_display.summary_text(save_id=save_id, today=False),
         }
         # F8 visibility: the last plan action and why the worker is waiting.
         worker = self._plan_worker
@@ -3140,7 +4369,8 @@ class ChatBridge:
             )
         if self._autonomy is not None and self._autonomy.is_cooling_down(save_id):
             payload["planWaitReason"] = "自动模式已熔断冷却"
-        overview = self._latest_work_overview(save_id)
+        if overview is None:
+            overview = self._latest_work_overview(save_id)
         if overview is not None:
             payload["lastSettledDay"] = overview.get("lastSettledDay")
             payload["hasExecutableWork"] = overview.get("hasExecutableWork")
@@ -3151,14 +4381,22 @@ class ChatBridge:
             payload["lastDaySettlement"] = self._last_day_settlement
         return payload
 
+    async def _push_usage_state(self, ws: WebSocketClient | None, save_id: str) -> None:
+        if ws is not None and save_id and self._autonomy is not None:
+            await self._send_reply(ws, Envelope.create_autonomy_state(
+                self.instance_id, "usage-update", save_id,
+                self._autonomy_state_payload(save_id, self._autonomy.state(save_id)), "confirmed", None,
+            ))
+
     async def _handle_autonomy_control(
-        self, ws: WebSocketClient | None, envelope: Envelope, active_save_id: str | None
-    ) -> None:
+        self, ws: WebSocketClient | None, envelope: Envelope, active_save_id: str | None,
+        *, preserve_life_request_id: str | None = None,
+    ) -> bool:
         """Apply controls synchronously and acknowledge only the active save."""
         save_id = str(envelope.payload.get("saveId") or envelope.save_id or "")
         request_id = str(envelope.payload.get("requestId") or envelope.message_id)
         if not save_id or not active_save_id or save_id != active_save_id or self._autonomy is None:
-            return
+            return False
         action = str(envelope.payload.get("action", ""))
         params = envelope.payload.get("parameters") or {}
         try:
@@ -3166,24 +4404,82 @@ class ChatBridge:
             current_command = self._current_command_id(save_id)
             if action in {"pause", "resume", "cancel"} and command_id and current_command and command_id != current_command:
                 raise ValueError("COMMAND_MISMATCH: control belongs to an older instruction")
+            lease_path = self.run_dir / "data" / "life-turn.json" if self.run_dir else None
+            with cache_lock(lease_path) if lease_path is not None else contextlib.nullcontext():
+                target_goal_id = str(params.get("goalId") or "") if action == "cancel" else ""
+                work = self._work_store.state(save_id) if self._work_store else None
+                if target_goal_id and (work is None or not any(g.id == target_goal_id for g in work.goals)):
+                    raise ValueError("UNKNOWN_GOAL: read the current arrangement before cancelling it")
+                current_goal = (work.decision.get("goalId") if work else None) or self._autonomy.state(save_id).goal_scope
+                unrelated_cancel = bool(target_goal_id and target_goal_id != current_goal)
+                pending_request_id = None
+                if action == "cancel" and not target_goal_id and not params.get("allArrangements") and work:
+                    queued = next((item for item in reversed(self._life_queue) if item.get("save_id") == save_id), None)
+                    candidate = queued.get("request_id") if queued else self._active_player_requests.get(save_id)
+                    if not candidate and self._busy_lock.locked() and self._active_task is None and self.run_dir:
+                        lease_path = self.run_dir / "data" / "life-turn.json"
+                        try:
+                            lease = json.loads(lease_path.read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            lease = {}
+                        if lease.get("saveId") == save_id:
+                            candidate = lease.get("requestId")
+                    request = next((r for r in work.requests if r.get("id") == candidate), None)
+                    if request is not None:
+                        # The candidate is only a pending request while it does not
+                        # own the active decision; a request bound to the selected
+                        # task or goal is the current arrangement's own instruction,
+                        # and a plain cancel must stop it outright (native job and
+                        # autonomy goal included), not withdraw it as background.
+                        decision_task = work.decision.get("taskId")
+                        owns_decision = (
+                            work.decision.get("requestId") == candidate
+                            or (bool(decision_task) and decision_task in (request.get("taskIds") or []))
+                            or (bool(work.decision.get("goalId"))
+                                and request.get("goalId") == work.decision.get("goalId"))
+                        )
+                        if not owns_decision:
+                            pending_request_id = str(candidate)
+                if (action in {"pause", "resume", "cancel"} and not unrelated_cancel
+                        and preserve_life_request_id != request_id):
+                    if lease_path is not None:
+                        temp = lease_path.with_suffix(".tmp")
+                        temp.write_text(json.dumps({"requestId": None, "saveId": save_id, "playerText": None}), encoding="utf-8")
+                        temp.replace(lease_path)
+                    self._life_control_generation[save_id] = self._life_control_generation.get(save_id, 0) + 1
             native_ok = True
+            if action == "resume" and not await self._retire_invalidated_native_jobs(save_id):
+                raise ValueError("NATIVE_SCOPE_CHANGE_UNCONFIRMED: 旧动作尚未确认停止，保持暂停")
             if action == "cancel":
-                native_ok = await self.handle_chat_cancel(ws, None, "F8 cancel", save_id, command_id=command_id or None)
-            state = self._autonomy.control(save_id, action, **params)
-            if self._work_store is not None:
+                if unrelated_cancel:
+                    # Cancelling a named, unrelated arrangement must not interrupt
+                    # the command connection or cancel the currently active goal.
+                    self._withdraw_work_goals(save_id, {target_goal_id})
+                    unrelated_cancel = True
+                else:
+                    native_ok = await self.handle_chat_cancel(ws, None, "F8 cancel", save_id, command_id=command_id or None,
+                        all_arrangements=bool(params.get("allArrangements")), target_goal_id=target_goal_id or None,
+                        pending_request_id=pending_request_id)
+            state = (self._autonomy.state(save_id) if action == "cancel" and (params.get("goalId") or pending_request_id)
+                     else self._autonomy.control(save_id, action, **params))
+            if self._work_store is not None and not unrelated_cancel:
                 self._apply_work_control(save_id, action, params)
             if action == "resume":
-                chain = self._command_chains.get(save_id)
-                if chain is not None and chain.pending_continuation:
-                    self._schedule_command_chain(save_id)
+                if self._work_store is not None:
+                    self._work_store.set_outbox_retry_block(save_id, None)
                 self._notify_plan_worker(save_id)
+                self._maybe_deliver_outbox(save_id)
             status, reason = ("confirmed", None) if native_ok else ("rejected", "NATIVE_CANCEL_UNCONFIRMED")
         except (TypeError, ValueError) as ex:
             state, status, reason = self._autonomy.state(save_id), "rejected", str(ex)
         reply = Envelope.create_autonomy_state(
             self.instance_id, request_id, save_id, self._autonomy_state_payload(save_id, state), status, reason
         )
+        reply.payload["controlAction"] = action
         await self._send_reply(ws, reply)
+        if action == "cancel" and self._milestone_store is not None:
+            await self._send_reply(ws, self._build_milestones_state(save_id, ""))
+        return status == "confirmed"
 
     async def _stop_autonomy_if_disabled(
         self, ws: WebSocketClient | None, save_id: str | None
@@ -3193,6 +4489,7 @@ class ChatBridge:
             return
         if (
             not self._autonomy.state(save_id).enabled
+            and not self._autonomy.state(save_id).goal_scope
             and self._active_task is not None
             and self._active_task.request_id.startswith("autonomy-")
         ):
@@ -3206,6 +4503,9 @@ class ChatBridge:
         save_id: str | None,
         *,
         command_id: str | None = None,
+        all_arrangements: bool = False,
+        target_goal_id: str | None = None,
+        pending_request_id: str | None = None,
     ) -> bool:
         """Handles immediate cancellation: kills active agy subprocess, records command, and notifies game."""
         current_command_id = self._current_command_id(save_id)
@@ -3217,29 +4517,53 @@ class ChatBridge:
             return False
         pending = self._pending_native_cancels.get(save_id or "")
         native_command_id = pending[1] if pending and pending[0] == current_command_id else None
-        if native_command_id is None and save_id and self._work_store is not None:
+        cancelled_goal_id = None
+        cancelled_goal_ids: set[str] = set()
+        if save_id and self._work_store is not None:
             state_before = self._work_store.state(save_id)
+            cancelled_goal_id = None if pending_request_id else target_goal_id or state_before.decision.get("goalId")
+            if pending_request_id:
+                scoped_request = next((r for r in state_before.requests if r.get("id") == pending_request_id), {})
+                cancelled_goal_ids.update(g.id for g in state_before.goals
+                    if g.constraints.get("playerRequestId") == pending_request_id or g.id == scoped_request.get("goalId"))
+            if all_arrangements:
+                cancelled_goal_ids.update(goal.id for goal in state_before.goals if goal.status in {"active", "paused"})
+            if reason not in {"Superseded by player", "autonomy disabled"}:
+                original_request_id = pending_request_id or state_before.decision.get("requestId")
+                if original_request_id:
+                    self._work_store.stop_request(save_id, original_request_id, reason="player_cancel")
             selected_task = next((item for item in state_before.tasks
                                   if item.id == state_before.decision.get("taskId")), None)
-            if selected_task is not None:
+            if native_command_id is None and selected_task is not None:
                 native_command_id = next((step.command_id for step in selected_task.steps
                                           if step.command_id and step.status == "running"), None)
-        self._break_command_chain(save_id)
-        native_ok = (await self._confirm_native_terminal(native_command_id)
+        self._active_player_requests.pop(save_id or "", None)
+        native_ok = True if pending_request_id else (await self._confirm_native_terminal(native_command_id, save_id)
                      if pending and pending[0] == current_command_id
                      else await self._interrupt_short_job(save_id))
         if save_id and not native_ok and native_command_id:
             self._pending_native_cancels[save_id] = (current_command_id or command_id or "", native_command_id)
         self._autonomy_pending_task_fingerprints.clear()
         task = self._active_task
+        if pending_request_id and task is not None and pending_request_id not in {task.request_id, task.command_id}:
+            task = None
         if self._autonomy is not None and save_id:
-            self._autonomy.set_enabled(save_id, False)
             self._autonomy.reset_breaker(save_id)
+            if reason not in {"Superseded by player", "autonomy disabled"}:
+                cancelled_goal_id = cancelled_goal_id or (None if pending_request_id else self._autonomy.state(save_id).goal_scope)
+                if cancelled_goal_id:
+                    cancelled_goal_ids.add(cancelled_goal_id)
+                if self._work_store:
+                    try:
+                        self._withdraw_work_goals(save_id, cancelled_goal_ids, all_arrangements=all_arrangements)
+                    except WorkStateError:
+                        logger.debug("Cancelled arrangement was already unavailable")
+                if not pending_request_id:
+                    self._autonomy.control(save_id, "cancel")
         if task is not None:
             active_req = task.request_id
             active_save = task.save_id or save_id or ""
             active_prompt = task.prompt
-            start_idx = task.start_max_idx
 
             self.abort_active_task(f"Cancel requested: {reason}")
             old_async_task = task.async_task
@@ -3253,7 +4577,9 @@ class ChatBridge:
                     native_ok = False
 
             # Resolve conversation id and compute any usage produced before cancellation
-            cid = self.get_conversation_id(active_save)
+            # The drained init event can establish a new CID and reset its baseline.
+            start_idx = task.start_max_idx
+            cid = task.provider_conversation_id or self.get_conversation_id(active_save)
             usage_delta = None
             if self.backend_name == "kimi":
                 end_idx = -1
@@ -3261,6 +4587,8 @@ class ChatBridge:
                 usage_delta = read_usage_since(
                     cid, task.wire_start_offset, cwd=project_root()
                 )
+            elif self.backend_name in {"codex", "mcode"}:
+                end_idx = -1
             else:
                 end_idx = get_max_gen_idx(cid) if cid else -1
                 if cid and end_idx > start_idx:
@@ -3274,30 +4602,32 @@ class ChatBridge:
                     else "cancelled_before_conversation_established"
                 )
 
-            self._record_command(
-                request_id=request_id or active_req,
-                save_id=active_save,
-                conversation_id=cid,
-                prompt=active_prompt,
-                status="cancelled",
-                start_idx=start_idx,
-                end_idx=end_idx,
-                usage=usage_delta,
-                missing_reason=missing_reason,
-                error="PLAYER_CANCELLED",
-                duration=0.0,
-            )
-            task.recorded = True
+            if self.backend_name not in {"codex", "mcode"} and not task.recorded:
+                self._record_command(
+                    request_id=active_req,
+                    save_id=active_save,
+                    conversation_id=cid,
+                    prompt=active_prompt,
+                    status="cancelled",
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    usage=usage_delta,
+                    missing_reason=missing_reason,
+                    error="PLAYER_CANCELLED",
+                    duration=0.0,
+                )
+                task.recorded = True
 
+            display_usage = normalize_usage(self.backend_name, usage_delta)
             reply = Envelope.create_chat_reply(
                 sender_instance_id=self.instance_id,
                 request_id=request_id or active_req,
                 status="cancelled" if native_ok else "job-waiting",
                 reply_text="任务已由玩家取消。" if native_ok else "取消已请求，原生作业终态尚未确认。",
                 save_id=active_save,
-                tokens_used=usage_delta["total_tokens"] if usage_delta else None,
-                prompt_tokens=usage_delta["input_tokens"] if usage_delta else None,
-                output_tokens=usage_delta["output_tokens"] if usage_delta else None,
+                tokens_used=display_usage.get("total_tokens") if display_usage else None,
+                prompt_tokens=display_usage.get("input_tokens") if display_usage else None,
+                output_tokens=display_usage.get("output_tokens") if display_usage else None,
                 cached_tokens=usage_delta["cache_read_tokens"] if usage_delta else None,
                 conversation_id=cid,
                 error="PLAYER_CANCELLED" if native_ok else "NATIVE_CANCEL_UNCONFIRMED",
@@ -3310,13 +4640,13 @@ class ChatBridge:
                 self._active_task = None
             # The cancelled provider turn no longer owns the command socket; hand
             # it back so the worker can settle its own epoch-checked bookkeeping.
-            if old_async_task is None:
+            if old_async_task is None and not task.read_only:
                 await self._release_execution(active_save or save_id)
         else:
             logger.info("chat.cancel received but no task was actively running.")
             binding = getattr(self, "_job_reply_binding", None)
             binding_command = (binding[4] if len(binding) > 4 else binding[0]) if binding else None
-            if binding and binding[1] == save_id and binding_command == current_command_id:
+            if not pending_request_id and binding and binding[1] == save_id and binding_command == current_command_id:
                 await self._send_reply(ws, Envelope.create_chat_reply(
                     self.instance_id, binding[0], "cancelled" if native_ok else "job-waiting",
                     "任务已由玩家取消。" if native_ok else "取消已请求，原生作业终态尚未确认。",
@@ -3325,16 +4655,31 @@ class ChatBridge:
                 ))
         if native_ok and save_id:
             self._pending_native_cancels.pop(save_id, None)
-        if native_ok and getattr(self, "_job_reply_binding", None) and self._job_reply_binding[1] == save_id:
+        if native_ok and not pending_request_id and getattr(self, "_job_reply_binding", None) and self._job_reply_binding[1] == save_id:
             self._job_reply_binding = None
         return native_ok
+
+    def _withdraw_work_goals(self, save_id: str, goal_ids: set[str], *, all_arrangements: bool = False) -> None:
+        """Revoke durable authority in both the work ledger and saved arrangements."""
+        if self._work_store is None:
+            return
+        for goal_id in goal_ids:
+            self._work_store.cancel_goal(save_id, goal_id)
+            goal = next((g for g in self._work_store.state(save_id).goals if g.id == goal_id), None)
+            if goal and goal.constraints.get("playerRequestId"):
+                self._work_store.stop_request(save_id, goal.constraints["playerRequestId"], reason="player_cancel")
+        if self._milestone_store:
+            self._milestone_store.withdraw_goals(save_id, goal_ids, all_arrangements=all_arrangements)
+            proposal = self._life_proposals.get(save_id)
+            if proposal and not self._current_life_proposal(save_id):
+                self._life_proposals.pop(save_id, None)
 
     def _current_command_id(self, save_id: str | None) -> str | None:
         if not save_id:
             return None
-        chain = self._command_chains.get(save_id)
-        if chain is not None:
-            return chain.root_request_id
+        root = self._active_player_requests.get(save_id)
+        if root is not None:
+            return root
         task = self._active_task
         if task is not None and task.save_id == save_id:
             return task.command_id or task.request_id
@@ -3347,6 +4692,46 @@ class ChatBridge:
         if pending is not None:
             return pending[0]
         return None
+
+    async def _retire_invalidated_native_jobs(self, save_id: str | None) -> bool:
+        """Confirm revoked commands before a revised scope can resume physical work."""
+        if not save_id or self._work_store is None:
+            return True
+        unresolved = [(task, step) for task in self._work_store.state(save_id).tasks
+                      if task.status == "cancelled" for step in task.steps
+                      if step.command_id and step.status in {"running", "unknown", "waiting"}]
+        if not unresolved:
+            return True
+        worker = self._plan_worker
+        if worker is None:
+            return False
+        for task, step in unresolved:
+            try:
+                receipt = await worker.client.reconcile(step.command_id)
+                native = receipt.get("native") if isinstance(receipt, dict) and "found" in receipt else receipt
+                outcome, reason, effects, revision = normalise_native_result(native)
+                if outcome is None:
+                    await worker.client.call_tool("cancel_plan_command", {"command_id": step.command_id})
+                    deadline = time.monotonic() + 5.0
+                    while outcome is None and time.monotonic() < deadline:
+                        await asyncio.sleep(0.1)
+                        receipt = await worker.client.reconcile(step.command_id)
+                        native = receipt.get("native") if isinstance(receipt, dict) and "found" in receipt else receipt
+                        outcome, reason, effects, revision = normalise_native_result(native)
+                if outcome is None:
+                    return False
+                current = self._work_store.state(save_id)
+                pending = next((item for entry in current.tasks if entry.id == task.id
+                                for item in entry.steps if item.id == step.id), None)
+                if pending and pending.status in {"running", "unknown", "waiting"}:
+                    self._work_store.commit_step_result(save_id, task_id=task.id, step_id=step.id,
+                        outcome=outcome, effects=effects, reason_code=reason, snapshot_revision=revision,
+                        command_id=step.command_id, game_date=self._plan_snapshot_state()[1],
+                        feedback=compact_job_feedback(native, operation=step.operation, status=outcome, params=step.params))
+            except Exception:
+                logger.warning("Revoked native command could not be retired", exc_info=True)
+                return False
+        return True
 
     async def _interrupt_short_job(self, save_id: str | None) -> bool:
         if not save_id or self._work_store is None:
@@ -3366,23 +4751,38 @@ class ChatBridge:
                     "operation": "cancel_task", "params": {}, "command_id": "interrupt-" + uuid.uuid4().hex})
             except Exception:
                 logger.warning("Native cancellation not confirmed; old job authority revoked")
-                return await self._confirm_native_terminal(native_command_id)
+                return await self._confirm_native_terminal(native_command_id, save_id)
         return True
 
-    async def _confirm_native_terminal(self, command_id: str | None) -> bool:
-        if not command_id or self._plan_worker is None:
+    async def _confirm_native_terminal(self, command_id: str | None, save_id: str | None = None) -> bool:
+        if not command_id:
+            return False
+
+        def recorded_terminal() -> bool:
+            if not save_id or self._work_store is None:
+                return False
+            entry = next((entry for entry in reversed(self._work_store.state(save_id).executions)
+                          if entry.command_id == command_id), None)
+            return bool(entry and entry.outcome in {"completed", "partial", "failed", "rejected", "cancelled"}
+                        and entry.reason_code != "NATIVE_TERMINAL_UNCONFIRMED")
+
+        if recorded_terminal():
+            return True
+        if self._plan_worker is None:
             return False
         try:
             result = await self._plan_worker.client.reconcile(command_id)
             if isinstance(result, dict) and "found" in result:
                 result = result.get("native") if result.get("found") else None
-            return isinstance(result, dict) and result.get("terminalState") in {
+            return recorded_terminal() or isinstance(result, dict) and result.get("terminalState") in {
                 "succeeded", "partially-succeeded", "partial", "failed",
                 "rejected", "cancelled", "canceled",
             }
         except Exception:
             logger.debug("Unable to confirm native terminal for cancelled command %s", command_id, exc_info=True)
-            return False
+            # The native terminal callback can land while reconciliation is
+            # waiting on an IPC session that subsequently closes.
+            return recorded_terminal()
 
     async def handle_chat_submit(
         self,
@@ -3390,27 +4790,98 @@ class ChatBridge:
         request_id: str,
         text: str,
         save_id: str | None,
+        *, _slot_owned: bool = False, _goal_scope: str | None = None,
+        _goal_default: str | None = None,
+        _delivery: dict[str, Any] | None = None,
     ) -> None:
         """Processes a user chat submit message."""
         logger.info("Processing chat submit [%s]: %s (saveId=%s)", request_id, text, save_id)
         if self._active_task and self._active_task.request_id == request_id:
             # Transport replay must not cancel and restart the same decision.
             return
+        # Stable preset replay is transport recovery, not a new human instruction.
+        # It must not preempt delivery, revoke authority, or undo a human pause.
+        if (self._is_preset_request(request_id) and save_id
+                and self._work_store is not None and self._autonomy is not None):
+            bound = self._preset_bound_goal(save_id, request_id)
+            policy = getattr(self, "_preset_day_boundary", None)
+            preset_path = getattr(policy, "preset_path", None)
+            if bound is None and preset_path:
+                preset = json.loads(Path(preset_path).read_text(encoding="utf-8-sig"))
+                import hashlib
+                expected = "preset-" + hashlib.sha256(
+                    (str(preset["runId"]) + "\n" + save_id).encode()).hexdigest()[:12]
+                authorized = str(preset.get("goalText") or "")
+                if request_id == expected and text == authorized:
+                    self._work_store.record_request(save_id, request_id, authorized, origin="player")
+                    bound = self._work_store.ensure_preset_main_goal(save_id, request_id, authorized)
+                    logger.info("Verified preset [%s] bound main goal %s before model planning", request_id, bound.id)
+            if bound is not None and bound.status == "active":
+                self._autonomy.set_goal_scope(save_id, bound.id)
+                # Reconnect replays this request. Wake once for the same native
+                # state; transport generations/hold ids do not constitute progress.
+                progress = (request_id, self._native_recovery_fingerprint(
+                    self._latest_snapshot_payload or {}))
+                resumes = getattr(self, "_preset_resume_progress", None)
+                if resumes is None:
+                    resumes = self._preset_resume_progress = {}
+                if resumes.get(save_id) != progress:
+                    self._autonomy.request_job_decision(save_id)
+                    resumes[save_id] = progress
+                self._preset_runs[save_id] = {"request_id": request_id, "goal_id": bound.id, "notified": False}
+                logger.info("Preset goal [%s] resumed: re-scoped to active goal %s", request_id, bound.id)
+                resume_reply = Envelope.create_chat_reply(
+                    self.instance_id, request_id, "selected",
+                    "继续已交付的农场照料安排。",
+                    save_id=save_id, command_id=request_id, command_complete=False)
+                resume_reply.payload["presetGoalId"] = bound.id
+                await self._send_reply(ws, resume_reply)
+                return
         if self._autonomy is not None and save_id:
             self._autonomy.record_event(save_id, f"chat-submit:{request_id}", "chat.submit")
 
         is_player = self._is_player_request(request_id)
-        if is_player:
+        paused_chat = bool(is_player and save_id and (
+            self._work_store and self._work_store.state(save_id).paused
+            or self._autonomy and self._autonomy.state(save_id).paused))
+        if paused_chat and self._requests_work_resume(text):
+            envelope = Envelope.create_autonomy_control(self.instance_id, request_id, save_id, "resume")
+            await self._handle_autonomy_control(ws, envelope, save_id)
+            await self._send_reply(ws, Envelope.create_chat_reply(self.instance_id, request_id, "completed",
+                "好，接着做。", save_id=save_id, command_id=request_id, command_complete=True))
+            return
+        midflight = False
+        if (is_player and not paused_chat and save_id
+                and not request_id.startswith("preparation-")
+                and self._job_in_flight(save_id)):
+            # A native job owns the execution connection: never interrupt it for
+            # chat. The original text is recorded durably; control utterances
+            # reach the in-flight command through the existing control bypass.
+            if self._work_store is not None:
+                try:
+                    self._work_store.record_request(save_id, request_id, text, origin="player-midflight")
+                except WorkStateError:
+                    logger.debug("Could not record midflight request %s", request_id, exc_info=True)
+            control = self._control_utterance(text)
+            if control in {"pause", "cancel"}:
+                envelope = Envelope.create_autonomy_control(self.instance_id, request_id, save_id, control)
+                confirmed = await self._handle_autonomy_control(ws, envelope, save_id)
+                if self._work_store is not None:
+                    self._work_store.mark_midflight_consumed(save_id, [request_id])
+                await self._send_reply(ws, Envelope.create_chat_reply(
+                    self.instance_id, request_id,
+                    "completed" if confirmed else "job-waiting",
+                    ("好，先停下来。" if control == "pause" else "好，取消这项安排。") if confirmed
+                    else "已收到，原生作业终态尚未确认。",
+                    save_id=save_id,
+                    error=None if confirmed else "NATIVE_CANCEL_UNCONFIRMED",
+                    command_id=request_id, command_complete=confirmed))
+                return
+            midflight = True
+        if is_player and not paused_chat and not midflight:
             self._preempt_autonomy_for_player(request_id)
             if self._autonomy is not None and save_id:
                 self._autonomy.reset_breaker(save_id)
-            if self._work_store is not None and save_id:
-                try:
-                    if self._work_store.state(save_id).paused:
-                        self._work_store.set_paused(save_id, False)
-                        logger.info("Player chat submit resumed paused work state for save %s [%s]", save_id, request_id)
-                except Exception:
-                    logger.warning("Failed to resume paused work state for player chat submit [%s]", request_id, exc_info=True)
             await self._interrupt_short_job(save_id)
             if self._active_task and not self._active_task.cancelled:
                 was_free = bool(self._autonomy and save_id and self._autonomy.state(save_id).enabled)
@@ -3420,11 +4891,52 @@ class ChatBridge:
                 async with self._busy_lock:
                     pass
             if save_id:
-                self._register_command_chain(save_id, text, ws, request_id)
+                if self._work_store is not None:
+                    try:
+                        self._work_store.record_request(save_id, request_id, text, origin="player")
+                    except WorkStateError:
+                        logger.debug("Could not record player request %s", request_id, exc_info=True)
+                self._active_player_requests[save_id] = request_id
+        if (not is_player and save_id and self._work_store is not None
+                and request_id in self._autonomy_requests):
+            try:
+                self._work_store.record_request(save_id, request_id, text[:300], origin="autonomy")
+            except WorkStateError:
+                logger.debug("Could not record autonomy request %s", request_id, exc_info=True)
+
+        # Independent autostart test resume: a re-fired stable preset id whose request
+        # is already bound to a goal never plans a duplicate. An active goal resumes
+        # its scope (the next snapshot's autonomy decision continues the persisted
+        # work without replaying completed native steps); a goal that already reached
+        # a persisted terminal state (e.g. a crash before the terminal marker reached
+        # the Mod) gets its terminal signal replayed idempotently instead.
+        if (is_player and self._is_preset_request(request_id) and save_id
+                and self._work_store is not None and self._autonomy is not None):
+            if self._preset_business_blocked(save_id):
+                await self._maybe_notify_preset_terminal(ws, save_id)
+                return
+            bound = self._preset_bound_goal(save_id, request_id)
+            if bound is not None and bound.status in {"completed", "cancelled"}:
+                self._preset_runs[save_id] = {"request_id": request_id, "goal_id": bound.id, "notified": True}
+                logger.info(
+                    "Preset goal [%s] re-fired after goal %s already %s; replaying terminal signal",
+                    request_id, bound.id, bound.status)
+                terminal_reply = Envelope.create_chat_reply(
+                    self.instance_id, request_id, bound.status,
+                    "本轮农场照料目标已完成。" if bound.status == "completed" else "本轮农场照料目标已取消。",
+                    save_id=save_id, command_id=request_id, command_complete=True)
+                terminal_reply.payload["presetGoalId"] = bound.id
+                terminal_reply.payload["presetGoalTerminal"] = bound.status
+                await self._send_reply(ws, terminal_reply)
+                return
 
         # 1. Concurrency deduplication guard
-        if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
+        if not _slot_owned and (self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled)):
             logger.warning("Chat submit [%s] rejected (companion busy)", request_id)
+            if _delivery is not None:
+                # The runner retries at the next boundary; no UI noise.
+                self._settle_delivery(request_id, False)
+                return
             busy_reply = Envelope.create_chat_reply(
                 sender_instance_id=self.instance_id,
                 request_id=request_id,
@@ -3438,56 +4950,82 @@ class ChatBridge:
             await self._send_reply(ws, busy_reply)
             return
 
-        async with self._busy_lock:
+        async with contextlib.nullcontext() if _slot_owned else self._busy_lock:
+            instructions = load_instruction_bundle(
+                actor_mode=getattr(self, "actor_mode", None))
             # A changed profile/tool surface (or a legacy session without a
             # recorded fingerprint) must not reuse the old provider session.
             existing_cid = self._ensure_session_matches_profile(
-                save_id, self.get_conversation_id(save_id)
+                save_id, self.get_conversation_id(save_id), instruction_revision=instructions.revision
             )
             previous_cid = existing_cid
-            if request_id in self._chain_requests:
-                chain = self._command_chains.get(save_id or "")
-                instruction = chain.instruction if chain else text
-                prompt = self._format_chain_prompt(instruction, save_id)
-                task_prompt = f"[续链#{chain.chain_count if chain else 1}] {instruction}"
-            else:
-                prompt = self._format_agent_prompt(text, save_id)
+            if _delivery is not None:
+                prompt = self._format_delivery_prompt(
+                    _delivery["events"], save_id or "",
+                    midflight=_delivery.get("midflight") or [],
+                    read_only=bool(_delivery.get("read_only")),
+                    instructions=instructions.text,
+                )
+                task_prompt = "[outbox-delivery]"
+            elif request_id in self._autonomy_requests:
+                prompt = instructions.text + "\n\n" + text
                 task_prompt = text
+            else:
+                prompt = self._format_agent_prompt(text, save_id, instructions=instructions.text)
+                task_prompt = text
+            if midflight or paused_chat:
+                prompt += "\n执行环境：" + json.dumps({
+                    "workDispatchAvailable": False, "paused": bool(paused_chat),
+                    "inFlight": self._in_flight_summary(save_id) if midflight else None,
+                }, ensure_ascii=False)
+            full_prompt = prompt
+            # PromptDelivery shares acknowledged guidance across all turn types.
+            reload_summary = self._work_reload_context(save_id, existing_cid)
+            if reload_summary:
+                prompt += "\n读档变化：" + json.dumps(reload_summary, ensure_ascii=False)
             is_kimi = self.backend_name == "kimi"
             # The agy SQLite bill is agy-only; Kimi usage comes from the provider
             # wire file. Capture the byte offset now so this turn's records are
             # attributable even on a resumed (cumulative) session.
-            start_max_idx = -1 if is_kimi else get_max_gen_idx(existing_cid)
-            start_max_step_idx = -1 if is_kimi else get_max_step_idx(existing_cid)
+            start_max_idx = get_max_gen_idx(existing_cid) if self.backend_name == "agy" else -1
+            start_max_step_idx = get_max_step_idx(existing_cid) if self.backend_name == "agy" else -1
             wire_start_offset = wire_offset(existing_cid, cwd=project_root()) if is_kimi else 0
 
             # Create active task record with prompt and starting boundary
             active_task = ActiveChatTask(
                 request_id=request_id,
                 save_id=save_id or "",
-                command_id=(self._command_chains[save_id].root_request_id
-                            if save_id in self._command_chains else request_id),
+                command_id=(str(_delivery.get("command_id") or request_id)
+                            if _delivery is not None else request_id),
                 prompt=task_prompt,
                 start_max_idx=start_max_idx,
                 start_max_step_idx=start_max_step_idx,
                 wire_start_offset=wire_start_offset,
                 async_task=asyncio.current_task(),
+                instructions_text=instructions.text,
+                read_only=paused_chat or midflight or bool((_delivery or {}).get("read_only")),
+                preserve_session=paused_chat or midflight or _delivery is not None,
+                goal_scope=_goal_scope,
+                goal_default=_goal_default,
+                work_request_ids=[str(m["id"]) for m in (_delivery or {}).get("midflight") or []],
             )
             self._active_task = active_task
+            starting_decision_token = ((self._work_store.state(save_id).decision or {}).get("token")
+                                       if self._work_store is not None and save_id else None)
             # Park the internal plan worker and release its MCP session: the Mod
             # serves one command socket and the provider turn now owns it.
-            await self._claim_execution(save_id)
-
+            # Read-only turns (paused/midflight/read-only delivery) only use the
+            # cached life surface and never touch the execution connection.
+            execution_claimed = False
             try:
-                # 2. Immediate progress notification (includes a profile/session
-                # rotation note when one just happened, so F8 never silently
-                # continues an old tool surface).
-                rotation_note = self.consume_profile_rotation_note()
+                if not active_task.read_only:
+                    execution_claimed = await self._claim_execution(save_id, recover=not paused_chat)
+                # 2. Immediate progress notification.
                 prog_reply = Envelope.create_chat_reply(
                     sender_instance_id=self.instance_id,
                     request_id=request_id,
                     status="processing",
-                    reply_text=rotation_note or "正在思考与执行...",
+                    reply_text="正在思考与执行...",
                     save_id=save_id,
                     command_id=active_task.command_id,
                     command_complete=False,
@@ -3503,34 +5041,53 @@ class ChatBridge:
                     start_max_idx,
                 )
 
-                # 4. Invoke agy CLI in executor
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    None,
-                    self._execute_turn,
-                    active_task, existing_cid, prompt,
-                )
+                # 4. Invoke the provider in an executor. A missing local session is
+                # rotated honestly (old id kept in history) and retried once on a
+                # fresh session carrying the full instructions.
+                session_retried = False
+                while True:
+                    result = await self._await_work_provider(active_task, existing_cid, prompt)
+                    if (not session_retried
+                            and not active_task.cancelled and save_id
+                            and (self.backend_name, result.get("error")) in {
+                                ("mcode", "MCODE_SESSION_UNAVAILABLE"),
+                                ("codex", "CODEX_SESSION_UNAVAILABLE"),
+                                ("codex", "CODEX_CONTEXT_EXHAUSTED"),
+                            }):
+                        session_retried = True
+                        self._rotate_provider_session(save_id, reason=str(result.get("error")))
+                        existing_cid = None
+                        prompt = full_prompt
+                        continue
+                    break
 
                 # If task was cancelled during execution, handle_chat_cancel already handled reply & record
                 if active_task.cancelled:
                     logger.info("Task [%s] was cancelled during execution; cancel handler finished.", request_id)
+                    if _delivery is not None:
+                        self._settle_delivery(request_id, False)
                     if not getattr(active_task, "recorded", False):
                         duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
-                        cid = self.get_conversation_id(save_id)
+                        cid = active_task.provider_conversation_id or result.get("conversation_id") or self.get_conversation_id(save_id)
+                        interrupted_usage = (get_command_usage_delta(cid, active_task.start_max_idx) if self.backend_name == "agy"
+                            else self._codex_turn_usage(result) if self.backend_name == "codex"
+                            else result.get("usage") if self.backend_name == "mcode" else None)
                         self._record_command(
                             request_id=request_id,
                             save_id=save_id,
                             conversation_id=cid,
                             prompt=text,
                             status="interrupted",
-                            start_idx=start_max_idx,
+                            start_idx=active_task.start_max_idx,
                             end_idx=-1,
-                            usage=None,
-                            missing_reason="interrupted",
+                            usage=interrupted_usage,
+                            missing_reason=None if interrupted_usage else "interrupted_usage_unknown",
                             error=getattr(active_task, "abort_reason", None) or "INTERRUPTED",
                             duration=duration,
                         )
                         active_task.recorded = True
+                        if self.backend_name in {"codex", "mcode"} and self._autonomy and save_id:
+                            self._autonomy.record_usage(save_id, self._current_game_day_key or "unknown", result.get("usage"))
                     return
 
                 # 5. Handle output & token usage
@@ -3541,6 +5098,8 @@ class ChatBridge:
                 new_session_established = previous_cid is None
                 self._notify_terminal(status)
                 reply_text = result.get("response", "")
+                if session_retried and result.get("success"):
+                    reply_text = "（会话已失效，已安全新建会话后继续。）\n" + reply_text
                 cid = result.get("conversation_id") or existing_cid
                 if cid and existing_cid and cid != existing_cid:
                     start_max_idx = -1
@@ -3550,22 +5109,41 @@ class ChatBridge:
                 duration = result.get("duration", 0.0)
 
                 if not result.get("success"):
-                    if err == "RESOURCE_EXHAUSTED":
+                    if err in {"TOOL_APPROVAL_REQUIRED", "CODEX_INVALID_PROMPT", "CONTENT_REVIEW_BLOCKED"}:
+                        reply_text = ("MiniMax Code 的内容审核拒绝了本次请求（CONTENT_REVIEW_BLOCKED）。工作及结果重投已暂停，保留游戏实际进度；请在客户端确认原因后手动继续。"
+                                      if err == "CONTENT_REVIEW_BLOCKED" else
+                                      "模型服务安全检查拒绝了本次请求（invalid_prompt）。自主工作及结果重投已暂停，保留此前实际进度；请处理请求问题后手动继续。"
+                                      if err == "CODEX_INVALID_PROMPT" else
+                                      "工具调用被审批策略拒绝，拒绝的操作未执行。自主工作已暂停，保留此前实际进度；请处理审批配置后手动继续。")
+                        if self._autonomy is not None and save_id:
+                            self._autonomy.control(save_id, "pause")
+                        if self._work_store is not None and save_id:
+                            self._work_store.set_paused(save_id, True)
+                            self._work_store.set_outbox_retry_block(save_id, str(err))
+                    elif err == "RESOURCE_EXHAUSTED":
                         reply_text = "AI 模型额度已用尽，本次任务已停止。自由模式已暂停，请处理额度后手动继续。"
                         if self._autonomy is not None and save_id:
                             try:
                                 self._autonomy.control(save_id, "pause")
                             except (TypeError, ValueError):
                                 logger.warning("Unable to pause free mode after quota exhaustion for %s", save_id)
+                        if self._work_store is not None and save_id:
+                            self._work_store.set_paused(save_id, True)
+                            self._work_store.set_outbox_retry_block(save_id, "RESOURCE_EXHAUSTED")
                     elif err == "AUTHENTICATION_REQUIRED":
                         reply_text = "Kimi 登录或认证已失效，请完成登录后再试。"
                     elif err == "RATE_LIMIT_EXCEEDED":
                         reply_text = "Kimi 请求过于频繁，请稍后重试。"
+                    elif err == "MCODE_SESSION_UNAVAILABLE":
+                        reply_text = "会话已失效，已安全新建会话；请再发一次。"
 
-                if cid and save_id:
+                if cid and save_id and (not active_task.read_only or active_task.preserve_session):
                     self.record_conversation_id(save_id, cid)
+                    if result.get("success") and reload_summary:
+                        self._work_reload_context(save_id, cid, delivered=True,
+                                                  expected_game_session_id=reload_summary.get("gameSessionId"))
 
-                end_max_idx = get_max_gen_idx(cid) if (cid and not is_kimi) else -1
+                end_max_idx = get_max_gen_idx(cid) if (cid and self.backend_name == "agy") else -1
 
                 missing_reason = None
                 tokens_used = None
@@ -3591,6 +5169,25 @@ class ChatBridge:
                         usage_source = usage.get("source", "kimi_wire_usage_record")
                         if usage.get("unknown"):
                             missing_reason = "kimi_wire_usage_partial_unknown"
+                elif self.backend_name == "codex":
+                    usage = self._codex_turn_usage(result)
+                    usage_source = result.get("usage_source", "unknown")
+                    if usage is None:
+                        missing_reason = result.get("usage_limits") or "codex_usage_unavailable"
+                elif self.backend_name == "dsh":
+                    # SDK assistant/message counters are already scoped to this
+                    # turn, including resumed sessions and interrupted jobs.
+                    usage = result.get("usage") or self._usage_display.turn_response_usage(request_id, save_id)
+                    usage_source = "dsh_assistant_message" if usage else "unknown"
+                    if usage is None:
+                        missing_reason = "dsh_response_usage_unavailable"
+                elif self.backend_name == "mcode":
+                    # One exec result is already scoped to exactly this turn,
+                    # resumed session or not.
+                    usage = result.get("usage")
+                    usage_source = "mcode_exec_result" if usage else "unknown"
+                    if usage is None:
+                        missing_reason = "mcode_exec_usage_unavailable"
                 else:
                     # Authoritative agy delta from the conversation DB (agy only).
                     usage_delta = get_command_usage_delta(cid, start_max_idx) if cid else None
@@ -3629,19 +5226,20 @@ class ChatBridge:
                         )
 
                 if usage:
-                    tokens_used = usage.get("total_tokens")
-                    prompt_tokens = usage.get("input_tokens")
+                    display_usage = normalize_usage(self.backend_name, usage)
+                    tokens_used = display_usage.get("total_tokens")
+                    prompt_tokens = display_usage.get("input_tokens")
                     if prompt_tokens is None:
                         prompt_tokens = usage.get("prompt_tokens")
                     output_tokens = usage.get("output_tokens")
-                    cached_tokens = usage.get("cache_read_tokens")
+                    cached_tokens = usage.get("cache_read_tokens", usage.get("cache_read_input_tokens"))
                     # Explicit split: cache read and cache write are different
                     # counters and must not be merged into one "cache" number.
-                    cache_read_tokens = usage.get("cache_read_tokens")
-                    cache_write_tokens = usage.get("cache_creation_tokens")
+                    cache_read_tokens = usage.get("cache_read_tokens", usage.get("cache_read_input_tokens"))
+                    cache_write_tokens = usage.get("cache_creation_tokens", usage.get("cache_write_input_tokens"))
                     # Number of provider model calls aggregated for this turn
                     # (usage.record lines already de-duplicated by the wire reader).
-                    model_calls = usage.get("generations_count")
+                    model_calls = usage.get("generations_count", usage.get("requestCount"))
 
                 # Persist command record into chat_commands.jsonl (success and failure)
                 self._record_command(
@@ -3659,30 +5257,52 @@ class ChatBridge:
                 )
                 active_task.recorded = True
 
-                plan_line = self._plan_status_line()
-                if plan_line:
-                    reply_text = (reply_text + "\n" + plan_line) if reply_text else plan_line
+                # Structured progress already feeds the player's work panel.
+                # Keep diagnostic operation names/reason codes out of chat.
                 reply_status = status
                 job_selected = False
-                if status == "completed" and self._work_store and save_id:
+                if not active_task.read_only and self._work_store and save_id:
                     selected = self._work_store.state(save_id).decision
                     if selected.get("selected") and not selected.get("finished"):
+                        # job-selected means dispatched, not finished: the model's
+                        # own acknowledgement is delivered verbatim and the
+                        # confirmed terminal arrives as a later delivery turn.
                         reply_status = "selected"
                         job_selected = True
                         self._job_reply_binding = (request_id, save_id, selected.get("taskId"), ws, active_task.command_id)
-                        chain = self._command_chains.get(save_id)
-                        if chain is not None:
-                            chain.waiting_task_id = selected.get("taskId")
-                        reply_text = "已选择短作业，等待原生执行。\n" + (reply_text or "")
-                    else:
+                    elif status == "completed":
                         reply_status = "decision-completed"
-                if not job_selected or status != "completed":
-                    self._break_command_chain(save_id)
+                # Independent autostart test: once the model binds a goal to the preset
+                # request, adopt it as the autonomy scope so continuation and restart
+                # resume the same persisted work instead of planning a duplicate goal.
+                # A goal completed within this very turn still reports its verified
+                # terminal state on the dedicated presetGoalTerminal field — generic
+                # reply status/commandComplete never settle the preset run.
+                preset_goal_id = None
+                preset_goal_terminal = None
+                if (self._is_preset_request(request_id) and save_id and self._autonomy is not None
+                        and self._work_store is not None and not active_task.cancelled):
+                    bound = self._preset_bound_goal(save_id, request_id)
+                    if bound is not None:
+                        preset_goal_id = bound.id
+                        self._preset_runs[save_id] = {"request_id": request_id, "goal_id": bound.id, "notified": False}
+                        if bound.status == "active":
+                            self._autonomy.set_goal_scope(save_id, bound.id)
+                            logger.info("Preset goal [%s] adopted goal scope %s", request_id, bound.id)
+                        elif bound.status in {"completed", "cancelled"}:
+                            policy = getattr(self, "_preset_day_boundary", None)
+                            if policy and policy.enabled:
+                                assessed = policy.reconcile(save_id, self._work_store, self._latest_snapshot_payload)
+                                bound = self._preset_bound_goal(save_id, request_id)
+                                if assessed and assessed.get("reason") and bound.status == "cancelled":
+                                    reply_text = "本轮未达到已核验的原生睡觉保存边界，已安全结束，不报告成功。 " + assessed["reason"]
+                            preset_goal_terminal = bound.status
                 final_reply = Envelope.create_chat_reply(
                     sender_instance_id=self.instance_id,
                     request_id=request_id,
                     status=reply_status,
-                    reply_text=reply_text or ("任务未能成功执行。" if status == "failed" else "任务执行完毕。"),
+                reply_text=reply_text or ("本次对话未能完成。" if active_task.read_only and status == "failed"
+                    else "已保留暂停。" if active_task.read_only else "任务未能成功执行。" if status == "failed" else "任务执行完毕。"),
                     save_id=save_id,
                     tokens_used=tokens_used,
                     prompt_tokens=prompt_tokens,
@@ -3698,8 +5318,28 @@ class ChatBridge:
                     command_id=active_task.command_id,
                     command_complete=not job_selected,
                 )
-                await self._send_reply(ws, final_reply)
-                if self._autonomy is not None and save_id:
+                if preset_goal_id:
+                    final_reply.payload["presetGoalId"] = preset_goal_id
+                if preset_goal_terminal:
+                    final_reply.payload["presetGoalTerminal"] = preset_goal_terminal
+                notification_saved = False
+                if _delivery is not None and result.get("success") and self._work_store and save_id:
+                    ids = [event["id"] for event in _delivery["events"]
+                           if event.get("requestId") and not str(event["requestId"]).startswith("autonomy-")]
+                    if ids:
+                        final_reply.payload["deliveryOutboxIds"] = ids
+                        self._work_store.queue_outbox_notification(save_id, ids, final_reply.to_mapping())
+                        notification_saved = True
+                sent_ok = await self._send_reply(ws, final_reply)
+                if preset_goal_terminal and sent_ok and self._preset_runs.get(save_id, {}).get("goal_id") == preset_goal_id:
+                    # The terminal signal rode this final reply; the snapshot-time
+                    # notifier must not send it again.
+                    self._preset_runs[save_id]["notified"] = True
+                if _delivery is not None:
+                    # Model completion consumes its turn. Player delivery needs
+                    # the native receipt; a failed socket replays the saved reply.
+                    self._settle_delivery(request_id, bool(sent_ok or notification_saved) and bool(result.get("success")))
+                if self._autonomy is not None and save_id and not active_task.read_only:
                     self._autonomy.record_event(save_id, f"chat-terminal:{request_id}:{status}", f"chat.{status}")
                     autonomy_fingerprint = self._autonomy_requests.pop(request_id, None)
                     if autonomy_fingerprint:
@@ -3710,11 +5350,20 @@ class ChatBridge:
                         elif self._work_store is not None:
                             job_state = self._work_store.state(save_id)
                             decision = job_state.decision if job_state else {}
-                            if not decision.get("selected"):
+                            # A finished selection left by an earlier turn is
+                            # historical feedback, not a dispatch by this turn.
+                            selected_this_turn = bool(decision.get("selected") and (
+                                not decision.get("finished")
+                                or decision.get("token") != starting_decision_token))
+                            if not selected_this_turn:
                                 self._autonomy.record_action_result(
                                     save_id, autonomy_fingerprint, True, reason="standby"
                                 )
+                                self._rearm_after_standby_turn(save_id)
                             else:
+                                day_key = self._current_game_day_key or "unknown"
+                                if getattr(self, "_standby_rearm_streak", None) is not None:
+                                    self._standby_rearm_streak.pop(f"{save_id}:{day_key}", None)
                                 task_id = decision.get("taskId")
                                 task = next((t for t in job_state.tasks if t.id == task_id), None) if task_id else None
                                 last_job = job_state.last_job or {}
@@ -3738,7 +5387,9 @@ class ChatBridge:
                                         if lj_status != "completed":
                                             fail_reason = last_job.get("reasonCode") or last_job.get("message") or last_job.get("error") or lj_status
 
-                                if terminal_status in {"partial", "rejected", "failed", "unknown", "cancelled"}:
+                                if fail_reason == "BEDTIME":
+                                    pass  # Planned rest is not a work failure.
+                                elif terminal_status in {"unknown", "cancelled"}:
                                     self._autonomy.record_action_result(
                                         save_id, autonomy_fingerprint, False, reason=fail_reason or terminal_status
                                     )
@@ -3758,21 +5409,7 @@ class ChatBridge:
                         self._current_game_day_key or "unknown",
                         usage_delta or usage,
                     )
-                    # If the provider has no usable context replacement (the game
-                    # backend session just grows), rotate on the configured input
-                    # context policy so the next turn carries goals/tasks/state
-                    # into a fresh session. Latest-request context only, never a
-                    # cumulative token sum.
-                    rotation_reason = self._note_session_context(save_id, usage_delta or usage)
-                    if rotation_reason:
-                        logger.info(
-                            "Session context policy hit for %s (%s): latestInputContext=%s requests=%s",
-                            save_id,
-                            rotation_reason,
-                            self._session_context_state.get(save_id, {}).get("latestInputContext"),
-                            self._session_requests.get(save_id),
-                        )
-                        self._rotate_provider_session(save_id, reason=rotation_reason)
+                    self._note_session_context(save_id, usage_delta or usage)
                 logger.info(
                     "Completed chat submit [%s] with status=%s, tokens=%s (source=%s)",
                     request_id,
@@ -3780,30 +5417,40 @@ class ChatBridge:
                     tokens_used,
                     usage.get("source", "none") if usage else (usage_source or "none"),
                 )
-
             except asyncio.CancelledError:
                 logger.info("handle_chat_submit [%s] cancelled.", request_id)
-                self._break_command_chain(save_id)
+                if _delivery is not None:
+                    self._settle_delivery(request_id, False)
+                fingerprint = self._autonomy_requests.pop(request_id, None)
+                if fingerprint and self._autonomy is not None and save_id:
+                    decision = self._work_store.state(save_id).decision if self._work_store else {}
+                    if not decision.get("selected"):
+                        # No native work owns this consumed wakeup. Permit one
+                        # fresh decision on reconnect; selected jobs keep their
+                        # existing execution/reconciliation gate unchanged.
+                        self._autonomy.request_job_decision(save_id)
                 if not getattr(active_task, "recorded", False):
                     duration = time.monotonic() - getattr(active_task, "start_time", time.monotonic())
-                    cid = self.get_conversation_id(save_id)
+                    cid = active_task.provider_conversation_id or self.get_conversation_id(save_id)
+                    interrupted_usage = get_command_usage_delta(cid, active_task.start_max_idx) if self.backend_name == "agy" else None
                     self._record_command(
                         request_id=request_id,
                         save_id=save_id,
                         conversation_id=cid,
                         prompt=active_task.prompt,
                         status="interrupted",
-                        start_idx=start_max_idx,
+                        start_idx=active_task.start_max_idx,
                         end_idx=-1,
-                        usage=None,
-                        missing_reason="interrupted",
+                        usage=interrupted_usage,
+                        missing_reason=None if interrupted_usage else "interrupted",
                         error=getattr(active_task, "abort_reason", None) or "INTERRUPTED",
                         duration=duration,
                     )
                     active_task.recorded = True
             except Exception as ex:
                 logger.error("Error in handle_chat_submit [%s]: %s", request_id, ex, exc_info=True)
-                self._break_command_chain(save_id)
+                if _delivery is not None:
+                    self._settle_delivery(request_id, False)
                 err_reply = Envelope.create_chat_reply(
                     sender_instance_id=self.instance_id,
                     request_id=request_id,
@@ -3819,85 +5466,226 @@ class ChatBridge:
                 if self._active_task is active_task:
                     self._active_task = None
                 # Hand the command socket back and let the worker advance any plan
-                # the provider just committed (no model turn per step).
-                await self._release_execution(save_id)
+                # the provider just committed (no model turn per step). Read-only
+                # turns never claimed it.
+                if execution_claimed:
+                    await self._release_execution(save_id)
+                # Publish after the provider slot is cleared. Publishing inside
+                # the try block leaves the player's last projection at planning,
+                # even when the native job and its model follow-up have settled.
+                if save_id:
+                    try:
+                        await self._push_work_state(ws, save_id)
+                    except Exception:
+                        logger.debug("Unable to publish settled work state", exc_info=True)
                 # A work turn just freed the single model slot: deliver any queued
                 # life-chat submits FIFO (each always reaches a terminal state).
-                if self._life_queue:
+                if self._life_queue or self._pending_life_preparation:
                     try:
-                        asyncio.get_running_loop().create_task(self._drain_life_queue(ws))
+                        task = asyncio.get_running_loop().create_task(self._drain_life_queue(ws))
+                        self._life_drain_tasks.add(task)
+                        task.add_done_callback(self._life_drain_tasks.discard)
                     except RuntimeError:
                         pass
 
-    def _format_agent_prompt(self, user_text: str, save_id: str | None = None) -> str:
-        context = render_decision_context(self._decision_context(save_id, origin="chat"))
+    def _work_reload_context(self, save_id: str | None, session_id: str | None, *, delivered: bool = False,
+                             expected_game_session_id: str | None = None):
+        from .game_reload import _read, _write, reload_context
+        from .snapshot_cache import cache_lock
+        if self.run_dir is None or not save_id:
+            return None
+        player_mode = getattr(self, "actor_mode", "companion") == "player"
+        # A delivery acknowledgement only needs immutable load metadata, never
+        # another full unlocked read of a work ledger that is being committed.
+        summary = (_read(self.run_dir / "data/reload-context.json").get(save_id)
+                   if player_mode else reload_context(self.run_dir, save_id))
+        if not summary:
+            return None
+        path = self.run_dir / "data/reload-deliveries.json"
+        actor_id = (self._latest_snapshot_payload or {}).get("actorMultiplayerId", "unknown")
+        # A model context rotation is not a native save reload. Acknowledgment
+        # belongs to the save/actor/world session, not the disposable provider CID.
+        key = (f"native-world:{save_id}:player:{actor_id}" if player_mode
+               else f"{self.backend_name}:{save_id}:{session_id}")
+        reload_id = summary.get("gameSessionId")
+        with cache_lock(path):
+            records = _read(path)
+            if (player_mode or session_id) and records.get(key) == reload_id:
+                return None
+            if delivered:
+                if player_mode and expected_game_session_id is not None and (
+                        reload_id != expected_game_session_id or
+                        getattr(self, "_player_session_id", None) != expected_game_session_id):
+                    return None  # A late old-world reply cannot acknowledge a new load.
+                records[key] = reload_id
+                _write(path, records)
+                return None
+        if player_mode or session_id:
+            return {k: summary[k] for k in ("gameSessionId", "loadedGameDate", "instruction", "requiresWorldRevalidation", "historyTool") if k in summary}
+        return summary
+
+    def _format_agent_prompt(self, user_text: str, save_id: str | None = None, *, instructions: str | None = None) -> str:
+        live = self._decision_context(save_id, origin="chat")
+        live.pop("reloadSummary", None)
+        context = render_decision_context(model_decision_context(live))
         return (
-            "你是星露谷伙伴智能体，请直接通过已接入的 stardew-companion MCP 工具操作游戏，完成玩家的指令。\n"
-            "每次请求都会附带以下紧凑实时上下文（字段缺失为 unknown）；工具结果是执行后的最新事实，"
-            "不要为了确认再重复查询。\n"
             f"实时上下文：{context}\n"
-            "用submit_plan选择本次唯一语义短作业；内部导航和同一业务的多步操作由运行时执行。"
-            "remember_intent记录目标与待办，它们不是执行授权。不要预排第二种业务；"
-            "下一业务须下一次模型决策。job-selected仅表示已选择，未执行成功；"
-            "下一次输入lastResult是实际终态，信任它，不重复核查。\n"
-            "自主执行，不要向玩家询问坐标或请求额外确认。不要读写代码文件或执行终端命令。\n"
-            "任务完成后，向玩家简短汇报完成情况与剩余工作。\n"
-            "始终用中文回复玩家。\n\n"
+            f"{instructions or decision_policy()}\n\n"
             f"玩家指令：{user_text}"
         )
 
     def _is_player_request(self, request_id: str) -> bool:
         if request_id in self._autonomy_requests:
             return False
-        if request_id in self._chain_requests:
-            return False
-        if request_id.startswith("autonomy-") or request_id.startswith("chain-"):
+        if request_id.startswith("autonomy-") or request_id.startswith("delivery-"):
             return False
         return True
 
-    def _register_command_chain(self, save_id: str, text: str, ws: WebSocketClient | None, request_id: str) -> None:
-        self._chain_generation += 1
-        self._pending_native_cancels.pop(save_id, None)
-        self._command_chains[save_id] = CommandChain(
-            instruction=text,
-            save_id=save_id,
-            root_request_id=request_id,
-            started_at=time.monotonic(),
-            chain_count=0,
-            generation=self._chain_generation,
-            ws=ws,
+    # Independent autostart test (isolated launcher opt-in). The Mod dispatches a
+    # preset goal through this exact chat pipeline with a stable per-run/save request
+    # id, so reconnect/restart never creates a duplicate goal: a re-fired id whose
+    # request is already bound to an active goal resumes that goal's scope instead of
+    # planning again.
+    _PRESET_REQUEST_PREFIX = "preset-"
+
+    def _is_preset_request(self, request_id: str) -> bool:
+        return isinstance(request_id, str) and request_id.startswith(self._PRESET_REQUEST_PREFIX)
+
+    def _preset_bound_goal(self, save_id: str | None, request_id: str):
+        """The active goal already bound to a preset request id, or None."""
+        if self._work_store is None or not save_id:
+            return None
+        state = self._work_store.state(save_id)
+        request = next((r for r in state.requests if r.get("id") == request_id), None)
+        goal_id = request.get("goalId") if request else None
+        if not goal_id:
+            return None
+        return next((g for g in state.goals if g.id == goal_id), None)
+
+
+    @staticmethod
+    def _requests_work_resume(text: str) -> bool:
+        # Whole work-control utterances only; '继续讲讲' is ordinary conversation.
+        normalized = text.strip().rstrip("。！!，, ")
+        return normalized in {"继续", "继续吧", "继续工作", "继续干活", "继续任务", "恢复工作", "恢复任务",
+                              "继续刚才的工作", "继续刚才的任务", "继续之前的工作", "继续暂停的工作", "现在开始吧", "开始工作", "恢复", "恢复吧"}
+
+    def _control_utterance(self, text: str) -> str | None:
+        # Whole work-control utterances only; conversation that merely mentions
+        # pause or cancel must never steer native work.
+        normalized = text.strip().rstrip("。！!，, ")
+        if self._requests_work_resume(text):
+            return "resume"
+        if normalized in {"暂停", "先停一下", "暂停工作", "先停下", "停一下"}:
+            return "pause"
+        if normalized in {"取消当前任务", "取消现在的工作", "取消任务"}:
+            return "cancel"
+        if explicit_cancel_scope(text) is not None:
+            return "cancel"
+        return None
+
+    def _job_in_flight(self, save_id: str | None) -> bool:
+        """A selected/undispatched-or-running native job owns the connection."""
+        if not save_id or self._work_store is None:
+            return False
+        state = self._work_store.state(save_id)
+        decision = state.decision
+        if decision.get("selected") and not decision.get("finished"):
+            selected = next((t for t in state.tasks if t.id == decision.get("taskId")), None)
+            # Legacy direct selections have no task. A cancelled pending plan,
+            # however, owns no physical work and cannot block its replacement.
+            if selected is None or selected.status != "cancelled":
+                return True
+        return any(
+            any(step.command_id and step.status in {"running", "unknown", "waiting"}
+                for step in task.steps)
+            for task in state.tasks
         )
 
-    def _break_command_chain(self, save_id: str | None = None) -> None:
-        self._chain_generation += 1
-        if save_id:
-            self._command_chains.pop(save_id, None)
-        else:
-            self._command_chains.clear()
-        # Never cancel the caller itself: a chain-continuation task breaks its
-        # own chain at end of turn and must still deliver the final reply.
+    def _work_settling(self, save_id: str | None) -> bool:
+        """Work executes natively or confirmed facts still await delivery."""
+        if not save_id or self._work_store is None:
+            return False
+        if self._job_in_flight(save_id):
+            return True
         try:
-            current = asyncio.current_task()
-        except RuntimeError:
-            current = None
-        for task in list(self._chain_tasks):
-            if task is current:
-                continue
-            if not task.done():
-                task.cancel()
-        self._chain_tasks.clear()
+            return bool(self._work_store.pending_outbox(save_id))
+        except Exception:
+            return False
 
-    def _get_command_chain_max(self) -> int:
-        try:
-            return int(os.getenv("STARDEW_COMMAND_CHAIN_MAX", "8"))
-        except ValueError:
-            return 8
+    def _in_flight_summary(self, save_id: str | None) -> dict[str, Any]:
+        if not save_id or self._work_store is None:
+            return {}
+        state = self._work_store.state(save_id)
+        task = next((t for t in state.tasks if t.id == state.decision.get("taskId")), None)
+        summary: dict[str, Any] = {}
+        if task is not None:
+            summary["title"] = task.title
+            summary["status"] = task.status
+        if state.decision.get("taskId"):
+            summary["taskId"] = state.decision.get("taskId")
+        return summary
 
     async def _on_job_terminal(
         self, save_id: str, execution: StepExecution, reason: str
     ) -> None:
         if not save_id:
             return
+        error_text = " ".join((str(execution.reason_code or ""), str(execution.message or ""),
+                               json.dumps(execution.result, ensure_ascii=False, default=str)))
+        blocker = re.search(r"\bIDEMPOTENCY_(?:CAPACITY_EXCEEDED|RECEIPT_UNAVAILABLE)\b", error_text)
+        if blocker:
+            # Receipt storage is infrastructure. The gameplay model cannot
+            # repair it by selecting another route, query, or business action.
+            self._pause_native_recovery(save_id, blocker.group())
+        task = next((t for t in self._work_store.state(save_id).tasks
+                     if t.id == execution.task_id), None) if self._work_store is not None else None
+        # Normal execution commits this fact with its native outcome.
+        # Callback-only integrations can still publish their supplied receipt
+        # before any care/UI await; never infer ownership from a newer request.
+        # Persist the confirmed terminal fact for the owning player request and
+        # schedule its boundary delivery. Autonomy-originated jobs already reach
+        # the model via lastResult in the next autonomy turn, so they stay out
+        # of the outbox (no extra model turn per autonomous job).
+        if self._work_store is not None:
+            request_record = None
+            try:
+                request_record = self._work_store.find_request_for_task(save_id, execution.task_id)
+            except Exception:
+                logger.debug("Could not resolve request for task %s", execution.task_id, exc_info=True)
+            request_id = (request_record or {}).get("id")
+            origin = (request_record or {}).get("origin")
+            if origin in {"player", "player-midflight"} and request_id:
+                feedback = compact_task_feedback(task,
+                    {**(execution.result or {}), "effects": execution.effects,
+                     "reasonCode": execution.reason_code, "commandId": execution.command_id},
+                    operation=execution.operation or "", status=execution.outcome)
+                event = {
+                    "kind": "terminal",
+                    "commandId": execution.command_id or execution.task_id or "unknown",
+                    "taskId": execution.task_id,
+                    "goalId": getattr(task, "goal_id", None),
+                    "operation": execution.operation,
+                    "outcome": execution.outcome,
+                    "reasonCode": execution.reason_code,
+                    "effects": execution.effects,
+                    "feedback": feedback,
+                    "snapshotRevision": self._latest_snapshot_revision,
+                    "gameDate": self._current_game_day_key,
+                    "requestId": request_id,
+                }
+                try:
+                    recorded = self._work_store.state(save_id).outbox
+                    if not any(e.get("commandId") == event["commandId"]
+                               and e.get("outcome") == event["outcome"] for e in recorded):
+                        self._work_store.append_outbox_event(save_id, event)
+                except WorkStateError:
+                    logger.warning("Could not append outbox event for %s", execution.task_id, exc_info=True)
+                if blocker:
+                    self._work_store.set_outbox_retry_block(save_id, blocker.group())
+                else:
+                    self._maybe_deliver_outbox(save_id)
+
         pending_af = self._autonomy_pending_task_fingerprints.pop(execution.task_id, None)
         job_success = execution.task_status == "completed" and execution.outcome == "completed"
         if job_success:
@@ -3905,174 +5693,243 @@ class ChatBridge:
             # by commandId) and evaluate the work-done care hook (contract §2/§4).
             # Failures/cancellals/plans never reach this branch.
             task_title: str | None = None
-            if self._work_store is not None:
-                try:
-                    job_state = self._work_store.state(save_id)
-                    task = next(
-                        (t for t in job_state.tasks if t.id == execution.task_id), None
-                    )
-                    if task is not None:
-                        task_title = task.title
-                except Exception:
-                    task_title = None
+            if task is not None:
+                task_title = task.title
             if not task_title:
                 task_title = execution.operation or "农场作业"
             event_ref = execution.command_id or execution.task_id or task_title
-            self._record_memory_event(save_id, f"完成了「{task_title}」", event_ref)
-            world: dict[str, Any] = {}
-            if isinstance(self._latest_snapshot_payload, dict):
-                world = self._latest_snapshot_payload.get("world") or {}
-            binding = getattr(self, "_job_reply_binding", None)
-            autonomous = bool(pending_af or (binding and str(binding[0]).startswith("autonomy-")))
-            if not autonomous:
-                await self._maybe_fire_care(
-                    save_id, "work-done", event_ref, world, fact=f"完成了「{task_title}」"
-                )
-        if pending_af and self._autonomy is not None:
+            feedback = compact_task_feedback(task,
+                {**(execution.result or {}), "effects": execution.effects,
+                 "reasonCode": execution.reason_code},
+                operation=execution.operation or "", status=execution.outcome)
+            fact = f"作业「{task_title}」的实际结果：{feedback['progressSummary']}"
+            self._record_memory_event(save_id, fact, event_ref)
+            # The durable result outbox owns the single player-facing report.
+            # A second care turn here duplicated results and delayed continuation.
+        if pending_af and self._autonomy is not None and execution.reason_code != "BEDTIME" and execution.outcome not in {"failed", "rejected", "partial"}:
             af_save_id, af_fingerprint = pending_af
             job_fail_reason = execution.reason_code or execution.message or execution.outcome or reason
             self._autonomy.record_action_result(
                 af_save_id, af_fingerprint, job_success, reason=None if job_success else job_fail_reason
             )
-        chain = self._command_chains.get(save_id)
-        if chain is None:
-            return
-        # Only the terminal of the task the chain is actually waiting on may
-        # advance it. A late terminal from a revoked previous job settles to
-        # history above but must not fire a chain turn for the player's new
-        # instruction; consuming the binding below also makes a duplicated
-        # terminal advance nothing.
-        if chain.waiting_task_id is None or chain.waiting_task_id != execution.task_id:
-            return
-        chain.waiting_task_id = None
-        if execution.reason_code == "NATIVE_TERMINAL_UNCONFIRMED":
-            self._break_command_chain(save_id)
-            await self._send_reply(chain.ws, Envelope.create_chat_reply(
-                self.instance_id, f"chain-unconfirmed-{uuid.uuid4().hex[:8]}",
-                "failed", "原生作业尚未返回最终结果；已停止续链，避免重复派发。",
-                save_id=save_id, error=execution.reason_code,
-                command_id=chain.root_request_id, command_complete=True,
-            ))
-            return
-        if self._work_store and self._work_store.state(save_id).paused:
-            chain.pending_continuation = True
-            return
-        self._schedule_command_chain(save_id)
+        await self._push_work_state(self._chat_ws, save_id)
 
-    def _schedule_command_chain(self, save_id: str) -> asyncio.Task | None:
-        chain = self._command_chains.get(save_id)
-        if chain is None:
-            return None
-        if self._work_store and self._work_store.state(save_id).paused:
-            chain.pending_continuation = True
-            return None
-        chain.pending_continuation = False
+    def _maybe_deliver_outbox(self, save_id: str | None) -> None:
+        """Start the boundary delivery turn for persisted terminal facts."""
+        if not save_id or self._work_store is None:
+            return
+        if self._latest_snapshot_payload is None:
+            return
+        if self.actor_mode == "player" and self.control_owner != "agent":
+            return
+        running = self._delivery_tasks.get(save_id)
+        if running is not None and not running.done():
+            return
+        try:
+            if not (self._work_store.pending_outbox(save_id)
+                    or self._work_store.pending_outbox_notifications(save_id)):
+                return
+        except Exception:
+            logger.debug("Could not read pending outbox for %s", save_id, exc_info=True)
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return None
-        task = loop.create_task(
-            self._run_command_chain_continuation(save_id, chain.generation)
-        )
-        self._chain_tasks.add(task)
-        task.add_done_callback(self._chain_tasks.discard)
-        return task
-
-    async def _run_command_chain_continuation(
-        self, save_id: str, generation: int
-    ) -> None:
-        while (
-            self._busy_lock.locked()
-            or self._active_task is not None
-            or (self._plan_worker and self._plan_worker._provider_active)
-        ):
-            await asyncio.sleep(0.05)
-            chain = self._command_chains.get(save_id)
-            if chain is None or chain.generation != generation:
-                return
-            if self._work_store and self._work_store.state(save_id).paused:
-                chain.pending_continuation = True
-                return
-
-        chain = self._command_chains.get(save_id)
-        if chain is None or chain.generation != generation:
             return
-        if self._work_store and self._work_store.state(save_id).paused:
-            chain.pending_continuation = True
-            return
+        task = loop.create_task(self._run_outbox_delivery(save_id))
+        self._delivery_tasks[save_id] = task
 
-        max_chains = self._get_command_chain_max()
-        if chain.chain_count >= max_chains:
-            self._break_command_chain(save_id)
-            msg = f"指令续链已达到上限（{max_chains}次），已停止继续。若任务未全部完成，请再次输入指令。"
-            reply = Envelope.create_chat_reply(
-                sender_instance_id=self.instance_id,
-                request_id=f"chain-limit-{uuid.uuid4().hex[:8]}",
-                status="completed",
-                reply_text=msg,
-                save_id=save_id,
-                command_id=chain.root_request_id,
-                command_complete=True,
-            )
-            await self._send_reply(chain.ws, reply)
-            return
+        def _clear(done_task: asyncio.Task) -> None:
+            if self._delivery_tasks.get(save_id) is done_task:
+                self._delivery_tasks.pop(save_id, None)
 
-        chain.chain_count += 1
-        req_id = f"chain-{uuid.uuid4().hex}"
-        self._chain_requests.add(req_id)
+        task.add_done_callback(_clear)
+
+    def _delivery_read_only(self, save_id: str) -> bool:
+        """Paused, bedtime or an in-flight selection: report facts only."""
+        if self._preset_business_blocked(save_id):
+            return True
+        if self._work_store is not None and self._work_store.state(save_id).paused:
+            return True
+        if self._bedtime_winding_down(save_id):
+            return True
+        return self._job_in_flight(save_id)
+
+    def _settle_delivery(self, request_id: str, ok: bool) -> None:
+        pending = self._delivery_pending.pop(request_id, None)
+        if pending is not None and not pending.done():
+            pending.set_result(ok)
+
+    async def _run_outbox_delivery(self, save_id: str) -> None:
+        """Deliver persisted terminal facts as the next turn of the same session.
+
+        Facts are consumed after a successful model turn with a persisted reply.
+        Pending player notifications replay that reply until the native receipt;
+        socket failure never requires another model turn or native command.
+        """
         try:
-            await self.handle_chat_submit(
-                chain.ws, req_id, chain.instruction, save_id
+            while (
+                self._busy_lock.locked()
+                or self._active_task is not None
+                or self._life_queue
+                or self._life_draining
+                or (self._plan_worker is not None and self._plan_worker._provider_active)
+                or (self._plan_worker is not None and getattr(self._plan_worker, "_executing", False) is True)
+            ):
+                await asyncio.sleep(0.05)
+            if self._work_store is None:
+                return
+            for notification in self._work_store.pending_outbox_notifications(save_id):
+                await self._send_reply(self._chat_ws, Envelope.from_mapping(notification))
+            events = self._work_store.pending_outbox(save_id)
+            if not events:
+                return
+            if any((event.get("delivery") or {}).get("retryBlocked") for event in events):
+                return
+            ws = self._chat_ws
+            if ws is None:
+                return
+            self._work_store.recover(save_id)
+            read_only = self._delivery_read_only(save_id)
+            midflight = [] if read_only else self._work_store.pending_midflight_requests(save_id)
+            requests_by_id = {str(r.get("id")): r for r in self._work_store.state(save_id).requests}
+            event_requests = {str(event["requestId"]) for event in events if event.get("requestId")}
+            if (not midflight and event_requests
+                    and all(requests_by_id.get(root, {}).get("workStopped") for root in event_requests)):
+                read_only = True
+            visible = any(
+                event.get("requestId") and not str(event.get("requestId")).startswith("autonomy-")
+                for event in events
             )
-        finally:
-            self._chain_requests.discard(req_id)
+            request_id = f"{'' if visible else 'autonomy-'}delivery-{uuid.uuid4().hex[:12]}"
+            root = next(
+                (str(event["requestId"]) for event in events
+                 if event.get("requestId") and not str(event.get("requestId")).startswith("autonomy-")),
+                None,
+            ) or request_id
+            ids = [str(event["id"]) for event in events if event.get("id")]
+            # The delivery turn continues the originating goal thread: a scoped
+            # job's follow-up dispatch must stay inside the same active goal so
+            # execution-scope constraints survive. A goal that ended between the
+            # terminal and this boundary falls back to the unscoped default.
+            goal_scope = None
+            try:
+                active_goal_ids = {
+                    goal.id for goal in self._work_store.state(save_id).goals if goal.status == "active"
+                }
+                goal_scope = next(
+                    (str(event["goalId"]) for event in events
+                     if event.get("goalId") and str(event.get("goalId")) in active_goal_ids),
+                    None,
+                )
+            except Exception:
+                goal_scope = None
+            self._work_store.mark_outbox_sent(save_id, ids)
+            done: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._delivery_pending[request_id] = done
+            try:
+                await self.handle_chat_submit(
+                    ws, request_id, "", save_id,
+                    _goal_default=goal_scope,
+                    _delivery={
+                        "events": events,
+                        "midflight": midflight,
+                        "midflight_ids": [m["id"] for m in midflight],
+                        "read_only": read_only,
+                        "command_id": root,
+                    },
+                )
+            finally:
+                self._delivery_pending.pop(request_id, None)
+            delivered = done.result() if done.done() else False
+            if delivered and self._work_store is not None:
+                self._work_store.mark_outbox_consumed(save_id, ids)
+                # Delivering A's terminal facts does not resolve queued request B.
+                # Only B's own selected job (or an explicit resolution) consumes
+                # it; a provider reply without a plan is merely an acknowledgement.
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Outbox delivery turn failed for %s", save_id, exc_info=True)
 
-    async def wait_for_chains(self, timeout: float = 5.0) -> None:
-        if not self._chain_tasks:
+    async def wait_for_deliveries(self, timeout: float = 5.0) -> None:
+        tasks = [task for task in self._delivery_tasks.values() if not task.done()]
+        if not tasks:
             return
         await asyncio.wait_for(
-            asyncio.gather(*list(self._chain_tasks), return_exceptions=True),
+            asyncio.gather(*tasks, return_exceptions=True),
             timeout=timeout,
         )
 
-    def _format_chain_prompt(
-        self, instruction: str, save_id: str | None = None
+    def _format_delivery_prompt(
+        self,
+        events: list[dict[str, Any]],
+        save_id: str,
+        *,
+        midflight: list[dict[str, Any]],
+        read_only: bool,
+        instructions: str | None = None,
     ) -> str:
-        snapshot: dict[str, Any] = {}
-        if self._latest_snapshot_payload is not None:
-            snapshot = {
-                "payload": self._latest_snapshot_payload,
-                "worldRevision": self._latest_snapshot_revision,
-            }
-        work = self._work_context(save_id) if save_id else None
-        compact = build_decision_context(
-            snapshot, work=work, origin="chat-continuation"
-        )
-        last_result = None
-        if self._work_store and save_id:
-            last_result = self._work_store.state(save_id).last_job
-        if not last_result and work and work.get("lastJob"):
-            last_result = work.get("lastJob")
-        if last_result:
-            compact["lastResult"] = last_result
-        context = render_decision_context(compact)
-        last_result_str = (
-            json.dumps(last_result, ensure_ascii=False) if last_result else "none"
-        )
+        live = self._decision_context(save_id, origin="delivery")
+        live.pop("reloadSummary", None)
+        context = render_decision_context(model_decision_context(live))
+        requests_by_id: dict[str, dict[str, Any]] = {}
+        request_totals: dict[str, Any] = {}
+        tasks_by_id: dict[str, Any] = {}
+        if self._work_store is not None and save_id:
+            try:
+                request_totals = self._work_store.overview(save_id).get("confirmedRequestTotals") or {}
+                state = self._work_store.state(save_id)
+                requests_by_id = {
+                    str(r.get("id")): r for r in state.requests
+                }
+                tasks_by_id = {entry["task"]["id"]: entry["task"] for entry in state.archive
+                               if isinstance(entry.get("task"), dict) and entry["task"].get("id")}
+                tasks_by_id.update({task.id: task for task in state.tasks})
+            except Exception:
+                requests_by_id = {}
+        facts = []
+        for event in events:
+            record = requests_by_id.get(str(event.get("requestId"))) or {}
+            feedback = event.get("feedback")
+            task = tasks_by_id.get(str(event.get("taskId")))
+            if task is not None and isinstance(feedback, dict):
+                feedback = project_task_feedback_state(feedback, task)
+            facts.append({
+                "kind": event.get("kind"),
+                "commandId": event.get("commandId"),
+                "taskId": event.get("taskId"),
+                "goalId": event.get("goalId"),
+                "requestId": event.get("requestId"),
+                "operation": event.get("operation"),
+                "outcome": event.get("outcome"),
+                "reasonCode": event.get("reasonCode"),
+                "effects": event.get("effects"),
+                "feedback": feedback,
+                "requestText": record.get("text"),
+                "requestWorkStopped": bool(record.get("workStopped")),
+                "requestStopReason": record.get("workStoppedReason"),
+            })
+        payload = {
+            "qualityCodes": {"0": "普通", "1": "银星", "2": "金星", "4": "铱星"},
+            "terminalFacts": facts,
+            "playerMessagesWhileWorking": [
+                {"requestId": m.get("id"), "text": m.get("text")} for m in midflight
+            ],
+            "confirmedRequestTotals": {
+                request_id: request_totals[request_id]
+                for request_id in dict.fromkeys(
+                    [str(event.get("requestId")) for event in events]
+                    + [str(message.get("id")) for message in midflight])
+                if request_id in request_totals
+            },
+        }
+        payload["workDispatchAvailable"] = not read_only
         return (
-            "你是星露谷伙伴智能体，请直接通过已接入的 stardew-companion MCP 工具操作游戏，完成玩家的指令。\n"
-            "每次请求都会附带以下紧凑实时上下文（字段缺失为 unknown）；工具结果是执行后的最新事实，"
-            "不要为了确认再重复查询。\n"
+            f"{instructions or decision_policy()}\n"
             f"实时上下文：{context}\n"
-            f"这是对玩家指令『{instruction}』的继续。若指令意图已全部完成，直接向玩家总结收尾（本轮不要 submit_plan）；若还有下一业务，用 submit_plan 选择下一个短作业。\n"
-            "用submit_plan选择本次唯一语义短作业；内部导航和同一业务的多步操作由运行时执行。"
-            "remember_intent记录目标与待办，它们不是执行授权。不要预排第二种业务；"
-            "下一业务须下一次模型决策。job-selected仅表示已选择，未执行成功；"
-            "下一次输入lastResult是实际终态，信任它，不重复核查。\n"
-            "自主执行，不要向玩家询问坐标或请求额外确认。不要读写代码文件或执行终端命令。\n"
-            "始终用中文回复玩家。\n\n"
-            f"原指令：{instruction}\n"
-            f"上一步作业结果（lastResult）：{last_result_str}"
+            f"终态事实：{json.dumps(payload, ensure_ascii=False)}\n"
+            "结合实际结果和玩家的新安排，说明进展并接续剩余工作。"
         )
 
     def _execute_turn(
@@ -4081,6 +5938,8 @@ class ChatBridge:
         conversation_id: str | None,
         prompt: str,
     ) -> dict[str, Any]:
+        if active_task.read_only:
+            return self._execute_life_turn(active_task, conversation_id, prompt, mode="chat")
         """Dispatch one turn to the configured provider adapter."""
         # Preserve the legacy test/integration seam when callers explicitly
         # replace _execute_agy_turn; normal production dispatch remains solely
@@ -4092,16 +5951,46 @@ class ChatBridge:
         token = uuid.uuid4().hex
         save_id = active_task.save_id
         if save_id and self._work_store is not None:
-            scope = (self._autonomy.state(save_id).goal_scope
+            scope = active_task.goal_scope or (self._autonomy.state(save_id).goal_scope
                      if self._autonomy and active_task.request_id.startswith("autonomy-") else None)
-            self._work_store.begin_decision(save_id, token, goal_scope=scope)
+            state = self._work_store.state(save_id)
+            goal = next((g for g in state.goals if g.id == scope), None)
+            source_id = goal.constraints.get("playerRequestId") if goal else None
+            source = next((r for r in state.requests if r.get("id") == source_id), None)
+            if source:
+                prompt += "\n玩家原始指令（保留动作限制、汇报要求与统计范围；当前已采纳范围以目标为准）：" + json.dumps(
+                    {"requestId": source_id, "text": source["text"]}, ensure_ascii=False)
+            self._work_store.begin_decision(
+                save_id, token, goal_scope=scope, goal_default=active_task.goal_default,
+                request_id=source_id if source else active_task.command_id or active_task.request_id,
+                request_ids=list(dict.fromkeys([
+                    *active_task.work_request_ids,
+                    *(str(request["id"]) for request in self._work_store.pending_midflight_requests(save_id)
+                      if not active_task.read_only),
+                ])),
+            )
+            active_task.decision_token = token
+            active_task.decision_day = self._work_store.state(save_id).last_settled_day
         previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
         os.environ["STARDEW_DECISION_TOKEN"] = token
         try:
             backend = self._get_backend()
-            if isinstance(backend, (KimiBackend, CodexBackend)):
+            if isinstance(backend, (KimiBackend, CodexBackend, DshBackend, McodeBackend)):
                 backend.progress = getattr(self, "_backend_progress_callback", None)
-            return backend.run(active_task, conversation_id, prompt)
+            delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
+                active_task, conversation_id, prompt, backend)
+            turn_native_session = getattr(self, "_player_session_id", None)
+            result = backend.run(active_task, conversation_id, sent_prompt)
+            delivered_session = result.get("conversation_id")
+            if delivered_session and not active_task.cancelled and not result.get("error"):
+                self._acknowledge_prompt_delivery(delivery_key, pending_prompt, save_id, str(delivered_session))
+                if self.actor_mode == "player":
+                    self._work_reload_context(active_task.save_id, str(delivered_session), delivered=True,
+                                              expected_game_session_id=turn_native_session)
+            logger.info("Prompt delivery save=%s session=%s version=%s originalBytes=%s newBytes=%s",
+                        active_task.save_id, delivered_session, pending_prompt["version"],
+                        pending_prompt["originalPromptBytes"], pending_prompt["newPromptBytes"])
+            return result
         finally:
             if previous_token is None:
                 os.environ.pop("STARDEW_DECISION_TOKEN", None)
@@ -4115,6 +6004,22 @@ class ChatBridge:
         prompt: str,
     ) -> dict[str, Any]:
         """Executes agy CLI command synchronously in background thread with cancellation support."""
+        requested_cid = conversation_id
+        # AGY MCP workers outlive CLI turns. Refresh the exact authorization
+        # through the same explicit per-run context mechanism used by other
+        # persistent provider workers; never bind to the global common install.
+        if self.run_dir:
+            context = {key: os.environ[key] for key in
+                       ("STARDEW_LIFE_MODE", "STARDEW_LIFE_TURN_ID", "STARDEW_LIFE_SAVE_ID", "STARDEW_DECISION_TOKEN")
+                       if key in os.environ}
+            path = Path(self.run_dir) / "data" / "agy-turn-context.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps(context), encoding="utf-8")
+            temp.replace(path)
+        server = os.environ.get("STARDEW_AGY_GAME_SERVER")
+        if server:
+            prompt = f"本回合游戏工具仅来自 MCP 服务 {server}，对应当前已绑定隔离存档；不要调用其他游戏服务。\n" + prompt
         cmd = [self.agy_cmd]
 
         # Keep the configured provider model on resume as well: agy otherwise
@@ -4132,8 +6037,6 @@ class ChatBridge:
             "--mode", "accept-edits",
             "--dangerously-skip-permissions",
             "--print-timeout", "10m",
-            "--output-format", "json",
-            "--print", prompt,
         ])
 
         logger.info("Executing agy CLI: %s", " ".join(cmd[:6]) + " ...")
@@ -4151,50 +6054,19 @@ class ChatBridge:
             }
 
         try:
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                active_task.process = proc
-            except Exception as ex:
-                logger.error("Failed to execute agy CLI: %s", ex, exc_info=True)
-                return {
-                    "success": False,
-                    "response": f"调用后台 AI 服务发生异常：{ex}",
-                    "error": str(ex),
-                    "conversation_id": conversation_id,
-                }
+            def on_conversation(cid: str) -> None:
+                if cid != requested_cid:
+                    active_task.start_max_idx = -1
+                    active_task.start_max_step_idx = -1
 
-            # Check AFTER spawn (cancel race condition guard)
-            if active_task.cancelled:
-                logger.info(
-                    "Task [%s] was cancelled immediately after Popen spawn; killing proc PID %d.",
-                    active_task.request_id,
-                    proc.pid,
-                )
-                try:
-                    proc.kill()
-                except Exception as ex:
-                    logger.debug("Error killing process on post-spawn cancel: %s", ex)
-                return {
-                    "success": False,
-                    "response": "任务已取消。",
-                    "error": "CANCELLED",
-                    "conversation_id": conversation_id,
-                    "duration": time.monotonic() - start_time,
-                    "status": "interrupted",
-                }
-
-            try:
-                stdout, stderr = proc.communicate(timeout=600)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
+            outcome = run_agy_process(active_task, cmd, prompt, conversation_id,
+                run_dir=self._commands_file.parent,
+                model=self.model or "", start_idx=active_task.start_max_idx,
+                timeout_seconds=600, on_conversation=on_conversation)
+            conversation_id = outcome.conversation_id or conversation_id
+            returncode = outcome.returncode
+            stdout, stderr = outcome.stdout, outcome.stderr
+            if outcome.timed_out:
                 logger.error("agy CLI timed out after 600s")
                 return {
                     "success": False,
@@ -4209,7 +6081,7 @@ class ChatBridge:
             stdout = stdout or ""
             stderr = stderr or ""
 
-            if active_task.cancelled:
+            if active_task.cancelled or outcome.cancelled:
                 return {
                     "success": False,
                     "response": "任务已取消。",
@@ -4258,7 +6130,7 @@ class ChatBridge:
             # Check for genuine fresh quota evidence:
             # 1. Authoritative DB steps check: new step_type=17 with idx > start_max_step_idx
             # Reset step baseline if agy established a new session / changed conversation_id
-            step_baseline = -1 if (cid and conversation_id and cid != conversation_id) else active_task.start_max_step_idx
+            step_baseline = -1 if (cid and requested_cid and cid != requested_cid) else active_task.start_max_step_idx
             is_new_quota_step, step_err_text = check_new_quota_error(
                 cid, step_baseline
             )
@@ -4309,7 +6181,7 @@ class ChatBridge:
                 }
 
             # 3. For new conversation only (not resumed), parsed.get("error") is fresh evidence
-            is_new_session = conversation_id is None
+            is_new_session = requested_cid is None
             if is_new_session and parsed and parsed.get("error"):
                 new_session_err = str(parsed.get("error"))
                 if hard_quota_pattern.search(new_session_err):
@@ -4355,17 +6227,17 @@ class ChatBridge:
                     }
 
             # 5. Non-zero exit code or failed status
-            is_error = (proc.returncode != 0) or (op_status not in ("SUCCESS", None))
+            is_error = (returncode != 0) or (op_status not in ("SUCCESS", None))
             if is_error:
                 cli_err = (parsed.get("error") or "") if is_new_session else ""
                 err_text = f"{stderr}\n{cli_err}".strip()
                 if err_text:
                     err_marker = err_text[:200]
-                    resp = response_text if response_text else f"AI 执行出错 (退出码 {proc.returncode})：{err_text[:200]}"
+                    resp = response_text if response_text else f"AI 执行出错 (退出码 {returncode})：{err_text[:200]}"
                 else:
-                    err_marker = f"AGY_EXIT_{proc.returncode}" if proc.returncode != 0 else f"AGY_STATUS_{op_status}"
-                    resp = response_text if response_text else f"AI 执行出错 (退出码 {proc.returncode})"
-                logger.error("agy exited with error: code=%d, status=%s, err=%s", proc.returncode, op_status, err_text[:300] or err_marker)
+                    err_marker = f"AGY_EXIT_{returncode}" if returncode != 0 else f"AGY_STATUS_{op_status}"
+                    resp = response_text if response_text else f"AI 执行出错 (退出码 {returncode})"
+                logger.error("agy exited with error: code=%s, status=%s, err=%s", returncode, op_status, err_text[:300] or err_marker)
                 return {
                     "success": False,
                     "response": resp,
@@ -4376,7 +6248,7 @@ class ChatBridge:
 
             # Plain text output fallback if proc.returncode == 0
             clean_stdout = stdout.strip()
-            if proc.returncode == 0 and clean_stdout:
+            if returncode == 0 and clean_stdout:
                 return {
                     "success": True,
                     "response": clean_stdout,
@@ -4386,7 +6258,7 @@ class ChatBridge:
 
             return {
                 "success": False,
-                "response": f"AI 未能正常生成回复 (code {proc.returncode})",
+                "response": f"AI 未能正常生成回复 (code {returncode})",
                 "error": "NO_OUTPUT",
                 "conversation_id": conversation_id,
                 "duration": duration,
@@ -4402,7 +6274,276 @@ class ChatBridge:
         finally:
             active_task.process = None
 
+    async def _push_work_state(self, ws: WebSocketClient | None, save_id: str) -> None:
+        if ws is None:
+            return
+        work = self._life_work_projection(save_id)
+        signature = json.dumps(work, sort_keys=True, ensure_ascii=False)
+        if self._last_work_projection.get(save_id) == signature:
+            return
+        profile = self._profile_store.get(save_id) if self._profile_store else {}
+        reply = Envelope.create_life_profile_state(
+            self.instance_id, "work-update", save_id, profile.get("profile"),
+            int(profile.get("profileRevision") or 0), work=work)
+        if await self._send_reply(ws, reply):
+            self._last_work_projection[save_id] = signature
+
+    async def _maybe_notify_preset_terminal(self, ws: WebSocketClient | None, save_id: str) -> None:
+        """Report an autostart preset run's terminal goal state to the Mod exactly once.
+
+        The Mod tracks the run lifecycle off the stable preset request id; the bound
+        goal may complete during an autonomy continuation turn, so completion is
+        detected here from the persisted work store rather than from a single turn.
+        """
+        if ws is None or not save_id or self._work_store is None:
+            return
+        policy = getattr(self, "_preset_day_boundary", None)
+        ended = policy.reconcile(save_id, self._work_store, self._latest_snapshot_payload) if policy else None
+        if ended:
+            self._autonomy.set_goal_scope(save_id, None)
+            existing = self._preset_runs.get(save_id)
+            if not existing or existing.get("request_id") != ended["requestId"]:
+                self._preset_runs[save_id] = {"request_id": ended["requestId"], "goal_id": ended["goalId"], "notified": False}
+        run = self._preset_runs.get(save_id)
+        if not run or run.get("notified"):
+            return
+        goal_id = run.get("goal_id")
+        if not goal_id:
+            return
+        goal = next((g for g in self._work_store.state(save_id).goals if g.id == goal_id), None)
+        if goal is None or goal.status not in {"completed", "cancelled"}:
+            return
+        run["notified"] = True
+        request_id = run["request_id"]
+        status = "completed" if goal.status == "completed" else "cancelled"
+        text = ("本轮限定游戏日已通过原生睡觉保存结束，停止派工；实际成果以原生结算记录为准。" if goal.status == "completed"
+                else "本轮农场照料目标已取消。")
+        if ended:
+            facts = ended.get("verifiedEffectsBeforeSleep") or {}
+            if ended.get("phase") == "completed" and ended.get("effectsScopeRequestId") == request_id:
+                text += f" 本轮原生账：浇水{facts.get('watered', 0)}格，收获{facts.get('harvested', 0)}格；已核验原生睡觉保存。"
+            elif ended.get("phase") == "completed":
+                text += " 重载检查点缺少本轮动作明细，数量不重报；原生睡觉保存已核验。"
+            elif ended.get("reason"):
+                text += " " + ended["reason"]
+        reply = Envelope.create_chat_reply(
+            self.instance_id, request_id, status, text,
+            save_id=save_id, command_id=request_id, command_complete=True)
+        reply.payload["presetGoalId"] = goal_id
+        # The dedicated terminal field is the Mod's ONLY completion authority for
+        # the run; the generic status/commandComplete on this reply describe just
+        # this notification turn.
+        reply.payload["presetGoalTerminal"] = goal.status
+        await self._send_reply(ws, reply)
+        logger.info("Preset goal [%s] reached terminal state %s; notified Mod", request_id, status)
+
+    # ---------------------------------------------------- player mode control
+    def _track_actor_mode(self, payload: Any) -> None:
+        """Learn player-mode facts from the snapshot's additive fields."""
+        if not isinstance(payload, dict):
+            return
+        actor_mode = payload.get("actorMode")
+        if actor_mode in {"companion", "player"} and actor_mode != self.actor_mode:
+            logger.info("Actor mode observed on chat channel: %s (was %s)", actor_mode, self.actor_mode)
+            self.actor_mode = actor_mode
+        control_owner = payload.get("controlOwner")
+        if control_owner in {"human", "agent"}:
+            self.control_owner = control_owner
+
+    async def _maybe_claim_player_control(
+        self, ws: WebSocketClient | None, save_id: str | None
+    ) -> None:
+        """Claim native player control once per connection (player mode only)."""
+        if save_id and self._manual_takeover.get(save_id):
+            # An explicit F9 takeover persists as manual across reconnects; only an
+            # explicit re-handoff (owner=agent from the mod) clears it. Never
+            # re-claim immediately after a reconnect.
+            logger.info(
+                "Skipping player.control auto-claim: explicit human takeover in effect for save %s until re-handoff",
+                save_id)
+            return
+        self._player_claim_attempted = True
+        request_id = f"player-claim-{uuid.uuid4().hex[:8]}"
+        envelope = Envelope.create_player_control(
+            self.instance_id, request_id, "claim", save_id=save_id, game_session_id=getattr(self,"_player_session_id",None))
+        if await self._send_reply(ws, envelope):
+            logger.info(
+                "Sent player.control claim [%s] (actorMode=player, saveId=%s)",
+                request_id, save_id)
+        else:
+            logger.warning(
+                "player.control claim [%s] could not be sent; control stays with its current owner",
+                request_id)
+
+    async def _handle_player_authority(
+        self,
+        ws: WebSocketClient | None,
+        payload: dict[str, Any],
+        active_save_id: str | None,
+    ) -> None:
+        """Apply a control-owner change reported by the mod (claim result, F9 takeover, unload)."""
+        owner = payload.get("owner")
+        if owner not in {"human", "agent"}:
+            return
+        if self.actor_mode != "player":
+            logger.debug("Ignoring player.authority owner=%s in companion mode", owner)
+            return
+        reason = str(payload.get("reason") or "")
+        save_id = str(payload.get("saveId") or active_save_id or "")
+        previous = self.control_owner
+        self.control_owner = owner
+        if owner == "agent":
+            # An explicit re-handoff (or the bootstrap claim) ends manual mode;
+            # work may resume under agent authority.
+            if save_id:
+                self._manual_takeover.pop(save_id, None)
+            self._maybe_arm_hold_recovery(save_id, self._latest_snapshot_payload)
+            self._maybe_deliver_outbox(save_id)
+            if previous != "agent":
+                logger.info(
+                    "Player control held by the agent (%s); work dispatch may resume",
+                    reason or "no reason")
+            return
+        if reason == "human-takeover" and save_id:
+            # Explicit F9 takeover persists as manual across bridge reconnects:
+            # no auto re-claim until the mod reports owner=agent again.
+            self._manual_takeover[save_id] = True
+        logger.warning(
+            "Player control taken over by the human (%s); aborting current agent work",
+            reason or "no reason")
+        # A preset (independent autostart) run whose bound goal is still active is
+        # paused, not cancelled: the human takeover stops agent work immediately,
+        # and an explicit re-handoff resumes the same persisted goal instead of
+        # replays or duplicates. Non-preset work keeps the existing cancel path.
+        preset_run = self._preset_runs.get(save_id) if save_id else None
+        preset_goal = None
+        if self._work_store is not None and save_id:
+            if preset_run is None:
+                # The in-memory run table is lost on a bridge restart; recover the
+                # preset binding from the persisted work store so a takeover before
+                # the next resume dispatch still pauses instead of cancelling.
+                state = self._work_store.state(save_id)
+                for record in state.requests:
+                    record_id = str(record.get("id") or "")
+                    if not self._is_preset_request(record_id) or not record.get("goalId"):
+                        continue
+                    candidate = next((g for g in state.goals if g.id == record["goalId"]), None)
+                    if candidate is not None and candidate.status == "active":
+                        preset_run = {"request_id": record_id, "goal_id": candidate.id, "notified": False}
+                        self._preset_runs[save_id] = preset_run
+                        break
+            if preset_run:
+                preset_goal = next(
+                    (g for g in self._work_store.state(save_id).goals
+                     if g.id == preset_run.get("goal_id")), None)
+        if preset_goal is not None and preset_goal.status == "active":
+            self._autonomy_generation += 1
+            task = self._active_task
+            if task is not None and not task.cancelled:
+                self.abort_active_task(f"player_takeover: {reason or 'human takeover'}")
+            if self._autonomy is not None:
+                self._autonomy.set_paused(save_id, True)
+            try:
+                self._work_store.revoke_decision(save_id)
+            except Exception:
+                logger.debug("Decision revoke after human takeover failed", exc_info=True)
+            logger.info(
+                "Preset run [%s] paused on human takeover; goal %s stays active for re-handoff resume",
+                preset_run.get("request_id"), preset_goal.id)
+            return
+        # Reuse the existing chat.cancel machinery: abort the active provider
+        # turn, withdraw dispatched work and stop new dispatches. Nothing new
+        # is dispatched until a fresh player.control claim is acknowledged
+        # with owner=agent.
+        self._autonomy_generation += 1
+        task = self._active_task
+        if task is not None and not task.cancelled:
+            await self.handle_chat_cancel(
+                ws, task.request_id, f"player_takeover: {reason or 'human takeover'}",
+                save_id or task.save_id or None)
+        elif self._autonomy is not None and save_id:
+            self._autonomy.control(save_id, "cancel")
+        if self._work_store is not None and save_id:
+            try:
+                self._work_store.revoke_decision(save_id)
+            except Exception:
+                logger.debug("Decision revoke after human takeover failed", exc_info=True)
+
+    @contextlib.asynccontextmanager
+    async def _thinking_pause(self, request_id: str, save_id: str | None):
+        """Pause the world clock around one provider model turn (player mode).
+
+        Sends agent.thinking begin before the provider call and always sends
+        the matching end (success, provider failure or cancellation) in a
+        finally. The /chat channel never sees mod.welcome, so the bridge
+        treats a player-mode snapshot as supporting the lease protocol and
+        the mod-side pause policy stays authoritative; a failed send is
+        logged and ignored because the mod expires thinking leases itself.
+        """
+        enabled = (
+            getattr(self, "actor_mode", None) == "player"
+            and getattr(self, "supports_thinking_pause", None) is not False
+        )
+        if not enabled:
+            yield
+            return
+        lease_id = uuid.uuid4().hex[:12]
+        lease_ws = self._chat_ws
+        lease_session = getattr(self,"_player_session_id",None)
+        renewal_task = None
+        # Both production providers have a 600-second call deadline. Keep an
+        # additional absolute safety bound in case an executor itself hangs.
+        renewal_deadline = time.monotonic() + 630.0
+        async def renew_active_provider():
+            while True:
+                await asyncio.sleep(getattr(self,"thinking_renew_interval_seconds",1.0))
+                if self._chat_ws is not lease_ws or getattr(self,"_player_session_id",None) != lease_session:
+                    return
+                if time.monotonic() >= renewal_deadline:
+                    logger.warning("Thinking renewal stopped at provider safety deadline [%s]", lease_id)
+                    return
+                active = getattr(self,"_active_task",None)
+                if getattr(self,"control_owner",None) == "human" or (active is not None and active.request_id == request_id and active.cancelled):
+                    return
+                renew = Envelope.create_agent_thinking(self.instance_id,request_id,"renew",lease_id,
+                    save_id=save_id,game_session_id=lease_session)
+                if not await self._send_reply(lease_ws,renew):
+                    return
+        begin = Envelope.create_agent_thinking(
+            self.instance_id, request_id, "begin", lease_id, save_id=save_id, game_session_id=lease_session)
+        try:
+            if not await self._send_reply(lease_ws, begin):
+                logger.warning(
+                    "agent.thinking begin [%s] could not be sent; continuing without a pause lease",
+                    lease_id)
+            else:
+                renewal_task=asyncio.create_task(renew_active_provider())
+            yield
+        finally:
+            if renewal_task is not None:
+                renewal_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await renewal_task
+            end = Envelope.create_agent_thinking(
+                self.instance_id, request_id, "end", lease_id, save_id=save_id, game_session_id=lease_session)
+            try:
+                if not await self._send_reply(lease_ws, end):
+                    logger.warning("agent.thinking end [%s] could not be sent", lease_id)
+            except Exception:
+                logger.warning("agent.thinking end [%s] send failed", lease_id, exc_info=True)
+
     async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> bool:
+        if reply.message_type == "chat.reply" and self._active_task is not None and self._active_task.read_only and (
+            reply.payload.get("requestId") == self._active_task.request_id
+        ):
+            reply.payload["readOnly"] = True
+        if reply.message_type in {"chat.reply", "life.chat.reply"} and reply.payload.get("status") in {
+            "completed", "failed", "cancelled", "interrupted", "selected", "decision-completed", "partial", "unknown",
+        }:
+            await self._push_usage_state(ws, str(reply.payload.get("saveId") or ""))
+        if reply.message_type in {"chat.reply", "life.chat.reply", "autonomy.state"} and ws is not None and reply.payload.get("saveId"):
+            save_id = str(reply.payload["saveId"])
+            await self._push_work_state(ws, save_id)
         if reply.message_type == "chat.reply" and str(reply.payload.get("requestId", "")).startswith("autonomy-"):
             if reply.payload.get("status") not in {"failed", "job-failed", "rejected", "unknown", "partial"}:
                 logger.info("Quiet autonomous reply: %s", json.dumps(dict(reply.payload), ensure_ascii=False))
@@ -4430,7 +6571,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to run directory containing transport-discovery.json (or set STARDEW_RUN_DIR)",
     )
     parser.add_argument(
-        "--backend", type=str, choices=["agy", "kimi", "codex"], default=None,
+        "--owner-pid", type=int, default=None,
+        help="Windows game process owning this automatic launch; exit when it ends",
+    )
+    parser.add_argument(
+        "--backend", type=str, choices=["agy", "kimi", "codex", "dsh", "mcode"], default=None,
         help="Chat provider (overrides config/chat-backend.json)",
     )
     parser.add_argument(
@@ -4443,8 +6588,8 @@ def main(argv: list[str] | None = None) -> None:
         "--effort",
         type=str,
         default=None,
-        choices=["default", "low", "medium", "high"],
-        help="Reasoning effort for agy (uses configuration or provider default); default omits the CLI option",
+        choices=["default", "low", "medium", "high", "xhigh"],
+        help="Reasoning effort for Codex/agy (xhigh requires Codex); default uses provider settings",
     )
     parser.add_argument(
         "--agy-cmd",
@@ -4453,8 +6598,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Path or name of the agy CLI binary",
     )
     parser.add_argument("--kimi-cmd", type=str, default="kimi.exe", help="Path or name of Kimi CLI")
+    parser.add_argument("--mcode-cmd", type=str, default="mcode", help="Path or name of MiniMax Code CLI")
 
     args = parser.parse_args(argv)
+    if args.owner_pid is not None and not 0 < args.owner_pid <= 0xFFFFFFFF:
+        parser.error("--owner-pid must be a positive Windows process ID")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -4462,6 +6610,21 @@ def main(argv: list[str] | None = None) -> None:
         datefmt="%H:%M:%S",
     )
 
+    owner_guard = OwnerProcessGuard(args.owner_pid) if args.owner_pid is not None else None
+    try:
+        _main_bridge(args, owner_guard)
+    finally:
+        # The module CLI keeps its daemon watchdog armed through interpreter
+        # shutdown. Explicit argv callers may release their embedded monitor.
+        if argv is not None and owner_guard is not None:
+            owner_guard.close()
+
+
+def _main_bridge(args: argparse.Namespace, owner_guard: OwnerProcessGuard | None) -> None:
+    # Start ownership monitoring before construction as configuration and model
+    # setup can block too. Manual launches retain the existing resident service.
+    if owner_guard is not None and owner_guard.owner_exited.is_set():
+        return
     bridge = ChatBridge(
         run_dir=args.run_dir,
         model=args.model,
@@ -4469,10 +6632,13 @@ def main(argv: list[str] | None = None) -> None:
         agy_cmd=args.agy_cmd,
         backend=args.backend,
         kimi_cmd=args.kimi_cmd,
+        mcode_cmd=args.mcode_cmd,
     )
 
     _, log_file_path = configure_chat_bridge_file_logging(bridge.run_dir)
     logger.info("ChatBridge 文件日志已启动: %s", log_file_path)
+    if owner_guard is not None:
+        logger.info("Game owner guard active (owner_pid=%d)", args.owner_pid)
 
     print("================================================================")
     print(">>> 星露谷伙伴后台对话服务 (Stardew Chat Bridge) 已就绪 <<<")
@@ -4504,7 +6670,7 @@ def main(argv: list[str] | None = None) -> None:
     sys.excepthook = _unhandled_exception_hook
 
     try:
-        asyncio.run(bridge.run())
+        asyncio.run(owner_guard.run(bridge.run) if owner_guard is not None else bridge.run())
     except KeyboardInterrupt:
         print("\n服务已由用户退出。")
     except Exception as ex:

@@ -23,6 +23,11 @@ public enum NativeActionKind
     PlaceItems,
     RemoveItems,
     CraftItems,
+    EatFood,
+    CutGrass,
+    BuildBuilding,
+    UpgradeBuilding,
+    PurchaseAnimal,
     MoveBuilding
 }
 
@@ -61,10 +66,16 @@ public sealed record NativeActionRequest(
     int ItemCount = 1,
     float MaxStamina = 100f,
     int MaxWater = 0,
-    int MaxGameMinutes = 60,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
-    long ExpectedWorldRevision = 1
+    long ExpectedWorldRevision = 1,
+    string? BuildingType = null,
+    string? BuildingId = null,
+    string? AnimalType = null,
+    string? AnimalName = null,
+    int? BudgetLimit = null,
+    TileCoordinate? DestinationTile = null
 );
 
 public sealed record NativeActionEffect(
@@ -87,6 +98,8 @@ public sealed class NativeActionResult
     public IReadOnlyList<NativeActionEffect> Failed { get; }
     public float StaminaUsed { get; }
     public int WaterUsed { get; }
+    public int TotalCost { get; }
+    public IReadOnlyList<Dictionary<string, object>>? InventoryDelta { get; }
     public int GameMinutesElapsed { get; }
     public long FinalWorldRevision { get; }
     public string? ErrorMessage { get; }
@@ -113,7 +126,8 @@ public sealed class NativeActionResult
         string? errorCode = null,
         bool retryRecommended = false,
         bool playerActionRequired = false,
-        NativeActionProgress? progress = null)
+        NativeActionProgress? progress = null, int totalCost = 0,
+        IReadOnlyList<Dictionary<string, object>>? inventoryDelta = null)
     {
         CommandId = commandId;
         TaskId = taskId;
@@ -131,6 +145,8 @@ public sealed class NativeActionResult
         RetryRecommended = retryRecommended;
         PlayerActionRequired = playerActionRequired;
         Progress = progress;
+        TotalCost = totalCost;
+        InventoryDelta = inventoryDelta;
     }
 
     public SkillResultPayload ToTransportPayload()
@@ -166,10 +182,20 @@ public sealed class NativeActionResult
 
         var details = new Dictionary<string, object>
         {
+            ["totalCost"] = TotalCost,
             ["completed"] = Effects.Select(Describe).ToList(),
             ["skipped"] = Skipped.Select(Describe).ToList(),
             ["failed"] = Failed.Select(Describe).ToList()
         };
+
+        if (InventoryDelta is not null)
+        {
+            details["inventoryDelta"] = InventoryDelta;
+            details["inventoryDeltaObserved"] = true;
+            details["inventoryDeltaEntryCount"] = InventoryDelta.Count;
+            details["inventoryDeltaTiming"] = "command-completion; later native proximity collection belongs to subsequent snapshots";
+            details["inventoryDeltaScope"] = "bound-native-player-command-interval";
+        }
 
         // Structured progress: emitted only when the state machine really tracked a
         // target loop. No data means no percentage is shown upstream.

@@ -208,6 +208,28 @@ public class CompanionMechanicsCoordinatorTests
         Assert.Equal("CANCELLED_BEFORE_EXECUTE", rejectResult.Error?.Code);
     }
 
+    [Theory]
+    [InlineData("cmd-active", true)]
+    [InlineData("task-active", true)]
+    [InlineData("cmd-old", false)]
+    public void CorrelatedCancellation_OnlyStopsItsOwnActiveCommand(string target, bool shouldCancel)
+    {
+        var (coordinator, _, observer) = CreateHarness();
+        observer.SetDirt(new TileCoordinate(10, 12), TileDirtState.DryDirt());
+        var execute = new SkillExecutePayload("cmd-active", "task-active", "water-zone", "0.1", 1,
+            new WaterZoneParameters("Farm", new List<TileCoord> { new(10, 12) }),
+            new ExecutionBudgets(60, 50f, 20), "safe-point", "policy-1");
+        Assert.True(coordinator.TryAcceptSkillExecute(execute, CreateEnvelope("skill.execute", "exec-active"), out _));
+
+        coordinator.OnCancelSkill(new SkillCancelPayload("cancel-control", "Scope changed", true, "safe-point"),
+            CreateEnvelope("skill.cancel", "cancel-message") with { CorrelationId = target });
+        coordinator.StateMachine.StepTicks(100);
+
+        Assert.NotNull(coordinator.LastResult);
+        Assert.Equal(shouldCancel ? ExecutionState.Cancelled : ExecutionState.Succeeded, coordinator.LastResult.FinalState);
+        Assert.Equal(shouldCancel ? 0 : 1, coordinator.LastResult.WateredTiles.Count);
+    }
+
     [Fact]
     public void TryAcceptSkillExecute_EmptyCan_RejectsImmediatelyWithCanEmpty()
     {

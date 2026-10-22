@@ -16,6 +16,8 @@ public sealed record WithdrawItemSpec(
     int Count
 );
 
+public sealed record DepositItemSpec(string ItemId, int Count);
+
 public sealed record ChestActionRequest(
     string CommandId,
     string TaskId,
@@ -26,10 +28,11 @@ public sealed record ChestActionRequest(
     IReadOnlyList<WithdrawItemSpec>? WithdrawItems = null,
     float MaxStamina = 270f,
     int MaxWater = 40,
-    int MaxGameMinutes = 60,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
-    long ExpectedWorldRevision = 1
+    long ExpectedWorldRevision = 1,
+    IReadOnlyList<DepositItemSpec>? DepositItems = null
 )
 {
     public string SkillId => Kind switch
@@ -80,6 +83,7 @@ public sealed class ChestActionResult
     public string? ErrorCode { get; }
     public bool RetryRecommended { get; }
     public bool PlayerActionRequired { get; }
+    public int? RequestedQuantity { get; }
 
     public string SkillId => Kind switch
     {
@@ -108,7 +112,8 @@ public sealed class ChestActionResult
         string? errorCode = null,
         bool retryRecommended = false,
         bool playerActionRequired = false,
-        IReadOnlyList<WithdrawnItemInfo>? withdrawnItems = null)
+        IReadOnlyList<WithdrawnItemInfo>? withdrawnItems = null,
+        int? requestedQuantity = null)
     {
         CommandId = commandId;
         TaskId = taskId;
@@ -129,6 +134,7 @@ public sealed class ChestActionResult
         ErrorCode = errorCode;
         RetryRecommended = retryRecommended;
         PlayerActionRequired = playerActionRequired;
+        RequestedQuantity = requestedQuantity;
     }
 
     /// <summary>
@@ -227,6 +233,17 @@ public sealed class ChestActionResult
         Dictionary<string, object>? details = ChestFull
             ? new Dictionary<string, object> { ["chestFull"] = true }
             : null;
+        if (RequestedQuantity is int requested)
+        {
+            details ??= new();
+            details["requestedQuantity"] = requested;
+            int actual = Kind == ChestActionKind.Deposit
+                ? DepositedItems.Sum(x => x.Stack) : WithdrawnItems.Sum(x => x.Stack);
+            details["actualQuantity"] = actual;
+            details["remainingQuantity"] = Math.Max(0, requested - actual);
+            details["quantityUnit"] = "items";
+            details["nativeCountsScope"] = "transferredStacks";
+        }
 
         return new SkillResultPayload(
             CommandId: CommandId,

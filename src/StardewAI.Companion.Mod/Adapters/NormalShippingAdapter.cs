@@ -161,10 +161,14 @@ public sealed class NormalShippingAdapter : IShippingAdapter
                 $"Shipping rejected: destination map must be 'Farm', got '{locationName}'.", skipReason: "invalid-location");
         }
 
-        if (!string.Equals(_observer.CurrentLocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
         {
             return ShippingItemResult.Failed(
-                $"Shipping target map '{locationName}' does not match active map '{_observer.CurrentLocationName}'.");
+                $"Shipping target map '{locationName}' does not match companion map '{actor.LocationName}'.");
+        }
+        if (!_observer.LocationExists(locationName))
+        {
+            return ShippingItemResult.Failed($"Shipping target map '{locationName}' is not loaded or does not exist.");
         }
 
         // 3. Companion check
@@ -200,9 +204,18 @@ public sealed class NormalShippingAdapter : IShippingAdapter
                 $"Companion has {backpackCountBefore} of '{itemId}', but {count} was requested.", skipReason: "insufficient-items");
         }
 
-        // 6. Host baseline isolation BEFORE the transfer
-        var playerBefore = _observer.GetPlayerSnapshot();
-        var originalPlayerRef = Game1.player;
+        // 6. Host baseline isolation BEFORE the transfer. The Money check is kept in
+        // both modes: shipping revenue settles overnight natively, so even in player
+        // mode Game1.player.Money must not change during this call. The remaining
+        // human-player invariants are companion-mode only (the actor IS the player).
+        bool playerBound = ActorGuards.IsPlayerBound(actor);
+        PlayerResourceSnapshot? playerBefore = null;
+        Farmer? originalPlayerRef = null;
+        if (!playerBound)
+        {
+            playerBefore = _observer.GetPlayerSnapshot();
+            originalPlayerRef = Game1.player;
+        }
         int hostMoneyBefore = Game1.player?.Money ?? 0;
 
         var farm = Game1.getFarm();
@@ -266,22 +279,27 @@ public sealed class NormalShippingAdapter : IShippingAdapter
         finally
         {
             // 10. Human player resource and reference isolation check
-            if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+            // (reference/resources: companion mode only. Money: both modes — shipping
+            // funds must only settle overnight, which holds natively for the player too.)
+            if (!playerBound)
             {
-                throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during shipping!");
-            }
+                if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+                {
+                    throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified during shipping!");
+                }
 
-            var playerAfter = _observer.GetPlayerSnapshot();
-            if (!playerBefore.EqualsPlayerResources(playerAfter))
-            {
-                throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion shipping! Before: {playerBefore}, After: {playerAfter}");
+                var playerAfter = _observer.GetPlayerSnapshot();
+                if (!playerBefore!.EqualsPlayerResources(playerAfter))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion shipping! Before: {playerBefore}, After: {playerAfter}");
+                }
             }
 
             if (Game1.player != null && Game1.player.Money != hostMoneyBefore)
             {
                 throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player money changed during companion shipping! Before: {hostMoneyBefore}, After: {Game1.player.Money}. Shipping funds must only settle overnight.");
+                    $"CRITICAL SAFETY VIOLATION: Player money changed during shipping! Before: {hostMoneyBefore}, After: {Game1.player.Money}. Shipping funds must only settle overnight.");
             }
         }
     }

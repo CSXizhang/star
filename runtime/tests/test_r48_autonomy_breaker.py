@@ -143,11 +143,11 @@ def test_job_level_failure_via_work_state(tmp_path: Path):
             asyncio.run(bridge.handle_chat_submit(None, "autonomy-req-2", "执行", save_id))
 
     state = bridge._autonomy.state(save_id)
-    assert state.failure_count == 1
-    assert state.breaker_reason == "LOCATION_MISMATCH"
+    assert state.failure_count == 0
+    assert not state.breaker_tripped
 
 
-def test_on_job_terminal_records_async_failure(tmp_path: Path):
+def test_native_partial_result_does_not_trip_provider_breaker(tmp_path: Path):
     bridge = ChatBridge(run_dir=tmp_path)
     bridge._autonomy.set_enabled("save-1", True)
     save_id = "save-1"
@@ -167,8 +167,8 @@ def test_on_job_terminal_records_async_failure(tmp_path: Path):
     asyncio.run(bridge._on_job_terminal(save_id, execution, "SHORT_JOB_TERMINAL"))
 
     state = bridge._autonomy.state(save_id)
-    assert state.failure_count == 1
-    assert state.breaker_reason == "LOCATION_MISMATCH"
+    assert state.failure_count == 0
+    assert not state.breaker_tripped
 
 
 def test_breaker_reset_on_player_chat_control_and_day_advance(tmp_path: Path):

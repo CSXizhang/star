@@ -318,6 +318,10 @@ public sealed class WorldMapGraph : IWorldMapGraph
         string locName = GetLocationName(loc) ?? loc.Name;
         if (string.IsNullOrWhiteSpace(locName)) return;
 
+        // Map is lazy-loaded; its native updateLayout populates doors and warps.
+        try { _ = loc.Map; }
+        catch { /* Headless observers can still supply real explicit warps. */ }
+
         // A. Real-time warps from loc.warps
         if (loc.warps != null)
         {
@@ -476,24 +480,18 @@ public sealed class WorldMapGraph : IWorldMapGraph
                 // Target arrival tile inside the indoors:
                 // Native Stardew Valley Building.doAction uses (indoors.warps[0].X, indoors.warps[0].Y - 1)
                 // where warps[0] is the return warp to the parent location.
-                TileCoordinate targetArrivalTile = new TileCoordinate(1, 1);
+                TileCoordinate targetArrivalTile;
                 try
                 {
-                    if (indoors.warps != null && indoors.warps.Count > 0)
-                    {
-                        Warp? returnWarp = indoors.warps.FirstOrDefault(w =>
-                            w != null && (string.Equals(w.TargetName, locName, StringComparison.OrdinalIgnoreCase) ||
-                                          string.Equals(w.TargetName, loc.Name, StringComparison.OrdinalIgnoreCase) ||
-                                          string.Equals(w.TargetName, "Farm", StringComparison.OrdinalIgnoreCase)));
-                        returnWarp ??= indoors.warps[0];
-
-                        if (returnWarp != null)
-                        {
-                            targetArrivalTile = new TileCoordinate(returnWarp.X, Math.Max(0, returnWarp.Y - 1));
-                        }
-                    }
+                    _ = indoors.Map;
                 }
                 catch { }
+                // Match Building.doAction exactly; never invent an arrival point
+                // when the native interior has no entrance warp yet.
+                if (indoors.warps == null || indoors.warps.Count == 0 || indoors.warps[0] == null)
+                    continue;
+                var returnWarp = indoors.warps[0];
+                targetArrivalTile = new TileCoordinate(returnWarp.X, Math.Max(0, returnWarp.Y - 1));
 
                 edges.Add(new MapEdge(
                     SourceLocation: locName,

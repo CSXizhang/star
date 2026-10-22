@@ -16,6 +16,23 @@ Wire compatibility rules:
 - All timestamps use RFC 3339 UTC strings.
 - `worldRevision` starts at zero during handshake.
 
+Production observations, resource recovery and building services are described in [Native production chain](production-chain.md).
+
+## Runtime restart reconciliation
+
+`mod.welcome.payload.commandResultQuery: true` advertises the optional read-only
+`skill.result.query` extension. A query carries the current `saveId`,
+`gameSessionId`, and `payload.commandId`. It returns one original cached
+`skill.result`, correlated with the query message, or `skill.result.status`
+with `status: "unknown" | "in-flight"`. It never dispatches or retries an action.
+Missing or mismatched save/session identities are rejected. Unknown is not a
+successful completion; the runtime must stop unconfirmed continuation.
+
+The cache lives only in the current native game session and retains the existing
+bounded idempotency history. This recovers a terminal receipt across a runtime
+restart, not across a native game/save reload. Older Mods without the capability
+retain the existing received-result reconciliation behavior.
+
 ## F8 command and control correlation
 
 The chat channel distinguishes a model turn from the whole player instruction.
@@ -58,6 +75,8 @@ Direction: **C#→Py** means the Companion Mod sends the message to the Runtime.
 | `mode` | str | `"chat"` (casual talk) or `"plan"` (read-only plan discussion; never dispatches) |
 | `text` | str | 1..500 chars |
 | `source` | str | always `"life-menu"` |
+| `replyToNoticeId` | str? | optional save-scoped pending decision identity; blank/unknown/already answered IDs are rejected |
+| `resolveNotice` | bool? | default false: a linked follow-up keeps the decision pending; true requires the player explicitly submitting their choice |
 
 ### `life.chat.reply` (Py→C#, §1.2)
 
@@ -71,6 +90,7 @@ Direction: **C#→Py** means the Companion Mod sends the message to the Runtime.
 | `error` | str? | present on `failed` |
 | `profileRevision` | int | for optimistic-lock tracking |
 | `memoryRevision` | int | for optimistic-lock tracking |
+| `answeredNoticeId` | str? | only after successfully accepting a linked decision reply; a failed exchange leaves the question pending |
 
 Never carries token/usage/session fields.
 
@@ -111,7 +131,6 @@ Never carries token/usage/session fields.
 | `mode` | str | `"free"` \| `"command"` |
 | `paused` | bool | |
 | `goal` | str? | |
-| `dailySpendLimit` | int? | real semantics: per-day purchase cap (not "reserved funds") |
 | `boxPreference` | str? | |
 | `dailySpend` | int? | |
 | `hasExecutableWork` | bool | |
@@ -288,6 +307,13 @@ The optional snapshot fields `world.playerMoney`, `world.playerStamina`, and
 `companion.availableMoney` and companion stamina; missing fields mean unknown,
 not zero or a shared wallet. Plan dialogue receives both resource views and
 compact current farm counts without requiring the player to re-enter them.
+
+The optional payload field `observedAt` records UTC Unix seconds at the native
+game observation. A player dialogue submission sends a new native snapshot
+before its request. Tool-start progress publishes another observation on the
+game thread when a long model turn reads state. Cached retransmission and runtime cache writes preserve the
+observation time; they do not renew freshness. Older snapshots without this
+field use their envelope timestamp when received.
 
 A plan turn that explicitly adopts/re-adopts or materially revises current due
 preparation may hand one short job to the existing work command path. It never

@@ -15,8 +15,8 @@ namespace StardewAI.Companion.Mod.Execution;
 /// toggle-animal-door, collect-animal-produce).
 ///
 /// It reuses the standard execution guarantees every other skill has: single-task
-/// dispatch, safe pause/resume/cancel boundaries, measured game-clock budget,
-/// monotonic timeout, per-target verification and native results only. The
+/// dispatch, safe pause/resume/cancel boundaries, optional game-clock budget,
+/// no-progress timeout, per-target verification and native results only. The
 /// action-specific native work lives in <see cref="INativeActionAdapter"/>; this
 /// machine never fabricates an effect.
 /// </summary>
@@ -24,8 +24,10 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600;
+    private const long MaxNoProgressTicks = 3600;
     private const int ActionDurationTicks = 8;
+    private const int MinToolAnimationTicks = 18;
+    private const int MaxToolAnimationTicks = 90;
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -45,14 +47,19 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
     private int _replanCount;
     private int _actionTicks;
     private bool _actionEffectExecuted;
+    private bool _nativeToolAnimation;
     private NativeActionStepResult? _lastStepResult;
+    private string? _firstPreconditionMessage;
 
     private readonly List<NativeActionEffect> _completed = new();
     private readonly List<NativeActionEffect> _skipped = new();
     private readonly List<NativeActionEffect> _failed = new();
+    private Dictionary<(string ItemId, int Quality), int>? _inventoryBefore;
     private float _staminaUsed;
+    private int _totalCost;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
     private bool _playerActionRequired;
 
@@ -132,16 +139,21 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         lock (_stateLock)
         {
             _currentRequest = request;
+            _inventoryBefore = ActorGuards.IsPlayerBound(_actor) ? SnapshotNativeInventory() : null;
             _completed.Clear();
             _skipped.Clear();
             _failed.Clear();
             _staminaUsed = 0f;
+            _totalCost = 0;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _actionTicks = 0;
             _actionEffectExecuted = false;
+            _nativeToolAnimation = false;
             _lastStepResult = null;
+            _firstPreconditionMessage = null;
             _playerActionRequired = false;
             _startClock = _observer.TimeOfDay;
             _cancelRequested = false;
@@ -162,7 +174,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             // on the companion, which may have navigated into a different interior.
             string companionLocation = _actor.LocationName;
             bool sameMap = string.Equals(companionLocation, request.LocationId, StringComparison.OrdinalIgnoreCase);
-            bool selfTargeted = request.Kind == NativeActionKind.FeedAnimals;
+            bool selfTargeted = request.Kind is NativeActionKind.FeedAnimals or NativeActionKind.BuildBuilding or NativeActionKind.UpgradeBuilding or NativeActionKind.PurchaseAnimal;
             if (!sameMap && !selfTargeted)
             {
                 CurrentState = ExecutionState.Rejected;
@@ -172,11 +184,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be at least 1.", "INVALID_PARAMETERS");
+                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be non-negative; 0 means no time limit.", "INVALID_PARAMETERS");
                 return false;
             }
 
@@ -235,6 +247,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         lock (_stateLock)
         {
             if (!IsExecuting) return;
+            if (IsPaused && _cancelRequested)
+            {
+                FinishExecution(ExecutionState.Cancelled, _cancelReason ?? "Cancelled by request.", "CANCELLED");
+                return;
+            }
             if (IsPaused) return;
 
             if (_pauseRequested && CurrentState is ExecutionState.Navigating or ExecutionState.Facing or ExecutionState.Preparing)
@@ -252,15 +269,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
             _elapsedTicks++;
 
-            if (_elapsedTicks > MaxMonotonicTicks)
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
-                Log($"{_currentRequest?.SkillId} monotonic timeout exceeded ({MaxMonotonicTicks} ticks). Terminating.", LogLevel.Warn);
-                FinishExecution(ExecutionState.Failed, "Monotonic tick limit exceeded.", "TIMEOUT");
+                Log($"{_currentRequest?.SkillId} no-progress timeout exceeded ({MaxNoProgressTicks} ticks). Terminating.", LogLevel.Warn);
+                FinishExecution(ExecutionState.Failed, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
             int elapsedMinutes = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (_currentRequest is not null && elapsedMinutes > _currentRequest.MaxGameMinutes)
+            if (_currentRequest is not null && _currentRequest.MaxGameMinutes > 0 && elapsedMinutes > _currentRequest.MaxGameMinutes)
             {
                 Log($"{_currentRequest.SkillId} budget exceeded: {elapsedMinutes} > {_currentRequest.MaxGameMinutes} minutes.", LogLevel.Warn);
                 FinishExecution(_completed.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Failed,
@@ -352,7 +369,10 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
         var targetStep = _currentPath[_currentPathIndex];
         var targetTile = targetStep.Tile;
-        var targetPixel = new Vector2(targetTile.X * 64, targetTile.Y * 64);
+        if (ActorGuards.HasReachedWalkingTile(_actor, targetTile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
+        var targetPixel = ActorGuards.WalkingTargetPixel(_actor, targetTile);
         var currentPixel = _actor.PixelPosition;
 
         if (_observer.IsPlayerOnTile(_currentRequest!.LocationId, targetTile))
@@ -384,6 +404,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         var diff = targetPixel - currentPixel;
         float dist = diff.Length();
 
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            _actor.MovePixels(diff.X, diff.Y);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             _actor.PixelPosition = targetPixel;
@@ -405,8 +430,25 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         _actionTicks = 0;
         _actionEffectExecuted = false;
         _lastStepResult = null;
-
-
+        _nativeToolAnimation = false;
+        if (_currentRequest!.Kind == NativeActionKind.EatFood && _actor is FarmerMechanicsActor eatingActor)
+        {
+            try { eatingActor.BeginEating(_currentRequest.ItemId); _nativeToolAnimation = true; }
+            catch (Exception ex) { eatingActor.EndUsingTool(); Log($"Eating animation unavailable: {ex.Message}", LogLevel.Warn); }
+            CurrentState = ExecutionState.Acting;
+            return;
+        }
+        var animationTool = _adapter.GetAnimationTool(_actor, _currentRequest!, _currentTarget);
+        if (ActorGuards.IsPlayerBound(_actor) && animationTool is null && _currentRequest!.Kind is NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.RefillWateringCan) {
+            FinishExecution(ExecutionState.Failed,"The requested native tool/target is unavailable; no action was performed.","NATIVE_TOOL_UNAVAILABLE"); return;
+        }
+        if (animationTool is not null)
+        {
+            try { _actor.BeginUsingTool(animationTool); _nativeToolAnimation = true; }
+            catch (Exception ex) { _actor.EndUsingTool(); Log($"{animationTool} animation unavailable: {ex.Message}", LogLevel.Warn);
+                if (ActorGuards.IsPlayerBound(_actor)) { FinishExecution(ExecutionState.Failed,ex.Message,"NATIVE_TOOL_START_FAILED"); return; }
+            }
+        }
         CurrentState = ExecutionState.Acting;
     }
 
@@ -437,9 +479,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
     private void HandleActing(GameTime? time, long tickCount)
     {
         _actionTicks++;
+        var phase = _nativeToolAnimation ? _actor.UpdateToolAnimation(time, tickCount) : ToolAnimationPhase.None;
 
 
-        if (!_actionEffectExecuted && _actionTicks >= ActionDurationTicks / 2)
+        bool effectDue = _nativeToolAnimation
+            ? phase is ToolAnimationPhase.EffectPoint or ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks / 2
+            : _actionTicks >= ActionDurationTicks / 2;
+        if (ActorGuards.IsPlayerBound(_actor) && _nativeToolAnimation)
+            effectDue=phase is ToolAnimationPhase.EffectPoint or ToolAnimationPhase.Completed;
+        if (!_actionEffectExecuted && effectDue)
         {
             _actionEffectExecuted = true;
             _lastStepResult = _adapter.Execute(_actor, _currentRequest!, _currentTarget);
@@ -450,11 +498,19 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             // exactly what the round consumed. Settled here once, Verifying
             // never adds it again.
             _staminaUsed += _lastStepResult.StaminaCost;
+            _totalCost += _lastStepResult.TotalCost;
             _waterUsed += _lastStepResult.WaterUsed;
         }
 
-        if (_actionTicks >= ActionDurationTicks)
+        bool finished = _nativeToolAnimation
+            ? _actionTicks >= MinToolAnimationTicks && (phase == ToolAnimationPhase.Completed || _actionTicks >= MaxToolAnimationTicks)
+            : _actionTicks >= ActionDurationTicks;
+        if (ActorGuards.IsPlayerBound(_actor) && _nativeToolAnimation && phase != ToolAnimationPhase.Completed && _actionTicks >= MaxToolAnimationTicks) {
+            FinishExecution(ExecutionState.Failed,"Native tool did not finish within its animation limit.","NATIVE_TOOL_TIMEOUT"); return;
+        }
+        if (finished)
         {
+            if (_nativeToolAnimation) { _actor.EndUsingTool(); _nativeToolAnimation = false; }
             CurrentState = ExecutionState.Verifying;
         }
     }
@@ -474,12 +530,30 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             // (see HandleActing); this stage only records the per-target effect.
             _completed.Add(new NativeActionEffect(targetLabel, result.State, null, result.ItemId, result.ItemCount, _currentTarget.Tile));
             EmitProgress("verifying", result.State);
+            // Water tiles are alternative refill sources, not separate jobs.
+            // Once the native adapter confirms a refill, the whole request is satisfied.
+            if (_currentRequest!.Kind == NativeActionKind.RefillWateringCan)
+            {
+                _currentTargetIndex++;
+                FinishExecution(ExecutionState.Succeeded, null, null);
+                return;
+            }
         }
         else if (result.PreconditionFailed)
         {
             _skipped.Add(new NativeActionEffect(targetLabel, "skipped", result.SkipReason, result.ItemId, 0, _currentTarget.Tile));
+            _firstPreconditionMessage ??= result.ErrorMessage;
             _playerActionRequired |= result.PlayerActionRequired;
             EmitProgress("waiting", result.SkipReason);
+            if (_currentRequest!.Kind == NativeActionKind.RefillWateringCan &&
+                string.Equals(result.SkipReason, "already-full", StringComparison.OrdinalIgnoreCase))
+            {
+                // The requested state is already true. Other water sources are
+                // alternatives, so visiting them cannot improve this result.
+                _currentTargetIndex++;
+                FinishExecution(ExecutionState.Succeeded, null, null);
+                return;
+            }
         }
         else if (result.InProgress)
         {
@@ -548,7 +622,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         if (unfulfilledSkip is not null)
         {
             errorCode = unfulfilledSkip.Reason ?? "PRECONDITION_FAILED";
-            errorMessage = $"Precondition not satisfied: {unfulfilledSkip.Reason}.";
+            errorMessage = _firstPreconditionMessage ?? $"Precondition not satisfied: {unfulfilledSkip.Reason}.";
             return _completed.Count > 0 ? ExecutionState.PartiallySucceeded : ExecutionState.Rejected;
         }
 
@@ -608,7 +682,9 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             errorCode: errorCode ?? (_failed.Count > 0 ? "TARGET_FAILED" : null),
             retryRecommended: false,
             playerActionRequired: _playerActionRequired,
-            progress: _lastProgress
+            progress: _lastProgress,
+            totalCost: _totalCost,
+            inventoryDelta: MeasureNativeInventoryDelta()
         );
 
         FinalResult = result;
@@ -616,6 +692,34 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
         OnCompleted?.Invoke(result);
         return result;
+    }
+
+    private Dictionary<(string ItemId, int Quality), int> SnapshotNativeInventory()
+    {
+        var totals = new Dictionary<(string, int), int>();
+        if (_actor.GameFarmer is not { } farmer) return totals;
+        foreach (var item in farmer.Items)
+        {
+            if (item is null) continue;
+            var key = (item.QualifiedItemId, item.Quality);
+            totals.TryGetValue(key, out var count);
+            totals[key] = count + item.Stack;
+        }
+        return totals;
+    }
+
+    private IReadOnlyList<Dictionary<string, object>>? MeasureNativeInventoryDelta()
+    {
+        if (_inventoryBefore is null) return null;
+        var after = SnapshotNativeInventory();
+        return _inventoryBefore.Keys.Union(after.Keys).Select(key =>
+        {
+            _inventoryBefore.TryGetValue(key, out var beforeCount);
+            after.TryGetValue(key, out var afterCount);
+            return new Dictionary<string, object> { ["itemId"] = key.ItemId,
+                ["quality"] = key.Quality, ["before"] = beforeCount,
+                ["after"] = afterCount, ["delta"] = afterCount - beforeCount };
+        }).Where(row => (int)row["delta"] != 0).ToArray();
     }
 
     private static string Describe(NativeActionTarget target) =>

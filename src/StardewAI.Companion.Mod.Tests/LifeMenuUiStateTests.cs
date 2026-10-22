@@ -7,6 +7,29 @@ namespace StardewAI.Companion.Mod.Tests;
 /// <summary>Contract §3 pure-logic projections for the life-menu UI state machine.</summary>
 public class LifeMenuUiStateTests
 {
+    [Fact]
+    public void WorkResult_ReplacesSettledReplyAndIsDeduplicated()
+    {
+        var state = new LifeMenuUiState();
+        state.BeginChat("original", "chat");
+        state.ApplyChatReply("original", "completed", "已接下", null, null, 0, 0);
+        Assert.True(state.ReceiveWorkResult("delivery", "取消了，实际未浇水。", "1:spring:2"));
+        Assert.Equal("取消了，实际未浇水。", state.ReplyText);
+        Assert.True(state.ReceiveWorkResult("delivery", "取消了，实际未浇水。", "1:spring:2"));
+        Assert.Single(state.Conversation);
+    }
+
+    [Fact]
+    public void WorkResult_DoesNotDisplaceNewerPendingConversation()
+    {
+        var state = new LifeMenuUiState();
+        state.BeginChat("newer-chat", "chat");
+        Assert.True(state.ReceiveWorkResult("older-delivery", "旧作业取消了。", "1:spring:2"));
+        Assert.Equal("newer-chat", state.PendingChatRequestId);
+        Assert.True(state.IsChatPending);
+        Assert.Null(state.ReplyText);
+        Assert.Single(state.Conversation);
+    }
     private static LifeMenuUiState NewState() => new();
 
     // ------------------------------------------------------------ chat submit/queued/done/failed
@@ -19,8 +42,18 @@ public class LifeMenuUiStateTests
         Assert.True(state.IsChatPending);
         Assert.Equal(LifeChatStatus.Sending, state.ChatStatus);
         Assert.Equal("req-1", state.PendingChatRequestId);
-        Assert.False(state.BeginChat("req-2", "plan"), "a second submit must not displace the in-flight one");
-        Assert.Equal("req-1", state.PendingChatRequestId);
+        // Bounded queue: a second submit is admitted and tracked, the newest exchange
+        // owns the UI status; the in-flight request still gets its reply applied.
+        Assert.True(state.BeginChat("req-2", "plan"));
+        Assert.Equal("req-2", state.PendingChatRequestId);
+        Assert.True(state.ApplyChatReply("req-1", "completed", "done-1", null, null, 1, 1),
+            "an older in-flight receipt is persisted without disturbing the current exchange");
+        Assert.Equal("req-2", state.PendingChatRequestId);
+        // Non-priority admission stops at the 8-entry bound.
+        var filled = NewState();
+        for (int i = 0; i < 8; i++) Assert.True(filled.BeginChat($"req-{i}", "chat"));
+        Assert.False(filled.BeginChat("req-overflow", "chat"), "queue bound rejects non-priority submits");
+        Assert.True(filled.BeginChat("req-control", "chat", priority: true), "priority controls are always admitted");
     }
 
     [Fact]
@@ -92,13 +125,13 @@ public class LifeMenuUiStateTests
         state.ApplyProfileState(
             onboarded: false, skipped: false, companionName: "阿星", playStyle: "earn",
             personality: "gentle", careFrequency: "moderate", profileRevision: 4,
-            workMode: "command", workPaused: false, dailySpendLimit: null, memoryRevision: 7,
+            workMode: "command", workPaused: false, memoryRevision: 7,
             requestId: "get-1");
         Assert.Equal("set-1", state.PendingProfileSetRequestId);
         state.ApplyProfileState(
             onboarded: true, skipped: false, companionName: "小星", playStyle: "workhorse",
             personality: "calm", careFrequency: "quiet", profileRevision: 5,
-            workMode: "free", workPaused: false, dailySpendLimit: 300, memoryRevision: 7,
+            workMode: "free", workPaused: false, memoryRevision: 7,
             requestId: "set-1");
         Assert.True(state.IsOnboarded);
         Assert.False(state.IsSkipped);
@@ -109,7 +142,6 @@ public class LifeMenuUiStateTests
         Assert.Equal(5, state.ProfileRevision);
         Assert.Equal("free", state.WorkMode);
         Assert.False(state.WorkPaused);
-        Assert.Equal(300, state.DailySpendLimit);
         Assert.Equal(7, state.MemoryRevision);
         Assert.Null(state.PendingProfileSetRequestId);
     }
@@ -209,7 +241,7 @@ public class LifeMenuUiStateTests
     public void Reset_ClearsChatAndHints_ButKeepsProfile()
     {
         var state = NewState();
-        state.ApplyProfileState(true, false, "小星", "earn", "gentle", "moderate", 5, "free", false, 100, 7);
+        state.ApplyProfileState(true, false, "小星", "earn", "gentle", "moderate", 5, "free", false, 7);
         state.BeginChat("req-1", "chat");
         state.AddUnreadCareHint(new PendingCareHint("key-1", "1:spring:1", "morning", "早安"));
         state.Reset();

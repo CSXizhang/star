@@ -19,5 +19,6 @@ public sealed record GroundItemScanInfo(
     /// <summary>True for a native stone obstacle (cleared with the native Pickaxe).</summary>
     bool IsStone = false,
     /// <summary>True for a native twig obstacle (cleared with the native Axe).</summary>
-    bool IsTwig = false
+    bool IsTwig = false,
+    int? Quality = null
 );

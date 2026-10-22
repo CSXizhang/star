@@ -12,6 +12,7 @@ public sealed class TestChestAdapter : IChestAdapter
     private readonly SimulatedWorldObserver _observer;
     public Dictionary<string, int> StoredItems { get; } = new(StringComparer.OrdinalIgnoreCase);
     public bool SimulateBackpackFull { get; set; } = false;
+    public int MaximumTransferPerCall { get; set; } = int.MaxValue;
 
     public TestChestAdapter(SimulatedWorldObserver observer)
     {
@@ -22,9 +23,14 @@ public sealed class TestChestAdapter : IChestAdapter
         IFarmerActor actor,
         string locationName,
         TileCoordinate chestTile,
-        int inventorySlotIndex)
+        int inventorySlotIndex,
+        int? count = null)
     {
-        return ChestDepositResult.Succeeded(1, false, "(O)24", "Parsnip", 0);
+        var slot = actor.GetInventorySnapshot().First(x => x.SlotIndex == inventorySlotIndex);
+        int moved = Math.Min(count ?? slot.Stack, slot.Stack);
+        ((MechanicsActor)actor).TryRemoveItemAtSlot(inventorySlotIndex, moved, out _);
+        StoredItems[slot.ItemId] = StoredItems.GetValueOrDefault(slot.ItemId) + moved;
+        return ChestDepositResult.Succeeded(moved, false, slot.ItemId, slot.Name, slot.Quality);
     }
 
     public ChestOrganizeResult OrganizeChest(
@@ -54,7 +60,7 @@ public sealed class TestChestAdapter : IChestAdapter
             return ChestWithdrawResult.PreconditionError($"Item {itemId} not in chest", skipReason: "item-not-found");
         }
 
-        int toTake = Math.Min(count, available);
+        int toTake = Math.Min(count, Math.Min(available, MaximumTransferPerCall));
         StoredItems[itemId] -= toTake;
         if (StoredItems[itemId] <= 0)
         {

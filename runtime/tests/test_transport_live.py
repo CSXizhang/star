@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 import pytest
 
 from stardew_ai_runtime.client import TransportClient
+from stardew_ai_runtime.scheduler import CompanionScheduler
 from stardew_ai_runtime.websocket_client import WebSocketError
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -40,6 +41,8 @@ class MockModTransportServer:
         self.delay_execution: bool = False
         self.pending_commands: list[tuple[dict, asyncio.StreamWriter]] = []
         self.idempotency_records: dict[str, dict] = {}
+        self.supports_result_query = False
+        self.result_queries: list[dict] = []
 
     def _next_seq(self) -> int:
         seq = self.sequence_number
@@ -219,6 +222,8 @@ class MockModTransportServer:
                     ],
                 },
             }
+            if self.supports_result_query:
+                welcome["payload"]["commandResultQuery"] = True
             await self._send_json(writer, welcome)
 
             snapshot = {
@@ -431,6 +436,22 @@ class MockModTransportServer:
             await self._send_json(writer, result)
             self.active_command_id = None
 
+        elif mtype == "skill.result.query":
+            self.result_queries.append(msg)
+            cmd_id = msg["payload"]["commandId"]
+            record = next((rec for rec in self.idempotency_records.values() if rec["commandId"] == cmd_id), None)
+            if record and record.get("result"):
+                reply = dict(record["result"])
+                reply["correlationId"] = msg_id
+            else:
+                reply = {"protocolVersion": "0.1", "messageType": "skill.result.status",
+                    "messageId": f"query-status-{self._next_seq()}", "correlationId": msg_id,
+                    "saveId": self.save_id, "gameSessionId": self.game_session_id,
+                    "senderInstanceId": "mock-mod-001", "sequenceNumber": self._next_seq(),
+                    "worldRevision": self.world_revision, "sentAt": datetime.now(UTC).isoformat(),
+                    "payload": {"commandId": cmd_id, "status": "in-flight" if record else "unknown"}}
+            await self._send_json(writer, reply)
+
         elif mtype == "skill.cancel":
             payload = msg.get("payload", {})
             cmd_id = payload.get("commandId", "cmd-unknown")
@@ -637,6 +658,63 @@ def test_live_mock_pause_and_resume() -> None:
 
             await client.close()
         finally:
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_reconcile_after_new_client_recovers_terminal_without_execute(tmp_path) -> None:
+    async def run():
+        server = MockModTransportServer()
+        server.supports_result_query = True
+        await server.start()
+        clients = []
+        try:
+            async def connect():
+                client = TransportClient(port=server.port, session_token=server.session_token)
+                clients.append(client)
+                await client.connect()
+                await client.handshake()
+                await client.wait_for_snapshot()
+                return client
+
+            original = await connect()
+            command_id = await original.execute_water_zone("Farm", [{"x": 64, "y": 15}])
+            receipt = await original.wait_for_result(command_id)
+            await original.close()
+            restarted = await connect()
+            scheduler = CompanionScheduler(run_dir=tmp_path, client=restarted)
+            recovered = await scheduler.reconcile_command(command_id)
+            assert recovered == receipt.payload
+            assert len(server.executed_commands) == 1
+            assert len(server.result_queries) == 1
+            assert server.result_queries[0]["saveId"] == server.save_id
+            assert server.result_queries[0]["gameSessionId"] == server.game_session_id
+        finally:
+            for client in clients:
+                await client.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("query_supported", [True, False])
+def test_reconcile_missing_receipt_keeps_unknown_and_never_dispatches(tmp_path, query_supported):
+    async def run():
+        server = MockModTransportServer()
+        server.supports_result_query = query_supported
+        await server.start()
+        client = TransportClient(port=server.port, session_token=server.session_token)
+        try:
+            await client.connect()
+            await client.handshake()
+            await client.wait_for_snapshot()
+            scheduler = CompanionScheduler(run_dir=tmp_path, client=client)
+            assert await scheduler.reconcile_command("unknown-command", timeout=0.05) is None
+            assert len(server.result_queries) == int(query_supported)
+            assert not server.executed_commands
+        finally:
+            await client.close()
             await server.stop()
 
     asyncio.run(run())

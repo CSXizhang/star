@@ -19,13 +19,15 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerLeg = 3;
-    private const long MaxMonotonicTicks = 7200;
+    private const long MaxNoProgressTicks = 7200;
     private const int VerificationSettleTicks = 3;
 
     private readonly IFarmerActor _actor;
     private readonly IWorldObserver _observer;
     private readonly SameMapNavigator _navigator;
     private readonly IWorldMapGraph _mapGraph;
+    private readonly ReachableRoutePlanner _routePlanner;
+    private IReadOnlyList<MapEdge> _plannedEdges = Array.Empty<MapEdge>();
     private readonly CompanionAvatar? _avatar;
     private readonly Action<string, LogLevel>? _log;
 
@@ -38,13 +40,22 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
     private List<PathStep> _currentPath = new();
     private int _currentPathIndex;
     private int _replanCount;
+    private long _replanAfterTick;
+    private Vector2? _nativeWalkingPoint;
+    private TileCoordinate? _nativeWalkingTile;
+    private int _nativeStallTicks;
+    private float _nativeBestDistance = float.PositiveInfinity;
+    private int _nativeNoProgressTicks;
 
     private readonly List<string> _visitedLocations = new();
     private readonly List<NavigationHopRecord> _hopRecords = new();
     private float _staminaUsed;
     private int _waterUsed;
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
+    private int? _pauseStartedClock;
+    private int _pausedGameMinutes;
     private bool _targetAdjusted;
     private TileCoordinate? _effectiveTargetTile;
     private int _verifyingTicks;
@@ -61,6 +72,37 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
     public NavigationResult? FinalResult { get; private set; }
 
     public NavigationRequest? CurrentRequest => _currentRequest;
+    public Dictionary<string, object> PreviewRoute(string location, TileCoordinate target)
+    {
+        var route = _routePlanner.Find(_actor.LocationName, _actor.Tile, location, target,
+            _observer.TimeOfDay, _actor.GameFarmer, out var failure, requireExactDestination: ActorGuards.IsPlayerBound(_actor));
+        var result = new Dictionary<string, object>
+        {
+            ["reachable"] = route is not null,
+            ["exactArrivalRequired"] = ActorGuards.IsPlayerBound(_actor),
+            ["nativeMovementGeometry"] = ActorGuards.IsPlayerBound(_actor) ? "standing-center-v2" : "avatar-grid-v1",
+            ["nativeUiClear"] = (!Game1.eventUp || ActorGuards.FestivalFreeRoam) && Game1.activeClickableMenu == null,
+            ["nativeCollisionChecked"] = ActorGuards.IsPlayerBound(_actor) && location==_actor.LocationName,
+            ["collisionEvidenceScope"] = location==_actor.LocationName ? "current-location-native-pathfinding-no-effects" : "cross-map-geometry-not-a-native-unlock-proof",
+            ["observedTime"] = _observer.TimeOfDay,
+            ["origin"] = new { locationId = _actor.LocationName, tile = _actor.Tile },
+            ["destination"] = new { locationId = location, tile = target },
+            ["estimateBasis"] = "Normal 60 FPS walking and 7-second game clock; excludes model deliberation, supplies and service time. Recheck service availability at dispatch."
+        };
+        if (route is null)
+        {
+            result["reason"] = failure?.Message ?? "No reachable route";
+            result["reasonCode"] = failure?.ReasonCode ?? "NO_ROUTE";
+        }
+        else
+        {
+            result["locations"] = new[] { _actor.LocationName }.Concat(route.Edges.Select(e => e.TargetLocation)).ToArray();
+            result["walkingTiles"] = route.WalkingTiles;
+            result["estimatedGameMinutes"] = (int)Math.Ceiling(route.WalkingTiles * 16d / 60d * 10d / 7d);
+            result["arrivalTile"] = route.TargetTile;
+        }
+        return result;
+    }
     public string? ActiveTaskId => _currentRequest?.TaskId;
     public int TotalTargets => _locationRoute.Count;
     public int CurrentTargetIndex => _currentLegIndex;
@@ -82,6 +124,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         _observer = observer ?? throw new ArgumentNullException(nameof(observer));
         _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
         _mapGraph = mapGraph ?? throw new ArgumentNullException(nameof(mapGraph));
+        _routePlanner = new ReachableRoutePlanner(_observer, _navigator, _mapGraph);
         _avatar = avatar;
         _log = log;
     }
@@ -96,6 +139,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         {
             _currentRequest = request;
             _locationRoute.Clear();
+            _plannedEdges = Array.Empty<MapEdge>();
             _visitedLocations.Clear();
             _hopRecords.Clear();
             _currentLegIndex = 0;
@@ -103,10 +147,19 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             _currentPath.Clear();
             _currentPathIndex = 0;
             _replanCount = 0;
+            _replanAfterTick = 0;
+            _nativeWalkingTile = null;
+            _nativeWalkingPoint = null;
+            _nativeStallTicks = 0;
+            _nativeNoProgressTicks = 0;
+            _nativeBestDistance = float.PositiveInfinity;
             _staminaUsed = 0f;
             _waterUsed = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _startClock = _observer.TimeOfDay;
+            _pauseStartedClock = null;
+            _pausedGameMinutes = 0;
             _cancelRequested = false;
             _cancelReason = null;
             _pauseRequested = false;
@@ -126,12 +179,12 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be at least 1.", "INVALID_PARAMETERS");
+                    $"Invalid maxGameMinutes: {request.MaxGameMinutes}. Must be non-negative; 0 means no time limit.", "INVALID_PARAMETERS");
                 return false;
             }
 
@@ -191,7 +244,11 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         {
             if (CurrentState == ExecutionState.Paused)
             {
+                if (_pauseStartedClock is { } pauseClock)
+                    _pausedGameMinutes += IWorldObserver.CalculateGameMinutesElapsed(pauseClock, _observer.TimeOfDay);
+                _pauseStartedClock = null;
                 _pauseRequested = false;
+                _locationRoute.Clear();
                 CurrentState = ExecutionState.Preparing;
                 Log($"navigate-to resumed (task={ActiveTaskId}).");
             }
@@ -217,34 +274,38 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         {
             if (!IsExecuting) return;
 
+            if (_cancelRequested)
+            {
+                FinishExecution(ExecutionState.Cancelled, _cancelReason ?? "Cancelled by request.", "CANCELLED");
+                return;
+            }
             if (IsPaused) return;
 
-            if (_pauseRequested && CurrentState is ExecutionState.Navigating or ExecutionState.Preparing)
+            if (_pauseRequested && CurrentState is ExecutionState.Navigating or ExecutionState.Preparing or ExecutionState.Verifying)
             {
                 _pauseRequested = false;
                 CurrentState = ExecutionState.Paused;
+                _pauseStartedClock = _observer.TimeOfDay;
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
                 NotifyPlayer("AI Companion: Navigation paused.");
                 return;
             }
 
-            if (_cancelRequested && CurrentState is not (ExecutionState.Cancelling or ExecutionState.Cancelled))
-            {
-                CurrentState = ExecutionState.Cancelling;
-            }
-
             _elapsedTicks++;
 
-            if (_elapsedTicks > MaxMonotonicTicks)
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
-                Log($"navigate-to monotonic timeout exceeded ({MaxMonotonicTicks} ticks). Terminating.", LogLevel.Warn);
-                FinishExecution(ExecutionState.Failed, "Monotonic tick limit exceeded.", "TIMEOUT");
+                Log($"navigate-to no-progress timeout exceeded ({MaxNoProgressTicks} ticks). Terminating.", LogLevel.Warn);
+                FinishExecution(ExecutionState.Failed, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
-            int elapsedMinutes = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (_currentRequest is not null && elapsedMinutes > _currentRequest.MaxGameMinutes)
+            // The execution budget counts active work; result resources continue
+            // to report the actual game-clock duration including player pauses.
+            int elapsedMinutes = Math.Max(0,
+                IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay) - _pausedGameMinutes);
+            if (_currentRequest is not null && _currentRequest.MaxGameMinutes > 0 && elapsedMinutes > _currentRequest.MaxGameMinutes)
             {
                 Log($"navigate-to budget exceeded: {elapsedMinutes} > {_currentRequest.MaxGameMinutes} minutes.", LogLevel.Warn);
                 FinishExecution(ExecutionState.PartiallySucceeded, "Game-clock minute budget exceeded.", "BUDGET_EXCEEDED");
@@ -272,6 +333,8 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
     private void HandlePreparing()
     {
         if (CheckPauseOrCancel()) return;
+        if (_elapsedTicks < _replanAfterTick) return;
+        if (TryVerifyArrival()) return;
 
         // If route not yet calculated, find route across maps
         if (_locationRoute.Count == 0)
@@ -279,19 +342,39 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             string startLoc = _actor.LocationName;
             string targetLoc = _currentRequest!.LocationId;
 
-            var route = _mapGraph.FindLocationRoute(startLoc, targetLoc, out var failureReason);
-            if (route == null || route.Count == 0)
+            var route = _routePlanner.Find(startLoc, _actor.Tile, targetLoc, _currentRequest.TargetTile,
+                _observer.TimeOfDay, _actor.GameFarmer, out var routeFailure, requireExactDestination: ActorGuards.IsPlayerBound(_actor));
+            if (route == null)
             {
-                FinishExecution(ExecutionState.Failed,
-                    failureReason ?? $"No route found between '{startLoc}' and '{targetLoc}'.",
-                    "NO_ROUTE");
+                // Same-map requests keep the established DESTINATION_UNREACHABLE code;
+                // cross-map failures surface the planner's structured classification
+                // (exit-side vs arrival-side blockage, coordinates, blocking tiles).
+                bool sameMap = string.Equals(startLoc, targetLoc, StringComparison.OrdinalIgnoreCase);
+                string failureCode;
+                string failureMessage;
+                if (sameMap)
+                {
+                    failureCode = "DESTINATION_UNREACHABLE";
+                    failureMessage = routeFailure?.Message ?? $"No route found between '{startLoc}' and '{targetLoc}'.";
+                }
+                else if (routeFailure is not null)
+                {
+                    failureCode = routeFailure.ReasonCode;
+                    failureMessage = routeFailure.Message;
+                }
+                else
+                {
+                    failureCode = "NO_ROUTE";
+                    failureMessage = $"No route found between '{startLoc}' and '{targetLoc}'.";
+                }
+                FinishExecution(ExecutionState.Failed, failureMessage, failureCode, routeFailure?.Details);
                 return;
             }
 
-            _locationRoute = route.ToList();
+            _plannedEdges = route.Edges;
+            _locationRoute = new[] { startLoc }.Concat(route.Edges.Select(e => e.TargetLocation)).ToList();
             _currentLegIndex = 0;
-            _visitedLocations.Clear();
-            _visitedLocations.Add(_actor.LocationName);
+            if (_visitedLocations.Count == 0) _visitedLocations.Add(_actor.LocationName);
 
             Log($"navigate-to route resolved: {string.Join(" -> ", _locationRoute)}.");
         }
@@ -306,103 +389,22 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         bool isFinalLeg = _currentLegIndex >= _locationRoute.Count - 1;
         if (isFinalLeg)
         {
+            if (TryVerifyArrival()) return;
             var requestedTile = _currentRequest!.TargetTile;
-            TileCoordinate targetTile = requestedTile;
-            PathResult? pathResult = null;
-            _targetAdjusted = false;
-            _effectiveTargetTile = requestedTile;
-
-            bool isTriggerTile = IsWarpOrDoorTriggerTile(_actor.LocationName, requestedTile);
-
-            if (!isTriggerTile && _observer.IsTilePassable(_actor.LocationName, requestedTile))
+            var pathResult = _routePlanner.FindDestinationPath(_actor.LocationName, _actor.Tile, requestedTile, requireExactDestination: ActorGuards.IsPlayerBound(_actor));
+            if (!pathResult.Success || pathResult.Steps.Count == 0)
             {
-                if (_actor.Tile == requestedTile)
-                {
-                    _verifyingTicks = 0;
-                    CurrentState = ExecutionState.Verifying;
-                    return;
-                }
-
-                pathResult = _navigator.FindPath(_actor.LocationName, _actor.Tile, requestedTile);
-                if (pathResult.Success && pathResult.Steps.Count > 0)
-                {
-                    targetTile = requestedTile;
-                    _effectiveTargetTile = requestedTile;
-                    _targetAdjusted = false;
-                }
-            }
-
-            if (pathResult == null || !pathResult.Success || pathResult.Steps.Count == 0)
-            {
-                if (_actor.Tile.IsAdjacentTo(requestedTile) &&
-                    _observer.IsTilePassable(_actor.LocationName, _actor.Tile) &&
-                    !IsWarpOrDoorTriggerTile(_actor.LocationName, _actor.Tile))
-                {
-                    _effectiveTargetTile = _actor.Tile;
-                    _targetAdjusted = true;
-                    Log($"Actor already at adjacent passable tile {_actor.Tile} for destination {requestedTile} (targetAdjusted=true).");
-                    _verifyingTicks = 0;
-                    CurrentState = ExecutionState.Verifying;
-                    return;
-                }
-
-                if (isTriggerTile)
-                {
-                    var adjacentCandidates = requestedTile.CardinalNeighbors()
-                        .Where(n => n.X >= 0 && n.Y >= 0 &&
-                                    _observer.IsTilePassable(_actor.LocationName, n) &&
-                                    !IsWarpOrDoorTriggerTile(_actor.LocationName, n) &&
-                                    !_observer.IsPlayerOnTile(_actor.LocationName, n))
-                        .OrderBy(n => Math.Abs(n.X - _actor.Tile.X) + Math.Abs(n.Y - _actor.Tile.Y))
-                        .ToList();
-
-                    foreach (var candidate in adjacentCandidates)
-                    {
-                        var path = _navigator.FindPath(_actor.LocationName, _actor.Tile, candidate);
-                        if (path.Success && path.Steps.Count > 0)
-                        {
-                            targetTile = candidate;
-                            pathResult = path;
-                            _effectiveTargetTile = targetTile;
-                            _targetAdjusted = true;
-                            Log($"Destination tile {requestedTile} is a warp/door trigger tile on '{_actor.LocationName}'. Snapped to adjacent non-trigger tile {targetTile} (targetAdjusted=true, steps={pathResult.Steps.Count}).");
-                            break;
-                        }
-                    }
-                }
-
-                if (pathResult == null || !pathResult.Success || pathResult.Steps.Count == 0)
-                {
-                    var fallback = _navigator.FindNearestPassableReachableTile(
-                        _actor.LocationName,
-                        _actor.Tile,
-                        requestedTile,
-                        maxRadius: 3,
-                        isTileExcluded: t => IsWarpOrDoorTriggerTile(_actor.LocationName, t));
-
-                    if (fallback.HasValue)
-                    {
-                        targetTile = fallback.Value.Tile;
-                        pathResult = fallback.Value.Path;
-                        _effectiveTargetTile = targetTile;
-                        _targetAdjusted = true;
-                        Log($"Adjusted target to nearest reachable non-trigger tile {targetTile} for destination {requestedTile} on '{_actor.LocationName}' (targetAdjusted=true, steps={pathResult.Steps.Count}).");
-                    }
-                }
-            }
-
-            if (pathResult == null || !pathResult.Success || pathResult.Steps.Count == 0)
-            {
-                FinishExecution(ExecutionState.Failed,
-                    $"No passable path found to destination tile {requestedTile} (or nearby reachable non-trigger tiles) on map '{_actor.LocationName}'.",
-                    "DESTINATION_UNREACHABLE");
+                string reason = pathResult.ErrorMessage ?? $"Destination {requestedTile} on '{_actor.LocationName}' is unreachable.";
+                if (_replanCount > 0) RetryBlockedLeg(reason, "DESTINATION_UNREACHABLE");
+                else FinishExecution(ExecutionState.Failed, reason, "DESTINATION_UNREACHABLE");
                 return;
             }
+            _effectiveTargetTile = pathResult.Steps[^1].Tile;
+            _targetAdjusted = _effectiveTargetTile != requestedTile;
 
             _currentExitEdge = null;
             _currentPath = pathResult.Steps.ToList();
             _currentPathIndex = 0;
-            _replanCount = 0;
             CurrentState = ExecutionState.Navigating;
             return;
         }
@@ -411,8 +413,8 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         string currentLoc = _locationRoute[_currentLegIndex];
         string nextLoc = _locationRoute[_currentLegIndex + 1];
 
-        var candidateEdges = _mapGraph.GetEdges(currentLoc, nextLoc);
-        if (candidateEdges.Count == 0)
+        var candidateEdges = new[] { _plannedEdges[_currentLegIndex] };
+        if (candidateEdges.Length == 0)
         {
             FinishExecution(ExecutionState.Failed,
                 $"No outgoing warp or door found from '{currentLoc}' to '{nextLoc}'.",
@@ -441,9 +443,8 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         if (availableEdges.Count == 0)
         {
             FinishExecution(ExecutionState.Failed,
-                firstUnavailableReason ?? $"All exits from '{currentLoc}' to '{nextLoc}' are unavailable.",
-                "DESTINATION_UNREACHABLE_NOW",
-                firstLockDetails);
+                firstUnavailableReason ?? $"Exit to '{nextLoc}' is unavailable.",
+                "DESTINATION_UNREACHABLE_NOW", firstLockDetails);
             return;
         }
 
@@ -475,21 +476,65 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
 
         if (bestSteps == null || bestEdge == null)
         {
-            FinishExecution(ExecutionState.Failed,
-                $"No passable path found on '{currentLoc}' to any warp leading to '{nextLoc}'.",
-                "PATH_BLOCKED");
+            string reason = $"No passable path to the exit from '{currentLoc}' to '{nextLoc}'.";
+            if (_replanCount > 0) RetryBlockedLeg(reason, "PATH_UNREACHABLE");
+            else FinishExecution(ExecutionState.Failed, reason, "PATH_UNREACHABLE");
             return;
         }
 
         _currentExitEdge = bestEdge;
         _currentPath = bestSteps.ToList();
         _currentPathIndex = 0;
-        _replanCount = 0;
         CurrentState = ExecutionState.Navigating;
+    }
+
+    private bool TryVerifyArrival()
+    {
+        if (!string.Equals(_actor.LocationName, _currentRequest!.LocationId, StringComparison.OrdinalIgnoreCase)
+            || _actor.Tile != (_effectiveTargetTile ?? _currentRequest.TargetTile)
+            || IsWarpOrDoorTriggerTile(_actor.LocationName, _actor.Tile)) return false;
+        _actor.Halt();
+        _effectiveTargetTile ??= _actor.Tile;
+        if (_visitedLocations.Count == 0) _visitedLocations.Add(_actor.LocationName);
+        _verifyingTicks = 0;
+        CurrentState = ExecutionState.Verifying;
+        return true;
+    }
+
+    private void RetryBlockedLeg(string reason, string code)
+    {
+        Log($"navigate-to replan ({code}): {reason}", LogLevel.Warn);
+        _actor.Halt();
+        _nativeWalkingPoint = null;
+        _nativeWalkingTile = null;
+        _nativeStallTicks = 0;
+        _nativeNoProgressTicks = 0;
+        _nativeBestDistance = float.PositiveInfinity;
+        if (++_replanCount > MaxReplansPerLeg)
+        {
+            FinishExecution(ExecutionState.Failed, reason, code);
+            return;
+        }
+        _replanAfterTick = _elapsedTicks + 30 * (1 << (_replanCount - 1));
+        CurrentState = ExecutionState.Preparing;
     }
 
     private void HandleNavigating()
     {
+        if (ActorGuards.IsPlayerBound(_actor) && _currentExitEdge != null &&
+            _actor.LocationName == _currentExitEdge.TargetLocation)
+        {
+            // Native warp tiles can transition before the grid path's final tick.
+            // Never carry a source-map route into the new map.
+            _actor.Halt();
+            _pendingNativeWarp=null;
+            _hopRecords.Add(new NavigationHopRecord(_currentExitEdge.SourceLocation,_currentPath.Count,_currentExitEdge));
+            _currentLegIndex++;
+            _replanCount=0; _replanAfterTick=0;
+            _visitedLocations.Add(_actor.LocationName);
+            PlanCurrentLeg();
+            return;
+        }
         if (_currentPathIndex >= _currentPath.Count)
         {
             _actor.Halt();
@@ -522,6 +567,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             // Perform map transition
             if (!PerformMapTransition(_currentExitEdge, out var transitionError))
             {
+                if (transitionError == null && ActorGuards.IsPlayerBound(_actor)) return;
                 FinishExecution(ExecutionState.Failed,
                     transitionError ?? "Map boundary transition failed.",
                     "TRANSITION_FAILED");
@@ -536,6 +582,8 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             ));
 
             _currentLegIndex++;
+            _replanCount = 0;
+            _replanAfterTick = 0;
             _visitedLocations.Add(_actor.LocationName);
 
             // Plan next leg on the newly arrived map
@@ -545,30 +593,93 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
 
         var targetStep = _currentPath[_currentPathIndex];
         var targetTile = targetStep.Tile;
-        var targetPixel = new Vector2(targetTile.X * 64, targetTile.Y * 64);
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            // A native event/warp may relocate the player while preserving the map
+            // name. BFS steps are adjacent: a distant next step is a stale path,
+            // not a collision to retry for minutes against the same old waypoint.
+            var currentTile = _actor.Tile;
+            bool wrongMap = _currentLegIndex < _locationRoute.Count
+                && !string.Equals(_actor.LocationName, _locationRoute[_currentLegIndex], StringComparison.OrdinalIgnoreCase);
+            if (wrongMap || Math.Abs(currentTile.X - targetTile.X) + Math.Abs(currentTile.Y - targetTile.Y) > 1)
+            {
+                _locationRoute.Clear();
+                _plannedEdges = Array.Empty<MapEdge>();
+                _currentLegIndex = 0;
+                _currentExitEdge = null;
+                _pendingNativeWarp = null;
+                _currentPath.Clear();
+                _currentPathIndex = 0;
+                RetryBlockedLeg("Native player pose changed outside the adjacent route; replanning from the actual position.", "NATIVE_ROUTE_CHANGED");
+                return;
+            }
+            if ((Game1.eventUp && !ActorGuards.FestivalFreeRoam) || Game1.activeClickableMenu != null)
+            {
+                FinishExecution(ExecutionState.PartiallySucceeded,
+                    "Native event/menu interrupted walking; inspect native UI and continue it through native-advance/native-answer before replanning.",
+                    "NATIVE_UI_ACTIVE");
+                return;
+            }
+            var point = _actor.PixelPosition;
+            var distance = Vector2.Distance(point, ActorGuards.WalkingTargetPixel(_actor, targetTile));
+            if (_nativeWalkingTile != targetTile || distance < _nativeBestDistance - 0.5f)
+            {
+                _nativeBestDistance = distance;
+                _nativeNoProgressTicks = 0;
+            }
+            else
+                _nativeNoProgressTicks++;
+            // Native animation or oscillation can move the position without
+            // approaching the waypoint. Bound that failure too, including a
+            // farmer whose native CanMove gate remains closed without a menu.
+            if (_nativeNoProgressTicks >= 180)
+            {
+                RetryBlockedLeg($"No native waypoint progress on '{_actor.LocationName}' from {_actor.Tile} toward {targetTile}; pixel={point}, distance={distance:F2}, best={_nativeBestDistance:F2}, canMove={_actor.GameFarmer?.CanMove}, usingTool={_actor.GameFarmer?.UsingTool}, heldDirection={(_actor as PlayerActor)?.HeldDirection}.", "NATIVE_MOVEMENT_STALLED");
+                return;
+            }
+            if (_nativeWalkingTile == targetTile && _nativeWalkingPoint.HasValue
+                && Vector2.Distance(point, _nativeWalkingPoint.Value) < 0.5f
+                && _actor.GameFarmer?.CanMove == true)
+                _nativeStallTicks++;
+            else
+                _nativeStallTicks = 0;
+            _nativeWalkingPoint = point;
+            _nativeWalkingTile = targetTile;
+            if (_nativeStallTicks >= 90)
+            {
+                RetryBlockedLeg($"Native collision prevented walking from {_actor.Tile} toward {targetTile} on '{_actor.LocationName}'; inspect the obstruction or choose another route.", "NATIVE_COLLISION");
+                return;
+            }
+        }
+        // Native farmers have a bounding-box standing point rather than the legacy
+        // avatar's exact grid origin. Arrival is the native tile actually reached.
+        if (ActorGuards.HasReachedWalkingTile(_actor, targetTile))
+        {
+            _actor.Halt();
+            _currentPathIndex++;
+            return;
+        }
+        var targetPixel = ActorGuards.WalkingTargetPixel(_actor, targetTile);
         var currentPixel = _actor.PixelPosition;
 
         // Player obstruction avoidance
-        if (_observer.IsPlayerOnTile(_actor.LocationName, targetTile))
+        if (_observer.IsPlayerOnTile(_actor.LocationName, targetTile)
+            || !_observer.IsTilePassable(_actor.LocationName, targetTile))
         {
-            _actor.Halt();
-            _replanCount++;
-            if (_replanCount > MaxReplansPerLeg)
-            {
-                FinishExecution(ExecutionState.Failed,
-                    $"Path obstructed by player on '{_actor.LocationName}' at {targetTile}.",
-                    "PATH_BLOCKED");
-                return;
-            }
-
-            // Replan current leg
-            PlanCurrentLeg();
+            // Give moving obstructions time to clear. Keep the route and retry
+            // only this leg; pause/cancel are still checked on every update.
+            RetryBlockedLeg($"Path obstructed on '{_actor.LocationName}' at {targetTile}.", "PATH_BLOCKED");
             return;
         }
 
         var diff = targetPixel - currentPixel;
         float dist = diff.Length();
 
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            _actor.MovePixels(diff.X, diff.Y);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             _actor.PixelPosition = targetPixel;
@@ -582,12 +693,25 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         }
     }
 
+    private string? _pendingNativeWarp;
     private bool PerformMapTransition(MapEdge edge, out string? error)
     {
         error = null;
         string targetLocName = edge.TargetLocation;
-        TileCoordinate targetTile = edge.TargetTile;
+        if (!_routePlanner.TryArrival(edge, out TileCoordinate targetTile))
+        {
+            error = $"No passable landing tile for boundary into '{targetLocName}'.";
+            return false;
+        }
 
+        if (ActorGuards.IsPlayerBound(_actor)) {
+            if (_actor.LocationName == targetLocName) { _pendingNativeWarp=null; return true; }
+            if (_pendingNativeWarp != targetLocName) {
+                if ((Math.Abs(_actor.Tile.X-edge.SourceTile.X)+Math.Abs(_actor.Tile.Y-edge.SourceTile.Y)) > 1) { error="Not at native exit."; return false; }
+                _pendingNativeWarp=targetLocName; _actor.SetLocation(targetLocName,targetTile);
+            }
+            return false; // Wait for native fade/map transition, never write actor coordinates.
+        }
         GameLocation? targetLoc = null;
         try
         {
@@ -608,23 +732,10 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         var gameFarmer = _actor.GameFarmer;
         var oldLoc = gameFarmer?.currentLocation;
 
-        // Safe arrival tile check: if exact landing tile is impassable, search adjacent tiles
-        if (!_observer.IsTilePassable(targetLocName, targetTile))
-        {
-            foreach (var neighbor in targetTile.CardinalNeighbors())
-            {
-                if (_observer.IsTilePassable(targetLocName, neighbor))
-                {
-                    targetTile = neighbor;
-                    break;
-                }
-            }
-        }
-
         if (gameFarmer != null && targetLoc != null)
         {
             gameFarmer.currentLocation = targetLoc;
-            gameFarmer.Position = new Vector2(targetTile.X * 64, targetTile.Y * 64);
+            gameFarmer.Position = ActorGuards.WalkingTargetPixel(_actor, targetTile);
             gameFarmer.faceDirection((int)FacingDirection.Down);
         }
 
@@ -651,7 +762,11 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         }
 
         bool tileMatches;
-        if (_targetAdjusted)
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            tileMatches = _actor.Tile == reqTile && !IsWarpOrDoorTriggerTile(_actor.LocationName, _actor.Tile);
+        }
+        else if (_targetAdjusted)
         {
             tileMatches = (_actor.Tile == expectedTile || _actor.Tile.IsAdjacentTo(expectedTile)) &&
                           !IsWarpOrDoorTriggerTile(_actor.LocationName, _actor.Tile);
@@ -724,7 +839,8 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         ExecutionState terminalState,
         string? errorMessage,
         string? errorCode,
-        Dictionary<string, object>? lockDetails = null)
+        Dictionary<string, object>? lockDetails = null,
+        Dictionary<string, object>? failureDetails = null)
     {
         CurrentState = terminalState;
         _actor.SetActiveTask(null);
@@ -750,7 +866,8 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             ErrorCode: errorCode,
             LockDetails: lockDetails,
             TargetAdjusted: _targetAdjusted,
-            RequestedTile: _currentRequest?.TargetTile
+            RequestedTile: _currentRequest?.TargetTile,
+            FailureDetails: failureDetails
         );
 
         FinalResult = result;

@@ -11,7 +11,7 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// <summary>
 /// Normal Watering Can Adapter implementing production tool execution.
 /// Enforces:
-/// 1. Main-thread and current-map execution only.
+/// 1. Main-thread execution on the companion's loaded map.
 /// 2. Precheck empty can before invoking tool logic (prevents accessing Game1.player empty-can path).
 /// 3. Human player resources are verified unchanged before and after tool use.
 /// 4. Game1.player is never swapped.
@@ -39,6 +39,11 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         string locationName,
         TileCoordinate targetTile)
     {
+        if (actor is PlayerActor player) {
+            var observed=_observer.GetDirtState(locationName,targetTile);
+            return observed.IsWatered ? WaterTileResult.Succeeded(Math.Max(0,player.ToolStartStamina-player.Stamina),Math.Max(0,player.ToolStartWater-player.WaterLeft)) : WaterTileResult.Failed("Native tool lifecycle completed without watering the target.");
+        }
+
         ArgumentNullException.ThrowIfNull(actor);
 
         // 1. Thread safety invariant
@@ -47,12 +52,17 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
             return WaterTileResult.Failed("Watering can operation rejected: must execute on the game main thread.");
         }
 
-        // 2. Target map must be loaded. The companion works on its own logical map,
+        // 2. Target map must be the companion's loaded map. It works independently
         // which may differ from the player's active map (e.g. the morning after a
         // pass-out the player wakes in the FarmHouse while the companion is on the Farm).
         if (!_observer.LocationExists(locationName))
         {
             return WaterTileResult.Failed($"Watering target map '{locationName}' is not loaded or does not exist.");
+        }
+        if (!string.Equals(actor.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        {
+            return WaterTileResult.Failed(
+                $"Watering target map '{locationName}' does not match companion map '{actor.LocationName}'.");
         }
 
         // 3. Precheck empty can (CRITICAL: prevent invoking game empty-can path which touches Game1.player)
@@ -82,14 +92,23 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         {
             return WaterTileResult.PreconditionError($"Tile {targetTile} does not contain tilled soil.");
         }
+        if (dirtState.IsDead)
+            return WaterTileResult.PreconditionError($"Tile {targetTile} contains a dead crop; clear it before planting.");
         if (dirtState.IsWatered)
         {
             return WaterTileResult.PreconditionError($"Tile {targetTile} is already watered.");
         }
 
         // 7. Verify human player baseline isolation BEFORE tool use
-        var playerBefore = _observer.GetPlayerSnapshot();
-        var originalPlayerRef = Game1.player;
+        // (skipped entirely in player mode: the actor IS Game1.player).
+        bool playerBound = ActorGuards.IsPlayerBound(actor);
+        PlayerResourceSnapshot? playerBefore = null;
+        Farmer? originalPlayerRef = null;
+        if (!playerBound)
+        {
+            playerBefore = _observer.GetPlayerSnapshot();
+            originalPlayerRef = Game1.player;
+        }
 
         try
         {
@@ -118,7 +137,8 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
             int companionWaterBefore = actor.WaterLeft;
 
             // Call normal game tool execution using the companion's independent Farmer
-            can.DoFunction(location, pixelX, pixelY, power: 1, who: actor.GameFarmer);
+            NativeToolLocationContext.Run(location,
+                () => can.DoFunction(location, pixelX, pixelY, power: 1, who: actor.GameFarmer));
 
             // Capture before/after actual costs directly from game execution:
             float measuredStaminaCost = Math.Max(0f, companionStaminaBefore - actor.Stamina);
@@ -128,19 +148,23 @@ public sealed class NormalWateringCanAdapter : IWateringCanAdapter
         }
         finally
         {
-            // 9. Strict Invariant Checks:
-            // - Game1.player was NOT swapped
-            if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+            // 9. Strict Invariant Checks (companion mode only; skipped for player-bound
+            // actors, where the stamina/water spend above is the intended effect):
+            if (!playerBound)
             {
-                throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified!");
-            }
+                // - Game1.player was NOT swapped
+                if (!object.ReferenceEquals(originalPlayerRef, Game1.player))
+                {
+                    throw new InvalidOperationException("CRITICAL SAFETY VIOLATION: Game1.player reference was modified!");
+                }
 
-            // - Game1.player resources were NOT drained or modified
-            var playerAfter = _observer.GetPlayerSnapshot();
-            if (!playerBefore.EqualsPlayerResources(playerAfter))
-            {
-                throw new InvalidOperationException(
-                    $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion tool action! Before: {playerBefore}, After: {playerAfter}");
+                // - Game1.player resources were NOT drained or modified
+                var playerAfter = _observer.GetPlayerSnapshot();
+                if (!playerBefore!.EqualsPlayerResources(playerAfter))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL SAFETY VIOLATION: Human player resources changed during companion tool action! Before: {playerBefore}, After: {playerAfter}");
+                }
             }
         }
     }

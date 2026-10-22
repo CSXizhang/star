@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Reflection;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
@@ -10,6 +12,160 @@ namespace StardewAI.Companion.Mod.Transport.Tests;
 
 public class WebSocketTransportServerTests
 {
+    [Fact]
+    public async Task LifeRequestPublishesNativeObservationFirstAndRetainsItsCaptureTime()
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler);
+        using var socket = new ControlledChatSocket();
+        SetChatSocket(server, socket, 1);
+        var observation = handler.CaptureCurrentSnapshot(7) with { ObservedAt = 123.5 };
+        Assert.True(await server.SendLifeChatSubmitAsync(new LifeChatSubmitPayload("r", "save", "chat", "work"), observation));
+        Assert.Equal(2, socket.SentMessages.Count);
+        using var first = JsonDocument.Parse(socket.SentMessages[0]);
+        Assert.Equal("world.snapshot", first.RootElement.GetProperty("messageType").GetString());
+        Assert.Equal(123.5, first.RootElement.GetProperty("payload").GetProperty("observedAt").GetDouble());
+        using var second = JsonDocument.Parse(socket.SentMessages[1]);
+        Assert.Equal("life.chat.submit", second.RootElement.GetProperty("messageType").GetString());
+    }
+
+    [Fact]
+    public async Task LifeRequestDoesNotDispatchWhenObservationPublicationFails()
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler);
+        using var socket = new ControlledChatSocket(fail: true);
+        SetChatSocket(server, socket, 1);
+        Assert.False(await server.SendLifeChatSubmitAsync(new LifeChatSubmitPayload("r", "save", "chat", "work"),
+            handler.CaptureCurrentSnapshot(7)));
+        Assert.DoesNotContain(socket.SentMessages, text => text.Contains("life.chat.submit"));
+    }
+
+    [Fact]
+    public async Task ChatSnapshotBackpressureReportsSafeTimeoutOnceOnGameThread()
+    {
+        var logs = new ConcurrentQueue<string>();
+        var problems = new List<string>();
+        int callbackThread = 0;
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler,
+            logger: (message, _) => logs.Enqueue(message));
+        server.OnChatChannelProblem += (_, _, reason) =>
+        {
+            callbackThread = Environment.CurrentManagedThreadId;
+            problems.Add(reason);
+        };
+        using var blockedSocket = new ControlledChatSocket(block: true);
+        SetChatSocket(server, blockedSocket, 1);
+        var snapshot = handler.CaptureCurrentSnapshot(1);
+        snapshot = snapshot with { Companion = snapshot.Companion with {
+            Activity = "private-payload-do-not-log" } };
+
+        // A transport whose write never completes exposes cancellation deterministically.
+        await server.SendSnapshotAsync(snapshot, 1).WaitAsync(TimeSpan.FromSeconds(12));
+        int updateThread = Environment.CurrentManagedThreadId;
+        server.Update();
+        Assert.Equal(updateThread, callbackThread);
+        Assert.Contains("快照发送超时（5秒）", Assert.Single(problems));
+        Assert.Contains(logs, l => l.Contains("Chat send timeout: world.snapshot, generation 1"));
+        Assert.DoesNotContain(logs, l => l.Contains("private-payload-do-not-log"));
+        Assert.DoesNotContain(problems, p => p.Contains("test-token"));
+        await server.SendSnapshotAsync(handler.CaptureCurrentSnapshot(2), 2);
+        server.Update();
+        Assert.Single(problems);
+    }
+
+    [Fact]
+    public async Task BlockedOldChatGenerationCannotReportFailureOrSendIntoReplacement()
+    {
+        var logs = new ConcurrentQueue<string>();
+        var problems = new List<string>();
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler,
+            logger: (message, _) => logs.Enqueue(message));
+        server.OnChatChannelProblem += (_, _, reason) => problems.Add(reason);
+        using var blockedSocket = new ControlledChatSocket(block: true);
+        SetChatSocket(server, blockedSocket, 1);
+        var small = handler.CaptureCurrentSnapshot(1);
+        Task blocked = server.SendSnapshotAsync(small, 1);
+        await blockedSocket.SendStarted.Task;
+        // Cache a small current snapshot; its old-generation send waits behind the blocked send.
+        Task oldQueued = server.SendSnapshotAsync(small, 2);
+        using var replacement = new ControlledChatSocket();
+        SetChatSocket(server, replacement, 2);
+
+        await Task.WhenAll(blocked, oldQueued).WaitAsync(TimeSpan.FromSeconds(12));
+        server.Update();
+        Assert.Empty(problems);
+        Assert.True(server.IsChatConnected);
+        Assert.Empty(replacement.SentMessages);
+        Assert.True(await server.SendChatSubmitAsync(new ChatSubmitPayload("new-request", "still connected", "text", "save")));
+        Assert.Contains("chat.submit", Assert.Single(replacement.SentMessages));
+    }
+
+    [Fact]
+    public async Task WebSocketFailureReturnsFalseAndDoesNotRepeatOrExposeExceptionPayload()
+    {
+        var logs = new ConcurrentQueue<string>();
+        var problems = new List<string>();
+        using var server = new WebSocketTransportServer(0, "test-token", new TestTransportHandler(),
+            logger: (message, _) => logs.Enqueue(message));
+        using var failing = new ControlledChatSocket(fail: true);
+        SetChatSocket(server, failing, 1);
+        server.OnChatChannelProblem += (_, _, reason) => problems.Add(reason);
+        var message = new ChatSubmitPayload("request", "private-message", "text", "save");
+        Assert.False(await server.SendChatSubmitAsync(message));
+        Assert.False(await server.SendChatSubmitAsync(message));
+        Assert.Empty(problems);
+        server.Update();
+        Assert.Contains("发送失败", Assert.Single(problems));
+        Assert.Single(logs.Where(l => l.Contains("Chat send WebSocket failure")));
+        Assert.DoesNotContain(logs, l => l.Contains("secret-from-exception") || l.Contains("private-message"));
+        SetChatSocket(server, failing, 2);
+        Assert.False(await server.SendChatSubmitAsync(message));
+        using var recovered = new ControlledChatSocket();
+        SetChatSocket(server, recovered, 3);
+        server.Update(); // a failure queued before replacement must be discarded too
+        Assert.Single(problems);
+        Assert.True(server.IsChatConnected);
+    }
+
+    private static void SetChatSocket(WebSocketTransportServer server, WebSocket socket, long generation)
+    {
+        typeof(WebSocketTransportServer).GetField("_chatSocket", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(server, socket);
+        typeof(WebSocketTransportServer).GetField("_chatSocketGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(server, generation);
+    }
+
+    private sealed class ControlledChatSocket : WebSocket
+    {
+        private readonly bool _block;
+        private readonly bool _fail;
+        private WebSocketState _state = WebSocketState.Open;
+        public TaskCompletionSource<bool> SendStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<string> SentMessages { get; } = new();
+        public ControlledChatSocket(bool block = false, bool fail = false) { _block = block; _fail = fail; }
+        public override WebSocketCloseStatus? CloseStatus => null;
+        public override string? CloseStatusDescription => null;
+        public override WebSocketState State => _state;
+        public override string? SubProtocol => null;
+        public override void Abort() { }
+        public override void Dispose() { }
+        public override Task CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
+        public override Task CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
+        public override Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public override async Task SendAsync(ArraySegment<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken)
+        {
+            SendStarted.TrySetResult(true);
+            if (_fail) throw new WebSocketException("secret-from-exception");
+            if (_block)
+            {
+                try { await Task.Delay(Timeout.Infinite, cancellationToken); }
+                catch (OperationCanceledException) { _state = WebSocketState.Aborted; throw; }
+            }
+            SentMessages.Add(Encoding.UTF8.GetString(buffer));
+        }
+    }
+
     [Fact]
     public async Task SpatialResultAbove64KbIsDeliveredAndOversizeResultBecomesTerminalError()
     {
@@ -218,7 +374,8 @@ public class WebSocketTransportServerTests
         string taskId,
         string idempotencyKey,
         List<TileCoord>? tiles = null,
-        DateTimeOffset? expiresAt = null)
+        DateTimeOffset? expiresAt = null,
+        int maxGameMinutes = 60)
     {
         return JsonSerializer.Serialize(new
         {
@@ -247,7 +404,7 @@ public class WebSocketTransportServerTests
                 },
                 budgets = new
                 {
-                    maxGameMinutes = 60,
+                    maxGameMinutes = maxGameMinutes,
                     maxStamina = 50.0f,
                     maxWater = 20
                 },
@@ -356,6 +513,29 @@ public class WebSocketTransportServerTests
         Assert.Equal("BOUNDS_VIOLATION", reject2.Payload["error"]?["code"]?.ToString());
     }
 
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(-1, false)]
+    public async Task UnlimitedGameTimeIsAcceptedButNegativeBudgetIsRejected(int minutes, bool accepted)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server,
+            CreateExecuteJson("budget-command", "budget-task", "budget-key", maxGameMinutes: minutes));
+        Assert.Equal(accepted ? 1 : 0, handler.AcceptCount);
+        if (!accepted)
+        {
+            var result = await ReceiveEnvelopeAsync(client);
+            Assert.Equal("rejected", result.Payload["terminalState"]?.ToString());
+        }
+    }
+
     [Fact]
     public async Task DuplicateAndReplay_PreservesOriginalResultWithoutReexecution()
     {
@@ -405,6 +585,153 @@ public class WebSocketTransportServerTests
         Assert.Equal("skill.result", replayedResult.MessageType);
         Assert.Equal("succeeded", replayedResult.Payload["terminalState"]?.ToString());
         Assert.Equal("cmd-water-1", replayedResult.Payload["commandId"]?.ToString());
+    }
+
+    private static string CreateResultQueryJson(string commandId, string? saveId = "save-123", string? sessionId = "session-456") =>
+        JsonSerializer.Serialize(new {
+            protocolVersion = "0.1", messageType = "skill.result.query", messageId = $"query-{commandId}",
+            senderInstanceId = "runtime-restarted", sequenceNumber = 2, worldRevision = 1,
+            sentAt = DateTimeOffset.UtcNow.ToString("O"), saveId, gameSessionId = sessionId,
+            payload = new { commandId }
+        });
+
+    [Theory]
+    [InlineData("succeeded")]
+    [InlineData("partially-succeeded")]
+    [InlineData("cancelled")]
+    [InlineData("failed")]
+    public async Task CommandResultQueryAfterReconnectReplaysTerminalWithoutRedispatch(string terminal)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using (var first = await ConnectClientAsync(server.Port, "test-token"))
+        {
+            await SendRawJsonAsync(first, CreateHelloJson("test-token"));
+            await ReceiveEnvelopeAsync(first);
+            server.Update();
+            await ReceiveEnvelopeAsync(first);
+            await SendAndDrainAsync(first, server, CreateExecuteJson("old-command", "old-task", "old-key"));
+            await server.SendSkillResultAsync(new SkillResultPayload("old-command", "old-task", terminal, 1, 0, 0, 2,
+                new List<Dictionary<string, object>> { new() { ["tile"] = new TileCoord(64, 15), ["state"] = "watered" } },
+                new SkillResultResources(2, 1, 10)), "original-execute", "old-key");
+            var original = await ReceiveEnvelopeAsync(first);
+            await first.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "runtime exits", CancellationToken.None);
+            await Task.Delay(60);
+            server.Update();
+
+            using var restarted = await ConnectClientAsync(server.Port, "test-token");
+            await SendRawJsonAsync(restarted, CreateHelloJson("test-token"));
+            await ReceiveEnvelopeAsync(restarted);
+            server.Update();
+            await ReceiveEnvelopeAsync(restarted);
+            await SendAndDrainAsync(restarted, server, CreateResultQueryJson("old-command"));
+            var recovered = await ReceiveEnvelopeAsync(restarted);
+            Assert.Equal("skill.result", recovered.MessageType);
+            Assert.Equal("query-old-command", recovered.CorrelationId);
+            Assert.Equal(original.Payload.ToJsonString(), recovered.Payload.ToJsonString());
+            Assert.Equal("save-123", recovered.SaveId);
+            Assert.Equal("session-456", recovered.GameSessionId);
+            Assert.Equal(1, handler.AcceptCount);
+            Assert.Null(server.ActiveCommandId);
+        }
+    }
+
+    [Theory]
+    [InlineData("unknown")]
+    [InlineData("in-flight")]
+    public async Task CommandResultQueryWithoutTerminalDoesNotFabricateOrExecute(string status)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        if (status == "in-flight")
+            await SendAndDrainAsync(client, server, CreateExecuteJson("pending-command", "pending-task", "pending-key"));
+        await SendAndDrainAsync(client, server, CreateResultQueryJson("pending-command"));
+        var result = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("skill.result.status", result.MessageType);
+        Assert.Equal(status, result.Payload["status"]?.ToString());
+        Assert.Null(result.Payload["terminalState"]);
+        Assert.Equal(status == "in-flight" ? 1 : 0, handler.AcceptCount);
+        Assert.Equal(status == "in-flight" ? "pending-command" : null, server.ActiveCommandId);
+    }
+
+    [Theory]
+    [InlineData(null, "session-456")]
+    [InlineData("save-123", null)]
+    [InlineData("wrong-save", "session-456")]
+    [InlineData("save-123", "old-session")]
+    public async Task CommandResultQueryRequiresExactSaveAndSession(string? saveId, string? sessionId)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server, CreateResultQueryJson("command", saveId, sessionId));
+        var result = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("protocol.error", result.MessageType);
+        Assert.Equal("RESULT_SESSION_MISMATCH", result.Payload["code"]?.ToString());
+        Assert.Equal(0, handler.AcceptCount);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(null)]
+    [InlineData(123)]
+    public async Task CommandResultQueryRejectsInvalidIdentityWithoutExecuting(object? commandId)
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        await ReceiveEnvelopeAsync(client);
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        var query = JsonNode.Parse(CreateResultQueryJson("command"))!.AsObject();
+        query["payload"]!["commandId"] = JsonSerializer.SerializeToNode(commandId);
+        await SendAndDrainAsync(client, server, query.ToJsonString());
+        var result = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("protocol.error", result.MessageType);
+        Assert.Equal("INVALID_PARAMETERS", result.Payload["code"]?.ToString());
+        Assert.Equal(0, handler.AcceptCount);
+    }
+
+    [Fact]
+    public async Task QueryingOldTerminalCannotClearOrRepeatOtherActiveWork()
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = await ConnectClientAsync(server.Port, "test-token");
+        await SendRawJsonAsync(client, CreateHelloJson("test-token"));
+        var welcome = await ReceiveEnvelopeAsync(client);
+        Assert.True(welcome.Payload["commandResultQuery"]!.GetValue<bool>());
+        server.Update();
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server, CreateExecuteJson("old-command", "old-task", "old-key"));
+        await server.SendSkillResultAsync(new SkillResultPayload("old-command", "old-task", "succeeded", 1, 0, 0, 2,
+            new List<Dictionary<string, object>>()), "old-execute", "old-key");
+        await ReceiveEnvelopeAsync(client);
+        await SendAndDrainAsync(client, server, CreateExecuteJson("new-command", "new-task", "new-key"));
+        for (int retry = 0; retry < 2; retry++)
+        {
+            await SendAndDrainAsync(client, server, CreateResultQueryJson("old-command"));
+            var oldResult = await ReceiveEnvelopeAsync(client);
+            Assert.Equal("succeeded", oldResult.Payload["terminalState"]?.ToString());
+            Assert.Equal("old-command", oldResult.Payload["commandId"]?.ToString());
+            Assert.Equal("new-command", server.ActiveCommandId);
+            Assert.Equal(2, handler.AcceptCount);
+        }
     }
 
     [Fact]
@@ -1231,7 +1558,4 @@ asyncio.run(main())
         Assert.False(server.IsChatConnected);
     }
 }
-
-
-
 

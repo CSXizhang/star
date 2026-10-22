@@ -10,6 +10,7 @@ public sealed partial class NormalNativeActionAdapter
 {
     private NativeActionStepResult CraftItems(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
+        if (ActorGuards.IsPlayerBound(actor)) return CraftViaPlayerMenu(actor, request);
         var farmer = actor.GameFarmer;
         string name = request.ItemId ?? "";
         if (farmer is null) return NativeActionStepResult.Failed("Companion farmer is unavailable.");

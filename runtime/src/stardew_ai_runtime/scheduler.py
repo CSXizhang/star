@@ -69,6 +69,70 @@ COMMON_GAME_PATHS: list[str] = [
 ]
 
 
+def _project_farm_work(raw: dict[str, Any] | None, companion_location: str | None) -> dict[str, Any]:
+    """Only an observed Farm scope can supply Farm counts or actionable tiles."""
+    raw = raw or {}
+    location = raw.get("locationId") or companion_location
+    status = raw.get("observationStatus", "observed" if raw else "unknown")
+    observed = isinstance(location, str) and location.casefold() == "farm" and status == "observed"
+    unwatered = raw.get("tilledUnwateredTiles", []) if observed else None
+    mature = raw.get("matureCrops", []) if observed else None
+    return {
+        "locationId": location,
+        "observationStatus": status if observed or status != "observed" else "not-observed",
+        "scope": raw.get("scope", "location"),
+        "visibleObservation": raw if status == "partial" else None,
+        "tilledUnwateredTiles": unwatered,
+        "tilledUnwateredCount": raw.get("tilledUnwateredCount", len(unwatered or [])) if observed else None,
+        "cropUnwateredTiles": raw.get("cropUnwateredTiles") if observed else None,
+        "cropUnwateredCount": raw.get("cropUnwateredCount") if observed else None,
+        "cropUnwateredTruncated": bool(raw.get("cropUnwateredTruncated", raw.get("isTruncated", raw.get("truncated", False)))) if observed else False,
+        "isTruncated": bool(raw.get("isTruncated", False) or raw.get("truncated", False)) if observed else False,
+        "matureCropCount": raw.get("matureCropCount", len(mature or [])) if observed else None,
+        "matureCrops": mature,
+        "matureCropsTruncated": bool(raw.get("matureCropsTruncated", raw.get("isTruncated", raw.get("truncated", False)))) if observed else False,
+        "deadCropCount": raw.get("deadCropCount") if observed else None,
+    }
+
+
+def _farm_action_location(work_info: dict[str, Any], requested_location: str | None = None) -> str:
+    """Reject unknown or off-map work before NO_WORK or any coordinate dispatch."""
+    farm_work = work_info.get("farmWork") or {}
+    companion_location = (work_info.get("companion") or {}).get("locationId")
+    location = farm_work.get("locationId") or companion_location
+    if (not isinstance(location, str) or location.casefold() != "farm"
+            or farm_work.get("observationStatus", "observed") != "observed"):
+        raise SchedulerError("Complete Farm observation is unavailable. Refresh the native Farm snapshot before choosing work; unknown counts are not zero.")
+    if not isinstance(companion_location, str) or companion_location.casefold() != location.casefold():
+        raise PolicyViolationError(f"Farm work belongs to {location}, but companion is at {companion_location or 'unknown'}. Navigate to {location} first; no action dispatched.")
+    if requested_location is not None:
+        if not isinstance(requested_location, str) or not requested_location.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
+        if requested_location.strip().casefold() != location.casefold():
+            raise PolicyViolationError(f"Requested work belongs to {requested_location}, but observed farm work belongs to {location}; no action dispatched.")
+    return location
+
+
+def _auto_target_coordinates(tiles: list[dict[str, int]] | None) -> set[tuple[int, int]] | None:
+    """None selects observed work; an explicit empty list selects no work."""
+    if tiles is None:
+        return None
+    if not isinstance(tiles, list):
+        raise PolicyViolationError("target_tiles must be a list of non-negative integer x/y coordinates")
+    validated = validate_action_tiles(tiles) if tiles else []
+    return {(tile["x"], tile["y"]) for tile in validated}
+
+
+def _scoped_observation_incomplete(allowed: set[tuple[int, int]] | None,
+                                   candidates: list[dict[str, Any]], total: Any,
+                                   truncated: bool) -> bool:
+    if allowed is None:
+        return False
+    published = {(tile["x"], tile["y"]) for tile in candidates}
+    incomplete = truncated or (type(total) is int and total > len(published))
+    return incomplete and bool(allowed - published)
+
+
 
 
 
@@ -76,7 +140,7 @@ COMMON_GAME_PATHS: list[str] = [
 def expand_water_zone(center_x: int, center_y: int, radius: int = 0) -> list[dict[str, int]]:
     """Expands center coordinates and radius into a list of grid coordinates.
 
-    Radius must be between 0 and 2 inclusive:
+    Radius must be a non-negative integer; for example:
     - radius 0: 1x1 (1 tile)
     - radius 1: 3x3 (up to 9 tiles)
     - radius 2: 5x5 (up to 25 tiles)
@@ -86,9 +150,9 @@ def expand_water_zone(center_x: int, center_y: int, radius: int = 0) -> list[dic
     """
     if isinstance(radius, bool) or not isinstance(radius, int):
         raise PolicyViolationError(f"radius must be an integer, got {type(radius).__name__}")
-    if radius < 0 or radius > 2:
+    if radius < 0:
         raise PolicyViolationError(
-            f"Invalid radius: {radius}. Radius must be between 0 and 2 (inclusive)."
+            f"Invalid radius: {radius}. Radius must be non-negative."
         )
 
     if isinstance(center_x, bool) or not isinstance(center_x, int):
@@ -125,7 +189,9 @@ def requested_task_id(command_id: str) -> str:
     return f"task-plan-{digest}"
 
 
-def validate_action_tiles(tiles: Any, max_tiles: int = 64) -> list[dict[str, int]]:
+def validate_action_tiles(
+    tiles: Any, *, preserve_order: bool = False
+) -> list[dict[str, int]]:
     """Validates and deduplicates tile coordinates for action skills.
 
     Enforces:
@@ -133,8 +199,7 @@ def validate_action_tiles(tiles: Any, max_tiles: int = 64) -> list[dict[str, int
     - each tile must be a dict with 'x' and 'y'
     - 'x' and 'y' must be non-negative integers (booleans strictly rejected)
     - deduplication of (x, y) coordinates
-    - batch limit: 1..max_tiles after deduplication
-    - returns coordinates sorted deterministically in row-major order: (y, x)
+    - returns row-major coordinates (y, x), or first occurrence order when requested
     """
     if not isinstance(tiles, list) or len(tiles) == 0:
         raise PolicyViolationError("tiles must be a non-empty list")
@@ -164,12 +229,8 @@ def validate_action_tiles(tiles: Any, max_tiles: int = 64) -> list[dict[str, int
 
     if len(unique_tiles) == 0:
         raise PolicyViolationError("tiles list must contain at least 1 coordinate")
-    if len(unique_tiles) > max_tiles:
-        raise PolicyViolationError(
-            f"tiles count ({len(unique_tiles)}) exceeds maximum allowed batch limit ({max_tiles})"
-        )
-
-    unique_tiles.sort(key=lambda item: (item["y"], item["x"]))
+    if not preserve_order:
+        unique_tiles.sort(key=lambda item: (item["y"], item["x"]))
     return unique_tiles
 
 
@@ -259,6 +320,12 @@ def extract_chest_summary(
 
     tile = chest.get("tile", {"x": chest_x, "y": chest_y})
     cap = chest.get("capacity", 36)
+    if chest.get("contentsObserved") is False:
+        return {"tile": tile, "capacity": cap, "freeSlots": None,
+                "itemCount": None, "items": [], "contents": [],
+                "contentsObserved": False, "matchingItems": [],
+                "hasDuplicateStacks": "unknown", "hasMergeableStacks": "unknown",
+                "canDeposit": "unknown", "fresh": True, "needsOpen": True}
     free = chest.get("freeSlots", 0)
     contents = chest.get("contents", [])
 
@@ -307,7 +374,9 @@ def extract_chest_summary(
     # - free == 0 and not matching_items: definitely False (chest full, no matching items)
     # - free == 0 and matching_items: without real maxStack metadata from snapshot,
     #   cannot guarantee stacks have room; return "unknown" instead of false True.
-    if free > 0:
+    if not isinstance(free, (int, float)):
+        can_deposit = "unknown"
+    elif free > 0:
         can_deposit: bool | str = True
     elif not matching_items:
         can_deposit = False
@@ -807,10 +876,22 @@ class CompanionScheduler:
         try:
             envelope = client.get_cached_result(command_id)
             if envelope is None:
+                welcome = getattr(client, "mod_welcome", None)
+                if isinstance(welcome, Envelope) and welcome.payload.get("commandResultQuery") is True:
+                    await client.request_command_result(command_id)
                 envelope = await client.wait_for_result(command_id, timeout=timeout)
             payload = envelope.payload
         except TimeoutError:
             return None
+        # A delayed terminal closes the same scheduler lifecycle as a result
+        # received during execute_skill. Otherwise the next plan step is
+        # rejected as concurrent even though the preceding native job finished.
+        if payload.get("terminalState") in {"succeeded", "partially-succeeded", "failed", "cancelled", "rejected"}:
+            async with self._lock:
+                if self._active_task and self._active_task.command_id == command_id:
+                    self._active_task.status = payload["terminalState"]
+                    self._active_task.is_terminal = True
+                    self._active_task = None
         self._settle_free_mode_purchase(str(client.save_id or "unknown-save"), command_id, payload)
         return payload
 
@@ -876,37 +957,47 @@ class CompanionScheduler:
         if self._client is not None and self._client.is_connected:
             return self._client
 
-        # If client was disconnected or not created yet
-        if self._client is None:
-            discovery = self._discovery_resolver(self.run_dir)
-            if not self.run_dir and discovery.get("modDir"):
-                self.run_dir = Path(discovery["modDir"])
-            self._client = TransportClient(
-                host=discovery["host"],
-                port=discovery["port"],
-                session_token=discovery["sessionToken"],
-            )
+        last_error: Exception | None = None
+        for attempt in range(2):
+            if self._client is None or attempt > 0:
+                # Re-resolve discovery on every fresh attempt: a mod restart may
+                # have moved the transport to a new port since a cached client
+                # (or an earlier attempt) was created.
+                discovery = self._discovery_resolver(self.run_dir)
+                if not self.run_dir and discovery.get("modDir"):
+                    self.run_dir = Path(discovery["modDir"])
+                if self._client is not None:
+                    try:
+                        await self._client.close()
+                    except Exception:
+                        pass
+                self._client = TransportClient(
+                    host=discovery["host"],
+                    port=discovery["port"],
+                    session_token=discovery["sessionToken"],
+                )
 
-        try:
-            if not self._client.is_connected:
-                await self._client.connect(timeout=5.0)
-                await self._client.handshake(timeout=5.0)
+            try:
+                if not self._client.is_connected:
+                    await self._client.connect(timeout=5.0)
+                    await self._client.handshake(timeout=5.0)
+                    try:
+                        snapshot_env = await self._client.wait_for_snapshot(timeout=3.0)
+                        self._cache_snapshot(snapshot_env)
+                    except Exception:
+                        pass
+            except Exception as ex:
+                last_error = ex
                 try:
-                    snapshot_env = await self._client.wait_for_snapshot(timeout=3.0)
-                    self._cache_snapshot(snapshot_env)
+                    await self._client.close()
                 except Exception:
                     pass
-        except Exception as ex:
-            try:
-                await self._client.close()
-            except Exception:
-                pass
-            self._client = None
-            raise SchedulerError(
-                f"Failed to connect and handshake with Companion Mod: {ex}"
-            ) from None
-
-        return self._client
+                self._client = None
+                continue
+            return self._client
+        raise SchedulerError(
+            f"Failed to connect and handshake with Companion Mod: {last_error}"
+        ) from None
 
     def _cache_snapshot(self, envelope: Envelope) -> None:
         if envelope and envelope.message_type == "world.snapshot":
@@ -1010,16 +1101,24 @@ class CompanionScheduler:
 
         # 1. Farm Work
         farm_work = payload.get("farmWork") or world.get("farmWork")
-        if farm_work is None:
+        projected = _project_farm_work(farm_work, companion.get("locationId"))
+        if projected["observationStatus"] != "observed":
             missing_sections.append("farmWork")
             farm_work_info: dict[str, Any] = {
+                "locationId": projected["locationId"],
+                "observationStatus": projected["observationStatus"],
+                "scope": projected.get("scope"),
+                "visibleObservation": projected.get("visibleObservation"),
                 "matureCropCount": None,
                 "tilledUnwateredCount": None,
+                "cropUnwateredCount": None,
+                "cropUnwateredTiles": None,
                 "isTruncated": False,
                 "missing": True,
-                "error": "farmWork section not found in snapshot",
+                "error": "Farm work was not observed on Farm in this snapshot",
             }
         else:
+            farm_work = projected
             unwatered_tiles = farm_work.get("tilledUnwateredTiles", [])
             unwatered_count = farm_work.get("tilledUnwateredCount", len(unwatered_tiles))
             mature_crops = farm_work.get("matureCrops", [])
@@ -1030,6 +1129,8 @@ class CompanionScheduler:
                 or farm_work.get("matureCropsTruncated", False)
             )
             farm_work_info = {
+                "locationId": farm_work["locationId"],
+                "observationStatus": farm_work["observationStatus"],
                 "matureCropCount": mature_count,
                 "tilledUnwateredCount": unwatered_count,
                 "cropUnwateredCount": farm_work.get("cropUnwateredCount"),
@@ -1054,8 +1155,8 @@ class CompanionScheduler:
                 "capacity": None,
                 "nonToolItems": [],
                 "activity": companion.get("activity", "idle"),
-                "stamina": companion.get("stamina", 0.0),
-                "waterCanLevel": companion.get("waterCanLevel", 0),
+                "stamina": companion.get("stamina"),
+                "waterCanLevel": companion.get("waterCanLevel"),
                 "missing": True,
                 "error": "inventory section not found in snapshot",
             }
@@ -1069,8 +1170,8 @@ class CompanionScheduler:
                 "capacity": capacity,
                 "nonToolItems": non_tool_items,
                 "activity": companion.get("activity", "idle"),
-                "stamina": companion.get("stamina", 0.0),
-                "waterCanLevel": companion.get("waterCanLevel", 0),
+                "stamina": companion.get("stamina"),
+                "waterCanLevel": companion.get("waterCanLevel"),
                 "missing": False,
             }
             if detail:
@@ -1161,15 +1262,8 @@ class CompanionScheduler:
                 "status": self._active_task.status,
             }
 
-        farm_work = payload.get("farmWork") or world.get("farmWork") or {}
-        unwatered_tiles = farm_work.get("tilledUnwateredTiles", [])
-        unwatered_count = farm_work.get("tilledUnwateredCount", len(unwatered_tiles))
-        is_truncated = bool(
-            farm_work.get("isTruncated", False) or farm_work.get("truncated", False)
-        )
-        mature_crop_count = farm_work.get("matureCropCount", 0)
-        mature_crops = farm_work.get("matureCrops", [])
-        mature_crops_truncated = bool(farm_work.get("matureCropsTruncated", False))
+        farm_work = _project_farm_work(
+            payload.get("farmWork") or world.get("farmWork"), companion.get("locationId"))
 
         return {
             "companion": {
@@ -1177,10 +1271,10 @@ class CompanionScheduler:
                 "tileX": companion.get("tileX", 0),
                 "tileY": companion.get("tileY", 0),
                 "facingDirection": companion.get("facingDirection", 2),
-                "stamina": companion.get("stamina", 0.0),
-                "maxStamina": companion.get("maxStamina", 270.0),
-                "waterCanLevel": companion.get("waterCanLevel", 0),
-                "maxWaterCanLevel": companion.get("maxWaterCanLevel", 40),
+                "stamina": companion.get("stamina"),
+                "maxStamina": companion.get("maxStamina"),
+                "waterCanLevel": companion.get("waterCanLevel"),
+                "maxWaterCanLevel": companion.get("maxWaterCanLevel"),
                 "hasWateringCan": companion.get("hasWateringCan", True),
                 "activity": companion.get("activity", "idle"),
                 "currentTask": current_task,
@@ -1199,23 +1293,17 @@ class CompanionScheduler:
                 # Real native weather icon; ``isRaining=false`` is not "clear".
                 "weatherIcon": world.get("weatherIcon"),
             },
-            "farmWork": {
-                "tilledUnwateredTiles": unwatered_tiles,
-                "tilledUnwateredCount": unwatered_count,
-                "cropUnwateredTiles": farm_work.get("cropUnwateredTiles"),
-                "cropUnwateredCount": farm_work.get("cropUnwateredCount"),
-                "isTruncated": is_truncated,
-                "matureCropCount": mature_crop_count,
-                "matureCrops": mature_crops,
-                "matureCropsTruncated": mature_crops_truncated,
-            },
+            "actorMode": payload.get("actorMode", client.actor_mode),
+            "actorMultiplayerId": str(payload.get("actorMultiplayerId",client.actor_multiplayer_id)) if payload.get("actorMultiplayerId",client.actor_multiplayer_id) is not None else None,
+            "controlOwner": payload.get("controlOwner",client.authority),
+            "farmWork": farm_work,
             "saveId": client.save_id or snap.get("saveId", "unknown"),
             "gameSessionId": client.game_session_id or snap.get("gameSessionId", "unknown"),
             "worldRevision": client.world_revision or snap.get("worldRevision", 0),
         }
 
     async def query_farm_work(self) -> dict[str, Any]:
-        """Queries farm work availability from the latest world snapshot.
+        """Queries Farm work from its observed snapshot scope; unobserved counts stay unknown.
 
         Returns:
         - farmWork: tilledUnwateredTiles, tilledUnwateredCount, isTruncated,
@@ -1241,42 +1329,20 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        include_empty_tiles: bool | None = None,
     ) -> dict[str, Any]:
         """Executes watering on an explicit list of tiles through policy validation and tracking.
 
         Enforces:
-        - tiles count between 1 and 64
+        - a non-empty, deduplicated list of tiles
         - coordinate non-negative integers
         - deterministic row-major ordering (y, x)
         - single active task concurrency check
         - idempotency key generation: {saveId}:{taskId}:attempt-1
         """
-        if not isinstance(tiles, list) or len(tiles) == 0:
-            raise PolicyViolationError("tiles must be a non-empty list")
-        if len(tiles) > 64:
-            raise PolicyViolationError(
-                f"tiles count ({len(tiles)}) exceeds maximum allowed batch limit (64)"
-            )
-
-        validated_tiles: list[dict[str, int]] = []
-        for t in tiles:
-            if not isinstance(t, dict) or "x" not in t or "y" not in t:
-                raise PolicyViolationError(f"invalid tile format: {t}")
-            x = t["x"]
-            y = t["y"]
-            if (
-                isinstance(x, bool)
-                or not isinstance(x, int)
-                or isinstance(y, bool)
-                or not isinstance(y, int)
-            ):
-                raise PolicyViolationError(f"tile coordinates must be integers: {t}")
-            if x < 0 or y < 0:
-                raise PolicyViolationError(f"tile coordinates must be non-negative: {t}")
-            validated_tiles.append({"x": x, "y": y})
-
-        # Sort deterministically row-major: y, then x
-        validated_tiles.sort(key=lambda item: (item["y"], item["x"]))
+        validated_tiles = validate_action_tiles(tiles)
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
 
         async def dispatch(
             client: TransportClient,
@@ -1284,16 +1350,23 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             water_kwargs: dict[str, Any] = {
                 "location_id": location_id,
                 "tiles": validated_tiles,
+                # The selected batch sets the allowance; the native actor still
+                # stops on its actual water/stamina. Hidden 20-water defaults
+                # must not split a declared 40-tile job while its can is full.
+                "max_water": len(validated_tiles),
+                "max_stamina": max(50.0, len(validated_tiles) * 2.0),
                 "task_id": task_id,
                 "idempotency_key": idempotency_key,
                 "expires_seconds": expires_seconds,
             }
             if command_id is not None:
                 water_kwargs["command_id"] = command_id
+            water_kwargs["include_empty_tiles"] = include_empty_tiles is True
             return await client.execute_water_zone(**water_kwargs)
 
         return await self.execute_skill(
@@ -1329,8 +1402,10 @@ class CompanionScheduler:
         - task expiration deadline and lifecycle tracking
 
         `dispatch` is invoked as
-        `dispatch(client, task_id=..., idempotency_key=..., expires_seconds=...)`
-        and must send the skill.execute envelope, returning its command id.
+        `dispatch(client, task_id=..., idempotency_key=..., expires_seconds=..., command_id=...)`
+        and must send the skill.execute envelope, returning its command id. The
+        ``command_id`` argument is the stable requested plan command id (None for
+        ad-hoc calls); closures forward it so the native command keeps one identity.
 
         ``pre_dispatch`` runs after the compatibility and single-active-task
         checks, immediately before ``dispatch`` — the reliable not-sent-yet
@@ -1396,6 +1471,7 @@ class CompanionScheduler:
                     task_id=self._active_task.task_id,
                     idempotency_key=self._active_task.idempotency_key,
                     expires_seconds=timeout_seconds,
+                    command_id=requested_command_id,
                 )
                 self._active_task.command_id = cmd_id
             elif not cmd_id:
@@ -1411,6 +1487,17 @@ class CompanionScheduler:
             terminal_state = payload.get("terminalState", "unknown")
             self._active_task.status = terminal_state
             self._active_task.is_terminal = True
+            native_counts = [payload.get(key) for key in ("completedCount", "skippedCount", "failedCount")]
+            confirmed_terminal = terminal_state in {
+                "succeeded", "partially-succeeded", "partial", "failed",
+                "rejected", "cancelled", "canceled",
+            }
+            unprocessed_count = None
+            if confirmed_terminal and all(
+                isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                for count in native_counts
+            ):
+                unprocessed_count = max(0, len(self._active_task.tiles) - sum(native_counts))
 
             return {
                 "status": "executed",
@@ -1420,19 +1507,34 @@ class CompanionScheduler:
                 "completedCount": payload.get("completedCount", 0),
                 "skippedCount": payload.get("skippedCount", 0),
                 "failedCount": payload.get("failedCount", 0),
+                "targetCount": len(self._active_task.tiles),
+                "unprocessedTargetCount": unprocessed_count,
                 "effects": payload.get("effects", []),
                 "details": payload.get("details"),
+                "resources": payload.get("resources"),
+                "inventoryDelta": (payload.get("inventoryDelta") if payload.get("inventoryDelta") is not None
+                                   else (payload.get("details") or {}).get("inventoryDelta")),
+                "resourceDelta": payload.get("resourceDelta"),
+                # Forward the native receipt's own terminal explanation top-level so
+                # downstream consumers (plan_executor, job_feedback) do not have to
+                # dig through the error dictionary; the original fields stay intact.
+                "reasonCode": payload.get("reasonCode"),
+                "message": payload.get("message"),
                 "error": payload.get("error"),
-                "worldRevision": payload.get("worldRevision"),
+                "worldRevision": payload.get("finalWorldRevision", payload.get("worldRevision", getattr(result_env, "world_revision", None))),
+                "saveId": result_env.save_id,
+                "gameSessionId": result_env.game_session_id,
             }
         except TimeoutError:
             # The mod task is still executing on the companion in the background.
             # Do NOT mark as failed or terminal!
             # Single active task state is preserved to prevent blind re-dispatch.
             if self._active_task:
-                self._active_task.status = "running"
+                # Pause/cancel may arrive while waiting. A wait timeout must not
+                # undo that control transition; newly created tasks already run.
                 self._active_task.is_terminal = False
             cur_tid = self._active_task.task_id if self._active_task else (task_id or "")
+            cur_status = self._active_task.status if self._active_task else "running"
             return {
                 "status": "executing",
                 "terminalState": "running",
@@ -1445,12 +1547,12 @@ class CompanionScheduler:
                 "effects": [],
                 "details": {
                     "taskId": cur_tid,
-                    "status": "running",
+                    "status": cur_status,
                     "inProgress": True,
                     "timeoutSeconds": timeout_seconds,
-                    "message": f"Task '{cur_tid}' is still executing on companion after {timeout_seconds}s (not failed). Use get_status or pass taskId to query completion.",
+                    "message": f"Task '{cur_tid}' is still active on companion after {timeout_seconds}s (status: {cur_status}, not failed). Use get_status or pass taskId to query completion.",
                 },
-                "message": f"Task '{cur_tid}' is still executing on companion after {timeout_seconds}s (in progress).",
+                "message": f"Task '{cur_tid}' is still active on companion after {timeout_seconds}s (status: {cur_status}).",
                 "error": None,
             }
         except Exception as ex:
@@ -1518,7 +1620,7 @@ class CompanionScheduler:
             "gameSessionId": client.game_session_id or snap.get("gameSessionId", "unknown"),
         }
 
-    async def query_planting_options(self, detail: bool = False) -> dict[str, Any]:
+    async def query_planting_options(self, detail: bool = False, location_id: str | None = None, region: dict[str, int] | None = None) -> dict[str, Any]:
         """Projects planting options (seeds, season, tillable dirt, hoed empty tiles) from snapshot.
 
         Enforces:
@@ -1527,6 +1629,30 @@ class CompanionScheduler:
         - returns season, dayOfMonth, companionHasHoe, seeds, candidateTiles, searchBounds,
           worldRevision, saveId, gameSessionId
         """
+        if location_id is not None or region is not None:
+            parameters: dict[str, Any] = {"locationId": location_id or "Farm"}
+            if region is not None:
+                self._validate_spatial_region(region)
+                parameters["region"] = dict(region)
+            result = await self._execute_native_action("inspect-planting", parameters, tiles=[])
+            facts = (result.get("details") or {}).get("planting")
+            if not isinstance(facts, dict):
+                raise SchedulerError("Native farm region observation unavailable")
+            # Regions are bounded candidates; detail controls tile arrays only.
+            facts = dict(facts)
+            player_catalog = region is None and ((self._latest_snapshot_data or {}).get("payload") or {}).get("actorMode") == "player"
+            if not detail or player_catalog:
+                facts["regions"] = [{key: value for key, value in r.items()
+                                      if not key.endswith("Tiles")}
+                                     for r in facts.get("regions", [])]
+            if player_catalog:
+                facts["tileDetails"] = {
+                    "status": "available-on-demand",
+                    "reason": "Whole-farm region catalog compares location/capacity/path costs without repeating hundreds of coordinates. This is not a visibility gate.",
+                    "query": "query_planting_options(location_id='Farm', region=<chosen bounds>, detail=true)",
+                    "completeChosenRegion": True,
+                }
+            return facts
         client = await self.ensure_connected()
         await self._refresh_snapshot(client)
 
@@ -1655,11 +1781,11 @@ class CompanionScheduler:
         name: str | None = None,
         is_seed: bool | None = None,
     ) -> dict[str, Any]:
-        """Projects shop information (items, stock, price, isOpen, availableMoney) from snapshot.
+        """Observes the requested native shop, using the default snapshot when it matches.
 
         Enforces:
         - explicit unknown/error if snapshot sections are missing (never pretends 0)
-        - raises clear error if requested shop_id is not published in current snapshot
+        - queries other shops on demand rather than treating missing publication as no stock
         - supports filtering items by item_id, name, or is_seed to prevent dumping full catalog
         - concise item projection by default (detail=False); complete item metadata when detail=True
         - returns shopId, status, isOpen, ownerPresent, closedMessage, owners,
@@ -1672,25 +1798,13 @@ class CompanionScheduler:
         snap = self._latest_snapshot_data or {}
         payload = snap.get("payload", {})
         shop_snap = payload.get("shop")
-        if shop_snap is None:
-            raise SchedulerError(
-                "World snapshot does not include a 'shop' section. "
-                "The running game build is too old; upgrade StardewAI.Companion.Mod "
-                "to a build that publishes shop snapshots."
-            )
+        if not isinstance(shop_id, str) or not shop_id.strip():
+            raise PolicyViolationError("shop_id must be a non-empty string")
+        if not isinstance(shop_snap, dict) or str(shop_snap.get("shopId", "")).lower() != shop_id.lower():
+            observed = await self._execute_native_action("inspect-shop", {"locationId": shop_id, "shopId": shop_id}, tiles=[])
+            shop_snap = (observed.get("details") or {}).get("shop")
         if not isinstance(shop_snap, dict):
-            raise SchedulerError("World snapshot contains an invalid 'shop' section")
-
-        published_id = shop_snap.get("shopId")
-        if not published_id or (
-            shop_id != published_id
-            and shop_id.lower() != str(published_id).lower()
-        ):
-            published_list = [published_id] if published_id else []
-            raise SchedulerError(
-                f"Shop '{shop_id}' is not published in current snapshot. "
-                f"Published shop ID(s): {published_list}."
-            )
+            raise SchedulerError(f"Native observation did not return shop '{shop_id}'.")
 
         status = shop_snap.get("status", "unknown")
         is_open = bool(shop_snap.get("isOpen", False))
@@ -1739,6 +1853,7 @@ class CompanionScheduler:
                     "price": it.get("price", 0),
                     "stock": it.get("stock", 0),
                     "isInfiniteStock": bool(it.get("isInfiniteStock", False)),
+                    "isSeed": it.get("isSeed"), "category": it.get("category"),
                 }
                 if it.get("tradeItem"):
                     item_dict["tradeItem"] = it.get("tradeItem")
@@ -1759,7 +1874,7 @@ class CompanionScheduler:
         interaction_tile = shop_snap.get("interactionTile")
 
         res: dict[str, Any] = {
-            "shopId": published_id,
+            "shopId": shop_snap.get("shopId", shop_id),
             "status": status,
             "isOpen": is_open,
             "ownerPresent": owner_present,
@@ -1769,6 +1884,10 @@ class CompanionScheduler:
             "availableMoney": available_money,
             "moneyStatus": money_status,
             "itemsCount": items_count,
+            "sourceItemsCount": len(raw_items) if isinstance(raw_items, list) else "unknown",
+            "filters": {"itemId": item_id, "name": name, "isSeed": is_seed},
+            "emptyReason": ("filtered-no-match" if items_count == 0 and raw_items and (item_id or name or is_seed is not None)
+                            else "empty-native-stock" if items_count == 0 else None),
             "items": items,
             "worldRevision": client.world_revision or snap.get("worldRevision", 0),
             "saveId": client.save_id or snap.get("saveId", "unknown"),
@@ -1789,11 +1908,13 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        target_tiles: list[dict[str, int]] | None = None,
+        location_id: str | None = None,
     ) -> dict[str, Any]:
         """Automatically harvests mature crops without manual coordinates.
 
         Policy rules:
-        - max_tiles must be an integer between 1 and 64 (inclusive).
+        - max_tiles must be a positive integer.
         - Rejects execution if another task is already active.
         - Reads mature crops from the snapshot farmWork.matureCrops section
           (already sorted Y-X by the mod).
@@ -1801,14 +1922,16 @@ class CompanionScheduler:
         - Takes up to max_tiles and executes via the harvest-zone skill.
         - Returns execution outcome with targeted tiles and remaining count
           (an estimate; re-query after the task for ground truth).
+        - Optional target_tiles bounds candidates to their observed intersection;
+          [] selects no work. location_id must match the observed work map.
         """
         if isinstance(max_tiles, bool) or not isinstance(max_tiles, int):
             raise PolicyViolationError(
                 f"max_tiles must be an integer, got {type(max_tiles).__name__}"
             )
-        if max_tiles < 1 or max_tiles > 64:
+        if max_tiles < 1:
             raise PolicyViolationError(
-                f"Invalid max_tiles: {max_tiles}. Value must be between 1 and 64 (inclusive)."
+                f"Invalid max_tiles: {max_tiles}. Value must be positive."
             )
 
         if self.has_active_task and self._active_task:
@@ -1818,12 +1941,27 @@ class CompanionScheduler:
                 "Concurrent tasks are not permitted."
             )
 
+        allowed_coordinates = _auto_target_coordinates(target_tiles)
         work_info = await self.query_farm_work()
+        location_id = _farm_action_location(work_info, location_id)
         farm_work = work_info.get("farmWork", {})
         mature_crops = farm_work.get("matureCrops", [])
         total_mature = farm_work.get("matureCropCount", len(mature_crops))
+        scope_incomplete = _scoped_observation_incomplete(
+            allowed_coordinates, mature_crops, total_mature, bool(farm_work.get("matureCropsTruncated")))
+        if allowed_coordinates is not None:
+            mature_crops = [crop for crop in mature_crops
+                            if (crop["x"], crop["y"]) in allowed_coordinates]
+            total_mature = len(mature_crops)
 
         if not mature_crops:
+            if scope_incomplete:
+                return {**build_unified_outcome(outcome="unknown", goal_satisfied=False, effects=[],
+                    remaining={"matureCrops": None}, reason_code="OBSERVATION_TRUNCATED",
+                    snapshot_revision=work_info.get("worldRevision")),
+                    "status": "unknown", "terminalState": "unknown", "targetTiles": [], "targetCount": 0,
+                    "remainingMatureCount": None, "scopeObservationIncomplete": True, "scopeIncomplete": True,
+                    "message": "The reported harvest candidate list is incomplete. Refresh or query the saved scope before concluding no work; no action dispatched."}
             return {
                 **build_unified_outcome(
                     outcome="completed",
@@ -1834,7 +1972,7 @@ class CompanionScheduler:
                     snapshot_revision=work_info.get("worldRevision"),
                 ),
                 "status": "no-work",
-                "message": "No mature crops ready for harvest on the farm. "
+                "message": "No observed mature crops ready for harvest in the selected scope. "
                 "Companion remains idle.",
                 "targetTiles": [],
                 "targetCount": 0,
@@ -1846,8 +1984,7 @@ class CompanionScheduler:
         target_tiles = [{"x": c["x"], "y": c["y"]} for c in selected]
         target_count = len(target_tiles)
         remaining = max(0, total_mature - target_count)
-        is_truncated = bool(farm_work.get("matureCropsTruncated", False))
-        location_id = work_info.get("companion", {}).get("locationId", "Farm")
+        is_truncated = bool(farm_work.get("matureCropsTruncated", False) or scope_incomplete)
 
         async def dispatch(
             client: TransportClient,
@@ -1855,6 +1992,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             harvest_kwargs: dict[str, Any] = {
                 "location_id": location_id,
@@ -1879,36 +2017,61 @@ class CompanionScheduler:
         )
 
         terminal_state = exec_res["terminalState"]
+        progress_pending = terminal_state in {"running", "unknown", None}
+        completed_in_scope = exec_res.get("completedCount", 0) or 0
+        harvested_effects = [effect for effect in exec_res.get("effects", [])
+                             if isinstance(effect, dict) and effect.get("state") == "harvested"]
+        if allowed_coordinates is not None and any(effect.get("harvestMethod") == "scythe" for effect in harvested_effects):
+            # Native scythe arcs can also harvest outside the planned candidates.
+            # Those are real effects, but cannot complete unharvested scope tiles.
+            completed_in_scope = len({(tile["x"], tile["y"])
+                for effect in harvested_effects if isinstance((tile := effect.get("tile")), dict)
+                and all(type(tile.get(key)) is int for key in ("x", "y"))
+                and (tile["x"], tile["y"]) in allowed_coordinates})
+        remaining = max(0, total_mature - completed_in_scope)
         if terminal_state == "succeeded":
-            outcome_name, goal_satisfied, reason_code = "completed", remaining <= 0, "OK"
+            outcome_name = "partial" if scope_incomplete else "completed"
+            goal_satisfied = remaining <= 0 and not scope_incomplete
+            reason_code = "OBSERVATION_TRUNCATED" if scope_incomplete else "OK"
         elif terminal_state in {"running", "unknown", None}:
             outcome_name, goal_satisfied, reason_code = "unknown", False, "IN_PROGRESS"
         else:
             completed_now = exec_res.get("completedCount", 0) or 0
             outcome_name = "partial" if completed_now > 0 else "unknown"
             goal_satisfied, reason_code = False, "HARVEST_INCOMPLETE"
+            native_error = exec_res.get("error")
+            if isinstance(native_error, dict) and native_error.get("code"):
+                reason_code = native_error["code"]
 
         return {
+            **{key: exec_res[key] for key in ("commandId", "taskId", "worldRevision", "resources", "inventoryDelta", "resourceDelta") if key in exec_res},
             **build_unified_outcome(
                 outcome=outcome_name,
                 goal_satisfied=goal_satisfied,
                 effects=exec_res.get("effects", []),
-                remaining={"matureCrops": remaining},
+                remaining={"matureCrops": None} if progress_pending else
+                    {"matureCrops": None, "observedMatureCrops": remaining} if scope_incomplete else {"matureCrops": remaining},
                 reason_code=reason_code,
-                snapshot_revision=work_info.get("worldRevision"),
+                snapshot_revision=exec_res.get("worldRevision", work_info.get("worldRevision")),
             ),
-            "status": "executed",
+            "status": exec_res.get("status", "executed"),
             "terminalState": terminal_state,
-            "completedCount": exec_res["completedCount"],
-            "skippedCount": exec_res["skippedCount"],
-            "failedCount": exec_res["failedCount"],
+            "completedCount": None if progress_pending else exec_res["completedCount"],
+            "skippedCount": None if progress_pending else exec_res["skippedCount"],
+            "failedCount": None if progress_pending else exec_res["failedCount"],
             "targetTiles": target_tiles,
             "targetCount": target_count,
-            "remainingMatureCount": remaining,
+            "remainingMatureCount": None if progress_pending or scope_incomplete else remaining,
+            "preDispatchObservedCount": total_mature,
+            "scopeObservationIncomplete": scope_incomplete, "scopeIncomplete": scope_incomplete,
+            "remainingCountSource": "awaiting_native_terminal" if progress_pending else
+                "pre_dispatch_scoped_observation_minus_native_completed" if allowed_coordinates is not None else "pre_dispatch_observation_minus_native_completed",
+            "unprocessedTargetCount": exec_res.get("unprocessedTargetCount"),
             "isTruncated": is_truncated,
             "effects": exec_res.get("effects", []),
             "details": exec_res.get("details"),
             "error": exec_res.get("error"),
+            "message": "Only the reported harvest candidates were selected; the truncated candidate list cannot prove the whole saved scope is complete." if scope_incomplete else exec_res.get("message"),
         }
 
     async def deposit_to_chest(
@@ -1919,18 +2082,27 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        location_id: str = "Farm",
+        items: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Deposits companion inventory items into a farm chest via deposit-chest.
 
         Policy rules:
         - chest_x/chest_y must be non-negative integers (booleans rejected).
         - item_ids, when provided, must be a list of at most 36 non-empty
-          strings; omitted means all non-tool items. Item ids are sorted
+          strings; native player deposits require explicit item choices, and
+          companion mode alone retains the non-tool default. Item ids are sorted
           before dispatch for a canonical wire shape.
         - single active task concurrency check.
         """
         self._validate_chest_coords(chest_x, chest_y)
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
+        location_id = location_id.strip()
         validated_item_ids = self._validate_item_ids(item_ids)
+        if items is not None and item_ids is not None:
+            raise PolicyViolationError("Specify either items with counts or item_ids, not both")
+        normalized_items = self._validate_withdraw_items(items=items) if items is not None else None
 
         async def dispatch(
             client: TransportClient,
@@ -1938,9 +2110,12 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
+            if getattr(client, "actor_mode", "companion") == "player" and not (validated_item_ids or normalized_items):
+                raise PolicyViolationError("Native player storage requires explicit item_ids or items; choose from the observed backpack")
             deposit_kwargs: dict[str, Any] = {
-                "location_id": "Farm",
+                "location_id": location_id,
                 "chest_x": chest_x,
                 "chest_y": chest_y,
                 "item_ids": validated_item_ids,
@@ -1950,13 +2125,15 @@ class CompanionScheduler:
             }
             if command_id is not None:
                 deposit_kwargs["command_id"] = command_id
+            if normalized_items is not None:
+                deposit_kwargs["items"] = normalized_items
             return await client.execute_deposit_chest(**deposit_kwargs)
 
         return await self.execute_skill(
             skill_id="deposit-chest",
             task_prefix="task-deposit-",
             dispatch=dispatch,
-            location_id="Farm",
+            location_id=location_id,
             tiles=[{"x": chest_x, "y": chest_y}],
             timeout_seconds=timeout_seconds,
             task_id=task_id,
@@ -1985,6 +2162,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             organize_kwargs: dict[str, Any] = {
                 "location_id": "Farm",
@@ -2037,6 +2215,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             withdraw_kwargs: dict[str, Any] = {
                 "location_id": location_id,
@@ -2164,6 +2343,7 @@ class CompanionScheduler:
         self,
         items: list[dict[str, Any]],
         location_id: str = "Farm",
+        max_game_minutes: int = 0,
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
@@ -2174,6 +2354,8 @@ class CompanionScheduler:
         - items must be a list of 1..36 items with valid itemId and count >= 1.
         - single active task concurrency check.
         """
+        if type(max_game_minutes) is not int or max_game_minutes < 0:
+            raise PolicyViolationError("max_game_minutes must be a non-negative integer; 0 means no time limit")
         validated_items = self._validate_ship_items(items)
 
         async def dispatch(
@@ -2182,10 +2364,12 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             ship_kwargs: dict[str, Any] = {
                 "location_id": location_id,
                 "items": validated_items,
+                "max_game_minutes": max_game_minutes,
                 "task_id": task_id,
                 "idempotency_key": idempotency_key,
                 "expires_seconds": expires_seconds,
@@ -2227,15 +2411,21 @@ class CompanionScheduler:
             cleaned_id = raw_id.strip()
             if not cleaned_id:
                 raise PolicyViolationError("itemId cannot be empty")
-            raw_count = item.get("count", 1)
-            if isinstance(raw_count, bool) or not isinstance(raw_count, int):
-                raise PolicyViolationError(
-                    f"count must be an integer, got {type(raw_count).__name__}"
-                )
-            if raw_count < 1:
-                raise PolicyViolationError(
-                    f"count must be at least 1, got {raw_count}"
-                )
+            for field_name in ("count", "quantity"):
+                if field_name not in item:
+                    continue
+                value = item[field_name]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise PolicyViolationError(
+                        f"{field_name} must be an integer, got {type(value).__name__}"
+                    )
+                if value < 1:
+                    raise PolicyViolationError(
+                        f"{field_name} must be at least 1, got {value}"
+                    )
+            if "count" in item and "quantity" in item and item["count"] != item["quantity"]:
+                raise PolicyViolationError("count and quantity must agree")
+            raw_count = item.get("count", item.get("quantity", 1))
             validated.append({"itemId": cleaned_id, "count": raw_count})
         return validated
 
@@ -2246,18 +2436,13 @@ class CompanionScheduler:
         budget_limit: int,
         shop_id: str,
         command_id: str | None,
+        reserve_allowance: bool = False,
     ) -> _FreePurchaseGuard:
-        """Enforce the free-mode daily purchase budget on the execution layer.
+        """Recover in-flight purchases and track actual spending in free mode.
 
-        Every real purchase path (plan worker, model surface, direct scheduler
-        call) funnels through ``execute_purchase_items``, so the daily limit is
-        a program guarantee here instead of a prompt hint. Free mode clamps
-        the forwarded call allowance to the daily remaining budget, quotes the
-        native shop snapshot, and refuses new spend while an older reservation
-        is still unverified. The reservation itself is created at the dispatch
-        boundary (``execute_skill``'s ``pre_dispatch`` hook), so a command that
-        fails the compatibility/concurrency pre-checks never occupies budget.
-        Command mode passes through untouched with the caller's budget_limit.
+        There is no daily purchase allowance. ``budget_limit`` belongs to this
+        single native command, chosen by the model from the observed quote.
+        Unknown purchase results must still be reconciled before another spend.
         """
         client = await self.ensure_connected()
         save_id = str(client.save_id or "unknown-save")
@@ -2299,7 +2484,7 @@ class CompanionScheduler:
                 return _FreePurchaseGuard(autonomy, save_id, command_id, budget_limit, early_response={
                     "status": "executing", "terminalState": "running", "inProgress": True,
                     "commandId": command_id,
-                    "message": "原购买命令仍待核对，已保留预算；核对完成前不会重新购物。",
+                    "message": "原购买命令仍待核对；核对完成前不会重复购买。",
                 })
             recovered_payload = recovered if isinstance(recovered, dict) else {}
             recovered_details = (
@@ -2313,21 +2498,12 @@ class CompanionScheduler:
                 "totalCost": recovered_cost, "details": recovered_details,
                 "error": recovered_payload.get("error"),
             })
-        remaining = max(
-            0,
-            (auto_state.budget_limit or 0)
-            - auto_state.daily_spend
-            - sum(auto_state.spend_reservations.values()),
-        )
-        effective_budget = min(budget_limit, remaining)
-        if effective_budget <= 0:
-            return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, early_response={
-                "status": "rejected", "terminalState": "rejected", "commandId": command_id,
-                "error": {
-                    "code": "AUTONOMY_BUDGET_EXHAUSTED",
-                    "message": "自由模式每日购买预算不足。",
-                },
-            })
+        effective_budget = budget_limit
+        if reserve_allowance:
+            # Native building/animal services enforce their live price against
+            # this allowance. Track the pending command until its exact
+            # totalCost is confirmed by the existing spend ledger.
+            return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, quote=effective_budget)
         # Quote from the native shop snapshot. Never infer a price.
         shop = await self.query_shop(shop_id=shop_id, detail=True)
         native_items = {
@@ -2343,15 +2519,15 @@ class CompanionScheduler:
             if not isinstance(price, int) or price < 0 or not isinstance(count, int):
                 raise SchedulerError("无法取得原生报价，已阻止自由模式购买。")
             quote += price * count
-        # The quote must fit the clamped allowance. The reservation itself is
+        # The quote must fit this command's quoted cost check. Its pending record is
         # created later, at the dispatch boundary inside execute_skill, so a
-        # command that never gets sent cannot leak budget.
+        # command that never gets sent leaves no pending purchase.
         if quote > effective_budget:
             return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, early_response={
                 "status": "rejected", "terminalState": "rejected", "commandId": command_id,
                 "error": {
-                    "code": "AUTONOMY_BUDGET_EXHAUSTED",
-                    "message": "自由模式每日购买预算不足。",
+                    "code": "PURCHASE_QUOTE_EXCEEDS_LIMIT",
+                    "message": "原生报价超过本次采购填写的金额，请按实际报价调整采购任务。",
                 },
             })
         return _FreePurchaseGuard(autonomy, save_id, command_id, effective_budget, quote=quote)
@@ -2373,10 +2549,8 @@ class CompanionScheduler:
         - budget_limit must be a positive integer.
         - shop_id must be non-empty string (defaults to "SeedShop").
         - single active task concurrency check.
-        - free mode: the daily purchase budget is enforced here on the shared
-          execution path — the native quote is reserved before dispatch, the
-          forwarded allowance is clamped to the daily remaining budget, and the
-          reservation is settled exactly once from the confirmed result.
+        - free mode: pending purchases are reconciled before dispatch, and
+          confirmed actual costs are recorded once. No daily allowance applies.
         """
         validated_items = self._validate_purchase_items(items)
         if command_id and task_id is None and self._active_task and self._active_task.requested_command_id == command_id:
@@ -2404,14 +2578,9 @@ class CompanionScheduler:
             command_id = guard.command_id
 
         def _reserve_free_mode_spend() -> None:
-            # Runs at execute_skill's not-sent-yet boundary: after the
-            # compatibility and single-active-task checks, immediately before
-            # the native dispatch. A command rejected by those checks — or a
-            # dispatch that never returns — therefore leaves no reservation
-            # behind, while a sent command keeps it until its result is
-            # confirmed. reserve_spend re-checks the daily remaining formula
-            # under its own lock, so a cross-process race still cannot
-            # overdraw (it surfaces as SchedulerError without a leak).
+            # Record only commands that reach the native dispatch boundary.
+            # Compatibility/concurrency rejection creates no pending purchase;
+            # a sent command remains tracked until its result is confirmed.
             if guard.autonomy is None or not guard.save_id or not command_id:
                 return
             guard.autonomy.reserve_spend(
@@ -2424,6 +2593,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             purchase_kwargs: dict[str, Any] = {
                 "shop_id": target_shop_id,
@@ -2453,6 +2623,59 @@ class CompanionScheduler:
             self._settle_free_mode_purchase(guard.save_id, command_id, result)
         return result
 
+    async def _observed_adjacent_entry(self, location_id: str) -> dict[str, int]:
+        """Resolve only a public outgoing warp on the player's actual map.
+
+        An exploration destination must not require guessing coordinates on a
+        map never visited. This selects no business activity or hidden item.
+        Native route admission still checks the actual exit/landing obstacles.
+        """
+        client = await self.ensure_connected()
+        await self._refresh_snapshot(client)
+        payload = (self._latest_snapshot_data or {}).get("payload") or {}
+        actor = payload.get("companion") or {}
+        current = actor.get("locationId")
+        if not isinstance(current, str):
+            raise SchedulerError("Current native actor location unavailable; no arrival guessed.")
+        space = await self.query_farm_space(location_id=current)
+        candidates = [w for w in space.get("warps", []) if isinstance(w, dict)
+                      and str(w.get("targetLocation", "")).casefold() == location_id.casefold()
+                      and all(type(w.get(k)) is int for k in ("x", "y", "targetX", "targetY"))
+                      and w["targetX"] >= 0 and w["targetY"] >= 0]
+        if not candidates:
+            raise SchedulerError(f"No observed public warp from {current} to {location_id}. Inspect current-map warps, choose an adjacent destination, or supply an observed exact tile; no coordinate guessed.")
+        if type(actor.get("tileX")) is int and type(actor.get("tileY")) is int:
+            candidates.sort(key=lambda w: abs(w["x"]-actor["tileX"])+abs(w["y"]-actor["tileY"]))
+        warp = candidates[0]
+        if "standingTileAvailable" in warp:
+            if warp.get("standingTileAvailable") is not True or any(type(warp.get(k)) is not int for k in ("standingX", "standingY")):
+                raise SchedulerError(f"Observed exit to {location_id} has no checked nearby standing point; this does not prove the whole destination unavailable. Re-observe geometry or choose another observed entrance.")
+            return {"x": warp["standingX"], "y": warp["standingY"]}
+        return {"x": warp["targetX"], "y": warp["targetY"]}
+
+    async def query_route(self, location_id: str, tile: dict[str, int] | None = None) -> dict[str, Any]:
+        """Preview exact native travel, or an observed adjacent-map entry."""
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise SchedulerError("Route location must be a non-empty string.")
+        if tile is None:
+            tile = await self._observed_adjacent_entry(location_id)
+        if not location_id.strip() or not isinstance(tile, dict) or any(type(tile.get(axis)) is not int or tile[axis] < 0 for axis in ("x", "y")):
+            raise SchedulerError("Route requires a location and non-negative integer destination tile.")
+        result = await self._execute_native_action("inspect-route", {"locationId": location_id, "tile": tile}, tiles=[])
+        details = result.get("details")
+        route = details.get("route") if isinstance(details, dict) else None
+        terminal = str(result.get("terminalState") or "").lower()
+        if (terminal not in {"", "succeeded"} or result.get("error")
+                or not isinstance(route, dict) or type(route.get("reachable")) is not bool):
+            # A rejected native observation is not an empty route preview. Keep
+            # its actual failure so the next decision can distinguish execution
+            # trouble from a checked, unreachable destination.
+            return {**result, "resolvedDestinationTile": tile,
+                    **({"status": "unavailable", "terminalState": "unknown", "reasonCode": "ROUTE_OBSERVATION_MISSING"}
+                       if terminal in {"", "succeeded"} and not result.get("error") else {})}
+        return {**route, "resolvedDestinationTile": tile,
+                **{key: result[key] for key in ("saveId", "commandId", "worldRevision") if key in result}}
+
     async def execute_navigate_to(
         self,
         location_id: str,
@@ -2462,11 +2685,7 @@ class CompanionScheduler:
         task_id: str | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Executes navigate-to skill to move companion across maps to a destination tile.
-
-        If tile is omitted, resolves known native landmarks (e.g. 'entrance', 'shipping_bin', 'default')
-        from COMMON_LOCATION_LANDMARKS.
-        """
+        """Walk to an explicit tile or the destination shop's live interaction point."""
         if not isinstance(location_id, str) or not location_id.strip():
             raise SchedulerError("location_id must be a non-empty string.")
 
@@ -2484,11 +2703,7 @@ class CompanionScheduler:
                 shop_loc = shop_data.get("locationId") or "SeedShop"
                 interaction_tile = shop_data.get("interactionTile")
                 if interaction_tile and isinstance(interaction_tile, dict):
-                    clean_landmark = (landmark or "").strip().lower()
-                    if (
-                        clean_loc.lower() == str(shop_loc).lower()
-                        or clean_landmark in ("counter", "shop", "seedshop", "store")
-                    ):
+                    if clean_loc.lower() == str(shop_loc).lower():
                         resolved_coord = {
                             "x": int(interaction_tile["x"]),
                             "y": int(interaction_tile["y"]),
@@ -2497,13 +2712,11 @@ class CompanionScheduler:
             if resolved_coord is not None:
                 tile = resolved_coord
             else:
-                landmark_hint = f" (landmark='{landmark}')" if landmark else ""
-                raise SchedulerError(
-                    f"No destination tile provided for '{clean_loc}'{landmark_hint} and no native dynamic "
-                    f"interaction data available in current game snapshot. "
-                    f"Please provide 'tile' with non-negative 'x' and 'y' coordinates; "
-                    f"static hardcoded landmark coordinates are unsupported."
-                )
+                if landmark:
+                    raise SchedulerError(
+                        f"Cannot resolve landmark '{landmark}': no native dynamic interaction data; provide an observed tile."
+                    )
+                tile = await self._observed_adjacent_entry(clean_loc)
 
         if not isinstance(tile, dict):
             raise SchedulerError("tile must be a dictionary with 'x' and 'y' coordinates.")
@@ -2533,6 +2746,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             nav_kwargs: dict[str, Any] = {
                 "location_id": clean_loc,
@@ -2556,6 +2770,172 @@ class CompanionScheduler:
             requested_command_id=command_id,
         )
 
+    async def open_shop(self, shop_id: str, location_id: str,
+                        timeout_seconds: float = 30.0, command_id: str | None = None,
+                        task_id: str | None = None) -> dict[str, Any]:
+        """Open the actual native shop at an adjacent counter and observe current stock before deciding what to buy."""
+        async def dispatch(client: TransportClient, *, task_id: str, idempotency_key: str,
+                           expires_seconds: float, command_id: str | None = None) -> str:
+            shop_kwargs: dict[str, Any] = {
+                "location_id": location_id,
+                "shop_id": shop_id,
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+                "expires_seconds": expires_seconds,
+            }
+            if command_id is not None:
+                shop_kwargs["command_id"] = command_id
+            return await client.execute_open_shop(**shop_kwargs)
+        return await self.execute_skill(skill_id="open-shop",task_prefix="task-open-shop-",
+            dispatch=dispatch,location_id=location_id,tiles=[],timeout_seconds=timeout_seconds,
+            task_id=task_id,requested_command_id=command_id)
+
+    async def open_chest(self, chest_x: int, chest_y: int, location_id: str = "Farm",
+                         timeout_seconds: float = 30.0, command_id: str | None = None,
+                         task_id: str | None = None) -> dict[str, Any]:
+        """Perform native opening; only then may chest observation reveal its contents."""
+        async def dispatch(client: TransportClient, *, task_id: str, idempotency_key: str,
+                           expires_seconds: float, command_id: str | None = None) -> str:
+            chest_kwargs: dict[str, Any] = {
+                "location_id": location_id,
+                "chest_x": chest_x,
+                "chest_y": chest_y,
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+                "expires_seconds": expires_seconds,
+            }
+            if command_id is not None:
+                chest_kwargs["command_id"] = command_id
+            return await client.execute_open_chest(**chest_kwargs)
+        return await self.execute_skill(skill_id="open-chest",task_prefix="task-open-chest-",
+            dispatch=dispatch,location_id=location_id,tiles=[],timeout_seconds=timeout_seconds,
+            task_id=task_id,requested_command_id=command_id)
+
+    async def execute_native_advance(
+        self,
+        allow_skip: bool = False,
+        timeout_seconds: float = 30.0,
+        task_id: str | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Advance the actor's current native UI one step (native-advance skill).
+
+        Behavior is owned by the Mod: a skippable cutscene is skipped when
+        ``allow_skip`` is true, an ordinary dialogue advances one line, an
+        informational menu is dismissed, and every other state is rejected with
+        an explicit reasonCode (EVENT_ACTIVE, MENU_OWNED_BY_SLEEP_FLOW,
+        CHOICE_REQUIRED with the listed responses, or NOTHING_TO_ADVANCE). The
+        result passes the native terminalState/reasonCode/message/details through.
+        """
+        if not isinstance(allow_skip, bool):
+            raise PolicyViolationError("allow_skip must be a boolean")
+
+        async def dispatch(client: TransportClient, *, task_id: str, idempotency_key: str,
+                           expires_seconds: float, command_id: str | None = None) -> str:
+            advance_kwargs: dict[str, Any] = {
+                "allow_skip": allow_skip,
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+                "expires_seconds": expires_seconds,
+            }
+            if command_id is not None:
+                advance_kwargs["command_id"] = command_id
+            return await client.execute_native_advance(**advance_kwargs)
+
+        return await self.execute_skill(
+            skill_id="native-advance",
+            task_prefix="task-advance-",
+            dispatch=dispatch,
+            location_id="Farm",
+            tiles=[],
+            timeout_seconds=timeout_seconds,
+            task_id=task_id,
+            requested_command_id=command_id,
+        )
+
+    async def execute_native_answer(
+        self,
+        choice_index: int,
+        timeout_seconds: float = 30.0,
+        task_id: str | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Answer the current question dialogue with an explicit choice (native-answer skill).
+
+        ``choice_index`` selects one of the responses the native side listed (a
+        preceding native-advance rejection with CHOICE_REQUIRED carries them in
+        details.responses). Answering is never implicit: the model must not pick
+        on the player's behalf. A non-question state is rejected NOT_A_QUESTION.
+        """
+        if isinstance(choice_index, bool) or not isinstance(choice_index, int) or choice_index < 0:
+            raise PolicyViolationError("choice_index must be a non-negative integer")
+
+        async def dispatch(client: TransportClient, *, task_id: str, idempotency_key: str,
+                           expires_seconds: float, command_id: str | None = None) -> str:
+            answer_kwargs: dict[str, Any] = {
+                "choice_index": choice_index,
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+                "expires_seconds": expires_seconds,
+            }
+            if command_id is not None:
+                answer_kwargs["command_id"] = command_id
+            return await client.execute_native_answer(**answer_kwargs)
+
+        return await self.execute_skill(
+            skill_id="native-answer",
+            task_prefix="task-answer-",
+            dispatch=dispatch,
+            location_id="Farm",
+            tiles=[],
+            timeout_seconds=timeout_seconds,
+            task_id=task_id,
+            requested_command_id=command_id,
+        )
+
+    async def execute_sleep(
+        self,
+        timeout_seconds: float = 300.0,
+        task_id: str | None = None,
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Executes the player-mode native sleep skill (ends the day, empty parameters).
+
+        Sleep spans an in-game night including the fade and the end-of-night
+        menu stack, so the default wait is far more generous than ordinary
+        skills. The mod owns the player-mode gate: in companion mode (or when
+        the human holds control) the native side rejects the command with
+        PLAYER_CONTROL_NOT_HELD and that rejection propagates as the result.
+        """
+
+        async def dispatch(
+            client: TransportClient,
+            *,
+            task_id: str,
+            idempotency_key: str,
+            expires_seconds: float,
+            command_id: str | None = None,
+        ) -> str:
+            sleep_kwargs: dict[str, Any] = {
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+                "expires_seconds": expires_seconds,
+            }
+            if command_id is not None:
+                sleep_kwargs["command_id"] = command_id
+            return await client.execute_sleep(**sleep_kwargs)
+
+        return await self.execute_skill(
+            skill_id="sleep",
+            task_prefix="task-sleep-",
+            dispatch=dispatch,
+            location_id="FarmHouse",
+            tiles=[],
+            timeout_seconds=timeout_seconds,
+            task_id=task_id,
+            requested_command_id=command_id,
+        )
+
     async def execute_hoe_tiles(
         self,
         tiles: list[dict[str, Any]],
@@ -2566,10 +2946,10 @@ class CompanionScheduler:
     ) -> dict[str, Any]:
         """Executes hoe-tiles skill on validated dirt tiles.
 
-        Validates 1..64 coordinates, non-negative integers (no booleans), deduplicates,
+        Validates a non-empty coordinate list, non-negative integers (no booleans), deduplicates,
         and dispatches via single-active-task scheduler.
         """
-        validated_tiles = validate_action_tiles(tiles, max_tiles=64)
+        validated_tiles = validate_action_tiles(tiles)
 
         async def dispatch(
             client: TransportClient,
@@ -2577,6 +2957,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             hoe_kwargs: dict[str, Any] = {
                 "location_id": location_id,
@@ -2611,11 +2992,11 @@ class CompanionScheduler:
     ) -> dict[str, Any]:
         """Executes plant-seeds skill on validated hoed empty tiles.
 
-        Validates seed_item_id, 1..64 coordinates, non-negative integers (no booleans),
+        Validates seed_item_id, a non-empty coordinate list, non-negative integers (no booleans),
         deduplicates, and dispatches via single-active-task scheduler.
         """
         clean_seed_id = validate_seed_item_id(seed_item_id)
-        validated_tiles = validate_action_tiles(tiles, max_tiles=64)
+        validated_tiles = validate_action_tiles(tiles)
 
         async def dispatch(
             client: TransportClient,
@@ -2623,6 +3004,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             plant_kwargs: dict[str, Any] = {
                 "location_id": location_id,
@@ -2662,6 +3044,7 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        pre_dispatch: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         async def dispatch(
             client: TransportClient,
@@ -2669,6 +3052,7 @@ class CompanionScheduler:
             task_id: str,
             idempotency_key: str,
             expires_seconds: float,
+            command_id: str | None = None,
         ) -> str:
             kwargs: dict[str, Any] = {
                 "skill_id": skill_id,
@@ -2690,7 +3074,61 @@ class CompanionScheduler:
             timeout_seconds=timeout_seconds,
             task_id=task_id,
             requested_command_id=command_id,
+            pre_dispatch=pre_dispatch,
         )
+
+    async def observe_player_activities(self, command_id: str | None = None) -> dict[str, Any]:
+        """Current public NPCs, map actions and shore geometry, never future loot."""
+        await self.ensure_connected()
+        status = await self.get_status()
+        location = (status.get("companion") or {}).get("locationId") or status.get("locationId")
+        if not isinstance(location, str) or not location:
+            snap = (self._latest_snapshot_data or {}).get("payload") or {}
+            location = (snap.get("companion") or {}).get("locationId")
+        if not location:
+            raise SchedulerError("Current native location unavailable")
+        result = await self._execute_native_action("inspect-player-activities", {"locationId": location}, tiles=[], command_id=command_id)
+        return {**result, "activities": (result.get("details") or {}).get("activities")}
+
+    async def talk_npc(self, npc_name: str, location_id: str, command_id: str | None = None) -> dict[str, Any]:
+        """Initiate one native conversation with a currently observed adjacent NPC."""
+        if not isinstance(npc_name, str) or not npc_name.strip() or not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("Explicit NPC name and location required")
+        return await self._execute_native_action("talk-npc", {"locationId": location_id, "npcName": npc_name}, tiles=[], command_id=command_id)
+
+    async def interact_tile(self, tile: dict[str, int], location_id: str, command_id: str | None = None) -> dict[str, Any]:
+        """One native adjacent map action; actual touch triggers still require walking."""
+        if not isinstance(tile, dict) or any(type(tile.get(k)) is not int or tile[k] < -1 for k in ("x", "y")):
+            raise PolicyViolationError("Explicit integer interaction coordinates >= -1 required")
+        target = {"x": tile["x"], "y": tile["y"]}
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("Explicit location required")
+        return await self._execute_native_action("interact-tile", {"locationId": location_id, "tile": target}, tiles=[], command_id=command_id)
+
+    async def fish(self, facing: int, location_id: str, command_id: str | None = None) -> dict[str, Any]:
+        """One full native cast from the current observed shore; requires owned rod."""
+        if type(facing) is not int or facing not in (0,1,2,3) or not isinstance(location_id,str) or not location_id.strip():
+            raise PolicyViolationError("Explicit facing 0..3 and location required")
+        return await self._execute_native_action("fish", {"locationId": location_id, "facing": facing}, tiles=[], timeout_seconds=165, command_id=command_id)
+
+    async def attack(self, facing: int, location_id: str, command_id: str | None = None) -> dict[str, Any]:
+        """One real melee swing; native monsters/weapon settle damage and drops."""
+        if type(facing) is not int or facing not in (0,1,2,3) or not isinstance(location_id,str) or not location_id.strip():
+            raise PolicyViolationError("Explicit facing 0..3 and location required")
+        return await self._execute_native_action("attack", {"locationId":location_id,"facing":facing},tiles=[],command_id=command_id)
+
+    async def native_menu_select(self, choice_index: int, location_id: str, command_id: str | None = None,
+                                 text: str | None = None) -> dict[str, Any]:
+        """Select an observed native menu choice; optional text belongs only to NamingMenu."""
+        if type(choice_index) is not int or choice_index<0 or not isinstance(location_id,str) or not location_id.strip():
+            raise PolicyViolationError("Explicit nonnegative choice_index and location required")
+        parameters = {"locationId": location_id, "choiceIndex": choice_index}
+        if text is not None:
+            if (not isinstance(text, str) or not text.strip() or len(text) > 64
+                    or any(ord(character) < 32 or ord(character) == 127 for character in text)):
+                raise PolicyViolationError("Naming text must contain 1..64 characters without control characters")
+            parameters["menuText"] = text
+        return await self._execute_native_action("native-menu-select", parameters, tiles=[], command_id=command_id)
 
     def _snapshot_farming_refill_tiles(self, max_tiles: int) -> list[dict[str, int]]:
         """Reads the companion's own map refill tiles from the latest native snapshot.
@@ -2734,6 +3172,11 @@ class CompanionScheduler:
         return {
             "location": farming.get("location", location_id),
             "refillWaterTiles": farming.get("refillWaterTiles", []),
+            "refillWaterScope": farming.get("refillWaterScope", "near-companion"),
+            "refillWaterRadius": farming.get("refillWaterRadius", 12),
+            "refillWaterCenter": farming.get("refillWaterCenter"),
+            "refillWaterTilesTruncated": farming.get("refillWaterTilesTruncated", False),
+            "refillWaterMapComplete": farming.get("refillWaterMapComplete", False),
             "groundItems": farming.get("groundItems", []),
             "groundItemsTruncated": bool(farming.get("groundItemsTruncated", False)),
             "fertilizedTiles": farming.get("fertilizedTiles", []),
@@ -2773,7 +3216,7 @@ class CompanionScheduler:
                             command_id: str | None = None) -> dict[str, Any]:
         if not isinstance(building_name, str) or not building_name.strip():
             raise PolicyViolationError("building_name must be the observed building identity")
-        validated = validate_action_tiles([tile], max_tiles=1)
+        validated = validate_action_tiles([tile])
         return await self._execute_native_action(
             "move-building", {"locationId": location_id, "buildingName": building_name, "tile": validated[0]},
             tiles=validated, timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
@@ -2790,23 +3233,89 @@ class CompanionScheduler:
             return details["mapImage"]
         raise SchedulerError(str(result.get("error") or result.get("message") or "Native map image unavailable"))
 
+    async def query_building_services(self, location_id: str = "Farm") -> dict[str, Any]:
+        result = await self._execute_native_action("inspect-building-services", {"locationId": location_id}, tiles=[])
+        details = result.get("details") or {}
+        if isinstance(details, dict) and isinstance(details.get("buildingServices"), dict):
+            return details["buildingServices"]
+        raise SchedulerError(str(result.get("error") or result.get("message") or "Native building services unavailable"))
+
+    async def _building_service(self, skill_id: str, parameters: dict[str, Any], budget_limit: int,
+                                timeout_seconds: float, task_id: str | None, command_id: str | None) -> dict[str, Any]:
+        if type(budget_limit) is not int or budget_limit <= 0:
+            raise PolicyViolationError("budget_limit must be a positive integer")
+        if command_id and task_id is None and self._active_task and self._active_task.requested_command_id == command_id:
+            task_id = self._active_task.task_id
+        guard = await self._guard_free_mode_purchase(items=[], budget_limit=budget_limit,
+                    shop_id="AnimalShop" if skill_id == "purchase-animal" else "ScienceHouse",
+                    command_id=command_id, reserve_allowance=True)
+        if guard.early_response is not None:
+            return guard.early_response
+        command_id = guard.command_id or command_id
+        def reserve() -> None:
+            if guard.autonomy is not None and guard.save_id and command_id:
+                guard.autonomy.reserve_spend(guard.save_id, command_id, guard.quote, limit=guard.effective_budget)
+        result = await self._execute_native_action(skill_id,
+            {**parameters, "budget_limit": guard.effective_budget}, tiles=[],
+            timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id, pre_dispatch=reserve)
+        if guard.autonomy is not None and guard.save_id and command_id:
+            self._settle_free_mode_purchase(guard.save_id, command_id, result)
+        return result
+
+    async def build_building(self, building_type: str, tile: dict[str, int], budget_limit: int,
+                             location_id: str = "Farm", timeout_seconds: float = 30.0,
+                             task_id: str | None = None, command_id: str | None = None) -> dict[str, Any]:
+        validated = validate_action_tiles([tile])
+        return await self._building_service("build-building", {"locationId": location_id,
+            "buildingType": building_type, "tile": validated[0]}, budget_limit, timeout_seconds, task_id, command_id)
+
+    async def upgrade_building(self, building_name: str, building_type: str, budget_limit: int,
+                               location_id: str = "Farm", timeout_seconds: float = 30.0,
+                               task_id: str | None = None, command_id: str | None = None) -> dict[str, Any]:
+        return await self._building_service("upgrade-building", {"locationId": location_id,
+            "buildingName": building_name, "buildingType": building_type}, budget_limit, timeout_seconds, task_id, command_id)
+
+    async def purchase_animal(self, building_name: str, animal_type: str, animal_name: str, budget_limit: int,
+                              location_id: str = "Farm", timeout_seconds: float = 30.0,
+                              task_id: str | None = None, command_id: str | None = None) -> dict[str, Any]:
+        return await self._building_service("purchase-animal", {"locationId": location_id,
+            "buildingName": building_name, "animalType": animal_type, "animalName": animal_name},
+            budget_limit, timeout_seconds, task_id, command_id)
+
+    @staticmethod
+    def _validate_spatial_region(region: dict[str, int]) -> None:
+        if not isinstance(region, dict) or set(region) != {"x", "y", "width", "height"}:
+            raise PolicyViolationError("region must contain x, y, width and height only")
+        if any(type(v) is not int for v in region.values()):
+            raise PolicyViolationError("region values must be integers")
+        if region["x"] < 0 or region["y"] < 0 or region["width"] < 1 or region["height"] < 1:
+            raise PolicyViolationError("region must have non-negative origin and positive dimensions")
+
     async def query_farm_space(self, location_id: str = "Farm", region: dict[str, int] | None = None) -> dict[str, Any]:
         """On-demand full native map; never included in routine snapshots/context."""
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
         parameters: dict[str, Any] = {"locationId": location_id.strip()}
         if region is not None:
-            if not isinstance(region, dict) or set(region) != {"x", "y", "width", "height"}:
-                raise PolicyViolationError("region must contain x, y, width and height only")
-            if any(isinstance(v, bool) or not isinstance(v, int) for v in region.values()):
-                raise PolicyViolationError("region coordinates and dimensions must be integers")
-            if region["x"] < 0 or region["y"] < 0 or region["width"] < 1 or region["height"] < 1:
-                raise PolicyViolationError("region origin must be non-negative and dimensions positive")
+            self._validate_spatial_region(region)
             parameters["region"] = dict(region)
         result = await self._execute_native_action("inspect-location", parameters, tiles=[])
         details = result.get("details") or {}
         if isinstance(details, dict) and isinstance(details.get("farmSpace"), dict):
-            return details["farmSpace"]
+            space = dict(details["farmSpace"])
+            occupants = space.get("occupants")
+            if isinstance(occupants, list):
+                limit = 128 if region is None else 512
+                space.update(occupantCount=len(occupants), occupantsTruncated=len(occupants) > limit,
+                             occupantDetailsComplete=len(occupants) <= limit)
+                counts: dict[str, int] = {}
+                for occupant in occupants:
+                    if isinstance(occupant, dict):
+                        kind = str(occupant.get("kind") or occupant.get("type") or "unknown")
+                        counts[kind] = counts.get(kind, 0) + 1
+                space["occupantCounts"] = counts
+                space["occupants"] = occupants[:limit]
+            return space
         raise SchedulerError(str(result.get("error") or result.get("message") or "Native farmSpace observation unavailable"))
 
     async def place_items(
@@ -2814,7 +3323,7 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0, task_id: str | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Place up to 64 copies of one carried item through real game rules."""
+        """Place copies of one carried item at the declared tiles through real game rules."""
         return await self._layout_items("place-items", tiles, item_id, location_id,
                                        timeout_seconds, task_id, command_id)
 
@@ -2829,7 +3338,7 @@ class CompanionScheduler:
 
     async def _layout_items(self, skill_id, tiles, item_id, location_id,
                             timeout_seconds, task_id, command_id) -> dict[str, Any]:
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         if not isinstance(item_id, str) or not item_id.strip():
             raise PolicyViolationError("item_id must identify the exact native item")
         if not isinstance(location_id, str) or not location_id.strip():
@@ -2840,69 +3349,73 @@ class CompanionScheduler:
         )
 
     async def query_machines(self, location_id: str = "Farm") -> dict[str, Any]:
-        """Projects the machine observation group (idle / processing / ready output)."""
+        """Inspect machines on the requested real map and subscribe to readiness facts."""
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
-        client = await self.ensure_connected()
-        await self._refresh_snapshot(client)
-        snap = self._latest_snapshot_data or {}
-        payload = snap.get("payload", {})
-        machines = payload.get("machines") if isinstance(payload, dict) else None
-        if not isinstance(machines, dict):
-            raise SchedulerError(
-                "World snapshot does not include a 'machines' section. The running game "
-                "build is too old; upgrade StardewAI.Companion.Mod."
-            )
-        items = machines.get("items") or []
-        return {
-            "machines": items,
-            "count": len(items),
-            "readyCount": sum(1 for m in items if isinstance(m, dict) and m.get("isReady")),
-            "truncated": bool(machines.get("truncated", False)),
-            "worldRevision": client.world_revision or snap.get("worldRevision", 0),
-            "saveId": client.save_id or snap.get("saveId", "unknown"),
-        }
+        result = await self._execute_native_action("inspect-machines", {"locationId": location_id.strip()}, tiles=[])
+        details = result.get("details") or {}
+        group = details.get("machines") if isinstance(details, dict) else None
+        if not isinstance(group, dict) or group.get("locationId") != location_id.strip():
+            raise SchedulerError(str(result.get("error") or result.get("message") or "Native machine observation unavailable for requested map"))
+        items = group.get("items") or []
+        return {"locationId": group["locationId"], "machines": items, "count": len(items),
+                "readyCount": sum(1 for m in items if isinstance(m, dict) and m.get("isReady")),
+                "truncated": bool(group.get("truncated", False)),
+                **({"saveId": result["saveId"]} if result.get("saveId") else {})}
 
-    async def query_livestock(self) -> dict[str, Any]:
-        """Projects the livestock observation group (buildings, feed, animals, produce)."""
-        client = await self.ensure_connected()
-        await self._refresh_snapshot(client)
-        snap = self._latest_snapshot_data or {}
-        payload = snap.get("payload", {})
-        livestock = payload.get("livestock") if isinstance(payload, dict) else None
+    async def query_production(self, location_id: str = "Farm") -> dict[str, Any]:
+        """Inspect ground produce, refill sources and real edible backpack items."""
+        if not isinstance(location_id, str) or not location_id.strip():
+            raise PolicyViolationError("location_id must be a non-empty string")
+        result = await self._execute_native_action("inspect-production", {"locationId": location_id.strip()}, tiles=[])
+        details = result.get("details") or {}
+        group = details.get("production") if isinstance(details, dict) else None
+        if isinstance(group, dict) and group.get("locationId") == location_id.strip():
+            return group
+        raise SchedulerError(str(result.get("error") or result.get("message") or "Native production observation unavailable for requested map"))
+
+    async def eat_food(self, item_id: str, location_id: str = "Farm",
+                       timeout_seconds: float = 30.0, task_id: str | None = None,
+                       command_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise PolicyViolationError("item_id must identify an observed edible backpack item")
+        return await self._execute_native_action(
+            "eat-food", {"locationId": location_id, "itemId": item_id}, tiles=[],
+            timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
+
+    async def cut_grass(self, tiles: list[dict[str, Any]], location_id: str = "Farm",
+                        timeout_seconds: float = 30.0, task_id: str | None = None,
+                        command_id: str | None = None) -> dict[str, Any]:
+        validated = validate_action_tiles(tiles, preserve_order=True)
+        return await self._execute_native_action("cut-grass", {"locationId": location_id, "tiles": validated},
+            tiles=validated, timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
+
+    async def query_livestock(self, location_id: str = "Farm") -> dict[str, Any]:
+        """Inspect requested native map; a companion-map snapshot cannot prove absence elsewhere."""
+        result = await self._execute_native_action("inspect-livestock", {"locationId": location_id}, tiles=[])
+        livestock = (result.get("details") or {}).get("livestock")
         if not isinstance(livestock, dict):
-            raise SchedulerError(
-                "World snapshot does not include a 'livestock' section. The running game "
-                "build is too old; upgrade StardewAI.Companion.Mod."
-            )
+            raise SchedulerError("Native livestock observation is unavailable; update the running Mod.")
         buildings = livestock.get("buildings") or []
         roaming = livestock.get("roamingAnimals") or []
-        return {
-            "buildings": buildings,
-            "roamingAnimals": roaming,
-            "buildingCount": len(buildings),
-            "animalCount": sum(
-                len(b.get("animals") or []) for b in buildings if isinstance(b, dict)
-            ) + len(roaming),
-            "buildingsTruncated": bool(livestock.get("buildingsTruncated", False)),
-            "animalsTruncated": bool(livestock.get("animalsTruncated", False)),
-            "worldRevision": client.world_revision or snap.get("worldRevision", 0),
-            "saveId": client.save_id or snap.get("saveId", "unknown"),
-        }
+        snap = self._latest_snapshot_data or {}
+        return {**livestock, "buildingCount": len(buildings),
+                "animalCount": sum(len(b.get("animals") or []) for b in buildings if isinstance(b, dict)) + len(roaming),
+                "worldRevision": livestock.get("capturedRevision"), "saveId": snap.get("saveId", "unknown")}
 
     async def refill_watering_can(
         self,
         tiles: list[dict[str, Any]] | None = None,
         location_id: str = "Farm",
         max_tiles: int = 4,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
         task_id: str | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Refills the companion's watering can at native refill tiles.
 
-        With no explicit tiles, the native snapshot's refillWaterTiles for the
-        companion's own map are used (never an invented coordinate).
+        With no explicit tiles, use local native observations first, then inspect
+        the requested map once for distant native refill sources.
         """
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
@@ -2910,7 +3423,7 @@ class CompanionScheduler:
             raise PolicyViolationError("max_tiles must be a positive integer")
 
         if tiles:
-            validated = validate_action_tiles(tiles, max_tiles=8)
+            validated = validate_action_tiles(tiles)
         else:
             client = await self.ensure_connected()
             await self._refresh_snapshot(client)
@@ -2942,10 +3455,29 @@ class CompanionScheduler:
                         "message": "Watering can is already full; no refill needed.",
                         "terminalState": "none",
                     }
-            validated = self._snapshot_farming_refill_tiles(max_tiles)
+            try:
+                farming = payload.get("farming") or {}
+                if farming.get("location", location_id) != location_id:
+                    raise SchedulerError("Local refill observation belongs to another map.")
+                validated = self._snapshot_farming_refill_tiles(max_tiles)
+            except SchedulerError as local_error:
+                production = await self.query_production(location_id=location_id)
+                observed = production.get("waterRefillTiles")
+                if not isinstance(observed, list) or not observed:
+                    map_complete = production.get("waterRefillMapComplete")
+                    observed_scope = production.get("waterRefillScope")
+                    scope = "this map" if map_complete else "the inspected area"
+                    raise SchedulerError(
+                        f"No native watering-can refill tile was found on {scope}. {local_error} "
+                        "This is a conclusion about the observed range only, not proof that the whole "
+                        "farm has no refill point: move next to water or a pond and retry, or re-check "
+                        "with observe_farming_helpers. "
+                        f"(observed waterRefillScope={observed_scope!r}, waterRefillMapComplete={map_complete!r})"
+                    ) from None
+                validated = validate_action_tiles(observed[:max_tiles])
 
         parameters = {"locationId": location_id, "tiles": validated}
-        return await self._execute_native_action(
+        result = await self._execute_native_action(
             "refill-watering-can",
             parameters,
             tiles=validated,
@@ -2953,6 +3485,18 @@ class CompanionScheduler:
             task_id=task_id,
             command_id=command_id,
         )
+        # These tiles are alternative sources for one refill, not separate jobs.
+        # Native completed/skipped/failed counters remain unchanged; only a
+        # confirmed success establishes that the single resource service settled.
+        result["candidateCount"] = len(validated)
+        result.pop("targetCount", None)
+        result.pop("unprocessedTargetCount", None)
+        if result.get("terminalState") == "succeeded":
+            result["targetCount"] = 1
+            result["unprocessedTargetCount"] = 0
+            result["targetCountSource"] = "singleRefillService"
+            result["unprocessedTargetCountSource"] = "nativeSuccessfulRefill"
+        return result
 
     async def apply_fertilizer(
         self,
@@ -2964,7 +3508,7 @@ class CompanionScheduler:
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Applies one explicit fertilizer item to explicit tilled tiles."""
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         if not isinstance(fertilizer_item_id, str) or not fertilizer_item_id.strip():
             raise PolicyViolationError("fertilizer_item_id must be a non-empty string")
         parameters = {
@@ -2995,7 +3539,7 @@ class CompanionScheduler:
         for stones, Axe/Pickaxe for twigs); other objects return an unsupported reason
         and a missing tool returns an actionable ``missing-tool:<Tool>`` precondition.
         """
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "clear-debris",
@@ -3015,7 +3559,8 @@ class CompanionScheduler:
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Picks up dropped debris / spawned items on explicitly selected tiles."""
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        # Picking up an entry tile can open the route to the following targets.
+        validated = validate_action_tiles(tiles, preserve_order=True)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "pickup-items",
@@ -3039,7 +3584,7 @@ class CompanionScheduler:
         Fruit trees are protected (``protected-tree``); tiles without a choppable
         target return ``no-tree`` and a missing Axe returns ``missing-tool:Axe``.
         """
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "chop-tree",
@@ -3061,7 +3606,7 @@ class CompanionScheduler:
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Inserts an explicit companion item stack into an explicit machine."""
-        validated = validate_action_tiles([tile], max_tiles=1)
+        validated = validate_action_tiles([tile])
         if not isinstance(item_id, str) or not item_id.strip():
             raise PolicyViolationError("item_id must be a non-empty string")
         if isinstance(item_count, bool) or not isinstance(item_count, int) or not 1 <= item_count <= 36:
@@ -3090,7 +3635,7 @@ class CompanionScheduler:
         command_id: str | None = None,
     ) -> dict[str, Any]:
         """Collects ready machine output from explicit machine tiles."""
-        validated = validate_action_tiles(tiles, max_tiles=64)
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "collect-machine",
@@ -3101,24 +3646,47 @@ class CompanionScheduler:
             command_id=command_id,
         )
 
+    async def _observed_animal_tile(self, animal_name: str, animal_id: str | None,
+                                    location_id: str) -> dict[str, int]:
+        group = await self.query_livestock()
+        animals = list(group.get("roamingAnimals") or [])
+        for building in group.get("buildings") or []:
+            animals.extend(building.get("animals") or [])
+        matches = [animal for animal in animals if isinstance(animal, dict)
+                   and (str(animal.get("animalId")) == animal_id if animal_id
+                        else str(animal.get("name", "")).casefold() == animal_name.casefold())]
+        if len(matches) != 1 or not isinstance(matches[0].get("tile"), dict):
+            raise SchedulerError("Observe livestock and supply one unambiguous animalId and real tile")
+        animal = matches[0]
+        if animal.get("locationName", animal.get("location")) not in {None, location_id}:
+            raise SchedulerError("Animal is on a different map; use its observed location_id")
+        return animal["tile"]
+
     async def pet_animal(
         self,
-        animal_name: str,
-        tile: dict[str, Any],
+        animal_name: str = "",
+        tile: dict[str, Any] | None = None,
         location_id: str = "Farm",
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        animal_id: str | None = None,
     ) -> dict[str, Any]:
         """Pets one named animal at its last observed tile."""
-        validated = validate_action_tiles([tile], max_tiles=1)
-        if not isinstance(animal_name, str) or not animal_name.strip():
+        if tile is None:
+            tile = await self._observed_animal_tile(animal_name, animal_id, location_id)
+        validated = validate_action_tiles([tile])
+        if not animal_id and (not isinstance(animal_name, str) or not animal_name.strip()):
             raise PolicyViolationError("animal_name must be a non-empty string")
         parameters = {
             "locationId": location_id,
             "tiles": validated,
             "animalName": animal_name.strip(),
         }
+        if animal_id is not None:
+            if not isinstance(animal_id, str) or not animal_id.strip():
+                raise PolicyViolationError("animal_id must be an observed non-empty identity")
+            parameters["animalId"] = animal_id.strip()
         return await self._execute_native_action(
             "pet-animal",
             parameters,
@@ -3130,22 +3698,29 @@ class CompanionScheduler:
 
     async def collect_animal_produce(
         self,
-        animal_name: str,
-        tile: dict[str, Any],
+        animal_name: str = "",
+        tile: dict[str, Any] | None = None,
         location_id: str = "Farm",
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        animal_id: str | None = None,
     ) -> dict[str, Any]:
         """Collects one animal's produce through its applicable native path."""
-        validated = validate_action_tiles([tile], max_tiles=1)
-        if not isinstance(animal_name, str) or not animal_name.strip():
+        if tile is None:
+            tile = await self._observed_animal_tile(animal_name, animal_id, location_id)
+        validated = validate_action_tiles([tile])
+        if not animal_id and (not isinstance(animal_name, str) or not animal_name.strip()):
             raise PolicyViolationError("animal_name must be a non-empty string")
         parameters = {
             "locationId": location_id,
             "tiles": validated,
             "animalName": animal_name.strip(),
         }
+        if animal_id is not None:
+            if not isinstance(animal_id, str) or not animal_id.strip():
+                raise PolicyViolationError("animal_id must be an observed non-empty identity")
+            parameters["animalId"] = animal_id.strip()
         return await self._execute_native_action(
             "collect-animal-produce",
             parameters,
@@ -3162,7 +3737,11 @@ class CompanionScheduler:
         task_id: str | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Feeds every animal inside one animal building through the native feed path."""
+        """Fill a house's trough shortage for all resident animals, including those outside.
+
+        Use the observed indoorsName; a friendly building name is accepted only
+        when it resolves to one house. The companion must be in that house.
+        """
         if not isinstance(building_name, str) or not building_name.strip():
             raise PolicyViolationError("building_name must be a non-empty string")
         parameters = {"locationId": building_name.strip(), "buildingName": building_name.strip()}
@@ -3177,14 +3756,26 @@ class CompanionScheduler:
 
     async def toggle_animal_door(
         self,
-        tiles: list[dict[str, Any]],
+        tiles: list[dict[str, Any]] | None = None,
         location_id: str = "Farm",
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        building_name: str | None = None,
     ) -> dict[str, Any]:
-        """Opens/closes the animal door of explicit buildings/door tiles."""
-        validated = validate_action_tiles(tiles, max_tiles=8)
+        """Resolve a current native building name or use explicit door tiles."""
+        if not tiles and building_name:
+            group = await self.query_livestock()
+            buildings = [b for b in group.get("buildings", []) if isinstance(b, dict)]
+            name = building_name.strip().casefold()
+            matches = [b for b in buildings if str(b.get("indoorsName", "")).casefold() == name]
+            if not matches:
+                matches = [b for b in buildings if str(b.get("buildingType", "")).casefold() == name]
+            if len(matches) != 1 or not isinstance(matches[0].get("doorTile"), dict):
+                raise PolicyViolationError("building_name must identify one observed animal building with a door")
+            door = matches[0]["doorTile"]
+            tiles = [{"x": int(door["x"]), "y": int(door["y"])}]
+        validated = validate_action_tiles(tiles)
         parameters = {"locationId": location_id, "tiles": validated}
         return await self._execute_native_action(
             "toggle-animal-door",
@@ -3207,19 +3798,20 @@ class CompanionScheduler:
     ) -> dict[str, Any]:
         """Executes a water-zone task through policy validation and tracking.
 
-        - Validates radius (0..2) and coordinates.
+        - Validates a non-negative integer radius and coordinates.
         - Expands into tiles.
         - Dispatches via execute_tiles.
         """
         tiles = expand_water_zone(center_x, center_y, radius)
-        # A water-zone call names an explicit area. Empty soil is therefore an
-        # intentional target selection; auto watering remains crop-only by default.
+        # Preserve the model's crop-only selection through native execution.
+        # The native observer filters real soil after any preceding planting.
         return await self.execute_tiles(
             tiles=tiles,
             location_id="Farm",
             timeout_seconds=timeout_seconds,
             task_id=task_id,
             command_id=command_id,
+            include_empty_tiles=include_empty_tiles,
         )
 
     async def water_auto(
@@ -3229,24 +3821,28 @@ class CompanionScheduler:
         timeout_seconds: float = 30.0,
         task_id: str | None = None,
         command_id: str | None = None,
+        target_tiles: list[dict[str, int]] | None = None,
+        location_id: str | None = None,
     ) -> dict[str, Any]:
         """Automatically waters unwatered tilled farm tiles without manual coordinates.
 
         Policy rules:
-        - max_tiles must be an integer between 1 and 64 (inclusive).
+        - max_tiles must be a positive integer.
         - Rejects execution if another task is already active.
         - Queries available farm work from snapshot.
         - If no unwatered tiles: returns status 'no-work' without sending command.
         - Takes up to max_tiles and executes via execute_tiles.
         - Returns execution outcome with targeted tiles and remaining count.
+        - Optional target_tiles bounds candidates to their observed intersection;
+          [] selects no work. location_id must match the observed work map.
         """
         if isinstance(max_tiles, bool) or not isinstance(max_tiles, int):
             raise PolicyViolationError(
                 f"max_tiles must be an integer, got {type(max_tiles).__name__}"
             )
-        if max_tiles < 1 or max_tiles > 64:
+        if max_tiles < 1:
             raise PolicyViolationError(
-                f"Invalid max_tiles: {max_tiles}. Value must be between 1 and 64 (inclusive)."
+                f"Invalid max_tiles: {max_tiles}. Value must be positive."
             )
 
         if self.has_active_task and self._active_task:
@@ -3259,11 +3855,14 @@ class CompanionScheduler:
                     "Concurrent tasks are not permitted."
                 )
 
+        allowed_coordinates = _auto_target_coordinates(target_tiles)
         work_info = await self.query_farm_work()
+        location_id = _farm_action_location(work_info, location_id)
         farm_work = work_info.get("farmWork", {})
         if include_empty_tiles:
             unwatered_tiles = farm_work.get("tilledUnwateredTiles", [])
             total_unwatered = farm_work.get("tilledUnwateredCount", len(unwatered_tiles))
+            observation_truncated = bool(farm_work.get("isTruncated"))
         else:
             # Crop-only is the safe default. Older mods lack the native crop list;
             # fail closed rather than silently watering empty prepared soil.
@@ -3273,8 +3872,23 @@ class CompanionScheduler:
             unwatered_tiles = native_crop_tiles
             crop_count = farm_work.get("cropUnwateredCount")
             total_unwatered = crop_count if isinstance(crop_count, int) else len(unwatered_tiles)
+            observation_truncated = bool(farm_work.get("cropUnwateredTruncated")) if isinstance(farm_work.get("cropUnwateredTiles"), list) else bool(farm_work.get("isTruncated"))
+
+        scope_incomplete = _scoped_observation_incomplete(
+            allowed_coordinates, unwatered_tiles, total_unwatered, observation_truncated)
+        if allowed_coordinates is not None:
+            unwatered_tiles = [tile for tile in unwatered_tiles
+                               if (tile["x"], tile["y"]) in allowed_coordinates]
+            total_unwatered = len(unwatered_tiles)
 
         if not unwatered_tiles:
+            if scope_incomplete:
+                return {**build_unified_outcome(outcome="unknown", goal_satisfied=False, effects=[],
+                    remaining={"unwateredTiles": None}, reason_code="OBSERVATION_TRUNCATED",
+                    snapshot_revision=work_info.get("worldRevision")),
+                    "status": "unknown", "terminalState": "unknown", "targetTiles": [], "targetCount": 0,
+                    "remainingUnwateredCount": None, "scopeObservationIncomplete": True, "scopeIncomplete": True,
+                    "message": "The reported watering candidate list is incomplete. Refresh or query the saved scope before concluding no work; no action dispatched."}
             return {
                 **build_unified_outcome(
                     outcome="completed",
@@ -3285,7 +3899,7 @@ class CompanionScheduler:
                     snapshot_revision=work_info.get("worldRevision"),
                 ),
                 "status": "no-work",
-                "message": "No unwatered tilled tiles found on the farm. Companion remains idle.",
+                "message": "No observed unwatered tiles found in the selected scope. Companion remains idle.",
                 "targetTiles": [],
                 "targetCount": 0,
                 "remainingUnwateredCount": 0,
@@ -3295,8 +3909,7 @@ class CompanionScheduler:
         target_tiles = unwatered_tiles[:max_tiles]
         target_count = len(target_tiles)
         remaining = max(0, total_unwatered - target_count)
-        is_truncated = bool(farm_work.get("isTruncated", False) or remaining > 0)
-        location_id = work_info.get("companion", {}).get("locationId", "Farm")
+        is_truncated = bool(observation_truncated or scope_incomplete or remaining > 0)
 
         effective_timeout = max(timeout_seconds, target_count * 2.5 + 15.0)
 
@@ -3306,43 +3919,69 @@ class CompanionScheduler:
             timeout_seconds=effective_timeout,
             task_id=task_id,
             command_id=command_id,
+            include_empty_tiles=include_empty_tiles,
         )
 
         terminal_state = exec_res.get("terminalState", "unknown")
+        progress_pending = terminal_state in {"running", "unknown", None}
         completed = exec_res.get("completedCount", 0)
-        if terminal_state == "succeeded" and remaining <= 0:
-            outcome_name, goal_satisfied, reason_code = "completed", True, "OK"
+        remaining = max(0, total_unwatered - (completed or 0))
+        # Watering empty prepared soil while no crop needs water is allowed, but
+        # it must stay visible: expansion without a planting plan can drain the
+        # can and the seed/water budget for no yield. Warn, never block.
+        empty_soil_warning = None
+        if include_empty_tiles:
+            crop_unwatered_observed = farm_work.get("cropUnwateredCount")
+            if type(crop_unwatered_observed) is int and crop_unwatered_observed == 0:
+                empty_soil_warning = (
+                    "只浇了无作物的空耕地；种子/水源有限时请确认扩张是否有产出计划"
+                )
+        if terminal_state == "succeeded" and scope_incomplete:
+            outcome_name, goal_satisfied, reason_code = "partial", False, "OBSERVATION_TRUNCATED"
+        elif terminal_state == "succeeded":
+            # max_tiles bounds this step, not the entire farm objective. A
+            # completed batch must allow the following refill/watering step.
+            outcome_name, goal_satisfied, reason_code = "completed", remaining <= 0, "OK"
         elif terminal_state in {"running", "unknown", None}:
             outcome_name, goal_satisfied, reason_code = "unknown", False, "IN_PROGRESS"
-        elif terminal_state == "succeeded":
-            outcome_name, goal_satisfied, reason_code = "partial", False, "REMAINING_WORK"
         else:
             outcome_name = "partial" if (completed or 0) > 0 or terminal_state in {"failed", "rejected"} else "unknown"
             goal_satisfied, reason_code = False, "WATER_INCOMPLETE"
+            native_error = exec_res.get("error")
+            if isinstance(native_error, dict) and native_error.get("code"):
+                reason_code = native_error["code"]
 
         return {
+            **{key: exec_res[key] for key in ("commandId", "worldRevision", "resources", "inventoryDelta", "resourceDelta") if key in exec_res},
             **build_unified_outcome(
                 outcome=outcome_name,
                 goal_satisfied=goal_satisfied,
                 effects=exec_res.get("effects", []),
-                remaining={"unwateredTiles": remaining},
+                remaining={"unwateredTiles": None} if progress_pending else
+                    {"unwateredTiles": None, "observedUnwateredTiles": remaining} if scope_incomplete else {"unwateredTiles": remaining},
                 reason_code=reason_code,
-                snapshot_revision=work_info.get("worldRevision"),
+                snapshot_revision=exec_res.get("worldRevision", work_info.get("worldRevision")),
             ),
             "status": exec_res.get("status", "executed"),
             "taskId": exec_res.get("taskId") or (self._active_task.task_id if self._active_task else task_id),
             "terminalState": terminal_state,
-            "completedCount": completed,
-            "skippedCount": exec_res.get("skippedCount", 0),
-            "failedCount": exec_res.get("failedCount", 0),
+            "completedCount": None if progress_pending else completed,
+            "skippedCount": None if progress_pending else exec_res.get("skippedCount", 0),
+            "failedCount": None if progress_pending else exec_res.get("failedCount", 0),
             "targetTiles": target_tiles,
             "targetCount": target_count,
-            "remainingUnwateredCount": remaining,
+            "remainingUnwateredCount": None if progress_pending or scope_incomplete else remaining,
+            "preDispatchObservedCount": total_unwatered,
+            "scopeObservationIncomplete": scope_incomplete, "scopeIncomplete": scope_incomplete,
+            "remainingCountSource": "awaiting_native_terminal" if progress_pending else
+                "pre_dispatch_scoped_observation_minus_native_completed" if allowed_coordinates is not None else "pre_dispatch_observation_minus_native_completed",
+            "unprocessedTargetCount": exec_res.get("unprocessedTargetCount"),
             "isTruncated": is_truncated,
             "effects": exec_res.get("effects", []),
             "details": exec_res.get("details"),
-            "message": exec_res.get("message"),
+            "message": "The truncated observation leaves part of the saved watering scope unconfirmed; use explicit water_tiles for that scope." if scope_incomplete else exec_res.get("message"),
             "error": exec_res.get("error"),
+            **({"warning": empty_soil_warning} if empty_soil_warning else {}),
         }
 
     async def pause_task(self) -> dict[str, Any]:
@@ -3449,8 +4088,8 @@ class CompanionScheduler:
             auto_water = water
         if not crop_name_or_id or not isinstance(crop_name_or_id, str):
             raise PolicyViolationError("crop_name_or_id must be a non-empty string.")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count > 64:
-            raise PolicyViolationError(f"count must be an integer between 1 and 64, got {count}.")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise PolicyViolationError(f"count must be a positive integer, got {count}.")
 
         clean_target = crop_name_or_id.strip().lower()
         snapshot_revision: int | None = None

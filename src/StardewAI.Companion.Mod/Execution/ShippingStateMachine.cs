@@ -21,7 +21,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
 {
     private const float WalkPixelsPerTick = 4f;
     private const int MaxReplansPerTarget = 3;
-    private const long MaxMonotonicTicks = 3600;
+    private const long MaxNoProgressTicks = 3600;
 
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
@@ -49,6 +49,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
     private readonly Dictionary<string, int> _remainingBackpackCounts = new(StringComparer.OrdinalIgnoreCase);
 
     private long _elapsedTicks;
+    private readonly ExecutionProgressWatchdog _progressWatchdog = new();
     private int _startClock;
 
     private volatile bool _cancelRequested;
@@ -109,6 +110,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
             _estimatedTotalValue = 0;
             _shippingBinTotalCount = 0;
             _elapsedTicks = 0;
+            _progressWatchdog.Reset();
             _replanCount = 0;
             _startClock = _observer.TimeOfDay;
             _cancelRequested = false;
@@ -142,12 +144,12 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
                 return false;
             }
 
-            if (request.MaxGameMinutes < 1)
+            if (request.MaxGameMinutes < 0)
             {
                 CurrentState = ExecutionState.Rejected;
                 _actor.SetActiveTask(null);
                 earlyTerminalResult = FinishExecution(ExecutionState.Rejected,
-                    "MaxGameMinutes budget must be at least 1.", "INVALID_PARAMETERS");
+                    "MaxGameMinutes must be non-negative; 0 means no time limit.", "INVALID_PARAMETERS");
                 return false;
             }
 
@@ -248,7 +250,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
             // 3. Game-level pause safety guard
             try
             {
-                if (Game1.paused || Game1.activeClickableMenu != null || !Context.IsWorldReady)
+                if (Game1.paused || StardewAI.Companion.Mod.Menus.CompanionMenuClock.HasBlockingMenu || !Context.IsWorldReady)
                 {
                     _actor.Halt();
                     return;
@@ -266,7 +268,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
 
             // 4. Actual game clock delta measurement & budget check
             int gameMinutesElapsed = IWorldObserver.CalculateGameMinutesElapsed(_startClock, _observer.TimeOfDay);
-            if (gameMinutesElapsed > _currentRequest.MaxGameMinutes)
+            if (_currentRequest.MaxGameMinutes > 0 && gameMinutesElapsed > _currentRequest.MaxGameMinutes)
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
@@ -277,15 +279,15 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
                 return;
             }
 
-            // 5. Monotonic timeout guard
-            if (_elapsedTicks > MaxMonotonicTicks)
+            // 5. No-progress timeout guard
+            if (_progressWatchdog.HasTimedOut(_elapsedTicks, MaxNoProgressTicks, _actor, CurrentTargetIndex))
             {
                 _actor.Halt();
                 _avatar?.SetAnimation("idle");
                 var terminalState = _shippedItems.Count > 0
                     ? ExecutionState.PartiallySucceeded
                     : ExecutionState.Failed;
-                FinishExecution(terminalState, "Execution exceeded monotonic tick timeout limit.", "TIMEOUT");
+                FinishExecution(terminalState, "Execution made no progress within the stall timeout.", "TIMEOUT");
                 return;
             }
 
@@ -370,6 +372,9 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
         }
 
         var step = _currentPath[_currentPathIndex];
+        if (ActorGuards.HasReachedWalkingTile(_actor, step.Tile)) {
+            _actor.Halt(); _currentPathIndex++; return;
+        }
 
         // Dynamic collision check BEFORE stepping
         bool isPassable = step.Tile == _actor.Tile ||
@@ -391,14 +396,20 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
             return;
         }
 
-        var targetPixelX = step.Tile.X * 64f + 32f;
-        var targetPixelY = step.Tile.Y * 64f + 32f;
+        var walkingTarget = ActorGuards.WalkingTargetPixel(_actor, step.Tile);
 
         var currentPos = _actor.PixelPosition;
-        float dx = targetPixelX - (currentPos.X + 32f);
-        float dy = targetPixelY - (currentPos.Y + 32f);
+        float dx = walkingTarget.X - currentPos.X;
+        float dy = walkingTarget.Y - currentPos.Y;
 
         float dist = MathF.Sqrt(dx * dx + dy * dy);
+        if (ActorGuards.IsPlayerBound(_actor))
+        {
+            // The native actor ignores position setters. Keep driving its held
+            // movement until the measured standing center actually reaches the tile.
+            _actor.MovePixels(dx, dy);
+            return;
+        }
         if (dist <= WalkPixelsPerTick)
         {
             _actor.PixelPosition = new Vector2(step.Tile.X * 64, step.Tile.Y * 64);
@@ -557,13 +568,13 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
 
         string statusText = terminalState switch
         {
-            ExecutionState.Succeeded => "completed successfully",
-            ExecutionState.PartiallySucceeded => "completed partially",
-            ExecutionState.Cancelled => "cancelled",
-            ExecutionState.Rejected => "rejected",
-            _ => "failed"
+            ExecutionState.Succeeded => "完成",
+            ExecutionState.PartiallySucceeded => "部分完成",
+            ExecutionState.Cancelled => "已取消",
+            ExecutionState.Rejected => "未开始",
+            _ => "未完成"
         };
-        NotifyPlayer($"AI Companion: Shipping task {statusText} ({_shippedItems.Count} items shipped, est. total value: {_estimatedTotalValue}g).");
+        NotifyPlayer($"伙伴出货{statusText}：已投入 {_shippedItems.Sum(item => item.Count)} 件，预计 {_estimatedTotalValue} 金，睡觉后结算。");
 
         return result;
     }

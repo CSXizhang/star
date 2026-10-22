@@ -9,7 +9,7 @@ public sealed record NavigationRequest(
     string TaskId,
     string LocationId,
     TileCoordinate TargetTile,
-    int MaxGameMinutes = 120,
+    int MaxGameMinutes = 0,
     float MaxStamina = 50f,
     int MaxWater = 0,
     string CancelPolicy = "safe-point"
@@ -39,7 +39,8 @@ public sealed record NavigationResult(
     string? ErrorCode = null,
     Dictionary<string, object>? LockDetails = null,
     bool TargetAdjusted = false,
-    TileCoordinate? RequestedTile = null
+    TileCoordinate? RequestedTile = null,
+    Dictionary<string, object>? FailureDetails = null
 )
 {
     public SkillResultPayload ToTransportPayload()
@@ -94,6 +95,13 @@ public sealed record NavigationResult(
         if (LockDetails != null)
         {
             details["lockDetails"] = LockDetails;
+        }
+
+        if (FailureDetails != null)
+        {
+            // Structured route-failure classification from the planner (reasonCode,
+            // blocked side, exit/landing coordinates, clearable blocking tiles).
+            details["failure"] = FailureDetails;
         }
 
         SkillResultResources? resources = new(StaminaUsed, WaterUsed, GameMinutesElapsed);

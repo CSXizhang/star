@@ -16,7 +16,7 @@ public sealed record PurchaseRequest(
     int BudgetLimit,
     float MaxStamina = 50f,
     int MaxWater = 0,
-    int MaxGameMinutes = 60,
+    int MaxGameMinutes = 0,
     string CancelPolicy = "safe-point",
     string? IdempotencyKey = null,
     long ExpectedWorldRevision = 1

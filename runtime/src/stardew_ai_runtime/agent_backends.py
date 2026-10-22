@@ -651,7 +651,7 @@ class DshBackend:
         # Separate homes prevent inherited coding tools/configuration from
         # entering this game-only profile. Credentials remain environment-owned.
         env["DSH_HOME"] = str(self.run_dir / "data" / "dsh-home")
-        env["DSH_SYSTEM_PROMPT"] = "你是星露谷农场伙伴。只通过提供的游戏工具交流与工作，通常回复一到两句。"
+        env["DSH_SYSTEM_PROMPT"] = runtime_instructions()
         # Keep this shim beside the profile's official node_modules so Node can
         # resolve its dependencies. Never patch the user's global installation.
         resume_plugin = Path(env["DSH_HOME"]) / "profiles" / "stardew-sdk-resume.mjs"

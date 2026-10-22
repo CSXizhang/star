@@ -19,7 +19,7 @@
 
 ### 2. 下载并安装
 
-1. 打开 [Releases](https://github.com/CSXizhang/star/releases/latest)，在 **Assets** 下载 `StardewAI.Companion.Mod-0.3.14-windows-x64.zip`。
+1. 打开 [Releases](https://github.com/CSXizhang/star/releases/latest)，在 **Assets** 下载 `StardewAI.Companion.Mod-0.3.15-windows-x64.zip`。
 2. 完整解压，进入 `StardewAI.Companion.Mod` 文件夹。关闭游戏，双击 **设置星露谷伙伴.cmd**。
 3. 选择游戏目录，也就是能看到 `StardewModdingAPI.exe` 的文件夹；左侧选模型客户端，右侧填模型，然后点 **安装并应用设置**。
 4. **Codex 和 MiniMax Code 的模型可以留空**，沿用客户端当前配置。其他后端按账号实际可用模型填写。
@@ -88,9 +88,9 @@ Kimi 用户首次使用还需在**安装后的伙伴文件夹**运行 `kimi`，�
 
 仍有问题可在 [Issues](https://github.com/CSXizhang/star/issues) 留下 Mod / SMAPI 版本、模型后端、你说的原话、伙伴回复与实际动作，并附相关报错或截图；不要上传账号密钥。更多排查见[安装指南](docs/release-guide.md#升级与排查)。
 
-## 0.3.14 更新
+## 0.3.15 更新
 
-本版简化提示词并复用聊天与工作会话，移除默认动作时限，修复跨地图浇水、满水壶阻断后续任务、镰刀收获和安排接续等问题。[完整更新说明](docs/release-notes-0.3.14.md)
+伙伴按玩家定义的性格、称呼和表达偏好交流，移除固定字数、强制温暖语气、预设工作数量和固定提前收工等提示词限制。[完整更新说明](docs/release-notes-0.3.15.md)
 
 ## 开发与其他接入
 

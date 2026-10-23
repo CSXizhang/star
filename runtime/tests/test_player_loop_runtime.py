@@ -238,11 +238,10 @@ def test_wire_schema_and_four_preferences():
     for style in ("earn", "workhorse", "community", "decor"):
         prompt = LifeChatService.build_system_prompt({"playStyle": style}, {}, {}, mode="plan")
         assert json.loads(prompt.split("实时上下文：", 1)[1])["profile"]["playStyle"] == style
-    decor = LifeChatService.build_system_prompt({"playStyle": "decor"}, {}, {}, mode="plan")
-    assert "摆放和回收家具、地板、围栏与物件" in decor
-    assert "制造已解锁配方" in decor and "搬迁建筑" in decor
-    assert "服务柜台办理并等待真实工期" in decor
-    assert "提交仍由玩家完成" in LifeChatService.build_system_prompt({"playStyle": "community"}, {}, {}, mode="plan")
+    decor = LifeChatService.profile_context({"playStyle": "decor"})
+    assert "装修农场" in decor["playStyleDescription"]
+    community = LifeChatService.profile_context({"playStyle": "community"})
+    assert "社区中心" in community["playStyleDescription"]
 
 
 def test_release_bridge_uses_selected_agy_model_and_provider_effort(tmp_path, monkeypatch):

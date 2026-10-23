@@ -41,7 +41,9 @@ export function apply(ctx) {
   const version = require('@deepseek-ai/dsh-sdk-jsonrpc-server/package.json').version;
   // These ordinary JS fields/methods are compatibility internals, not a promise
   // made by future SDK releases. Refuse unknown versions instead of losing data.
-  if (version !== '0.1.5-rc.2' ||
+  // [patched] 放宽版本号硬校验：允许 0.1.5-rc.2 及 0.2.x 系列（API 符号经实测仍在）。
+  const _verOk = /^0\.(1\.5-rc\.2|2\.)/.test(version);
+  if (!_verOk ||
       typeof HarnessSdkJsonRpcServer.prototype.createSession !== 'function') {
     throw new Error('DSH_RESUME_PROTOCOL_UNSUPPORTED');
   }

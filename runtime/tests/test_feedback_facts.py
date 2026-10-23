@@ -92,6 +92,18 @@ def test_request_totals_survive_reload_and_keep_save_history_separate(tmp_path):
     assert actual['scope'] == 'original_player_request'
 
 
+def test_autonomy_request_history_does_not_repeat_generated_snapshot(tmp_path):
+    store = WorkStore(tmp_path / 'data/work-state.json')
+    def seed(state):
+        state.requests = [{'id': 'auto', 'origin': 'autonomy', 'text': '实时上下文：旧状态', 'taskIds': ['job']}]
+        state.executions = [ExecutionEntry('native', 'job', 's', 'water_auto', 'completed',
+                                          effects=[{'state': 'watered'}])]
+    store._mutate('farm', seed)
+    actual = store.overview('farm')['confirmedRequestTotals']['auto']
+    assert actual['requestText'] is None
+    assert actual['effectCounts'] == {'watered': 1}
+
+
 def test_accepted_work_prompt_keeps_original_request_totals(tmp_path):
     from stardew_ai_runtime.chat_bridge import ChatBridge
     bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)

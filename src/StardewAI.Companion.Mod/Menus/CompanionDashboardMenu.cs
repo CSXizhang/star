@@ -176,6 +176,12 @@ public sealed class CompanionDashboardMenu : IClickableMenu
         }
         else
         {
+            if (_actions.GameSettings != null)
+            {
+                AddButton(x, y, Math.Min(260, contentWidth), "游戏模式与更新", _actions.GameSettings);
+                y += 58;
+                Divider(ref y);
+            }
             int columns = _layout.FieldColumns, fieldWidth = (contentWidth - (columns - 1) * 24) / columns;
             int fieldY = y;
             Label(x, ref fieldY, "伙伴名字", fieldWidth, Color.SaddleBrown);

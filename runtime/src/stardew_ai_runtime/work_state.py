@@ -3519,7 +3519,9 @@ class WorkStore:
             },
             "confirmedRequestTotals": {
                 request_id: {**self._execution_totals(entries), "scope": "original_player_request",
-                             "requestId": request_id, "requestText": requests.get(request_id, {}).get("text"),
+                             "requestId": request_id,
+                             "requestText": (None if requests.get(request_id, {}).get("origin") == "autonomy"
+                                             else requests.get(request_id, {}).get("text")),
                              "source": "native_terminal_ledger",
                              "excludes": "other requests; inventory; planned counts"}
                 for request_id, entries in grouped.items()

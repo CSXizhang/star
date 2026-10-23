@@ -1,25 +1,37 @@
 ﻿# Shared checks for player packages. No game or global client changes here.
+function Get-ReleaseNativePath([string]$Path) {
+    if ($Path.Length -lt 240 -or $Path.StartsWith('\\?\')) { return $Path }
+    if ($Path.StartsWith('\\')) { return '\\?\UNC\' + $Path.Substring(2) }
+    return '\\?\' + $Path
+}
+
 function Get-ReleaseHash([string]$Path) {
     $sha = [Security.Cryptography.SHA256]::Create()
-    $stream = [IO.File]::OpenRead($Path)
+    $stream = [IO.File]::OpenRead((Get-ReleaseNativePath $Path))
     try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
     finally { $stream.Dispose(); $sha.Dispose() }
 }
 
 function Get-ReleasePath([string]$Root, [string]$Relative) {
     $base = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    foreach ($part in ($Relative -split '[\\/]')) {
+        if (-not $part -or $part -match '[<>:"|?*\x00-\x1f]|[. ]$|^(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)') { throw "Unsafe release path: $Relative" }
+    }
     if ([IO.Path]::IsPathRooted($Relative) -or $Relative -match '(^|[\\/])\.\.([\\/]|$)|:') { throw "Unsafe release path: $Relative" }
-    if ($Relative -match '^(?i)(data|config|\.kimi-code|\.env|\.env.local)([\\/]|$)') { throw 'Release manifest cannot own player data or settings.' }
+    if ($Relative -match '^(?i)(data|config|config\.json|\.kimi-code|\.env|\.env.local)([\\/]|$)') { throw 'Release manifest cannot own player data or settings.' }
     $path = [IO.Path]::GetFullPath([IO.Path]::Combine($base, $Relative))
+    $nativePath = Get-ReleaseNativePath $path
+    if ([IO.File]::Exists($nativePath) -and ([IO.File]::GetAttributes($nativePath) -band [IO.FileAttributes]::ReparsePoint)) { throw 'Linked release file not allowed.' }
     if (-not $path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { throw 'Release path escapes package.' }
     $probe = [IO.Path]::GetDirectoryName($path)
     while ($probe.Length -ge $base.TrimEnd('\').Length) {
         # This runs for every parent of every bundled file. Native path/attribute
         # calls preserve the link checks without thousands of provider lookups.
-        if ([IO.Directory]::Exists($probe) -and ([IO.File]::GetAttributes($probe) -band [IO.FileAttributes]::ReparsePoint)) { throw "Linked release directory not allowed: $probe" }
+        $nativeProbe = Get-ReleaseNativePath $probe
+        if ([IO.Directory]::Exists($nativeProbe) -and ([IO.File]::GetAttributes($nativeProbe) -band [IO.FileAttributes]::ReparsePoint)) { throw "Linked release directory not allowed: $probe" }
         $probe = [IO.Path]::GetDirectoryName($probe)
     }
-    return $path
+    return $nativePath
 }
 
 function Read-VerifiedRelease([string]$Root, [switch]$FullVerify) {

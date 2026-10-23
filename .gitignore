@@ -98,6 +98,7 @@ MagicMock/
 !/tools/build-mod.ps1
 !/tools/build-release.py
 !/tools/install-release.ps1
+!/tools/apply-update.ps1
 !/tools/release-package.ps1
 !/tools/candidate-package.ps1
 !/tools/check_release_boundaries.py

@@ -2,6 +2,7 @@
 
 - [项目介绍与功能状态](../README.md)
 - [Windows 发行包安装](release-guide.md)
+- [0.3.16 更新说明](release-notes-0.3.16.md)
 - [玩家指南](companion-guide.md)
 - [自主生活与农场改造](farm-projects.md)
 - [MCP 与聊天接入](mcp.md)
@@ -9,7 +10,8 @@
 - [后端验证状态与成本基线](tested-backends.md)
 - [通信协议](../protocol/README.md)
 - [0.3.6 更新说明](release-notes-0.3.6.md)
-- [真实模型单人游玩方案（尚未实现）](autonomous-single-player-plan.md)
+- [AI 自己玩与游戏内设置](companion-guide.md#两种模式)
+- [伙伴效率与可玩性设计（待实施）](companion-efficiency-and-play-design.md)
 
 ## 决策设计审核草案
 

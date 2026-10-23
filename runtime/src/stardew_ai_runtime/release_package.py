@@ -22,7 +22,7 @@ def managed_path(root: Path, relative: str) -> Path:
     target = (root / normalized).resolve()
     if not target.is_relative_to(root.resolve()) or target == root.resolve():
         raise ValueError(f"Package path escapes root: {relative}")
-    if parts[0].lower() in {"data", "config", ".kimi-code", ".env", ".env.local"}:
+    if parts[0].lower() in {"data", "config", "config.json", ".kimi-code", ".env", ".env.local"}:
         raise ValueError(f"Release cannot own player settings: {relative}")
     return target
 

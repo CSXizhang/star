@@ -22,7 +22,7 @@ PYTHON_VERSION = "3.13.11"
 PYTHON_SHA256 = "1ec066fb61ba5e8c73e29e048cd07c26850f74585e3a116005135b31b8004890"
 MOD_FILES = ("manifest.json", "StardewAI.Companion.Mod.dll", "StardewAI.Companion.Mod.deps.json")
 TOOL_FILES = ("setup-companion.ps1", "start-companion.ps1", "register-mcp.ps1",
-              "candidate-package.ps1", "release-package.ps1", "install-release.ps1", "detect-game.ps1")
+              "candidate-package.ps1", "release-package.ps1", "install-release.ps1", "apply-update.ps1", "detect-game.ps1")
 
 
 def digest(path: Path) -> str:

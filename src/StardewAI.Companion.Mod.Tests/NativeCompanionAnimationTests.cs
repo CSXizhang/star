@@ -10,6 +10,80 @@ namespace StardewAI.Companion.Mod.Tests;
 public class NativeCompanionAnimationTests
 {
     [Theory]
+    [InlineData(FacingDirection.Down, 32)]
+    [InlineData(FacingDirection.Right, 40)]
+    [InlineData(FacingDirection.Up, 48)]
+    [InlineData(FacingDirection.Left, 56)]
+    public void RunningUsesNativeRunningCycle(FacingDirection facing, int index) =>
+        Assert.Equal(index, NativeCompanionAnimation.MovementIndex(facing, true));
+
+    private sealed class HeadlessSprite : FarmerSprite
+    {
+        public override void UpdateSourceRect() { }
+    }
+    private sealed class HeadlessFarmer : Farmer
+    {
+        public override int FacingDirection { get; set; }
+    }
+
+    [Fact]
+    public void RepeatingSameFacingDoesNotResetNativeAnimationTimer()
+    {
+        var farmer = (HeadlessFarmer)FormatterServices.GetUninitializedObject(typeof(HeadlessFarmer));
+        var sprite = (HeadlessSprite)FormatterServices.GetUninitializedObject(typeof(HeadlessSprite));
+        AccessTools.Field(typeof(AnimatedSprite), "currentAnimation").SetValue(sprite,
+            new List<FarmerSprite.AnimationFrame>());
+        AccessTools.Field(typeof(Character), "sprite").SetValue(farmer, new Netcode.NetRef<AnimatedSprite>(sprite));
+        farmer.FacingDirection = 1;
+        var actor = new FarmerMechanicsActor("same-facing");
+        AccessTools.Field(typeof(FarmerMechanicsActor), "_gameFarmer").SetValue(actor, farmer);
+        sprite.setCurrentFrame(8);
+        sprite.timer = 150;
+        for (int i = 0; i < 30; i++) actor.Face(FacingDirection.Right);
+        Assert.Equal(150, sprite.timer);
+        Assert.Equal(4, sprite.CurrentAnimation.Count);
+    }
+
+    [Fact]
+    public void NativeWalkingCycleHasDistinctFramesAndStopRemainsNeutral()
+    {
+        var sprite = (HeadlessSprite)FormatterServices.GetUninitializedObject(typeof(HeadlessSprite));
+        AccessTools.Field(typeof(AnimatedSprite), "currentAnimation").SetValue(sprite,
+            new List<FarmerSprite.AnimationFrame>());
+        var frames = new HashSet<int>();
+        sprite.setCurrentFrame(0);
+        for (int i = 0; i < 30; i++)
+        {
+            // Exercise the native frame advance without its separate audio hook,
+            // which requires a running game sound engine.
+            AccessTools.Method(typeof(FarmerSprite), "currentAnimationTick").Invoke(sprite, null);
+            frames.Add(sprite.CurrentFrame);
+        }
+        Assert.True(frames.Count >= 3);
+        NativeCompanionAnimation.Stand(sprite, FacingDirection.Down);
+        Assert.Equal(0, sprite.CurrentFrame);
+    }
+
+    [Theory]
+    [InlineData(FacingDirection.Down, 0)]
+    [InlineData(FacingDirection.Right, 6)]
+    [InlineData(FacingDirection.Up, 12)]
+    [InlineData(FacingDirection.Left, 6)]
+    public void StopUsesNativeNeutralPoseRatherThanRaisedFoot(FacingDirection facing, int frame)
+    {
+        var sprite = (HeadlessSprite)FormatterServices.GetUninitializedObject(typeof(HeadlessSprite));
+        AccessTools.Field(typeof(AnimatedSprite), "currentAnimation").SetValue(sprite,
+            new List<FarmerSprite.AnimationFrame>());
+        sprite.getAnimationFromIndex(NativeCompanionAnimation.WalkingIndex(facing), sprite, 100, 1, false, false);
+        Assert.NotEqual(frame, sprite.CurrentAnimation[0].frame);
+        sprite.PauseForSingleAnimation = true;
+        NativeCompanionAnimation.Stand(sprite, facing);
+        Assert.Equal(frame, sprite.CurrentFrame);
+        Assert.False(sprite.PauseForSingleAnimation);
+        Assert.Equal(facing == FacingDirection.Left, sprite.CurrentAnimationFrame.flip);
+    }
+
+    [Theory]
     [InlineData(FacingDirection.Up, 16)]
     [InlineData(FacingDirection.Right, 8)]
     [InlineData(FacingDirection.Down, 0)]

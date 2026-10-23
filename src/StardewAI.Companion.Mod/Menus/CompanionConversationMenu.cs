@@ -9,7 +9,7 @@ namespace StardewAI.Companion.Mod.Menus;
 
 public sealed record CompanionHubActions(Action Pause, Action Resume, Action Cancel, Action ToggleAutonomy,
     Action<string, string, string, string> SaveSettings, Action Memory,
-    Func<IReadOnlyList<string>, bool, bool> SetDecisionVisibility);
+    Func<IReadOnlyList<string>, bool, bool> SetDecisionVisibility, Action? GameSettings = null);
 
 /// <summary>NPC speech and input only; management and scrollable history live in F8.</summary>
 public sealed class CompanionConversationMenu : IClickableMenu

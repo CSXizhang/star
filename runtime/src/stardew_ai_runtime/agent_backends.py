@@ -948,7 +948,13 @@ class McodeBackend:
 
     def compact_session(self, active_task: ActiveTaskLike, session_id: str) -> dict[str, Any]:
         from .mcode_compaction import compact_existing_session
-        return compact_existing_session(self, active_task, session_id)
+        result = compact_existing_session(self, active_task, session_id)
+        if result.get("success") and result.get("compacted"):
+            from .prompt_delivery import PromptDelivery
+            delivery = PromptDelivery(self.run_dir / "prompt-delivery.json")
+            for key in list(delivery.state):
+                delivery.invalidate_session(key, session_id)
+        return result
 
     def _write_workspace(self, surface: str) -> Path:
         """Write this turn's game-only MCP file and return its directory."""

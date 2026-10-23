@@ -34,6 +34,8 @@ public class CompanionBedtimeTests
         var conversation = (IClickableMenu)FormatterServices.GetUninitializedObject(typeof(CompanionLifeMenu));
         var inventory = (IClickableMenu)FormatterServices.GetUninitializedObject(typeof(InventoryMenu));
         Assert.True(CompanionMenuClock.IsConversation(conversation));
+        var settings = (IClickableMenu)FormatterServices.GetUninitializedObject(typeof(CompanionOptionsMenu));
+        Assert.True(CompanionMenuClock.IsConversation(settings));
         Assert.False(CompanionMenuClock.IsConversation(inventory));
         Assert.False(CompanionMenuClock.IsConversation(null));
         try

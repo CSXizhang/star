@@ -1150,7 +1150,7 @@ def test_life_provider_never_borrows_native_socket_even_on_failure(tmp_path):
 
 
 
-def test_continuation_keeps_full_current_facts_and_deduplicates_core(tmp_path):
+def test_continuation_updates_current_facts_and_deduplicates_core(tmp_path):
     from stardew_ai_runtime.agent_instructions import runtime_instructions
     from stardew_ai_runtime.prompt_delivery import PromptDelivery
     svc = _bridge(tmp_path)._life_chat
@@ -1170,7 +1170,8 @@ def test_continuation_keeps_full_current_facts_and_deduplicates_core(tmp_path):
     second = svc.build_turn_prompt("S", "cid", profile, {"agreements": []}, {"paused": True}, **options)
     sent, _ = delivery.prepare("fake:S", "cid", second, core)
     assert core not in sent
-    facts = json.loads(sent.split("实时上下文：", 1)[1])
+    from test_prompt_delivery_delta import apply
+    facts = apply(sent, json.loads(first.split("实时上下文：", 1)[1]))
     assert facts["live"]["resources"]["player"]["money"] == "unknown"
     assert facts["work"]["paused"] is True and facts["milestones"] == []
     assert facts["memory"]["agreements"] == [] and "不卖木材" not in sent

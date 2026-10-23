@@ -30,6 +30,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/setup-companion.ps
 
 游戏对象的读写在游戏主线程执行。模型发出任务意图，具体动作由 Mod 执行；修改动作逻辑时需要同时检查前置条件、物品消耗和最终结果。
 
+伙伴与自玩共用运行时；自玩入口在 Mod 的 `PlayerMode` 与 F8 设置中，不依赖维护者本地脚本。项目约定见 `AGENTS.md`；应用提示词以 `docs/agent-core-instructions-draft.md`、领域指导和 `agent-skills/stardew-companion` 为单一来源。
+
+Windows 发布使用 `tools/build-release.py`，上传生成的 ZIP 和 SHA256 文件到稳定版 Release。更新器只接受本仓库带 SHA256 digest 的正式安装包；改动须验证下载校验、文件占用回滚、设置保留及新旧版本配对。
+
 ## 验证改动
 
 在仓库根目录运行：

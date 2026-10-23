@@ -54,5 +54,5 @@ def test_core_is_shared_and_only_repeated_for_a_new_session(tmp_path, mode):
     assert sent.count(core) == 1
     delivery.acknowledge("fake:farm", pending, "cid")
     sent, _ = delivery.prepare("fake:farm", "cid", prompt, core)
-    assert core not in sent and "实时上下文：" in sent
+    assert core not in sent and "上下文增量：" in sent
     assert delivery.prepare("fake:farm", "new", prompt, core)[0].count(core) == 1

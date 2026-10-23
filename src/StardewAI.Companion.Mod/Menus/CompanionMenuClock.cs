@@ -10,7 +10,7 @@ public static class CompanionMenuClock
 {
     public static IClickableMenu? OwnedQuestion { get; set; }
     public static bool IsConversation(IClickableMenu? menu) => menu != null &&
-        (menu is CompanionCommandMenu or CompanionLifeMenu or CompanionSpeechInputMenu or CompanionNpcDialogueBox or CompanionConversationMenu or CompanionDashboardMenu
+        (menu is CompanionCommandMenu or CompanionLifeMenu or CompanionSpeechInputMenu or CompanionNpcDialogueBox or CompanionConversationMenu or CompanionDashboardMenu or CompanionOptionsMenu
          || ReferenceEquals(menu, OwnedQuestion));
     public static bool HasBlockingMenu => Game1.activeClickableMenu != null && !IsConversation(Game1.activeClickableMenu);
 

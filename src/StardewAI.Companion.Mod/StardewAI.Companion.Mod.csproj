@@ -1,13 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <AssemblyName>StardewAI.Companion.Mod</AssemblyName>
-    <Version>0.3.14</Version>
+    <Version>0.3.17</Version>
     <RootNamespace>StardewAI.Companion.Mod</RootNamespace>
     <PlatformTarget>x64</PlatformTarget>
     <StardewGamePath Condition="'$(StardewGamePath)' == ''">$(STARDEW_GAME_PATH)</StardewGamePath>
   </PropertyGroup>
 
   <ItemGroup>
+    <Reference Include="SMAPI.Toolkit.CoreInterfaces">
+      <HintPath>$(StardewGamePath)\smapi-internal\SMAPI.Toolkit.CoreInterfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="0Harmony">
       <HintPath>$(StardewGamePath)\smapi-internal\0Harmony.dll</HintPath>
       <Private>false</Private>

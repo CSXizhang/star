@@ -248,7 +248,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
             lock (_lock)
             {
                 _facing = value;
-                if (_gameFarmer != null)
+                if (_gameFarmer != null && _gameFarmer.FacingDirection != (int)value)
                 {
                     _gameFarmer.faceDirection((int)value);
                 }
@@ -369,8 +369,7 @@ public sealed class FarmerMechanicsActor : IFarmerActor
                 _gameFarmer.Halt();
                 if (!_gameFarmer.isInBed.Value && _gameFarmer.FarmerSprite is { } sprite)
                 {
-                    sprite.setCurrentFrame(NativeCompanionAnimation.WalkingIndex(Facing));
-                    sprite.UpdateSourceRect();
+                    NativeCompanionAnimation.Stand(sprite, Facing);
                 }
             }
         }
@@ -499,15 +498,14 @@ public sealed class FarmerMechanicsActor : IFarmerActor
                 _gameFarmer.isInBed.Value || sprite.PauseForSingleAnimation) return;
             if (moved)
             {
-                sprite.animate(NativeCompanionAnimation.WalkingIndex(Facing),
+                sprite.animate(NativeCompanionAnimation.MovementIndex(Facing, _gameFarmer.running),
                     time ?? new GameTime(TimeSpan.Zero, TimeSpan.FromMilliseconds(16.6667)));
                 _wasWalking = true;
             }
             else if (_wasWalking)
             {
-                sprite.StopAnimation();
-                sprite.setCurrentFrame(NativeCompanionAnimation.WalkingIndex(Facing));
-                sprite.UpdateSourceRect();
+                _gameFarmer.Halt();
+                NativeCompanionAnimation.Stand(sprite, Facing);
                 _wasWalking = false;
             }
         }
@@ -591,8 +589,8 @@ public sealed class FarmerMechanicsActor : IFarmerActor
                 _gameFarmer.UsingTool = false;
                 _gameFarmer.canReleaseTool = true;
                 _gameFarmer.Halt();
-                _gameFarmer.FarmerSprite?.setCurrentFrame(NativeCompanionAnimation.WalkingIndex(Facing));
-                _gameFarmer.FarmerSprite?.UpdateSourceRect();
+                if (_gameFarmer.FarmerSprite is { } sprite)
+                    NativeCompanionAnimation.Stand(sprite, Facing);
             }
             _eatingAnimation = false;
             _previousEatingItem = null;

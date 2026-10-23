@@ -52,3 +52,24 @@ def test_successful_chat_connection_restarts_worker_and_never_mutates_saved_work
             assert (tmp_path / "data" / "work-state.json").read_bytes() == before
             assert store.state("farm").decision["token"] == "still-valid-token"
     asyncio.run(scenario())
+
+
+def test_player_takeover_keeps_goal_and_requires_explicit_handoff(tmp_path):
+    async def scenario():
+        bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        bridge.actor_mode = "player"
+        bridge.control_owner = "agent"
+        goal = bridge._work_store.add_goal("farm", "持续经营，不丢失进度", source="user")
+        bridge._autonomy.set_enabled("farm", True)
+        bridge._work_store.begin_decision("farm", "old-token")
+        ws = SimpleNamespace(send_text=AsyncMock())
+        await bridge._handle_player_authority(ws, {"owner": "human", "reason": "human-takeover"}, "farm")
+        assert bridge._work_store.state("farm").goals[0].id == goal.id
+        assert bridge._work_store.state("farm").goals[0].status == "active"
+        assert bridge._autonomy.state("farm").paused
+        await bridge._maybe_claim_player_control(ws, "farm")
+        ws.send_text.assert_not_awaited()
+        await bridge._handle_player_authority(ws, {"owner": "agent", "reason": "human-explicit-handoff"}, "farm")
+        assert not bridge._autonomy.state("farm").paused
+        assert bridge._work_store.state("farm").goals[0].status == "active"
+    asyncio.run(scenario())

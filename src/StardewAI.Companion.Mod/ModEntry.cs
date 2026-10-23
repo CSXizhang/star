@@ -24,13 +24,14 @@ namespace StardewAI.Companion.Mod;
 /// state machine, visible avatar rendering, per-save partition persistence,
 /// and WebSocket transport server with local endpoint discovery.
 /// </summary>
-public sealed class ModEntry : StardewModdingAPI.Mod
+public sealed partial class ModEntry : StardewModdingAPI.Mod
 {
     private DiscoveryService? _discoveryService;
     private IActorStateRepository? _stateRepository;
     private IFarmerActor? _actor;
     private ModConfig _config = new();
     private PlayerControlAuthority? _authority;
+    private bool _playerControlApproved;
     private DecisionPauseController? _thinking;
     private PlayerKnowledgeTracker? _knowledge;
     private bool PlayerModeEnabled => _config.Mode == "player";
@@ -88,6 +89,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         Monitor.Log("Stardew AI Companion initializing Stage 0 mechanics and transport.", LogLevel.Info);
 
         _config = Helper.ReadConfig<ModConfig>();
+        InitializeUpdates();
         if (!PlayerModeEnabled) CompanionMenuClock.Install();
         _discoveryService = new DiscoveryService(helper.DirectoryPath, Monitor);
         _conversationStore = new CompanionConversationStore(Path.Combine(helper.DirectoryPath, "data", "conversations"));
@@ -147,7 +149,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (PlayerModeEnabled)
         {
             InitializePlayerMode();
-            Game1.addHUDMessage(new HUDMessage($"伙伴已就绪：按 F8 直接回复，告诉它今天要做什么；{_config.TakeoverKey} 接管/交还。", HUDMessage.newQuest_type));
+            Game1.addHUDMessage(new HUDMessage($"AI 自己玩：F8 随时指导，{_config.TakeoverKey} 开始托管 / 接管。", HUDMessage.newQuest_type));
         }
         else InitializeCompanion();
     }
@@ -228,6 +230,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private void ReleasePlayerControl(string reason)
     {
         if (!PlayerModeEnabled) return;
+        _playerControlApproved = false;
         _thinking?.ReleaseAll(reason);
         if (reason == "disconnected" && _thinking?.CurrentHold is not { Active: true }
             && _preset is { Enabled: true, Phase: not (PresetGoalPhase.Done or PresetGoalPhase.Cancelled) })
@@ -251,6 +254,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         }, _knowledge, Monitor.Log);
         _navigator = new SameMapNavigator(_observer);
         _authority = new PlayerControlAuthority(Monitor.Log);
+        _playerControlApproved = false;
         NativePlayerIntentHook.Bind((PlayerActor)_actor,_authority);
         _thinking = new DecisionPauseController(TimeSpan.FromSeconds(_config.ThinkingPauseMaxSeconds), Monitor.Log);
         _adapter = new NormalWateringCanAdapter(_observer, Monitor);
@@ -309,7 +313,10 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         _transportServer!.OnPlayerMessage += (type, payload) => InSession(() => {
             if (type == "disconnected") { ReleasePlayerControl("disconnected"); return; }
             if (type == "player.control") {
-                if (payload["action"]?.GetValue<string>() == "claim") _authority.RequestAgent("explicit-claim");
+                if (payload["action"]?.GetValue<string>() == "claim") {
+                    if (_playerControlApproved || _preset?.Enabled == true) _authority.RequestAgent("explicit-claim");
+                    else _ = _transportServer.SendPlayerAuthorityAsync("human", "awaiting-user");
+                }
                 else ReleasePlayerControl("runtime-release");
             } else if (type == "agent.thinking") {
                 var id = payload["leaseId"]?.GetValue<string>() ?? "";
@@ -670,6 +677,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
         while (_mainThreadActions.TryDequeue(out var action)) action();
+        ShowPendingUpdate();
         _thinking?.Tick();
         TickUnattendedPassoutGuard();
         if (PlayerModeEnabled && e.IsMultipleOf(30) && _coordinator != null && _transportServer != null) { _ = _transportServer.SendSnapshotAsync(_coordinator.CaptureCurrentSnapshot(_observer!.WorldRevision),_observer.WorldRevision); }
@@ -1115,8 +1123,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         Microsoft.Xna.Framework.Vector2 textSize = font.MeasureString(text);
         int boxWidth = (int)Math.Ceiling(textSize.X) + padding * 2;
         int boxHeight = (int)Math.Ceiling(textSize.Y) + padding * 2;
-        if (!PlayerModeEnabled)
-            _companionHudBounds = new Microsoft.Xna.Framework.Rectangle(margin, boxY, boxWidth, boxHeight);
+        _companionHudBounds = new Microsoft.Xna.Framework.Rectangle(margin, boxY, boxWidth, boxHeight);
 
         StardewValley.Menus.IClickableMenu.drawTextureBox(e.SpriteBatch, Game1.menuTexture,
             new Microsoft.Xna.Framework.Rectangle(0, 256, 60, 60), margin, boxY, boxWidth, boxHeight, Color.White * 0.75f, 1f, false);
@@ -1125,7 +1132,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
-        if (!PlayerModeEnabled && Context.IsWorldReady && _actor != null && _coordinator != null
+        if (Context.IsWorldReady && _actor != null && _coordinator != null
             && Game1.activeClickableMenu == null && !Game1.eventUp && Game1.displayHUD
             && e.Button == SButton.MouseLeft
             && _companionHudBounds.Contains(Game1.getMouseX(true), Game1.getMouseY(true)))
@@ -1143,6 +1150,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             }
             else if (_authority != null)
             {
+                _playerControlApproved = true;
                 _authority.RequestAgent("human-explicit-handoff");
                 Game1.addHUDMessage(new HUDMessage("已交还控制权给 AI：按 F8 告诉它今天要做什么。", HUDMessage.newQuest_type));
             }
@@ -2052,7 +2060,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     {
         DispatchLifeProfileRefresh();
         var actions = new CompanionHubActions(RequestPauseMenuAction, RequestResumeMenuAction, RequestCancelMenuAction,
-            ToggleAutonomyMode, SendLifeProfileSetOnly, OpenCompanionMemoryForDashboard, DispatchDecisionVisibility);
+            ToggleAutonomyMode, SendLifeProfileSetOnly, OpenCompanionMemoryForDashboard, DispatchDecisionVisibility, OpenGameSettings);
         GetCompanionDialogue().OpenDashboard(actions, OpenCompanionReplyInput, tab);
     }
 

@@ -3320,6 +3320,7 @@ class ChatBridge:
             delivery_root = Path(self.run_dir) if self.run_dir else Path(self._sessions_file).parent
             self._prompt_delivery = PromptDelivery(delivery_root / "prompt-delivery.json")
         key = f"{self.backend_name}:{active_task.save_id}:{getattr(self, 'actor_mode', '')}:{(self._latest_snapshot_payload or {}).get('actorMultiplayerId', 'unknown')}"
+        key += f":{getattr(self, '_player_session_id', None) or 'unknown-session'}"
         sent, pending = self._prompt_delivery.prepare(
             key, conversation_id, prompt,
             load_instruction_bundle(getattr(self, "actor_mode", None)).text)
@@ -4900,7 +4901,7 @@ class ChatBridge:
         if (not is_player and save_id and self._work_store is not None
                 and request_id in self._autonomy_requests):
             try:
-                self._work_store.record_request(save_id, request_id, text[:300], origin="autonomy")
+                self._work_store.record_request(save_id, request_id, "结合当前目标和游戏状态安排下一步。", origin="autonomy")
             except WorkStateError:
                 logger.debug("Could not record autonomy request %s", request_id, exc_info=True)
 
@@ -6396,7 +6397,9 @@ class ChatBridge:
             # An explicit re-handoff (or the bootstrap claim) ends manual mode;
             # work may resume under agent authority.
             if save_id:
-                self._manual_takeover.pop(save_id, None)
+                was_manual = self._manual_takeover.pop(save_id, None)
+                if was_manual and self._autonomy is not None:
+                    self._autonomy.set_paused(save_id, False)
             self._maybe_arm_hold_recovery(save_id, self._latest_snapshot_payload)
             self._maybe_deliver_outbox(save_id)
             if previous != "agent":
@@ -6404,10 +6407,21 @@ class ChatBridge:
                     "Player control held by the agent (%s); work dispatch may resume",
                     reason or "no reason")
             return
-        if reason == "human-takeover" and save_id:
+        if reason in {"human-takeover", "awaiting-user"} and save_id:
             # Explicit F9 takeover persists as manual across bridge reconnects:
             # no auto re-claim until the mod reports owner=agent again.
             self._manual_takeover[save_id] = True
+        if reason in {"human-takeover", "awaiting-user", "disconnected"} and save_id:
+            # Handing the character back is a pause, not cancellation of the
+            # player's durable goal. Native actions are stopped by the Mod.
+            self._autonomy_generation += 1
+            if self._active_task is not None and not self._active_task.cancelled:
+                self.abort_active_task(f"player_takeover: {reason}")
+            if self._autonomy is not None:
+                self._autonomy.set_paused(save_id, True)
+            if self._work_store is not None:
+                self._work_store.revoke_decision(save_id)
+            return
         logger.warning(
             "Player control taken over by the human (%s); aborting current agent work",
             reason or "no reason")

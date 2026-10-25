@@ -3342,10 +3342,10 @@ class ChatBridge:
         event = {}
         for match in re.finditer(r"(?m)^实时上下文：([^\n]*)", prefix):
             original = json.loads(match.group(1))
-            for field in ("projectScope", "objective", "wakeReason", "acceptedArrangement",
+            for event_key in ("projectScope", "objective", "wakeReason", "acceptedArrangement",
                           "boxRange", "idlePreference", "idleHelpEnabled", "autonomyMode"):
-                if field in original:
-                    event[field] = original[field]
+                if event_key in original:
+                    event[event_key] = original[event_key]
         decision = context.get("decision") or {}
         event.update(requestId=active_task.request_id, workDispatchAvailable=not active_task.read_only)
         event["goalId"] = decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope

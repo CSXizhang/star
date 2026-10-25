@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from support.release_fixture import package_at
 
 from stardew_ai_runtime import compatibility

@@ -1,8 +1,10 @@
 from unittest.mock import AsyncMock, MagicMock, create_autospec
+
 import pytest
+
+from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.scheduler import CompanionScheduler
 from stardew_ai_runtime.work_state import WorkStore
-from stardew_ai_runtime.mcp_server import create_mcp_server
 
 
 @pytest.fixture

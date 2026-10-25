@@ -280,8 +280,9 @@ def test_timeout_reconciles_same_command_without_replaying(tmp_path):
 
 
 def test_timeout_keeps_missing_effects_unknown_even_with_zero_completed():
-    from stardew_ai_runtime.job_feedback import compact_job_feedback, compact_task_feedback
     from types import SimpleNamespace
+
+    from stardew_ai_runtime.job_feedback import compact_job_feedback, compact_task_feedback
     raw = {'terminalState': 'partial', 'reasonCode': 'TIMEOUT', 'effects': [], 'completedCount': 0}
     feedback = compact_job_feedback(raw, operation='chop_tree', status='partial')
     assert feedback['resultUncertain'] is True

@@ -4,7 +4,6 @@ import asyncio
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
-
 from support.validated_game import game as game
 
 from stardew_ai_runtime.mcp_server import create_mcp_server

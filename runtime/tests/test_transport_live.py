@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from support.mock_mod_server import MockModTransportServer
 
 from stardew_ai_runtime.client import TransportClient

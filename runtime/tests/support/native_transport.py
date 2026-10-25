@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock, MagicMock
+
 from stardew_ai_runtime.protocol import Envelope
 
 

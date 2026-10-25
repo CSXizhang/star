@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
-from support.validated_game import game as _game_fixture
 from support.native_transport import _client, _snapshot_env
+from support.validated_game import game as _game_fixture
 
 from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.scheduler import CompanionScheduler, SchedulerError

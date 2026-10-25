@@ -12,8 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from support.native_transport import _snapshot_env, _client
+from support.native_transport import _client, _snapshot_env
 
 from stardew_ai_runtime.mcp_server import (
     _PLAN_OPERATION_CALLS,

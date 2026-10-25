@@ -17,16 +17,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
-
-from support.mcp_scheduler import _grant_decision, mock_scheduler as mock_scheduler
+from support.mcp_scheduler import _grant_decision
+from support.mcp_scheduler import mock_scheduler as mock_scheduler
+from support.mock_mod_server import MockModTransportServer
 
 from stardew_ai_runtime.mcp_server import create_mcp_server
 from stardew_ai_runtime.plan_executor import PlanExecutor
 from stardew_ai_runtime.protocol import Envelope
 from stardew_ai_runtime.scheduler import CompanionScheduler, NoActiveTaskError
 from stardew_ai_runtime.work_state import WorkStore
-
-from support.mock_mod_server import MockModTransportServer
 
 
 @pytest.fixture(autouse=True)
@@ -2059,7 +2058,6 @@ def test_milestone_revise_passes_preparation_and_preserves_omitted_items(mock_sc
             "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot}), encoding="utf-8")
         monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="life")
-        tools = {tool.name: tool for tool in await server.list_tools()}
         preparation_schema = server._tool_manager.get_tool("manage_arrangements").fn_metadata.arg_model.model_fields["change"].annotation.model_fields["manage_milestones"].annotation.__args__[0].model_json_schema()["properties"]["preparation"]
         assert "omitted/null keeps current preparation" in preparation_schema["description"]
         assert "[] clears it" in preparation_schema["description"]
@@ -2102,7 +2100,6 @@ def test_milestone_exact_scope_roundtrip_and_full_single_node_read(mock_schedule
             "saveId": "mock-save-123", "capturedAt": time.time(), **mock_scheduler.latest_snapshot}), encoding="utf-8")
         monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="life")
-        tools = {tool.name: tool for tool in await server.list_tools()}
         schema = server._tool_manager.get_tool("manage_arrangements").fn_metadata.arg_model.model_fields["change"].annotation.model_fields["manage_milestones"].annotation.__args__[0].model_json_schema()["properties"]["execution_scope"]
         assert "Candidate tile count is independent" in schema["description"]
         assert {"locationId", "tiles"} == set(schema["anyOf"][2]["required"])

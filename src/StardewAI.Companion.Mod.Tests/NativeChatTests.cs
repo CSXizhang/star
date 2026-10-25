@@ -1,10 +1,55 @@
 using StardewAI.Companion.Mod.Menus;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using HarmonyLib;
+using StardewValley.Menus;
 using Xunit;
 
 namespace StardewAI.Companion.Mod.Tests;
 
 public class NativeChatTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void NativeSendClearsOnlyAcceptedInput(bool sent)
+    {
+        var owner = (ModEntry)RuntimeHelpers.GetUninitializedObject(typeof(ModEntry));
+        var chat = (ChatBox)RuntimeHelpers.GetUninitializedObject(typeof(ChatBox));
+        chat.chatBox = new ChatTextBox(null, null, null, Color.White);
+        var snippet = (ChatSnippet)RuntimeHelpers.GetUninitializedObject(typeof(ChatSnippet));
+        snippet.message = "先浇水";
+        var snippets = (List<ChatSnippet>)typeof(ChatTextBox)
+            .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Single(f => f.FieldType == typeof(List<ChatSnippet>)).GetValue(chat.chatBox)!;
+        snippets.Add(snippet);
+        Assert.Equal("先浇水", string.Concat(snippets.Select(s => s.message)));
+        typeof(ModEntry).GetField("_unsentChatText", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(owner, "旧草稿");
+        // Supply only font metrics; exercise the real ChatBox/TextBox clearing path.
+        var harmony = new Harmony("stardew-tests.native-chat-font");
+        harmony.Patch(AccessTools.Method(typeof(ChatBox), nameof(ChatBox.messageFont)),
+            prefix: new HarmonyMethod(typeof(NativeChatTests), nameof(HeadlessChatFont)));
+        try
+        {
+            typeof(ModEntry).GetMethod("CompleteNativeChatSend", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(owner, new object[] { chat, "先浇水", sent });
+        }
+        finally { harmony.UnpatchAll(harmony.Id); }
+        Assert.Equal(sent ? "" : "先浇水", string.Concat(snippets.Select(s => s.message)));
+        Assert.Equal(sent ? null : "先浇水", typeof(ModEntry)
+            .GetField("_unsentChatText", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(owner));
+    }
+
+    private static bool HeadlessChatFont(ref SpriteFont __result)
+    {
+        __result = new SpriteFont(null, new List<Rectangle>(), new List<Rectangle>(),
+            new List<char>(), 16, 0, new List<Vector3>(), null);
+        return false;
+    }
+
     [Fact]
     public void ChatLinesFitActualFontWidthWithoutDroppingText()
     {

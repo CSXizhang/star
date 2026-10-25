@@ -3599,7 +3599,7 @@ class ChatBridge:
                     for n in self._work_store.state(save_id).notices) else None
                 self._record_command(
                     request_id=request_id, save_id=save_id,
-                    conversation_id=result.get("conversation_id") or existing_cid,
+                    conversation_id=result.get("conversation_id") or (None if result.get("session_retried") else existing_cid),
                     prompt=text, status="completed" if success else "failed",
                     start_idx=-1, end_idx=-1,
                     usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
@@ -3621,7 +3621,7 @@ class ChatBridge:
                     if changed:
                         proposed = max(changed, key=lambda node: node.get("updatedAt", 0))
                         self._life_proposals[save_id] = (proposed["id"], self._profile_revision(save_id), proposed["updatedAt"])
-                cid = result.get("conversation_id") or existing_cid
+                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
                 if cid and self._life_chat is not None and save_id:
                     self._life_chat.record_session_id(save_id, str(cid))
                     self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
@@ -3974,7 +3974,7 @@ class ChatBridge:
                     command_id="", prompt=prompt, async_task=asyncio.current_task())
                 active_task.read_only = True
                 result = await self._await_life_provider(active_task, existing_cid, prompt)
-                cid = result.get("conversation_id") or existing_cid
+                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
                 if cid and self._life_chat:
                     self._life_chat.record_session_id(save_id, str(cid))
                     self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
@@ -4975,7 +4975,6 @@ class ChatBridge:
                     "workDispatchAvailable": False, "paused": bool(paused_chat),
                     "inFlight": self._in_flight_summary(save_id) if midflight else None,
                 }, ensure_ascii=False)
-            full_prompt = prompt
             # PromptDelivery shares acknowledged guidance across all turn types.
             reload_summary = self._work_reload_context(save_id, existing_cid)
             if reload_summary:
@@ -5038,25 +5037,9 @@ class ChatBridge:
                     start_max_idx,
                 )
 
-                # 4. Invoke the provider in an executor. A missing local session is
-                # rotated honestly (old id kept in history) and retried once on a
-                # fresh session carrying the full instructions.
-                session_retried = False
-                while True:
-                    result = await self._await_work_provider(active_task, existing_cid, prompt)
-                    if (not session_retried
-                            and not active_task.cancelled and save_id
-                            and (self.backend_name, result.get("error")) in {
-                                ("mcode", "MCODE_SESSION_UNAVAILABLE"),
-                                ("codex", "CODEX_SESSION_UNAVAILABLE"),
-                                ("codex", "CODEX_CONTEXT_EXHAUSTED"),
-                            }):
-                        session_retried = True
-                        self._rotate_provider_session(save_id, reason=str(result.get("error")))
-                        existing_cid = None
-                        prompt = full_prompt
-                        continue
-                    break
+                # Chat and work share the same bounded session recovery.
+                result = await self._await_work_provider(active_task, existing_cid, prompt)
+                session_retried = bool(result.get("session_retried"))
 
                 # If task was cancelled during execution, handle_chat_cancel already handled reply & record
                 if active_task.cancelled:
@@ -5097,7 +5080,7 @@ class ChatBridge:
                 reply_text = result.get("response", "")
                 if session_retried and result.get("success"):
                     reply_text = "（会话已失效，已安全新建会话后继续。）\n" + reply_text
-                cid = result.get("conversation_id") or existing_cid
+                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
                 if cid and existing_cid and cid != existing_cid:
                     start_max_idx = -1
                 if new_session_established and cid:
@@ -5980,10 +5963,23 @@ class ChatBridge:
             backend = self._get_backend()
             if isinstance(backend, (KimiBackend, CodexBackend, DshBackend, McodeBackend)):
                 backend.progress = getattr(self, "_backend_progress_callback", None)
-            delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
-                active_task, conversation_id, prompt, backend)
             turn_native_session = getattr(self, "_player_session_id", None)
-            result = backend.run(active_task, conversation_id, sent_prompt)
+            for attempt in range(2):
+                delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
+                    active_task, conversation_id, prompt, backend)
+                result = backend.run(active_task, conversation_id, sent_prompt)
+                if attempt:
+                    result["session_retried"] = True
+                if (attempt == 0 and conversation_id and save_id and not active_task.cancelled
+                        and (self.backend_name, result.get("error")) in {
+                            ("mcode", "MCODE_SESSION_UNAVAILABLE"),
+                            ("codex", "CODEX_SESSION_UNAVAILABLE"),
+                            ("codex", "CODEX_CONTEXT_EXHAUSTED"),
+                        }):
+                    self._rotate_provider_session(save_id, reason=str(result["error"]))
+                    conversation_id = None
+                    continue
+                break
             delivered_session = result.get("conversation_id")
             if delivered_session and not active_task.cancelled and not result.get("error"):
                 self._acknowledge_prompt_delivery(delivery_key, pending_prompt, save_id, str(delivered_session))

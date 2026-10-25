@@ -55,9 +55,19 @@ public sealed partial class ModEntry
         string? target = NativeChatText.ReplyTarget(owner._chatDecisionId,
             owner._lifeMenuUiState.PendingDecisions.Select(e => e.DecisionId).OfType<string>());
         // Natural language is interpreted in the shared round, without a second approval step.
-        if (!owner.DispatchLifeChat(text_to_send, "chat", null, target, false))
-            owner._unsentChatText = text_to_send;
+        owner.CompleteNativeChatSend(Game1.chatBox, text_to_send,
+            owner.DispatchLifeChat(text_to_send, "chat", null, target, false));
         return false;
+    }
+
+    private void CompleteNativeChatSend(ChatBox chatBox, string text, bool sent)
+    {
+        if (sent)
+        {
+            chatBox.setText("");
+            _unsentChatText = null;
+        }
+        else _unsentChatText = text;
     }
 
     private void TickNativeChatInput()

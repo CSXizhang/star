@@ -104,7 +104,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
         helper.Events.GameLoop.UpdateTicking += (_, _) => TickNativeChatInput();
         helper.Events.GameLoop.TimeChanged += OnTimeChanged;
-        helper.Events.Display.RenderedWorld += OnRenderedWorld;
+        CompanionWorldDraw.Install(() => PlayerModeEnabled ? null : _avatar);
         helper.Events.Display.RenderedHud += OnRenderedHud;
         helper.Events.Display.MenuChanged += (_, e) => {
             if (PlayerModeEnabled && Context.IsWorldReady && e.NewMenu is StardewValley.Menus.ItemGrabMenu menu && menu.context is StardewValley.Objects.Chest chest)
@@ -252,7 +252,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         _knowledge = new PlayerKnowledgeTracker();
         _knowledge.Load(Helper.Data);
         _observer = new PlayerKnownObserver(new GameWorldObserver(Monitor) {
-            NativeCollisionActor = () => _actor is PlayerActor p && p.BindingValid ? p.GameFarmer : null
+            NativeCollisionActor = () => _actor?.GameFarmer
         }, _knowledge, Monitor.Log);
         _navigator = new SameMapNavigator(_observer);
         _authority = new PlayerControlAuthority(Monitor.Log);
@@ -644,6 +644,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             // Persist companion state on every task completion, not only at game-save time:
             // save/exit/reload durability must not depend on save-event timing.
             _coordinator.OnExecutionCompleted += () => PersistActorState("task completion");
+            _coordinator.OnInventoryChanged += () => PersistActorState("nearby pickup");
             _coordinator.OnNotification += OnCompanionNotification;
             _coordinator.OnNativeActionProgress += HandleNativeActionProgress;
 
@@ -827,12 +828,6 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         ProjectChatUiAvailability();
         if (Game1.activeClickableMenu is CompanionCommandMenu && !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && !_chatUiState.IsPaused && !_chatUiState.LocalPauseRequested && _transportServer?.IsChatConnected != true)
             CompanionCommandMenu.CurrentStatusText = GetBridgeConnectionProblem() ?? "桥接未连接，输入会保留";
-    }
-
-    private void OnRenderedWorld(object? sender, RenderedWorldEventArgs e)
-    {
-        if (PlayerModeEnabled) return;
-        _avatar?.Draw(e.SpriteBatch);
     }
 
     private void OnTimeChanged(object? sender, TimeChangedEventArgs e)
@@ -1061,15 +1056,13 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             string? problem = GetBridgeConnectionProblem();
             string state = problem != null ? problem.TrimEnd('。')
                 : _chatUiState.ShouldPauseNative || _lifeMenuUiState.WorkPaused ? "工作已暂停"
-                : _coordinator.Rest.IsResting ? (_coordinator.Rest.IsDaytimeRest ? "休息恢复中" : "已休息，等明天")
-                : activity != "idle" ? (task.Running ? task.Stage : "正在工作")
+                : _coordinator.Rest.IsResting ? _coordinator.GetActivityLabel()
+                : activity != "idle" ? _coordinator.GetActivityLabel()
                 : _lifeMenuUiState.IsChatPending ? _lifeMenuUiState.PendingChatDescription
-                : task.Running ? task.Stage
                 : _lifeMenuUiState.UnreadReplyCount > 0 ? "有新回复"
                 : "等你安排";
             stateLine = _lifeMenuUiState.CompanionName + " · " + state;
-            hintLine = activity != "idle" && !string.IsNullOrWhiteSpace(task.Progress)
-                ? task.Progress + " · F8" : "点击交谈 · F8";
+            hintLine = "点击交谈 · F8";
         }
         if (_lifeMenuUiState.UnreadReplyCount > 0)
             hintLine = (hintLine.Length > 0 ? hintLine + " · " : "") + $"{_lifeMenuUiState.UnreadReplyCount} 条新回复";
@@ -1345,6 +1338,16 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
     private void HandleChatReplyReceived(ChatReplyPayload reply)
     {
         string currentSave = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        if (string.Equals(reply.SaveId, currentSave, StringComparison.Ordinal) &&
+            _conversationSaveId == currentSave && !string.IsNullOrWhiteSpace(reply.ReplyText) &&
+            reply.DeliveryOutboxIds is not { Count: > 0 } &&
+            reply.Status is "public-message" or "selected" or "decision-completed" or "completed" or "failed" or "partial" or "unknown")
+        {
+            _lifeMenuUiState.RecordCompanionReply(reply.RequestId,
+                CompanionDialogueInbox.PlainText(reply.ReplyText), GetCurrentGameDate());
+            PersistConversation();
+        }
+        if (reply.Status == "public-message") return;
         // Independent autostart test replies keep the common freshness/outbox
         // processing below (long model planning must read fresh snapshots); only the
         // F8 command-slot UI routing is bypassed further down.
@@ -2467,6 +2470,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 DispatchLifeProfileRefresh();
                 return;
             }
+            if (reply.AnsweredNoticeId != null)
+                _lifeMenuUiState.ConfirmDecisionReply(reply.AnsweredNoticeId);
             bool accepted = _lifeMenuUiState.ApplyChatReply(
                 reply.RequestId,
                 reply.Status,
@@ -2487,8 +2492,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                         _lifeMenuUiState.ConfirmDecisionReply(reply.AnsweredNoticeId);
                     string text = !string.IsNullOrWhiteSpace(reply.ReplyText) ? reply.ReplyText
                         : !string.IsNullOrWhiteSpace(reply.Error) ? $"这次没能回复：{reply.Error}" : "这次没有收到回复，请再试一次。";
-                    if (_lifeMenuUiState.RecordConversation(reply.RequestId + ":companion", _lifeMenuUiState.CompanionName,
-                        text, GetCurrentGameDate(), isPlayer: false, unread: true))
+                    if (_lifeMenuUiState.RecordCompanionReply(reply.RequestId,
+                        CompanionDialogueInbox.PlainText(text), GetCurrentGameDate()))
                     {
                         if (!visible)
                         {

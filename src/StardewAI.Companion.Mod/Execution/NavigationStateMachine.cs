@@ -53,6 +53,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
     private int _waterUsed;
     private long _elapsedTicks;
     private readonly ExecutionProgressWatchdog _progressWatchdog = new();
+    private readonly WalkingProgress _walkingProgress = new();
     private int _startClock;
     private int? _pauseStartedClock;
     private int _pausedGameMinutes;
@@ -157,6 +158,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
             _waterUsed = 0;
             _elapsedTicks = 0;
             _progressWatchdog.Reset();
+            _walkingProgress.Reset();
             _startClock = _observer.TimeOfDay;
             _pauseStartedClock = null;
             _pausedGameMinutes = 0;
@@ -593,6 +595,12 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
 
         var targetStep = _currentPath[_currentPathIndex];
         var targetTile = targetStep.Tile;
+        if (!ActorGuards.IsPlayerBound(_actor) && _walkingProgress.IsBlocked(_actor, targetTile))
+        {
+            FinishExecution(ExecutionState.Failed,
+                $"Walking blocked on '{_actor.LocationName}' at {_actor.Tile} toward {targetTile}; pixel={_actor.PixelPosition}. Inspect the obstruction before choosing clearance or another route.", "MOVEMENT_BLOCKED");
+            return;
+        }
         if (ActorGuards.IsPlayerBound(_actor))
         {
             // A native event/warp may relocate the player while preserving the map
@@ -682,7 +690,7 @@ public sealed class NavigationStateMachine : ISkillExecutionMachine
         }
         if (dist <= WalkPixelsPerTick)
         {
-            _actor.PixelPosition = targetPixel;
+            if (!ActorGuards.TryFinishWalkingStep(_actor, targetPixel)) return;
             _currentPathIndex++;
         }
         else

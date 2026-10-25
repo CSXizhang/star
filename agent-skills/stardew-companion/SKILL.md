@@ -40,14 +40,15 @@ description: 通过 stardew-companion MCP 与玩家一起经营星露谷农场�
 
 ## 游戏内决策
 
-游戏内模型使用[游戏内执行方法](references/ingame-execution.md)，由 `consult.read_guidance` 的 execution 主题 返回。本轮已提供令牌和实际结果；选中短作业后结束回复，原生执行器在终态后唤醒下一轮。
+游戏内模型使用[游戏内执行方法](references/ingame-execution.md)，由 `consult.read_guidance` 的 execution 主题 返回。本轮已提供实际状态；每次立即执行一个动作，复查游戏后继续剩余工作，不创建工单。
 
 ## 外部 Codex 连接与执行
 
 - 已有注入的实时上下文或增量时直接据此决定，不再读取完整状态和工作历史；增量仅更新所列字段，删除字段不再沿用。外部首次接手且无实时上下文时，用简要 `get_status` 和 `query_game.get_work_overview` 确认存档、已有工作及结果。只观察时不提交任务。缺少工具时提示玩家在目标 Codex 项目运行发行包中的注册脚本，并重新打开会话；不要改写全局配置。
 - 按需用 `query_game` 观察，用 `submit_work` 提交具名动作及独立参数。不要猜物品、位置或能力是否存在。
-- 玩家要求执行时，先用 `begin_game_turn` 开启本次决策，再使用 `submit_work` 交付一段可中断的连续行动；不同操作与地图可通过必要导航顺序接续。任务规模按真实资源决定，参数以当前 schema 为准。忙碌或暂停时先向玩家说明现状，不自动取消已有工作。`manage_arrangements.remember_intent` 记录目标，不代表执行授权。
+- 玩家要求执行时，先用 `begin_game_turn` 开启本次决策，再使用 `submit_work` 立即执行一个动作，观察结果后再选择下一步或必要导航。任务规模按真实资源决定，参数以当前 schema 为准。忙碌或暂停时先向玩家说明现状，不自动取消已有工作。`manage_arrangements.remember_intent` 记录目标，不代表执行授权。
 - `job-selected` / `not_executed_yet` 只说明已选中；提交后用 `query_game.work_plan_overview` 查看持久化任务终态，避免 `get_status` 或 `get_work_overview` 再占用游戏唯一命令连接。避免密集轮询或重复提交。任务失败时根据错误调整；连接或权限缺失时停止重复尝试，说明阻塞原因。
 - `blockedBranches` 记录同一对象、操作与原因的失败，首次失败后两次尝试仍失败就停该分支。可做清障、进食、补水或其他主任务；修复后 `query_route` 的可达证据、`observe_machines` 的实际就绪及真实补给结果可解除对应阻塞，不能只换任务名称重试。其他原因需先取得相应恢复证据再安排，不把未知结果计为失败。
 - 外部 Codex 操作期间不要同时从 F8、NPC 聊天或自由模式派工。沿用已经运行的伙伴服务执行任务，不另起聊天桥接服务。游戏需已通过 SMAPI 载入存档，伙伴聊天与计划面板不暂停已接受的农活动作；其他原生菜单与游戏暂停仍按游戏规则处理。
 - 按玩家定义的性格、称呼和表达偏好交流结果与未完成事项。
+- 采木优先成熟树，保留幼树；必要清障或玩家明确要求时例外。

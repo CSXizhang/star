@@ -16,6 +16,7 @@ class ProtocolError(ValueError):
 # here, schedule, transport, MCP schema and the C# handler all validate the same
 # contract, and an unknown skill/parameter is rejected instead of being forwarded.
 NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
+    "rest": frozenset({"locationId", "targetStamina"}),
     "inspect-player-activities": frozenset({"locationId"}),
     "talk-npc": frozenset({"locationId", "npcName"}),
     "interact-tile": frozenset({"locationId", "tile"}),

@@ -205,7 +205,7 @@ def test_duplicate_terminal_delivers_fact_once(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_terminal_during_pause_is_delivered_read_only_without_new_dispatch(tmp_path, monkeypatch):
+def test_terminal_during_pause_is_delivered_execution_deferred_without_new_dispatch(tmp_path, monkeypatch):
     """暂停期间落定的终态以只读投递送达：事实被消费，但不派生新的原生作业。"""
     client = _BlockingClient()
 

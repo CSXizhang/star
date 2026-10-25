@@ -15,7 +15,7 @@ public static class CompanionBedtime
     public static bool ShouldPreviewRoute(int now, int bedtime) =>
         Minutes(now) >= Minutes(Normalize(bedtime)) - RoutePreviewWindowMinutes;
     public static bool NeedsDaytimeRest(float stamina, int maxStamina) =>
-        maxStamina > 0 && stamina <= Math.Max(20, maxStamina * 0.1f);
+        maxStamina > 0 && stamina <= 0;
     public static bool HasRecovered(float stamina, int maxStamina) =>
         maxStamina > 0 && stamina >= maxStamina;
 }

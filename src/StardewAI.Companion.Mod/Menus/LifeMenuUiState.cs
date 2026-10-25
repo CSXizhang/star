@@ -35,6 +35,15 @@ public sealed class LifeMenuUiState
         return true;
     }
 
+    public bool RecordCompanionReply(string requestId, string text, string gameDate)
+    {
+        // De-duplicate against messages actually received by the game, not merely
+        // sent by the bridge. A missed early delivery remains in the final reply.
+        foreach (var entry in _conversation.Where(e => e.Id.StartsWith(requestId + ":message:", StringComparison.Ordinal)))
+            if (text.StartsWith(entry.Text, StringComparison.Ordinal)) text = text[entry.Text.Length..].TrimStart();
+        return RecordConversation(requestId + ":companion", CompanionName, text, gameDate, false, unread: true);
+    }
+
     public void MarkConversationRead(string? entryId = null)
     {
         if (UnreadReplyCount == 0) return;
@@ -52,6 +61,7 @@ public sealed class LifeMenuUiState
         int index = _conversation.FindIndex(e => e.DecisionId == noticeId && e.DecisionStatus == "pending");
         if (index < 0) return;
         _conversation[index] = _conversation[index] with { DecisionStatus = "answered", Unread = false };
+        _unreadCareHints.RemoveAll(h => h.EventKey == "decision:" + noticeId);
         ConversationRevision++;
         ConversationChanged?.Invoke();
     }

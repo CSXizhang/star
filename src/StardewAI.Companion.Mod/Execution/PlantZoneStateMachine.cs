@@ -410,7 +410,7 @@ public sealed class PlantZoneStateMachine : ISkillExecutionMachine
         }
         if (dist <= WalkPixelsPerTick)
         {
-            _actor.PixelPosition = targetPixel;
+            if (!ActorGuards.TryFinishWalkingStep(_actor, targetPixel)) return;
             _currentPathIndex++;
         }
         else

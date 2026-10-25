@@ -115,3 +115,23 @@ def test_bridge_reload_hands_off_to_new_session_but_reconnect_keeps_it(tmp_path)
         assert bridge._work_store.state("farm").goals[0].text == "new goal after reload"
         bridge._send_reply = AsyncMock()
     asyncio.run(scenario())
+
+
+def test_reload_repairs_only_exact_linked_choices_without_replaying_work(tmp_path):
+    import hashlib
+
+    from stardew_ai_runtime.game_reload import recover_recorded_choices
+    from stardew_ai_runtime.work_state import WorkStore
+    store = WorkStore(tmp_path / "data/work-state.json")
+    goal = store.add_goal("farm", "农场")
+    first = store.request_player_decision("farm", goal.id, "存哪里？", choices=["左箱", "右箱"])
+    second = store.request_player_decision("farm", goal.id, "种什么？", choices=["土豆", "草莓"])
+    path = tmp_path / "data/conversations" / (hashlib.sha256(b"farm").hexdigest().upper() + ".json")
+    write(path, {"SaveId": "farm", "Entries": [
+        {"Id": "selected:player", "IsPlayer": True, "Text": "右箱", "ReplyToDecisionId": first["id"]},
+        {"Id": "question:player", "IsPlayer": True, "Text": "哪个好？", "ReplyToDecisionId": second["id"]}]})
+    assert recover_recorded_choices(tmp_path, "farm") == 1
+    restored = WorkStore(tmp_path / "data/work-state.json")
+    assert [n["id"] for n in restored.unresolved_player_notices("farm")] == [second["id"]]
+    assert not restored.state("farm").tasks
+    assert recover_recorded_choices(tmp_path, "farm") == 0

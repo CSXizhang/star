@@ -41,9 +41,12 @@ public sealed partial class GameWorldObserver
         var location = RequireProductionLocation(locationName);
         var layer = location.Map?.Layers.FirstOrDefault() ?? throw new InvalidOperationException("Map is not loaded.");
         int width = layer.LayerWidth, height = layer.LayerHeight;
-        var center = new TileCoordinate(width / 2, height / 2);
+        var center = actor.LocationName == locationName ? actor.Tile : new TileCoordinate(width / 2, height / 2);
         // Scan the whole requested map, including indoor eggs. Bounded facts, explicit truncation.
         var ground = ScanGroundItems(locationName, center, Math.Max(width,height),257);
+        // ScanGroundItems sorts collectibles first. Obstacles belong to farming/map
+        // observations, not the remaining pickup work after harvesting.
+        var collectibles = ground.Where(g => g.IsDropped || g.CanBeGrabbed).ToList();
         var waterCenter = actor.LocationName == locationName ? actor.Tile : center;
         var water = FindWaterRefillTiles(locationName, waterCenter, Math.Max(width,height),33);
         var foods = actor.GameFarmer?.Items.OfType<StardewValley.Object>()
@@ -51,8 +54,9 @@ public sealed partial class GameWorldObserver
             .Select(i => new { itemId=i.QualifiedItemId, name=i.DisplayName, stack=i.Stack,
                 staminaRecovered=i.staminaRecoveredOnConsumption(), healthRecovered=i.healthRecoveredOnConsumption() }).ToList();
         return new() { ["locationId"]=locationName, ["capturedRevision"]=WorldRevision,
-            ["groundItems"]=ground.Take(256).Select(g=> new GroundItemSnapshot(new(g.Tile.X,g.Tile.Y),g.Kind,g.ItemId,g.Name,g.Stack,g.IsDropped,g.IsWeed,g.CanBeGrabbed,g.ClearTool,g.IsStone,g.IsTwig,g.Quality)).ToList(),
-            ["groundItemsTruncated"]=ground.Count>256, ["waterRefillTiles"]=water.Take(32).Select(t=>new TileCoord(t.X,t.Y)).ToList(),
+            ["groundItems"]=collectibles.Take(256).Select(g=> new GroundItemSnapshot(new(g.Tile.X,g.Tile.Y),g.Kind,g.ItemId,g.Name,g.Stack,g.IsDropped,g.IsWeed,g.CanBeGrabbed,g.ClearTool,g.IsStone,g.IsTwig,g.Quality)).ToList(),
+            ["groundItemsScope"]="existing-drops-and-collectibles",
+            ["groundItemsTruncated"]=collectibles.Count>256 || Math.Max(width,height)>256, ["waterRefillTiles"]=water.Take(32).Select(t=>new TileCoord(t.X,t.Y)).ToList(),
             ["waterRefillTilesTruncated"]=water.Count>32, ["waterRefillScope"]="map", ["waterRefillMapComplete"]=true,
             ["foods"]=(object?)foods ?? Array.Empty<object>(), ["inventoryOwner"]="companion" };
     }

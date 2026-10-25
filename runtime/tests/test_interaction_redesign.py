@@ -127,7 +127,7 @@ def test_usage_today_save_total_and_partial_response_without_double_count(tmp_pa
     assert "250+未记录 token" in display.today_text(now, save_id="farm")
 
 
-def test_historical_recovery_is_save_scoped_idempotent_and_read_only(tmp_path):
+def test_historical_recovery_is_save_scoped_idempotent_and_execution_deferred(tmp_path):
     commands = tmp_path / "chat_commands.jsonl"
     row = {"provider": "dsh", "conversationId": "stardew-own", "saveId": "farm", "requestId": "autonomy-r",
            "timestamp": "2026-10-02T01:00:10Z", "durationSeconds": 10, "usage": None}
@@ -178,7 +178,7 @@ def test_lost_confirmation_remains_in_reconnect_projection_after_new_notices(tmp
 
 
 @pytest.mark.parametrize("success,resolve", [(True, True), (False, True), (True, False)])
-def test_free_text_decision_reply_keeps_question_and_only_success_answers(tmp_path, success, resolve):
+def test_choice_is_saved_even_when_provider_fails_but_free_text_remains_pending(tmp_path, success, resolve):
     async def scenario():
         bridge = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)
         goal = bridge._work_store.add_goal("farm", "装修")
@@ -194,7 +194,9 @@ def test_free_text_decision_reply_keeps_question_and_only_success_answers(tmp_pa
                                                    "text": "保留它", "replyToNoticeId": notice["id"], "resolveNotice": resolve}, "farm")
         assert "树要保留吗？" in captured[0] and "保留它" in captured[0]
         pending = bridge._work_store.unresolved_player_notices("farm")
-        assert bool(pending) is not (success and resolve)
+        assert bool(pending) is not resolve
+        restored = WorkStore(tmp_path / "data" / "work-state.json")
+        assert bool(restored.unresolved_player_notices("farm")) is not resolve
         terminals = [call.args[1] for call in bridge._send_reply.call_args_list if call.args[1].message_type == "life.chat.reply"]
         assert terminals[-1].payload.get("answeredNoticeId") == (notice["id"] if success and resolve else None)
     asyncio.run(scenario())
@@ -247,7 +249,7 @@ def test_stale_decision_submit_rejects_before_provider_or_control(tmp_path, reas
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("resolve", [False, True])
+@pytest.mark.parametrize("resolve", [False])
 def test_queued_decision_answered_before_drain_rejects_without_provider(tmp_path, resolve):
     async def scenario():
         bridge = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)

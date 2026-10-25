@@ -25,6 +25,19 @@ public sealed class CompanionRestController
     public int? SleepStartedAt { get; private set; }
     public bool IsDaytimeRest { get; private set; }
     public bool IsResting => State != "awake";
+    public float? RecoveryTarget { get; private set; }
+
+    public void BeginDaytimeRest(float target)
+    {
+        if (!float.IsFinite(target) || target <= 0 || target > _actor.MaxStamina)
+            throw new ArgumentOutOfRangeException(nameof(target));
+        if (IsResting && !IsDaytimeRest) throw new InvalidOperationException("Companion is sleeping for the night.");
+        RecoveryTarget = target;
+        IsDaytimeRest = true;
+        if (_actor.Stamina >= target) { Wake(); return; }
+        if (!IsResting) State = "winding-down";
+        Reason = $"回床恢复至 {target:0} 体力。";
+    }
 
     public CompanionRestController(IFarmerActor actor, NavigationStateMachine navigation)
     { _actor = actor; _navigation = navigation; }
@@ -54,6 +67,7 @@ public sealed class CompanionRestController
             _navigation.Update(null, 0);
         }
         State = "awake";
+        RecoveryTarget = null;
         Reason = null;
         SleepStartedAt = null;
         IsDaytimeRest = false;
@@ -120,7 +134,7 @@ public sealed class CompanionRestController
                 if (_actor.GameFarmer is { } sleepingFarmer) sleepingFarmer.timeWentToBed.Value = now;
                 return;
             }
-            if (IsDaytimeRest && CompanionBedtime.HasRecovered(_actor.Stamina, _actor.MaxStamina))
+            if (IsDaytimeRest && _actor.Stamina >= (RecoveryTarget ?? _actor.MaxStamina))
             {
                 Wake();
                 return;
@@ -155,7 +169,7 @@ public sealed class CompanionRestController
             {
                 IsDaytimeRest = !CompanionBedtime.ShouldWindDown(now, Bedtime, 0);
                 State = "winding-down";
-                Reason = IsDaytimeRest ? "体力偏低，收尾后回床恢复。" : null;
+                Reason = IsDaytimeRest ? "体力耗尽，回床恢复。" : null;
             }
             else if (!CompanionBedtime.ShouldPreviewRoute(now, Bedtime)) return;
         }
@@ -215,7 +229,8 @@ public sealed class CompanionRestController
             {
                 float distance = delta.Length();
                 var step = delta / distance * Math.Min(4f, distance);
-                _actor.MovePixels(step.X, step.Y);
+                if (_actor is FarmerMechanicsActor companion) companion.MoveIntoBed(step.X, step.Y);
+                else _actor.MovePixels(step.X, step.Y);
                 return;
             }
             _actor.Halt();

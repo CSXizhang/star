@@ -144,8 +144,8 @@ def test_paused_chat_uses_life_surface_and_preserves_existing_work(tmp_path, mon
 
         class FakeProvider:
             def run(self, task, cid, prompt):
-                assert "STARDEW_DECISION_TOKEN" not in os.environ
-                assert os.environ["STARDEW_MCP_SURFACE"] == "life"
+                assert os.environ.get("STARDEW_DECISION_TOKEN") != "outer-work-token"
+                assert os.environ["STARDEW_MCP_SURFACE"] == "light"
                 async def tools():
                     server = create_mcp_server(scheduler=MagicMock(), surface="full")
                     return {tool.name for tool in await server.list_tools()}

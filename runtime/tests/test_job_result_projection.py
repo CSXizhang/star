@@ -103,7 +103,7 @@ def test_delivery_prompt_keeps_full_batch_accounting_when_receipt_coordinates_ar
     ))
     for snapshot in (None, {"world": {"season": "summer", "dayOfMonth": 16}}):
         bridge._latest_snapshot_payload = snapshot
-        prompt = bridge._format_delivery_prompt([], "farm", midflight=[], read_only=False)
+        prompt = bridge._format_delivery_prompt([], "farm", midflight=[], execution_deferred=False)
         context = json.loads(prompt.split("实时上下文：", 1)[1].split("\n", 1)[0])
         evidence = context["plantingEvidence"]
         assert evidence == store.overview("farm")["plantingEvidence"]

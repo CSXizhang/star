@@ -33,7 +33,7 @@ internal static class FarmSpaceObserver
         var region = requestedRegion ?? new Rectangle(0, 0, mapWidth, mapHeight);
         if (region.Width < 1 || region.Height < 1 || region.X < 0 || region.Y < 0
             || (long)region.X + region.Width > mapWidth || (long)region.Y + region.Height > mapHeight)
-            throw new ArgumentException("Region must be a positive rectangle inside the loaded map.");
+            throw new ArgumentException($"Region must fit mapWidth={mapWidth}, mapHeight={mapHeight}; x+width <= mapWidth and y+height <= mapHeight. Omit region for the full map.");
         int width = region.Width, height = region.Height;
         if ((long)width * height > 65536)
             throw new InvalidOperationException("Map exceeds the spatial observation limit (65536 tiles); no truncated map returned.");
@@ -55,9 +55,19 @@ internal static class FarmSpaceObserver
         foreach (var building in location.buildings)
         {
             var door = building.getPointForHumanDoor();
+            var perimeter = new List<Domain.TileCoordinate>();
+            for (int x = building.tileX.Value - 1; x <= building.tileX.Value + building.tilesWide.Value; x++)
+                for (int y = building.tileY.Value - 1; y <= building.tileY.Value + building.tilesHigh.Value; y++)
+                    if (x < building.tileX.Value || x >= building.tileX.Value + building.tilesWide.Value
+                        || y < building.tileY.Value || y >= building.tileY.Value + building.tilesHigh.Value)
+                        perimeter.Add(new(x, y));
+            var standing = perimeter.Where(t => observer.IsTilePassable(location.NameOrUniqueName, t)
+                    && !observer.IsWarpOrDoorTile(location.NameOrUniqueName, t))
+                .OrderBy(t => Math.Abs(t.X - door.X) + Math.Abs(t.Y - door.Y)).Cast<Domain.TileCoordinate?>().FirstOrDefault();
             occupants.Add(new { kind = "building", id = building.id.Value.ToString(), name = building.buildingType.Value,
                 x = building.tileX.Value, y = building.tileY.Value, width = building.tilesWide.Value, height = building.tilesHigh.Value,
                 entrance = new { x = door.X, y = door.Y },
+                standingTile = standing.HasValue ? new { x = standing.Value.X, y = standing.Value.Y } : null,
                 indoors = building.GetIndoors()?.NameOrUniqueName });
         }
         foreach (var feature in location.largeTerrainFeatures)

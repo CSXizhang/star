@@ -134,9 +134,35 @@ public sealed partial class GameWorldObserver : IWorldObserver
             // collision query: pathfinding and skipCollisionEffects prevent
             // damage/doors/other collision side effects. No actor is moved.
             var body=collisionActor.GetBoundingBox();
-            var probe=new Rectangle(tile.X*64+32-body.Width/2,tile.Y*64+32-body.Height/2,body.Width,body.Height);
+            var probe = ReferenceEquals(collisionActor, Game1.player)
+                ? new Rectangle(tile.X*64+32-body.Width/2,tile.Y*64+32-body.Height/2,body.Width,body.Height)
+                : new Rectangle(tile.X*64 + body.X - (int)collisionActor.Position.X,
+                    tile.Y*64 + body.Y - (int)collisionActor.Position.Y, body.Width, body.Height);
             if(loc.isCollidingPosition(probe,Game1.viewport,true,0,false,collisionActor,
                 pathfinding:true,projectile:false,ignoreCharacterRequirement:false,skipCollisionEffects:true))return false;
+        }
+        return true;
+    }
+
+    public bool CanWalkBetween(string locationName, TileCoordinate from, TileCoordinate to)
+    {
+        var farmer = NativeCollisionActor?.Invoke();
+        if (farmer?.currentLocation is not { } location || location.NameOrUniqueName != locationName)
+            return true; // Re-evaluated after entering the next map.
+        var body = farmer.GetBoundingBox();
+        bool player = ReferenceEquals(farmer, Game1.player);
+        var offset = player ? new Vector2(32 - body.Width / 2, 32 - body.Height / 2)
+            : new Vector2(body.X - (int)farmer.Position.X, body.Y - (int)farmer.Position.Y);
+        var start = new Vector2(from.X * 64, from.Y * 64) + offset;
+        var end = new Vector2(to.X * 64, to.Y * 64) + offset;
+        int steps = Math.Max(1, (int)Math.Ceiling(Vector2.Distance(start, end) / 4f));
+        for (int step = 1; step <= steps; step++)
+        {
+            var point = Vector2.Lerp(start, end, (float)step / steps);
+            var probe = new Rectangle((int)point.X, (int)point.Y, body.Width, body.Height);
+            if (location.isCollidingPosition(probe, Game1.viewport, true, 0, false, farmer,
+                pathfinding: true, projectile: false, ignoreCharacterRequirement: false, skipCollisionEffects: true))
+                return false;
         }
         return true;
     }
@@ -1897,7 +1923,8 @@ public sealed partial class GameWorldObserver : IWorldObserver
                 // These identities are the installed game's native Hoe branch
                 // (Object.performToolAction); CanBeGrabbed alone is not pickup eligibility.
                 bool digSpot = obj.QualifiedItemId is "(O)590" or "(O)SeedSpot";
-                bool canGrab = !parcel && !digSpot && !isWeed && !isStone && !isTwig && obj.CanBeGrabbed;
+                bool canGrab = obj is not StardewValley.Objects.Chest && !obj.bigCraftable.Value
+                    && !digSpot && !isWeed && !isStone && !isTwig && obj.CanBeGrabbed;
                 string kind = parcel ? "giftbox" : digSpot ? "dig-spot" : isWeed ? "weed" : (isStone ? "stone" : (isTwig ? "twig" : (canGrab ? "object" : "obstacle")));
                 string? clearTool = isWeed ? "hoe" : (isStone ? "pickaxe" : (isTwig ? "axe" : null));
                 items.Add(new GroundItemScanInfo(
@@ -1937,7 +1964,8 @@ public sealed partial class GameWorldObserver : IWorldObserver
             _monitor.Log($"Error scanning ground items at '{locationName}': {ex.Message}", LogLevel.Warn);
         }
 
-        return items.OrderBy(i => Math.Abs(i.Tile.X - center.X) + Math.Abs(i.Tile.Y - center.Y))
+        return items.OrderByDescending(i => i.IsDropped || i.CanBeGrabbed)
+            .ThenBy(i => Math.Abs(i.Tile.X - center.X) + Math.Abs(i.Tile.Y - center.Y))
             .ThenBy(i => i.Tile.Y).ThenBy(i => i.Tile.X).Take(maxItems).ToList();
     }
 

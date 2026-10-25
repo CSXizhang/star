@@ -26,6 +26,7 @@ public static class ReleaseBridgeLauncher
         foreach (string argument in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
             "-OwnerProcessId", Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture) })
             start.ArgumentList.Add(argument);
+        start.Environment["STARDEW_BRIDGE_STOP_FILE"] = Path.Combine(Path.GetTempPath(), "stardew-bridge-stop-" + Guid.NewGuid().ToString("N"));
         return start;
     }
 
@@ -189,6 +190,22 @@ public sealed class ReleaseBridgeLaunch : IDisposable
         try
         {
             if (process.HasExited) return;
+            if (process.StartInfo.Environment.TryGetValue("STARDEW_BRIDGE_STOP_FILE", out var marker) && marker != null)
+            {
+                try
+                {
+                    File.WriteAllText(marker, "stop");
+                    if (process.WaitForExit(10000)) return;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                finally
+                {
+                    try { File.Delete(marker); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+            }
             process.Kill(entireProcessTree: true);
             // ProcessExit cannot await the background task. Bound the synchronous
             // wait, while allowing the launcher/mutex to finish before a new save.

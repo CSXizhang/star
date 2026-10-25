@@ -226,3 +226,27 @@ def read_reload_history(run_dir: Path, save_id: str, offset: int = 0, limit: int
     end = min(len(entries), offset + limit)
     return {"entries": entries[offset:end], "total": len(entries),
             "nextOffset": end if end < len(entries) else None, "executionEvidenceIsCurrent": False}
+
+
+def recover_recorded_choices(run_dir: Path, save_id: str) -> int:
+    """Repair old pending notices only from an exact, linked player choice."""
+    path = run_dir / "data/conversations" / (hashlib.sha256(save_id.encode()).hexdigest().upper() + ".json")
+    archive = _read(path)
+    if archive.get("SaveId") != save_id:
+        return 0
+    store = WorkStore(run_dir / "data/work-state.json")
+    pending = {n["id"]: n for n in store.unresolved_player_notices(save_id)}
+    entries = archive.get("Entries", [])
+    questions = {e.get("DecisionId"): e for e in entries if e.get("DecisionId")}
+    recovered = 0
+    for entry in entries:
+        notice_id = entry.get("ReplyToDecisionId")
+        if not entry.get("IsPlayer") or entry.get("RolledBack") or notice_id not in pending:
+            continue
+        choices = pending[notice_id].get("choices") or questions.get(notice_id, {}).get("Choices") or []
+        if entry.get("Text") not in choices:
+            continue
+        store.answer_player_notice(save_id, notice_id, entry["Text"], entry["Id"].removesuffix(":player"))
+        pending.pop(notice_id)
+        recovered += 1
+    return recovered

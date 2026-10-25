@@ -1,0 +1,9 @@
+{
+  "Name": "StardewAI Companion Test Driver",
+  "Author": "Astra Infra",
+  "Version": "0.1.0",
+  "Description": "Test-only harness driver for Stardew AI Companion. Provides early save path isolation, deterministic scenario orchestration, and evidence capture.",
+  "UniqueID": "StardewAI.Companion.TestDriver",
+  "EntryDll": "StardewAI.Companion.TestDriver.dll",
+  "MinimumApiVersion": "4.2.1"
+}

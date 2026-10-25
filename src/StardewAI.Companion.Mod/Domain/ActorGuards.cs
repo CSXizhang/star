@@ -15,6 +15,14 @@ namespace StardewAI.Companion.Mod.Domain;
 /// </summary>
 public static class ActorGuards
 {
+    /// <summary>Final short waypoint step uses the same collision check as walking.</summary>
+    public static bool TryFinishWalkingStep(IFarmerActor actor, Vector2 target)
+    {
+        var delta = target - actor.PixelPosition;
+        actor.MovePixels(delta.X, delta.Y);
+        return Vector2.DistanceSquared(actor.PixelPosition, target) < 0.01f;
+    }
+
     // Festivals expose native free-roam while eventUp remains true. Cutscenes
     // and scripted festival phases still retain exclusive movement control.
     public static bool FestivalFreeRoam => Game1.eventUp

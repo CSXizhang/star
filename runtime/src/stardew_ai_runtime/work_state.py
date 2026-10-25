@@ -732,6 +732,24 @@ class WorkStore:
             self._load()
             return self._states.setdefault(save_id, SaveWorkState())
 
+    def retire_legacy_execution(self) -> None:
+        """Retain player intent, but never resume pre-upgrade action queues."""
+        self.reload()
+        for save_id in list(self._states):
+            def retire(state: SaveWorkState) -> None:
+                # Historical evidence stays archived; it is not today's progress.
+                state.archive.extend({"task": asdict(task), "reason": "world_observation_execution"}
+                                     for task in state.tasks)
+                state.archive = state.archive[-100:]
+                state.tasks.clear()
+                state.decision.clear()
+                if state.last_job.get("status") in {"unknown", "running", "pending", "waiting", "executing"}:
+                    state.last_job.clear()
+                state.branch_failures.clear()
+                for request in state.requests:
+                    request["taskIds"] = []
+            self._mutate(save_id, retire)
+
     def request_player_decision(self, save_id: str, goal_id: str, message: str, choices: list[str] | None = None) -> dict[str, Any]:
         """Explicit model signal, separate from routine completion text."""
         text = message.strip()
@@ -1110,7 +1128,8 @@ class WorkStore:
             "player to close it. Only a verified preset day boundary may end it."
         )
 
-    def complete_goal(self, save_id: str, goal_id: str, *, verified_native_boundary: dict | None = None) -> Goal:
+    def complete_goal(self, save_id: str, goal_id: str, *, verified_native_boundary: dict | None = None,
+                      completion_observation: dict | None = None) -> Goal:
         """Close the model's project assessment without inventing native effects."""
         preset_finalize = self._check_preset_completion(save_id, goal_id)
         def mutate(state: SaveWorkState) -> Goal:
@@ -1130,11 +1149,13 @@ class WorkStore:
                             and isinstance(verified_native_boundary.get("startDay"), int)
                             and isinstance(verified_native_boundary.get("endDay"), int)
                             and verified_native_boundary["endDay"] > verified_native_boundary["startDay"])
-            if not completed and not restored:
-                raise WorkStateError("PROJECT_NO_EXECUTION: no completed native task evidence; cancel an unneeded goal instead")
+            if not completed and not restored and completion_observation is None:
+                raise WorkStateError("PROJECT_NO_EXECUTION: observe the game before assessing completion")
             goal.status = "completed"
             goal.project = {**goal.project, "phase": "completed", "completionAssessment": "model-reviewed",
                             "completedTaskIds": completed[-64:]}
+            if completion_observation is not None:
+                goal.project["completionObservation"] = completion_observation
             goal.updated_at = _now_iso()
             goal.epoch += 1
             self._retire_child_authorizations(state, goal)

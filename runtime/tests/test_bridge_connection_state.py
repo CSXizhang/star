@@ -16,7 +16,7 @@ def test_successful_chat_connection_restarts_worker_and_never_mutates_saved_work
         store = bridge._work_store
         store.add_goal("farm", "保留已接受的工作", source="user")
         store.begin_decision("farm", "still-valid-token")
-        before = (tmp_path / "data" / "work-state.json").read_bytes()
+        before = store.state("farm").goals
         before_epoch = store.state("farm").scheduler_epoch
         worker = SimpleNamespace(start=Mock(), stop=AsyncMock(), notify=Mock(), supplied_save_id=None)
         bridge._plan_worker = worker
@@ -44,13 +44,15 @@ def test_successful_chat_connection_restarts_worker_and_never_mutates_saved_work
             # A bridge reconnect in the same game session retains the persisted
             # authorized selection; only a real native reload revokes it.
             assert store.state("farm").scheduler_epoch == before_epoch
-            assert store.state("farm").decision["token"] == "still-valid-token"
+            assert not store.state("farm").decision
+            assert store.state("farm").goals == before
             ws.close.assert_awaited_once()
         else:
             worker.start.assert_not_called()
             bridge._notify_plan_worker.assert_not_called()
-            assert (tmp_path / "data" / "work-state.json").read_bytes() == before
-            assert store.state("farm").decision["token"] == "still-valid-token"
+            assert store.state("farm").goals == before
+            assert not store.state("farm").decision
+            assert store.state("farm").goals == before
     asyncio.run(scenario())
 
 

@@ -316,10 +316,25 @@ public sealed class FarmerMechanicsActor : IFarmerActor
     }
 
     public void MovePixels(float dx, float dy)
+        => MovePixelsCore(dx, dy, checkCollision: true);
+
+    // Only the rest controller's verified, short bed entrance may cross furniture.
+    internal void MoveIntoBed(float dx, float dy)
+        => MovePixelsCore(dx, dy, checkCollision: false);
+
+    private void MovePixelsCore(float dx, float dy, bool checkCollision)
     {
         lock (_lock)
         {
             var nextPos = PixelPosition + new Vector2(dx, dy);
+            if (checkCollision && _gameFarmer?.currentLocation is { } location)
+            {
+                var body = _gameFarmer.GetBoundingBox();
+                var nextBody = new Rectangle((int)(body.X + dx), (int)(body.Y + dy), body.Width, body.Height);
+                if (location.isCollidingPosition(nextBody, Game1.viewport, true, 0, false, _gameFarmer,
+                    pathfinding: true, projectile: false, ignoreCharacterRequirement: false, skipCollisionEffects: true))
+                    return;
+            }
             PixelPosition = nextPos;
             _movedThisTick |= dx != 0 || dy != 0;
 

@@ -173,7 +173,8 @@ public sealed class SameMapNavigator
                     continue;
 
                 // Neighbor must be navigable (or the goal tile)
-                if (neighbor == goal || IsTileNavigable(locationName, neighbor, avoidTiles))
+                if ((neighbor == goal || IsTileNavigable(locationName, neighbor, avoidTiles))
+                    && _observer.CanWalkBetween(locationName, current, neighbor))
                 {
                     visited.Add(neighbor);
                     parentMap[neighbor] = current;

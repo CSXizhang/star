@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -1083,9 +1084,8 @@ class ActiveChatTask:
     instructions_text: str | None = None
     # Full original context is retained only for a provider's fresh-session recovery.
     provider_bootstrap_prompt: str | None = None
-    read_only: bool = False
-    # In-game read-only turns retain conversation history while the life tool
-    # surface independently removes execution authority.
+    execution_deferred: bool = False
+    # Conversations retain their session while existing native work settles.
     preserve_session: bool = False
     goal_scope: str | None = None
     goal_default: str | None = None
@@ -1303,13 +1303,14 @@ class ChatBridge:
         loop = asyncio.get_running_loop()
 
         def callback(event: Any) -> None:
-            if event.kind != "tool_started" or not event.tool_name:
+            public = event.kind == "public_message"
+            if not public and (event.kind != "tool_started" or not event.tool_name):
                 return
             reply = Envelope.create_chat_reply(
                 sender_instance_id=self.instance_id,
-                request_id=request_id,
+                request_id=(request_id + ":message:" + hashlib.sha256(event.message.encode()).hexdigest()[:16] if public else request_id),
                 status="processing",
-                reply_text=f"{event.message}：{event.tool_name}",
+                reply_text=event.message if public else f"{event.message}：{event.tool_name}",
                 save_id=save_id,
                 provider=self.backend_name,
                 command_id=(self._active_task.command_id if self._active_task and self._active_task.request_id == request_id else request_id),
@@ -1691,6 +1692,7 @@ class ChatBridge:
         )
 
         last_wait_log = 0.0
+        retired_execution_paths: set[str] = set()
 
         while stop_event is None or not stop_event.is_set():
             try:
@@ -1721,6 +1723,12 @@ class ChatBridge:
                             logger.info("已将日志文件切换至运行目录: %s", new_log)
                         except Exception as ex:
                             logger.debug("Failed to switch log path to %s: %s", self.run_dir, ex)
+
+                if not self._enable_plan_worker and self._work_store is not None:
+                    state_path = str(self._work_store.state_path)
+                    if state_path not in retired_execution_paths:
+                        self._work_store.retire_legacy_execution()
+                        retired_execution_paths.add(state_path)
 
                 # Guard against save switch while task was running
                 if self._active_task and self._active_task.save_id != save_id:
@@ -1777,6 +1785,7 @@ class ChatBridge:
         from .game_reload import (
             mark_game_load_applied,
             pending_game_load,
+            recover_recorded_choices,
             restore_game_load,
             rotate_provider_sessions,
         )
@@ -1785,6 +1794,7 @@ class ChatBridge:
             return
         request = pending_game_load(self.run_dir, save_id, session_id)
         if request is None:
+            recover_recorded_choices(self.run_dir, save_id)
             return
         self.abort_active_task("Game save reloaded")
         self._autonomy_generation += 1
@@ -1819,6 +1829,7 @@ class ChatBridge:
         self._bind_autonomy_store()
         self._bind_work_store()
         self._bind_companion_stores()
+        recover_recorded_choices(self.run_dir, save_id)
         if self._life_chat is not None:
             self._life_chat.record_fingerprint(save_id, self._profile_revision(save_id), self._memory_instruction_revision(save_id))
         mark_game_load_applied(self.run_dir, request)
@@ -3149,7 +3160,11 @@ class ChatBridge:
                     or lease.get("saveId") != save_id):
                 continue  # A newer player control invalidated this delayed response.
             action = intent.get("action")
-            if action == "bedtime" and self._profile_store is not None:
+            if action == "speak":
+                await self._send_reply(ws, Envelope.create_chat_reply(
+                    self.instance_id, f"{request_id}:speech:{path.stem}", "public-message",
+                    str(intent.get("text") or ""), save_id=save_id, command_complete=False))
+            elif action == "bedtime" and self._profile_store is not None:
                 self._profile_store.set(save_id, {"bedtime": intent.get("bedtime")}, self._profile_revision(save_id))
                 profile = self._profile_store.get(save_id)
                 await self._send_reply(ws, Envelope.create_life_profile_state(
@@ -3248,7 +3263,17 @@ class ChatBridge:
         if self._work_store is not None and payload.text.strip():
             self._work_store.record_request(save_id, payload.request_id, payload.text,
                                             origin="player-midflight" if midflight else "player")
+        answered_notice = None
+        if payload.reply_to_notice_id and payload.resolve_notice and self._work_store:
+            answered_notice = next(dict(n) for n in self._work_store.unresolved_player_notices(save_id)
+                                   if n.get("id") == payload.reply_to_notice_id)
+            self._work_store.answer_player_notice(save_id, payload.reply_to_notice_id, payload.text, payload.request_id)
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                self.instance_id, payload.request_id, save_id, status="processing",
+                answered_notice_id=payload.reply_to_notice_id,
+                profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
         item = {
+            "answered_notice": answered_notice,
             "ws": ws,
             "request_id": payload.request_id,
             "save_id": save_id,
@@ -3265,6 +3290,10 @@ class ChatBridge:
             # player-visible queued status; the drain after that turn finishes
             # delivers the terminal state FIFO (never silently dropped).
             self._life_queue.append(item)
+            if self.run_dir and self._active_task and self._active_task.save_id == save_id and not payload.accepted_node_id:
+                from .turn_messages import exchange
+                exchange(self.run_dir / "data" / "turn-messages.json", self._active_task.request_id, save_id,
+                         publish=[{"requestId": payload.request_id, "text": payload.text}])
             await self._send_reply(ws, Envelope.create_life_chat_reply(
                 sender_instance_id=self.instance_id,
                 request_id=payload.request_id,
@@ -3334,7 +3363,7 @@ class ChatBridge:
         boundary = marker.start() if marker else len(prompt)
         prefix, player = prompt[:boundary], prompt[boundary:]
         context = model_decision_context(self._decision_context(active_task.save_id, origin="game"))
-        context["workDispatchAvailable"] = not active_task.read_only
+        context["executionOccupied"] = active_task.execution_deferred
         if self._profile_store and active_task.save_id:
             context["profile"] = (self._profile_store.get(active_task.save_id) or {}).get("profile")
         context["milestones"] = self._life_milestone_summary(active_task.save_id, "chat")
@@ -3347,7 +3376,7 @@ class ChatBridge:
                 if event_key in original:
                     event[event_key] = original[event_key]
         decision = context.get("decision") or {}
-        event.update(requestId=active_task.request_id, workDispatchAvailable=not active_task.read_only)
+        event.update(requestId=active_task.request_id, executionOccupied=active_task.execution_deferred)
         event["goalId"] = decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope
         # These are already represented in the current state; don't inject duplicates from reload.
         if isinstance(context.get("reloadSummary"), dict):
@@ -3427,6 +3456,23 @@ class ChatBridge:
                 logger.debug("Interrupted provider exited with an error", exc_info=True)
                 break
 
+    async def _settle_turn_messages(self, active_task, result):
+        if not self.run_dir or not result.get("success"):
+            return result  # A failed delivery remains queued for the next normal turn.
+        from .turn_messages import exchange
+        delivered = exchange(self.run_dir / "data" / "turn-messages.json",
+                             active_task.request_id, active_task.save_id)
+        ids = {message["requestId"] for message in delivered}
+        for item in list(self._life_queue):
+            if item["request_id"] not in ids or item["save_id"] != active_task.save_id:
+                continue
+            self._life_queue.remove(item)
+            await self._send_reply(item.get("ws") or self._chat_ws, Envelope.create_life_chat_reply(
+                self.instance_id, item["request_id"], item["save_id"], status="completed",
+                profile_revision=self._profile_revision(item["save_id"]),
+                memory_revision=self._memory_revision(item["save_id"])))
+        return result
+
     async def _await_work_provider(
         self, active_task: ActiveChatTask, conversation_id: str | None, prompt: str,
     ) -> dict[str, Any]:
@@ -3434,7 +3480,10 @@ class ChatBridge:
             None, self._execute_turn, active_task, conversation_id, prompt)
         try:
             async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
-                return await asyncio.shield(future)
+                while not future.done():
+                    await asyncio.wait({future}, timeout=0.1)
+                    await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
+                return await self._settle_turn_messages(active_task, await asyncio.shield(future))
         except asyncio.CancelledError:
             await self._join_interrupted_provider(active_task, future)
             raise
@@ -3453,7 +3502,7 @@ class ChatBridge:
                 while not future.done():
                     await asyncio.wait({future}, timeout=0.1)
                     await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
-                return await asyncio.shield(future)
+                return await self._settle_turn_messages(active_task, await asyncio.shield(future))
         except asyncio.CancelledError:
             # Cancelling an executor await does not stop the executor thread.
             # Wait for this owned turn before releasing the model/native slot.
@@ -3483,7 +3532,7 @@ class ChatBridge:
                         self.instance_id, request_id, save_id, status="completed", reply_text="这条旧请求已被新的工作控制撤销。",
                         profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
                     return
-                if await self._replay_answered_decision(ws, save_id, item.get("reply_to_notice_id"), request_id, bool(item.get("resolve_notice"))):
+                if not item.get("answered_notice") and await self._replay_answered_decision(ws, save_id, item.get("reply_to_notice_id"), request_id, bool(item.get("resolve_notice"))):
                     return
                 profile = None
                 if self._profile_store is not None and save_id:
@@ -3528,7 +3577,7 @@ class ChatBridge:
                 notice_id = item.get("reply_to_notice_id")
                 if notice_id:
                     notices = self._work_store.unresolved_player_notices(save_id) if self._work_store else []
-                    notice = next((n for n in notices if n.get("id") == notice_id), None)
+                    notice = item.get("answered_notice") or next((n for n in notices if n.get("id") == notice_id), None)
                     if notice is None:
                         await self._send_life_error(ws, "life.chat.submit", {"requestId": request_id}, save_id, "DECISION_NO_LONGER_PENDING")
                         return
@@ -3547,7 +3596,7 @@ class ChatBridge:
                     command_id=request_id,
                     prompt=text,
                     async_task=asyncio.current_task(),
-                    read_only=self._delivery_read_only(save_id) or self._job_in_flight(save_id),
+                    execution_deferred=self._execution_occupied(save_id) or self._job_in_flight(save_id),
                 )
                 self._configure_backend_progress(ws, request_id, save_id)
                 await self._send_reply(ws, Envelope.create_life_chat_reply(
@@ -3566,12 +3615,12 @@ class ChatBridge:
                 previous_active = self._active_task
                 self._active_task = active_task
                 try:
-                    if not active_task.read_only:
+                    if not active_task.execution_deferred:
                         execution_claimed = await self._claim_execution(save_id)
                         if self._work_store and text.strip():
                             self._work_store.record_request(save_id, request_id, text, origin="player")
                     result = await self._await_life_provider(active_task, existing_cid, prompt, mode)
-                    if result.get("success") and not active_task.read_only and self._work_store:
+                    if result.get("success") and not active_task.execution_deferred and self._work_store:
                         selected = self._work_store.state(save_id).decision
                         if selected.get("selected") and not selected.get("finished"):
                             self._active_player_requests[save_id] = request_id
@@ -3972,8 +4021,24 @@ class ChatBridge:
                 active_task = ActiveChatTask(
                     request_id=f"care-{uuid.uuid4().hex[:8]}", save_id=save_id,
                     command_id="", prompt=prompt, async_task=asyncio.current_task())
-                active_task.read_only = True
-                result = await self._await_life_provider(active_task, existing_cid, prompt)
+                active_task.execution_deferred = self._execution_occupied(save_id)
+                self._life_turn_lease(active_task.request_id, save_id)
+                previous_active = self._active_task
+                self._active_task = active_task
+                execution_claimed = False
+                result = {}
+                try:
+                    if not active_task.execution_deferred:
+                        execution_claimed = await self._claim_execution(save_id)
+                    result = await self._await_life_provider(active_task, existing_cid, prompt)
+                finally:
+                    if (not result.get("success") or active_task.cancelled) and active_task.decision_token and self._work_store:
+                        if self._work_store.state(save_id).decision.get("token") == active_task.decision_token:
+                            self._work_store.revoke_decision(save_id)
+                    if self._active_task is active_task:
+                        self._active_task = previous_active
+                    if execution_claimed:
+                        await self._release_execution(save_id)
                 cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
                 if cid and self._life_chat:
                     self._life_chat.record_session_id(save_id, str(cid))
@@ -4637,7 +4702,7 @@ class ChatBridge:
                 self._active_task = None
             # The cancelled provider turn no longer owns the command socket; hand
             # it back so the worker can settle its own epoch-checked bookkeeping.
-            if old_async_task is None and not task.read_only:
+            if old_async_task is None and not task.execution_deferred:
                 await self._release_execution(active_save or save_id)
         else:
             logger.info("chat.cancel received but no task was actively running.")
@@ -4742,6 +4807,14 @@ class ChatBridge:
         native_command_id = next((step.command_id for step in selected_task.steps
                                   if step.command_id and step.status == "running"), None) if selected_task else None
         self._work_store.revoke_decision(save_id)
+        if self._plan_worker is None:
+            native = (self._latest_snapshot_payload or {}).get("companion", {}).get("activeCommandId")
+            if not native:
+                return True
+            cancel = Envelope.create_cancel(self.instance_id, 0, save_id,
+                getattr(self, "_player_session_id", None), 0, "interrupt-" + uuid.uuid4().hex,
+                native, "Player changed or stopped current work")
+            return await self._send_reply(self._chat_ws, cancel)
         if d.get("selected") and not d.get("finished") and was_dispatched and self._plan_worker:
             try:
                 await self._plan_worker.client.call_tool("dispatch_plan_operation", {
@@ -4960,7 +5033,7 @@ class ChatBridge:
                 prompt = self._format_delivery_prompt(
                     _delivery["events"], save_id or "",
                     midflight=_delivery.get("midflight") or [],
-                    read_only=bool(_delivery.get("read_only")),
+                    execution_deferred=bool(_delivery.get("execution_deferred")),
                     instructions=instructions.text,
                 )
                 task_prompt = "[outbox-delivery]"
@@ -4972,7 +5045,7 @@ class ChatBridge:
                 task_prompt = text
             if midflight or paused_chat:
                 prompt += "\n执行环境：" + json.dumps({
-                    "workDispatchAvailable": False, "paused": bool(paused_chat),
+                    "executionOccupied": True, "paused": bool(paused_chat),
                     "inFlight": self._in_flight_summary(save_id) if midflight else None,
                 }, ensure_ascii=False)
             # PromptDelivery shares acknowledged guidance across all turn types.
@@ -4999,7 +5072,7 @@ class ChatBridge:
                 wire_start_offset=wire_start_offset,
                 async_task=asyncio.current_task(),
                 instructions_text=instructions.text,
-                read_only=paused_chat or midflight or bool((_delivery or {}).get("read_only")),
+                execution_deferred=paused_chat or midflight or bool((_delivery or {}).get("execution_deferred")),
                 preserve_session=paused_chat or midflight or _delivery is not None,
                 goal_scope=_goal_scope,
                 goal_default=_goal_default,
@@ -5010,11 +5083,10 @@ class ChatBridge:
                                        if self._work_store is not None and save_id else None)
             # Park the internal plan worker and release its MCP session: the Mod
             # serves one command socket and the provider turn now owns it.
-            # Read-only turns (paused/midflight/read-only delivery) only use the
-            # cached life surface and never touch the execution connection.
+            # Existing work keeps ownership; tools recheck current state when called.
             execution_claimed = False
             try:
-                if not active_task.read_only:
+                if not active_task.execution_deferred:
                     execution_claimed = await self._claim_execution(save_id, recover=not paused_chat)
                 # 2. Immediate progress notification.
                 prog_reply = Envelope.create_chat_reply(
@@ -5117,7 +5189,7 @@ class ChatBridge:
                     elif err == "MCODE_SESSION_UNAVAILABLE":
                         reply_text = "会话已失效，已安全新建会话；请再发一次。"
 
-                if cid and save_id and (not active_task.read_only or active_task.preserve_session):
+                if cid and save_id and (not active_task.execution_deferred or active_task.preserve_session):
                     self.record_conversation_id(save_id, cid)
                     if result.get("success") and reload_summary:
                         self._work_reload_context(save_id, cid, delivered=True,
@@ -5241,7 +5313,7 @@ class ChatBridge:
                 # Keep diagnostic operation names/reason codes out of chat.
                 reply_status = status
                 job_selected = False
-                if not active_task.read_only and self._work_store and save_id:
+                if not active_task.execution_deferred and self._work_store and save_id:
                     selected = self._work_store.state(save_id).decision
                     if selected.get("selected") and not selected.get("finished"):
                         # job-selected means dispatched, not finished: the model's
@@ -5281,8 +5353,8 @@ class ChatBridge:
                     sender_instance_id=self.instance_id,
                     request_id=request_id,
                     status=reply_status,
-                reply_text=reply_text or ("本次对话未能完成。" if active_task.read_only and status == "failed"
-                    else "已保留暂停。" if active_task.read_only else "任务未能成功执行。" if status == "failed" else "任务执行完毕。"),
+                reply_text=reply_text or ("本次对话未能完成。" if active_task.execution_deferred and status == "failed"
+                    else "已保留暂停。" if active_task.execution_deferred else "任务未能成功执行。" if status == "failed" else "任务执行完毕。"),
                     save_id=save_id,
                     tokens_used=tokens_used,
                     prompt_tokens=prompt_tokens,
@@ -5319,7 +5391,7 @@ class ChatBridge:
                     # Model completion consumes its turn. Player delivery needs
                     # the native receipt; a failed socket replays the saved reply.
                     self._settle_delivery(request_id, bool(sent_ok or notification_saved) and bool(result.get("success")))
-                if self._autonomy is not None and save_id and not active_task.read_only:
+                if self._autonomy is not None and save_id and not active_task.execution_deferred:
                     self._autonomy.record_event(save_id, f"chat-terminal:{request_id}:{status}", f"chat.{status}")
                     autonomy_fingerprint = self._autonomy_requests.pop(request_id, None)
                     if autonomy_fingerprint:
@@ -5725,7 +5797,7 @@ class ChatBridge:
 
         task.add_done_callback(_clear)
 
-    def _delivery_read_only(self, save_id: str) -> bool:
+    def _execution_occupied(self, save_id: str) -> bool:
         """Current native ownership, not the event source, gates execution."""
         if self.actor_mode == "player" and self.control_owner != "agent":
             return True
@@ -5772,13 +5844,13 @@ class ChatBridge:
             if ws is None:
                 return
             self._work_store.recover(save_id)
-            read_only = self._delivery_read_only(save_id)
-            midflight = [] if read_only else self._work_store.pending_midflight_requests(save_id)
+            execution_deferred = self._execution_occupied(save_id)
+            midflight = [] if execution_deferred else self._work_store.pending_midflight_requests(save_id)
             requests_by_id = {str(r.get("id")): r for r in self._work_store.state(save_id).requests}
             event_requests = {str(event["requestId"]) for event in events if event.get("requestId")}
             if (not midflight and event_requests
                     and all(requests_by_id.get(root, {}).get("workStopped") for root in event_requests)):
-                read_only = True
+                execution_deferred = True
             visible = any(
                 event.get("requestId") and not str(event.get("requestId")).startswith("autonomy-")
                 for event in events
@@ -5817,7 +5889,7 @@ class ChatBridge:
                         "events": events,
                         "midflight": midflight,
                         "midflight_ids": [m["id"] for m in midflight],
-                        "read_only": read_only,
+                        "execution_deferred": execution_deferred,
                         "command_id": root,
                     },
                 )
@@ -5849,7 +5921,7 @@ class ChatBridge:
         save_id: str,
         *,
         midflight: list[dict[str, Any]],
-        read_only: bool,
+        execution_deferred: bool,
         instructions: str | None = None,
     ) -> str:
         live = self._decision_context(save_id, origin="delivery")
@@ -5906,7 +5978,7 @@ class ChatBridge:
                 if request_id in request_totals
             },
         }
-        payload["workDispatchAvailable"] = not read_only
+        payload["executionOccupied"] = execution_deferred
         return (
             f"{instructions or decision_policy()}\n"
             f"实时上下文：{context}\n"
@@ -5930,7 +6002,7 @@ class ChatBridge:
         assert_native_compatible(self.run_dir)
         token = uuid.uuid4().hex
         save_id = active_task.save_id
-        if save_id and self._work_store is not None and not active_task.read_only:
+        if save_id and self._work_store is not None and not active_task.execution_deferred:
             scope = active_task.goal_scope or (self._autonomy.state(save_id).goal_scope
                      if self._autonomy and active_task.request_id.startswith("autonomy-") else None)
             state = self._work_store.state(save_id)
@@ -5946,7 +6018,7 @@ class ChatBridge:
                 request_ids=list(dict.fromkeys([
                     *active_task.work_request_ids,
                     *(str(request["id"]) for request in self._work_store.pending_midflight_requests(save_id)
-                      if not active_task.read_only),
+                      if not active_task.execution_deferred),
                 ])),
             )
             active_task.decision_token = token
@@ -5954,8 +6026,8 @@ class ChatBridge:
         previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
         previous_surface = os.environ.get("STARDEW_MCP_SURFACE")
         # Capability discovery stays fixed; only cached reads/execution admission differ.
-        os.environ["STARDEW_MCP_SURFACE"] = "life" if active_task.read_only else "light"
-        if active_task.read_only:
+        os.environ["STARDEW_MCP_SURFACE"] = "light"
+        if active_task.execution_deferred:
             os.environ.pop("STARDEW_DECISION_TOKEN", None)
         else:
             os.environ["STARDEW_DECISION_TOKEN"] = token
@@ -5981,7 +6053,7 @@ class ChatBridge:
                     continue
                 break
             delivered_session = result.get("conversation_id")
-            if delivered_session and not active_task.cancelled and not result.get("error"):
+            if delivered_session and (getattr(active_task, "provider_input_delivered", False) or (not active_task.cancelled and not result.get("error"))):
                 self._acknowledge_prompt_delivery(delivery_key, pending_prompt, save_id, str(delivered_session))
                 if self.actor_mode == "player":
                     self._work_reload_context(active_task.save_id, str(delivered_session), delivered=True,
@@ -6549,7 +6621,7 @@ class ChatBridge:
                 logger.warning("agent.thinking end [%s] send failed", lease_id, exc_info=True)
 
     async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> bool:
-        if reply.message_type == "chat.reply" and self._active_task is not None and self._active_task.read_only and (
+        if reply.message_type == "chat.reply" and self._active_task is not None and self._active_task.execution_deferred and (
             reply.payload.get("requestId") == self._active_task.request_id
         ):
             reply.payload["readOnly"] = True
@@ -6560,10 +6632,6 @@ class ChatBridge:
         if reply.message_type in {"chat.reply", "life.chat.reply", "autonomy.state"} and ws is not None and reply.payload.get("saveId"):
             save_id = str(reply.payload["saveId"])
             await self._push_work_state(ws, save_id)
-        if reply.message_type == "chat.reply" and str(reply.payload.get("requestId", "")).startswith("autonomy-"):
-            if reply.payload.get("status") not in {"failed", "job-failed", "rejected", "unknown", "partial"}:
-                logger.info("Quiet autonomous reply: %s", json.dumps(dict(reply.payload), ensure_ascii=False))
-                return True
         if ws is None:
             return False
         try:
@@ -6649,6 +6717,7 @@ def _main_bridge(args: argparse.Namespace, owner_guard: OwnerProcessGuard | None
         backend=args.backend,
         kimi_cmd=args.kimi_cmd,
         mcode_cmd=args.mcode_cmd,
+        enable_plan_worker=False,
     )
 
     _, log_file_path = configure_chat_bridge_file_logging(bridge.run_dir)

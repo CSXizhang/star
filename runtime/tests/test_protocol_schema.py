@@ -110,7 +110,7 @@ def test_native_snapshot_contract_remains_strict(path, value):
 
 
 @pytest.mark.parametrize("status", ["unknown", "in-flight"])
-def test_result_reconciliation_schema_has_read_only_session_bound_shapes(status):
+def test_result_reconciliation_schema_has_execution_deferred_session_bound_shapes(status):
     from stardew_ai_runtime.protocol import Envelope
 
     validator = Draft202012Validator(json.loads(SCHEMA_PATH.read_text(encoding="utf-8")))

@@ -129,7 +129,7 @@ def test_slow_conversation_never_claims_or_releases_native_worker(tmp_path, monk
 
 
 @pytest.mark.parametrize("action,bedtime", [("pause", None), ("resume", None), ("bedtime", 2300)])
-def test_manage_companion_real_registered_call_uses_cache_without_native_connection(tmp_path, monkeypatch, action, bedtime):
+def test_manage_companion_real_registered_call_uses_live_save(tmp_path, monkeypatch, action, bedtime):
     async def scenario():
         monkeypatch.setenv("STARDEW_MCP_SURFACE", "life")
         monkeypatch.setenv("STARDEW_LIFE_TURN_ID", "accepted-control")
@@ -142,7 +142,7 @@ def test_manage_companion_real_registered_call_uses_cache_without_native_connect
             "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 2}},
         }), encoding="utf-8")
         scheduler = CompanionScheduler(run_dir=tmp_path)
-        scheduler.get_status = AsyncMock(side_effect=AssertionError("conversation opened the native connection"))
+        scheduler.get_status = AsyncMock(return_value={"saveId": "farm"})
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="life")
         arguments = {"action": action}
         if bedtime is not None:
@@ -152,7 +152,7 @@ def test_manage_companion_real_registered_call_uses_cache_without_native_connect
         assert intent["saveId"] == "farm"
         assert intent["action"] == action
         assert intent["bedtime"] == bedtime
-        scheduler.get_status.assert_not_called()
+        scheduler.get_status.assert_awaited()
 
     asyncio.run(scenario())
 
@@ -168,7 +168,9 @@ def test_conversation_cache_rejects_switching_to_another_loaded_save(tmp_path, m
             "saveId": "new-farm", "capturedAt": time.time(), "worldRevision": 1,
             "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 2}},
         }), encoding="utf-8")
-        server = create_mcp_server(run_dir=tmp_path, surface="life")
+        scheduler = CompanionScheduler(run_dir=tmp_path)
+        scheduler.get_status = AsyncMock(return_value={"saveId": "new-farm"})
+        server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="life")
         with pytest.raises(ToolError, match="SAVE_CHANGED"):
             await server.call_tool("manage_arrangements", {"change": {"manage_companion": {"action": "pause"}}})
         assert not list((data / "life-controls").glob("old-farm-turn*.json"))

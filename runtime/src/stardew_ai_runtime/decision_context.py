@@ -773,6 +773,32 @@ def model_decision_context(context: dict[str, Any]) -> dict[str, Any]:
                                  ("funds", "spendableMoney"), ("fundsStatus", "moneyStatus")):
             if canonical in companion:
                 result.pop(alias, None)
+    # Historical ledgers remain queryable; unrelated past requests are not part
+    # of the current decision. Keep the uncertainty flag and the current request.
+    request_id = (result.get("decision") or {}).get("requestId")
+    totals = result.get("confirmedRequestTotals")
+    if isinstance(totals, dict):
+        result["confirmedRequestTotals"] = {request_id: totals[request_id]} if request_id in totals else {}
+    goals = result.get("goals") or []
+    goal_ids = {g.get("id") for g in goals if isinstance(g, dict)}
+    prep = result.get("duePreparation")
+    if isinstance(prep, list):
+        date = result.get("date") or {}
+        def past(item):
+            trigger = item.get("trigger") or {}
+            try:
+                return (str(trigger.get("year")) == str(date.get("year"))
+                        and trigger.get("season") == date.get("season")
+                        and int(trigger.get("day", 99)) < int(date.get("day", 0)))
+            except (TypeError, ValueError):
+                return False
+        # A dated observation is not a fresh command. Preserve linked goals and
+        # constraints, but don't repeat their long scope text in preparations.
+        result["duePreparation"] = [
+            {k: row[k] for k in ("id", "goalId", "trigger") if k in row}
+            if row.get("goalId") in goal_ids else row
+            for row in prep if isinstance(row, dict) and (row.get("goalId") or not past(row))]
+        result["historicalPreparationCount"] = sum(1 for row in prep if isinstance(row, dict) and not row.get("goalId") and past(row))
     return result
 
 

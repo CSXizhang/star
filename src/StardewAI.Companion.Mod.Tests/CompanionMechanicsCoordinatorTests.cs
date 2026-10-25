@@ -64,6 +64,42 @@ public class CompanionMechanicsCoordinatorTests
     }
 
     [Fact]
+    public void RestCommandReturnsItsTargetResultAndCanBeCancelled()
+    {
+        var (coordinator, actor, _) = CreateHarness();
+        actor.Stamina = 25;
+        var request = new SkillExecutePayload("rest-command", "rest-task", "rest", "0.1", 1,
+            new WaterZoneParameters("FarmHouse", new()) { TargetStamina = 80 },
+            new ExecutionBudgets(0, 0, 0), "safe-point", "test");
+        var envelope = CreateEnvelope("skill.execute", "rest-message");
+        Assert.True(coordinator.TryAcceptSkillExecute(request, envelope, out var rejection));
+        Assert.Null(rejection);
+        Assert.Equal(80, coordinator.Rest.RecoveryTarget);
+        Assert.Null(coordinator.LastSkillResultPayload);
+        coordinator.OnCancelSkill(new SkillCancelPayload("cancel", "test", true, "safe-point"),
+            envelope with { CorrelationId = request.CommandId });
+        Assert.Equal("cancelled", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("awake", coordinator.Rest.State);
+
+        actor.Stamina = 80;
+        Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-done" }, envelope, out rejection));
+        coordinator.Update(null, 1);
+        Assert.Equal("succeeded", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("rest-done", coordinator.LastSkillResultPayload.CommandId);
+
+        actor.Stamina = 25;
+        Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-blocked" }, envelope, out rejection));
+        typeof(CompanionRestController).GetProperty("State")!.SetValue(coordinator.Rest, "waiting-for-bed");
+        coordinator.Update(null, 2);
+        Assert.Equal("failed", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("awake", coordinator.Rest.State);
+        Assert.False(coordinator.Rest.IsDaytimeRest);
+        Assert.Null(coordinator.Rest.RecoveryTarget);
+        coordinator.Update(null, 3);
+        Assert.Equal("awake", coordinator.Rest.State);
+    }
+
+    [Fact]
     public void TryAcceptSkillExecute_ValidWaterZone_AcceptedAndExecuted()
     {
         var (coordinator, actor, observer) = CreateHarness();

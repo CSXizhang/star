@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from stardew_ai_runtime.autonomy import AutonomyController
-from stardew_ai_runtime.client import TransportClient
+from stardew_ai_runtime.client import NativeResultUnavailable, TransportClient
 from stardew_ai_runtime.protocol import NATIVE_ACTION_TASK_PREFIXES, Envelope
 
 logger = logging.getLogger("stardew_ai_runtime.scheduler")
@@ -1006,6 +1006,7 @@ class CompanionScheduler:
                 "saveId": envelope.save_id,
                 "gameSessionId": envelope.game_session_id,
                 "worldRevision": envelope.world_revision,
+                "observedAt": envelope.sent_at.isoformat(),
             }
 
     async def _refresh_snapshot(self, client: TransportClient) -> None:
@@ -1246,14 +1247,24 @@ class CompanionScheduler:
                     self._active_task.is_terminal = True
                     self._active_task = None
                 except Exception:
-                    pass
+                    # A fresh native idle observation releases execution even if
+                    # its terminal receipt was lost. It does NOT prove success.
+                    observed_at = snap.get("observedAt")
+                    try:
+                        fresh_idle = (datetime.fromisoformat(observed_at) > self._active_task.expires_at
+                                      and snap.get("gameSessionId") == client.game_session_id)
+                    except (TypeError, ValueError):
+                        fresh_idle = False
+                    if fresh_idle:
+                        self._active_task = None
 
         snap = self._latest_snapshot_data or {}
         payload = snap.get("payload", {})
         companion = payload.get("companion", {})
         world = payload.get("world", {})
 
-        current_task = None
+        current_task = ({"commandId": companion["activeCommandId"], "status": companion.get("activity")}
+                        if companion.get("activeCommandId") else None)
         if self.has_active_task and self._active_task:
             current_task = {
                 "taskId": self._active_task.task_id,
@@ -1480,9 +1491,30 @@ class CompanionScheduler:
             if not cmd_id:
                 raise SchedulerError("Active task missing command ID for wait")
 
-            result_env = await client.wait_for_result(
-                command_id=cmd_id, timeout=timeout_seconds
-            )
+            if getattr(self, "await_terminal_results", False):
+                deadline = time.monotonic() + max(timeout_seconds, 600.0)
+                while True:
+                    try:
+                        result_env = await client.wait_for_result(
+                            command_id=cmd_id, timeout=min(30.0, max(0.1, deadline - time.monotonic())))
+                        break
+                    except NativeResultUnavailable as ex:
+                        raise SchedulerError("EXECUTION_UNCONFIRMED: native command record is unavailable") from ex
+                    except TimeoutError:
+                        if time.monotonic() >= deadline:
+                            await client.cancel_skill(
+                                command_id=f"cmd-cancel-{uuid.uuid4().hex[:8]}", correlation_id=cmd_id,
+                                reason="Execution result deadline exceeded", requested_by_player=False)
+                            try:
+                                result_env = await client.wait_for_result(command_id=cmd_id, timeout=10.0)
+                                break
+                            except TimeoutError as ex:
+                                raise SchedulerError("EXECUTION_UNCONFIRMED: cancellation sent but native result missing") from ex
+                        await client.request_command_result(cmd_id)
+            else:
+                result_env = await client.wait_for_result(
+                    command_id=cmd_id, timeout=timeout_seconds
+                )
             payload = result_env.payload
             terminal_state = payload.get("terminalState", "unknown")
             self._active_task.status = terminal_state
@@ -2709,6 +2741,17 @@ class CompanionScheduler:
                             "y": int(interaction_tile["y"]),
                         }
 
+            if landmark and resolved_coord is None:
+                space = await self.query_farm_space(location_id=clean_loc)
+                def normalize(value):
+                    return "".join(c for c in str(value).casefold() if c.isalnum())
+                matches = [row for row in space.get("occupants", []) if isinstance(row, dict)
+                           and normalize(landmark) in {normalize(row.get("id")), normalize(row.get("name"))}]
+                candidates = [row.get("standingTile") for row in matches if isinstance(row.get("standingTile"), dict)]
+                if len(candidates) == 1:
+                    resolved_coord = candidates[0]
+                elif matches:
+                    raise SchedulerError(f"Landmark {landmark!r} has no unique checked standing tile; inspect its observed footprint and obstruction.")
             if resolved_coord is not None:
                 tile = resolved_coord
             else:
@@ -4041,7 +4084,16 @@ class CompanionScheduler:
     async def cancel_task(self, reason: str = "User cancelled via MCP") -> dict[str, Any]:
         """Cancels the currently active task."""
         if not self.has_active_task or not self._active_task:
-            raise NoActiveTaskError("No active task to cancel. Companion is currently idle.")
+            # After reconnect the game, not a local task ledger, owns the action.
+            status = await self.get_status()
+            current = status.get("companion", {}).get("currentTask") or {}
+            if not current.get("commandId"):
+                raise NoActiveTaskError("No active task to cancel. Companion is currently idle.")
+            client = await self.ensure_connected()
+            await client.cancel_skill(command_id=f"cmd-cancel-{uuid.uuid4().hex[:8]}",
+                                      correlation_id=current["commandId"], reason=reason)
+            return {"status": "cancelling", "commandId": current["commandId"],
+                    "message": "Cancellation requested; observe the game before the next action."}
 
         client = await self.ensure_connected()
         cancel_cmd_id = f"cmd-cancel-{uuid.uuid4().hex[:8]}"

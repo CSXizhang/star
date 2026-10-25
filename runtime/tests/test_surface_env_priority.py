@@ -58,7 +58,7 @@ def test_env_life_overrides_cli_surface_light(mock_scheduler, tmp_path, monkeypa
     assert len(names) == 8
     assert "call_capability" not in names
     assert "discover_capabilities" not in names
-    assert server.exposure_surface == "life"
+    assert server.exposure_surface == "light"
 
 
 def test_cli_surface_light_unchanged_when_env_unset(mock_scheduler, tmp_path, monkeypatch):

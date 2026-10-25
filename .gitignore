@@ -84,7 +84,11 @@ MagicMock/
 /安装三天候选并启动伙伴.cmd
 /检查三天候选（不安装）.cmd
 /更新伙伴修复包.cmd
-/src/StardewAI.Companion.TestDriver/
+/src/StardewAI.Companion.TestDriver/*
+!/src/StardewAI.Companion.TestDriver/manifest.json
+!/src/StardewAI.Companion.TestDriver/SaveIsolationPatcher.cs
+!/src/StardewAI.Companion.TestDriver/StardewAI.Companion.TestDriver.csproj
+!/src/StardewAI.Companion.TestDriver/TestDriverMod.cs
 /config/test-runner*.json
 /tests/test_save_isolation.py
 /tests/test_harness_behavioral.py
@@ -111,3 +115,7 @@ MagicMock/
 !/tools/start-companion.ps1
 !/tools/test.ps1
 !/tools/view-usage.py
+!/tools/run-companion-presets.ps1
+!/tools/companion_acceptance/
+!/tools/launch-game.ps1
+!/tools/build-testdriver.ps1

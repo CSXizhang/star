@@ -1645,6 +1645,14 @@ public sealed class WebSocketTransportServer : ITransportServer
                             ? mtProp.GetString()
                             : null;
 
+                        if (msgType == "skill.cancel")
+                        {
+                            var cancel = JsonSerializer.Deserialize<EnvelopeDto>(jsonString, JsonOptions);
+                            if (cancel != null && cancel.SaveId == _saveId && cancel.GameSessionId == _gameSessionId)
+                                HandleSkillCancel(cancel);
+                            continue;
+                        }
+
                         bool hasPayload = root.TryGetProperty("payload", out var payloadElem);
 
                         if (string.Equals(msgType, "autonomy.state", StringComparison.OrdinalIgnoreCase) && hasPayload)

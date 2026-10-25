@@ -106,9 +106,7 @@ public sealed partial class ModEntry
         foreach (var entry in _lifeMenuUiState.Conversation.ToArray())
         {
             if (!_publishedChatEntries.Add(entry.Id) || entry.RolledBack) continue;
-            var font = ChatBox.messageFont(LocalizedContentManager.CurrentLanguageCode);
-            foreach (string part in NativeChatText.Segments(entry.Text,
-                line => font.MeasureString(entry.Speaker + "：" + line).X, Game1.chatBox.width - 32))
+            foreach (string part in NativeChatText.Segments(entry.Text))
                 Game1.chatBox.addMessage($"{entry.Speaker}：{part}", entry.IsPlayer ? Color.LightBlue : Color.White);
             _lifeMenuUiState.MarkConversationRead(entry.Id);
         }

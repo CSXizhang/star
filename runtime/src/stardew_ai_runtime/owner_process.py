@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("stardew_ai_runtime.owner_process")
@@ -96,7 +97,7 @@ class _WindowsProcessLifetime:
 class OwnerProcessGuard:
     """Cancel on owner exit, then bound cleanup even if asyncio/threads stall."""
 
-    def __init__(self, owner_pid: int, *, shutdown_timeout: float = 5.0):
+    def __init__(self, owner_pid: int, *, shutdown_timeout: float = 12.0):
         if not 0 < owner_pid <= 0xFFFFFFFF:
             raise ValueError("owner PID must be a positive Windows process ID")
         self._lifetime = _WindowsProcessLifetime(owner_pid)
@@ -115,7 +116,7 @@ class OwnerProcessGuard:
                 # A failed retained-handle wait also stops this owned service;
                 # it must never silently turn into an unmonitored daemon.
                 try:
-                    exited = self._lifetime.has_exited()
+                    exited = self._lifetime.has_exited() or bool(os.environ.get("STARDEW_BRIDGE_STOP_FILE") and Path(os.environ["STARDEW_BRIDGE_STOP_FILE"]).exists())
                 except OSError:
                     exited = True
                 if exited:

@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -906,7 +907,16 @@ class McodeBackend:
     """
 
     name = "mcode"
-    terminate = staticmethod(KimiBackend.terminate)
+    @staticmethod
+    def terminate(proc: Any) -> None:
+        marker = getattr(proc, "stardew_cancel_file", None)
+        if marker is not None and proc.poll() is None:
+            try:
+                Path(marker).touch()
+                proc.wait(timeout=8)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        KimiBackend.terminate(proc)
     server_name = "stardew-companion"
     #: ``--effort`` values mcode accepts; "default" omits the flag entirely.
     efforts = frozenset({"default", "low", "medium", "high", "xhigh", "max"})
@@ -993,14 +1003,13 @@ class McodeBackend:
             node = str(sibling) if sibling.is_file() else shutil.which("node")
             if not node or not entry.is_file():
                 raise FileNotFoundError("Repair the MiniMax Code npm installation and Node.js")
-            prefix = [node, str(entry)]
+            prefix = [node, "--import", Path(__file__).with_name("mcode_cancel.mjs").resolve().as_uri(), str(entry)]
         cmd = [*prefix, "exec", "--cwd", str(workspace),
                "--output-format", "stream-json", "--permission", "full",
-               "--timeout", f"{max(1, int(self.timeout_seconds) + 30)}s", "--input", "-"]
+               "--input", "-"]
         if self.model:
             cmd.extend(["--model", self.model])
-        if self.effort and self.effort != "default":
-            cmd.extend(["--effort", self.effort])
+        cmd.extend(["--effort", self.effort if self.effort not in (None, "default") else "low"])
         if session_id:
             cmd.extend(["--session", session_id])
         return cmd
@@ -1092,17 +1101,21 @@ class McodeBackend:
         proc: Any = None
         requested_session = session_id
         started = False
+        active_task.provider_input_delivered = False
         visible_messages: dict[str, str] = {}
         invocation_unix = time.time()
         terminal_error: Any = None
         # A file-backed stdin avoids both Windows command-line limits and a
         # blocking pipe write before the cancellation/deadline loop can start.
         prompt_stream = tempfile.TemporaryFile()
+        cancel_file = Path(tempfile.gettempdir()) / ("stardew-mcode-cancel-" + uuid.uuid4().hex)
+        process_env = dict(os.environ, STARDEW_MCODE_CANCEL_FILE=str(cancel_file))
         try:
             prompt_stream.write(prompt.encode("utf-8"))
             prompt_stream.seek(0)
             proc = subprocess.Popen(cmd, cwd=str(workspace), stdin=prompt_stream, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=process_env)
+            proc.stardew_cancel_file = cancel_file
             active_task.process = proc
             if self.progress:
                 self.progress(BackendProgress(self.name, "started", "已启动 MiniMax Code"))
@@ -1148,6 +1161,13 @@ class McodeBackend:
                 if not isinstance(event, dict):
                     continue
                 kind = event.get("type")
+                item_type = (event.get("item") or {}).get("type")
+                if kind in {"item.started", "item.completed"} and item_type in {"tool_call", "agent_message"}:
+                    active_task.provider_input_delivered = True
+                # A productive sequence has no aggregate wall-clock limit. Bound
+                # each silent interval instead; native actions retain their own watchdog.
+                if kind in {"item.started", "item.completed"} and item_type == "tool_call":
+                    deadline = time.monotonic() + self.timeout_seconds
                 # Public provider events only: never persist reasoning items or credentials.
                 public_item = event.get("item") or {}
                 if (kind in {"session.started", "session.resumed", "turn.completed", "turn.failed", "exec.completed"}
@@ -1186,8 +1206,11 @@ class McodeBackend:
                     item = event.get("item") or {}
                     if item.get("type") == "agent_message" and item.get("content"):
                         text = str(item["content"])
-                        visible_messages[str(item.get("id") or text)] = text
-                        reply = "\n\n".join(visible_messages.values())
+                        message_id = str(item.get("id") or text)
+                        if message_id not in visible_messages and self.progress:
+                            self.progress(BackendProgress(self.name, "public_message", text))
+                        visible_messages[message_id] = text
+                        reply = text
                     elif item.get("type") == "tool_call":
                         call = item.get("toolCall") or {}
                         if self.progress:
@@ -1203,7 +1226,7 @@ class McodeBackend:
                     if result.get("output"):
                         output = str(result["output"])
                         if output != reply and output not in visible_messages.values():
-                            reply = "\n\n".join([*visible_messages.values(), output])
+                            reply = output
                     usage = self._usage(result.get("usage")) or usage
                     if usage and result.get("usageIncomplete"):
                         usage["partial"] = True
@@ -1268,6 +1291,7 @@ class McodeBackend:
                         self.terminate(proc)
                 except Exception:
                     logger.exception("Failed to clean up mcode process")
+            cancel_file.unlink(missing_ok=True)
             active_task.process = None
 
     def run(self, active_task: ActiveTaskLike, session_id: str | None, prompt: str) -> dict[str, Any]:

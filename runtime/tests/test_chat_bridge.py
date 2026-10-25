@@ -310,7 +310,7 @@ def test_format_agent_prompt() -> None:
 
 def test_format_delivery_prompt_contains_chinese_reply_instruction() -> None:
     bridge = ChatBridge()
-    prompt = bridge._format_delivery_prompt([], "save", midflight=[], read_only=False)
+    prompt = bridge._format_delivery_prompt([], "save", midflight=[], execution_deferred=False)
     assert decision_policy() in prompt
 
 
@@ -932,10 +932,10 @@ def test_autonomy_chat_channel_lifecycle_replays_initial_snapshot_and_enable(tmp
 
     asyncio.run(exercise())
     assert not bridge._autonomy_requests  # finished dispatch reservations are released
-    # Native profile synchronization is allowed; routine completion sends no chat reply.
+    # Autonomous public replies and usage telemetry both reach the game.
     families = [json.loads(message)["messageType"] for message in sent]
-    assert "chat.reply" not in families
-    assert set(families) <= {"life.profile.state", "autonomy.state"}
+    assert "chat.reply" in families
+    assert set(families) <= {"life.profile.state", "autonomy.state", "chat.reply"}
     assert "autonomy.state" in families, "terminal usage telemetry remains visible"
 
 
@@ -1770,3 +1770,41 @@ def test_provider_default_effort_omits_unsupported_cli_option(conversation_id):
         assert result["success"]
         assert "--effort" not in popen.call_args[0][0]
         assert ("--conversation" in popen.call_args[0][0]) == bool(conversation_id)
+
+
+def test_work_narration_goes_to_status_and_final_reply_stays_in_chat(tmp_path):
+    from stardew_ai_runtime.agent_backends import BackendProgress
+    async def run():
+        bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        socket = AsyncMock()
+        bridge._configure_backend_progress(socket, "autonomy-public", "save-1")
+        bridge._backend_progress_callback(BackendProgress("mcode", "public_message", "还剩86格，我继续浇水。"))
+        for _ in range(20):
+            if socket.send_text.await_count:
+                break
+            await asyncio.sleep(0.01)
+        packets = [json.loads(call.args[0]) for call in socket.send_text.await_args_list]
+        public = next(p for p in packets if p['payload'].get('status') == 'processing')
+        assert public['payload']['replyText'] == '还剩86格，我继续浇水。'
+        await bridge._send_reply(socket, Envelope.create_chat_reply(
+            bridge.instance_id, "autonomy-public", "completed",
+            "已经浇完。", save_id="save-1"))
+        final = json.loads(socket.send_text.await_args_list[-1].args[0])
+        assert final['payload']['replyText'] == '已经浇完。'
+        assert final['payload']['status'] == 'completed'
+    asyncio.run(run())
+
+
+def test_stop_uses_game_owned_command_without_saved_work_queue(tmp_path):
+    async def run():
+        bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
+        bridge._chat_ws = AsyncMock()
+        bridge._player_session_id = 'game-session'
+        bridge._latest_snapshot_payload = {'companion': {'activeCommandId': 'native-watering'}}
+        assert await bridge._interrupt_short_job('save-1')
+        packet = json.loads(bridge._chat_ws.send_text.await_args.args[0])
+        assert packet['messageType'] == 'skill.cancel'
+        assert packet['correlationId'] == 'native-watering'
+        assert packet['gameSessionId'] == 'game-session'
+        assert not bridge._work_store.state('save-1').tasks
+    asyncio.run(run())

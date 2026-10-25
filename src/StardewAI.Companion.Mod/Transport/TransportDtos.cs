@@ -62,7 +62,8 @@ public sealed record CompanionSnapshot(
     [property: JsonPropertyName("moneyStatus"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? MoneyStatus = null,
     [property: JsonPropertyName("restState"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? RestState = null,
     [property: JsonPropertyName("bedtime"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Bedtime = null,
-    [property: JsonPropertyName("sleepStartedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? SleepStartedAt = null
+    [property: JsonPropertyName("sleepStartedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? SleepStartedAt = null,
+    [property: JsonPropertyName("activeCommandId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ActiveCommandId = null
 );
 
 public sealed record MatureCropTile(
@@ -530,6 +531,8 @@ public sealed record WaterZoneParameters(
     public string? NpcName { get; init; }
     [JsonPropertyName("facing")]
     public int? Facing { get; init; }
+    [JsonPropertyName("targetStamina")]
+    public float? TargetStamina { get; init; }
 }
 
 public sealed record ExecutionBudgets(

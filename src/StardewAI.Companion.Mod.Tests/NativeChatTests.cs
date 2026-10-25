@@ -51,11 +51,11 @@ public class NativeChatTests
     }
 
     [Fact]
-    public void ChatLinesFitActualFontWidthWithoutDroppingText()
+    public void ChatKeepsParagraphsTogetherForNativeWrapping()
     {
-        string text = new string('字', 99);
-        var parts = NativeChatText.Segments(text, s => s.Length * 20, 800).ToArray();
-        Assert.All(parts, p => Assert.True(p.Length * 20 <= 800));
+        string text = new string('字', 99) + "\n继续浇水。";
+        var parts = NativeChatText.Segments(text).ToArray();
+        Assert.Single(parts);
         Assert.Equal(text, string.Concat(parts));
     }
     [Fact]
@@ -75,7 +75,7 @@ public class NativeChatTests
         string text = new string('字', 159) + "😀" + new string('尾', 600);
         var parts = NativeChatText.Segments(text).ToArray();
         Assert.Equal(text, string.Concat(parts));
-        Assert.All(parts, p => Assert.InRange(p.Length, 1, 160));
+        Assert.Single(parts);
         Assert.All(parts, p => Assert.False(char.IsHighSurrogate(p[^1])));
     }
 
@@ -96,5 +96,17 @@ public class NativeChatTests
         Assert.Null(NativeChatText.ReplyTarget("old", new[] { "new" }));
         Assert.Equal("only", NativeChatText.ReplyTarget(null, new[] { "only" }));
         Assert.Null(NativeChatText.ReplyTarget(null, new[] { "one", "two" }));
+    }
+    [Fact]
+    public void FinalReplyDeduplicatesOnlyMessagesActuallyReceived()
+    {
+        var state = new LifeMenuUiState();
+        Assert.True(state.RecordCompanionReply("turn:message:first", "继续浇水。", "1:spring:21"));
+        Assert.False(state.RecordCompanionReply("turn:message:first", "继续浇水。", "1:spring:21"));
+        Assert.True(state.RecordCompanionReply("turn", "继续浇水。\n\n已浇完。", "1:spring:21"));
+        Assert.Equal(new[] { "继续浇水。", "已浇完。" }, state.Conversation.Select(e => e.Text));
+        var missed = new LifeMenuUiState();
+        Assert.True(missed.RecordCompanionReply("turn", "继续浇水。\n\n已浇完。", "1:spring:21"));
+        Assert.Equal("继续浇水。\n\n已浇完。", Assert.Single(missed.Conversation).Text);
     }
 }

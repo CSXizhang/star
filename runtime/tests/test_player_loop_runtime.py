@@ -62,7 +62,7 @@ def test_archived_native_result_and_new_job_have_separate_specific_names(tmp_pat
     assert bridge._player_activity("S")["nextStep"] == "春23日核对鸡舍进度，再继续养鸡安排。"
 
 
-def test_quiet_autonomy_updates_named_work_panel_without_chat_chatter(tmp_path):
+def test_autonomy_updates_work_panel_and_delivers_public_replies(tmp_path):
     from stardew_ai_runtime.work_state import Step, Task
 
     async def run():
@@ -75,9 +75,9 @@ def test_quiet_autonomy_updates_named_work_panel_without_chat_chatter(tmp_path):
         running = Envelope.create_chat_reply(bridge.instance_id, "autonomy-test", "job-running", "routine", save_id="S")
         assert await bridge._send_reply(ws, running)
         await bridge._send_reply(ws, running)
-        assert ws.send_text.await_count == 1
-        payload = json.loads(ws.send_text.call_args.args[0])
-        assert payload["messageType"] == "life.profile.state"
+        packets = [json.loads(call.args[0]) for call in ws.send_text.await_args_list]
+        assert any(p["messageType"] == "chat.reply" for p in packets)
+        payload = next(p for p in packets if p["messageType"] == "life.profile.state")
         assert payload["payload"]["work"]["activity"]["summary"] == "正在处理：浇好新种的菜地"
         bridge._work_store._mutate("S", lambda state: (
             setattr(state.tasks[0], "status", "completed"),
@@ -87,8 +87,9 @@ def test_quiet_autonomy_updates_named_work_panel_without_chat_chatter(tmp_path):
         ))
         await bridge._send_reply(ws, Envelope.create_chat_reply(
             bridge.instance_id, "autonomy-test", "job-completed", "routine", save_id="S"))
-        payload = json.loads(ws.send_text.call_args.args[0])
-        assert ws.send_text.await_count == 2
+        packets = [json.loads(call.args[0]) for call in ws.send_text.await_args_list]
+        payload = [p for p in packets if p["messageType"] == "life.profile.state"][-1]
+        assert packets[-1]["messageType"] == "chat.reply"
         assert payload["payload"]["work"]["activity"]["summary"] == "浇好新种的菜地：已浇水 18 格。"
         assert payload["payload"]["work"]["activity"]["phase"] == "completed"
     asyncio.run(run())

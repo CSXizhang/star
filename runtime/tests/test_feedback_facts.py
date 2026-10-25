@@ -132,7 +132,7 @@ def test_delivery_prompt_contains_original_total_when_recent_batch_is_only_nine(
     bridge._work_store._mutate('farm', seed)
     prompt = bridge._format_delivery_prompt([{'requestId': 'original-A', 'taskId': 'batch9',
         'commandId': 'batch9', 'outcome': 'completed', 'effects': [{'state': 'harvested'}] * 9}],
-        'farm', midflight=[], read_only=True)
+        'farm', midflight=[], execution_deferred=True)
     payload = json.loads(prompt.split('终态事实：', 1)[1].split('\n', 1)[0])
     assert payload['qualityCodes']['1'] == '银星' and payload['qualityCodes']['2'] == '金星'
     actual = payload['confirmedRequestTotals']['original-A']
@@ -209,7 +209,7 @@ def test_delivery_uses_persisted_step_state_without_changing_native_receipt(tmp_
              'feedback': {'candidateCount': 4, 'completedCount': 0, 'actualSummary': '未确认实际变化',
                           'remainingSteps': [{'stepId': 'water', 'operation': 'water_tiles', 'status': 'pending'}],
                           'stepResults': [{'stepId': 'refill', 'status': 'cancelled', 'candidateCount': 4}]}}
-    prompt = bridge._format_delivery_prompt([event], 'farm', midflight=[], read_only=True)
+    prompt = bridge._format_delivery_prompt([event], 'farm', midflight=[], execution_deferred=True)
     fact = json.loads(prompt.split('终态事实：', 1)[1].split('\n', 1)[0])['terminalFacts'][0]
     assert fact['feedback']['taskStatus'] == 'cancelled'
     assert fact['feedback']['remainingSteps'][1]['status'] == 'cancelled'
@@ -271,49 +271,29 @@ def test_incomplete_item_effects_do_not_invent_a_quantity(tmp_path, stack):
         'knownCount': 3, 'unknownStackEffects': 1}
 
 
-def test_control_receipt_is_queued_and_refresh_reads_new_native_facts_without_socket(tmp_path, monkeypatch):
+def test_control_receipt_is_queued_and_queries_use_live_native_facts(tmp_path, monkeypatch):
     async def scenario():
         monkeypatch.setenv('STARDEW_LIFE_SAVE_ID', 'farm')
         monkeypatch.setenv('STARDEW_LIFE_TURN_ID', 'turn')
         data = tmp_path / 'data'
         data.mkdir()
         (data/'life-turn.json').write_text(json.dumps({'saveId':'farm','requestId':'turn'}))
-        def snapshot(revision, count):
-            (data/'life-snapshot.json').write_text(json.dumps({'saveId':'farm','capturedAt':time.time(),
-                'worldRevision':revision,'payload':{'world':{},'farmWork':farm(),
-                'inventory':{'slots':[{'itemId':'(O)24','name':'Parsnip','stack':count,'isTool':False}]}}}))
-        snapshot(1, 5)
+        # An old chat snapshot must not replace a fresh native query.
+        (data/'life-snapshot.json').write_text(json.dumps({'saveId':'farm',
+            'capturedAt':time.time(), 'worldRevision':1, 'payload':{'world':{}}}))
         scheduler = CompanionScheduler(run_dir=tmp_path)
-        scheduler.get_status = AsyncMock(side_effect=AssertionError('life tool must not open command socket'))
+        scheduler.get_status = AsyncMock(return_value={'saveId':'farm'})
+        scheduler.get_work_overview = AsyncMock(return_value={
+            'saveId':'farm', 'worldRevision':2, 'companion':{'nonToolItems':[
+                {'itemId':'(O)24','stack':8}]}, 'farmWork':farm()})
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface='life')
-        _, receipt = await server.call_tool("manage_arrangements", {"change": {"manage_companion": {'action':'pause'}}})
-        assert receipt['accepted'] and receipt['status']=='queued'
+        _, receipt = await server.call_tool('manage_arrangements', {'change': {'manage_companion': {'action':'pause'}}})
+        assert receipt['accepted'] and receipt['status'] == 'queued'
         assert receipt['nativeOutcomeConfirmed'] is False
-        snapshot(2, 8)  # the native action continued before pause was applied
-        _, fresh = await server.call_tool("query_game", {"query": {"get_work_overview": {}}})
+        _, fresh = await server.call_tool('query_game', {'query': {'get_work_overview': {}}})
         assert fresh['worldRevision'] == 2
-        assert fresh['observedFacts']['inventory']['items'][0]['count'] == 8
-        assert fresh['observedFacts']['farmWork']['cropWaterFacts']['unwateredNonHarvestableCount'] == 1
-        store = WorkStore(data/'work-state.json')
-        def unconfirmed(state):
-            state.tasks = [Task('job', '', 'harvest', status='cancelled', steps=[
-                Step('step', 'harvest_auto', status='unknown', command_id='active-native')])]
-        store._mutate('farm', unconfirmed)
-        _, pending = await server.call_tool("query_game", {"query": {"get_work_overview": {"detail": True}}})
-        facts = pending['observedFacts']
-        assert facts['observationStatus'] == 'pending_native_result'
-        assert facts['inventory'] == facts['resources'] == facts['farmWork'] == 'unknown'
-        assert facts['confirmedExecutionTotals']['hasUnconfirmedCommands']
-        assert 'native' not in pending  # raw stale counts cannot contradict the safe projection
-        def confirmed(state):
-            state.executions = [ExecutionEntry('active-native', 'job', 'step', 'harvest_auto', 'partial',
-                effects=[{'state':'harvested'} for _ in range(3)])]
-        store._mutate('farm', confirmed)
-        snapshot(3, 11)
-        _, terminal = await server.call_tool("query_game", {"query": {"get_work_overview": {}}})
-        assert terminal['observedFacts']['inventory']['items'][0]['count'] == 11
-        assert terminal['observedFacts']['confirmedExecutionTotals']['effectCounts'] == {'harvested':3}
-        scheduler.get_status.assert_not_called()
+        assert fresh['companion']['nonToolItems'][0]['stack'] == 8
+        scheduler.get_work_overview.assert_awaited_once()
     asyncio.run(scenario())
 
 

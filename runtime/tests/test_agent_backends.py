@@ -434,12 +434,13 @@ def test_mcode_backend_binds_run_local_mcp_workspace_and_normalizes_usage(tmp_pa
     assert any(e.tool_name == "get_status" and e.kind == "tool_started" for e in events)
 
 
-def test_mcode_leaves_model_and_effort_to_the_cli_when_unset(tmp_path: Path) -> None:
+def test_mcode_uses_local_model_and_low_effort_for_default_game_turn(tmp_path: Path) -> None:
     proc = _mcode_proc([{"type": "exec.completed", "result": {
         "status": "succeeded", "output": "好", "sessionId": "keep-me"}}])
     result, popen = _run_mcode(McodeBackend(tmp_path, effort="default"), proc, "keep-me", "继续")
     cmd = popen.call_args.args[0]
-    assert "--model" not in cmd and "--effort" not in cmd
+    assert "--model" not in cmd and cmd[cmd.index("--effort") + 1] == "low"
+    assert "--timeout" not in cmd
     assert cmd[cmd.index("--session") + 1] == "keep-me"
     assert result["conversation_id"] == "keep-me"
     assert result["success"] is True
@@ -570,7 +571,8 @@ def test_mcode_npm_launch_uses_node_without_shell(tmp_path, suffix):
     node = prefix / "node.exe"
     node.touch()
     command = McodeBackend(tmp_path)._command(str(prefix / ("mcode" + suffix)), tmp_path, None)
-    assert command[:3] == [str(node), str(entry), "exec"]
+    assert command[:2] == [str(node), "--import"]
+    assert command[3:5] == [str(entry), "exec"]
     assert command[command.index("--input") + 1] == "-"
 
 
@@ -601,13 +603,26 @@ def test_mcode_honors_provider_incomplete_usage(tmp_path):
     assert result["usage"]["total_tokens"] == 32
 
 @pytest.mark.parametrize('final', ['材料已核对，尚未开始砍树。', '收到，先准备鸡舍。\n\n材料已核对，尚未开始砍树。'])
-def test_mcode_keeps_all_visible_messages_without_repeating_exec_output(tmp_path, final):
+def test_mcode_final_reply_does_not_replay_progress_messages(tmp_path, final):
     events = [
         {'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'content': '收到，先准备鸡舍。'}},
         {'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'content': '收到，先准备鸡舍。'}},
         {'type': 'item.completed', 'item': {'id': 'b', 'type': 'agent_message', 'content': '材料已核对，尚未开始砍树。'}},
         {'type': 'exec.completed', 'result': {'status': 'succeeded', 'sessionId': 's', 'output': final}},
     ]
-    result, _ = _run_mcode(McodeBackend(tmp_path), _mcode_proc(events))
+    progress = []
+    result, _ = _run_mcode(McodeBackend(tmp_path, progress=progress.append), _mcode_proc(events))
+    assert [event.message for event in progress if event.kind == "public_message"] == [
+        '收到，先准备鸡舍。', '材料已核对，尚未开始砍树。']
     assert result['success']
-    assert result['response'] == '收到，先准备鸡舍。\n\n材料已核对，尚未开始砍树。'
+    assert result['response'] == final
+
+
+def test_mcode_productive_tools_extend_silent_interval_not_total_deadline(tmp_path):
+    fake = tmp_path / 'productive.py'
+    fake.write_text("import json,time\nfor i in range(5):\n print(json.dumps({'type':'item.completed','item':{'type':'tool_call','toolCall':{'name':'get_status'}}}),flush=True)\n time.sleep(.15)\nprint(json.dumps({'type':'exec.completed','result':{'status':'succeeded','sessionId':'live','output':'done'}}),flush=True)\n")
+    backend = McodeBackend(tmp_path, command=sys.executable, timeout_seconds=.4)
+    backend._command = lambda *a: [sys.executable, str(fake)]
+    task = _task()
+    result = backend.run(task, None, 'work')
+    assert result['success'] and task.provider_input_delivered

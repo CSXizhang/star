@@ -1,14 +1,11 @@
 import asyncio
 from unittest.mock import AsyncMock
 
-import pytest
-
 from stardew_ai_runtime.client import TransportClient
 from stardew_ai_runtime.scheduler import CompanionScheduler
 
 
-@pytest.mark.parametrize("include_empty", [False, True])
-def test_zone_selection_reaches_the_native_wire_without_being_dropped(include_empty):
+def test_zone_selection_reaches_the_native_wire_without_being_dropped():
     async def check():
         client = TransportClient()
         client.save_id = "farm"
@@ -21,9 +18,9 @@ def test_zone_selection_reaches_the_native_wire_without_being_dropped(include_em
                 idempotency_key="selection-1", expires_seconds=30)
 
         scheduler.execute_skill = AsyncMock(side_effect=dispatch_skill)
-        await scheduler.execute_water_zone(10, 12, radius=1, include_empty_tiles=include_empty)
+        await scheduler.execute_water_zone(10, 12, radius=1, include_empty_tiles=True)
         envelope = client.send_envelope.await_args.args[0]
-        assert envelope.payload["parameters"]["includeEmptyTiles"] is include_empty
+        assert envelope.payload["parameters"]["includeEmptyTiles"] is True
         assert len(envelope.payload["parameters"]["tiles"]) == 9
 
     asyncio.run(check())

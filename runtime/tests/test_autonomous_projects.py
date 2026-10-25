@@ -118,6 +118,10 @@ def test_map_image_is_mcp_content_and_rejects_arbitrary_file(tmp_path, monkeypat
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="full")
         result = await server.call_tool("observe_map_image", {})
+        compact = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="light")
+        compact_result = await compact.call_tool("query_game", {"query": {"observe_map_image": {}}})
+        assert compact_result.content[0].type == "image"
+        assert compact_result.content[0].data == result[0].data
         assert result[0].type == "image" and result[0].mimeType == "image/png"
         scheduler.query_map_image.return_value = {"path": str(tmp_path / "private.png")}
         with pytest.raises(ToolError, match="controlled image directory"):
@@ -125,7 +129,7 @@ def test_map_image_is_mcp_content_and_rejects_arbitrary_file(tmp_path, monkeypat
         names = {tool.name for tool in await server.list_tools()}
         assert "observe_map_image" in names
         life = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="life")
-        assert "observe_map_image" not in {tool.name for tool in await life.list_tools()}
+        assert "query_game" in {tool.name for tool in await life.list_tools()}
     asyncio.run(run())
 
 
@@ -197,7 +201,7 @@ def test_space_region_preserves_absolute_coordinates_and_full_map_default():
             await sched.query_farm_space(region={**region, "width": 0})
         wrapper = MagicMock()
         wrapper.query_farm_space = AsyncMock(side_effect=sched.query_farm_space)
-        server = create_mcp_server(scheduler=wrapper, surface="light")
+        server = create_mcp_server(scheduler=wrapper, surface="full")
         _, result = await server.call_tool("observe_farm_space", {"region": region})
         assert result == expected
         with pytest.raises(ToolError):

@@ -142,7 +142,7 @@ def test_work_plan_overview_exempt_from_protect_job(tmp_path):
     mock_sched = MagicMock()
     mock_sched.get_status = AsyncMock(return_value={"saveId": "Save1"})
     mock_sched.latest_snapshot = {"payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 1}}}
-    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_sched, surface="light")
+    server = create_mcp_server(run_dir=tmp_path, scheduler=mock_sched, surface="full")
 
     async def run():
         # Calling work_plan_overview through call_capability should not raise SHORT_JOB_UNSUPPORTED

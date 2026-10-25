@@ -82,13 +82,13 @@ def test_midflight_player_chat_is_recorded_and_answered_read_only(tmp_path, monk
     bridge._chat_ws = ws
 
     life_turns = []
-    original_life = bridge._execute_life_turn
+    original_life = bridge._execute_turn
 
-    def spy_life(active_task, conversation_id, prompt, mode="chat"):
+    def spy_life(active_task, conversation_id, prompt):
         life_turns.append((active_task, prompt))
-        return original_life(active_task, conversation_id, prompt, mode=mode)
+        return original_life(active_task, conversation_id, prompt)
 
-    bridge._execute_life_turn = spy_life
+    bridge._execute_turn = spy_life
 
     seen = []
 
@@ -106,7 +106,7 @@ def test_midflight_player_chat_is_recorded_and_answered_read_only(tmp_path, monk
 
         # The turn ran on the cached life surface with no decision token.
         assert len(life_turns) == 1
-        assert seen == [{"surface": "life", "token": None, "mode": "chat"}]
+        assert seen == [{"surface": "life", "token": None, "mode": None}]
         active, prompt = life_turns[0]
         assert active.read_only is True
         assert '"workDispatchAvailable": false' in prompt
@@ -203,7 +203,7 @@ def test_preparation_prefix_keeps_the_claiming_execution_path(tmp_path, monkeypa
         # they run a regular claiming turn with a fresh decision token.
         life_turns.assert_not_called()
         assert len(seen) == 1
-        assert seen[0]["surface"] is None
+        assert seen[0]["surface"] == "light"
         assert seen[0]["token"]
         recorded = next(r for r in bridge._work_store.state("Save1").requests
                         if r["id"] == "preparation-abc123")

@@ -32,7 +32,7 @@ from typing import Any
 
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 
-from stardew_ai_runtime.job_feedback import compact_job_feedback
+from stardew_ai_runtime.job_feedback import compact_job_feedback, timed_out_receipt
 from stardew_ai_runtime.work_state import (
     READ_ONLY_OPERATIONS,
     WorkStateError,
@@ -532,6 +532,22 @@ class PlanExecutor:
                     compact_job_feedback(result, operation=step.operation, status="unknown"))
             result = await self._await_native_terminal(save_id, command_id, result,
                                                        operation=step.operation, params=dispatch_params)
+
+        # A timeout can arrive after effects were applied. Read the same native
+        # command once; never replay it to discover whether it succeeded.
+        if timed_out_receipt(result) and self.reconcile is not None:
+            try:
+                receipt = await self.reconcile(command_id)
+                if isinstance(receipt, dict) and receipt.get("terminalState") in {
+                    "succeeded", "partially-succeeded", "partial", "failed", "rejected", "cancelled", "canceled",
+                }:
+                    result = merge_reconciled_operation_result(step.operation, result, receipt, params=dispatch_params)
+                    result = {**result, "reconciliation": "same_command_terminal_receipt"}
+                else:
+                    result = {**result, "reconciliation": "terminal_receipt_unconfirmed"}
+            except Exception:
+                logger.debug("Timeout receipt reconciliation failed for %s", command_id, exc_info=True)
+                result = {**result, "reconciliation": "unavailable"}
 
         # A native result may name an explicit, checkable precondition (e.g. the
         # shop is closed, the player is standing on the tile, seeds are missing).

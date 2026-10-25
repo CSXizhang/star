@@ -159,6 +159,43 @@ def mark_game_load_applied(run_dir: Path, request: dict[str, Any]) -> None:
     _write(path, document)
 
 
+def rotate_provider_sessions(run_dir: Path, request: dict[str, Any],
+                             sessions: dict[str, str], sessions_file: Path) -> None:
+    """Checkpoint a bounded handoff before detaching old provider histories.
+
+    Saved goals, agreements and decisions already live in reload_context; do not
+    copy provider reasoning/tool transcripts or pay for another model generation.
+    """
+    save_id = request["saveId"]
+    key = hashlib.sha256((save_id + ":" + request["gameSessionId"]).encode()).hexdigest()
+    path = run_dir / "data/reloads" / (key + "-sessions.json")
+    old = {k: v for k, v in sessions.items() if k == save_id or k.endswith(":" + save_id)}
+    if not path.exists():
+        discussions = _read(sessions_file.with_name("life_discussions.json"))
+        recent = discussions.get(f"{save_id}:chat", {}).get("turns", [])
+        dialogue = []
+        budget = 2000
+        for turn in reversed(recent[-4:]):
+            text = str(turn.get("text") or "")
+            if not text or len(text) > budget:
+                continue
+            dialogue.insert(0, {"speaker": turn.get("speaker"), "text": text})
+            budget -= len(text)
+        _write(path, {"saveId": save_id, "gameSessionId": request["gameSessionId"],
+                      "previousSessions": old, "recentDialogue": dialogue})
+    checkpoint = _read(path)
+    summaries = _read(run_dir / "data/reload-context.json")
+    summary = summaries.setdefault(save_id, {})
+    summary["conversationHandoff"] = {
+        "recentDialogue": checkpoint.get("recentDialogue", []),
+        "instruction": "新游戏会话：沿用已保存目标、约定和决定；摘录仅供衔接交流，旧回复中的行动和数量不作当前事实。完整原文按需分页读取。",
+    }
+    _write(run_dir / "data/reload-context.json", summaries)
+    for name in old:
+        sessions.pop(name, None)
+    _write(sessions_file, sessions)
+
+
 def reload_context(run_dir: Path | None, save_id: str | None) -> dict[str, Any] | None:
     if run_dir is None or not save_id:
         return None

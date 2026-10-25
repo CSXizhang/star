@@ -408,6 +408,7 @@ def test_mcode_backend_binds_run_local_mcp_workspace_and_normalizes_usage(tmp_pa
     workspace = tmp_path / "data" / "mcode"
     assert cmd[0:2] == ["mcode.exe", "exec"]
     assert cmd[cmd.index("--cwd") + 1] == str(workspace)
+    assert "--config" not in cmd
     assert cmd[cmd.index("--output-format") + 1] == "stream-json"
     assert cmd[cmd.index("--permission") + 1] == "full"
     assert cmd[cmd.index("--effort") + 1] == "low"
@@ -598,3 +599,15 @@ def test_mcode_honors_provider_incomplete_usage(tmp_path):
     result, _ = _run_mcode(McodeBackend(tmp_path), proc)
     assert result["success"] and result["usage"]["partial"]
     assert result["usage"]["total_tokens"] == 32
+
+@pytest.mark.parametrize('final', ['材料已核对，尚未开始砍树。', '收到，先准备鸡舍。\n\n材料已核对，尚未开始砍树。'])
+def test_mcode_keeps_all_visible_messages_without_repeating_exec_output(tmp_path, final):
+    events = [
+        {'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'content': '收到，先准备鸡舍。'}},
+        {'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'content': '收到，先准备鸡舍。'}},
+        {'type': 'item.completed', 'item': {'id': 'b', 'type': 'agent_message', 'content': '材料已核对，尚未开始砍树。'}},
+        {'type': 'exec.completed', 'result': {'status': 'succeeded', 'sessionId': 's', 'output': final}},
+    ]
+    result, _ = _run_mcode(McodeBackend(tmp_path), _mcode_proc(events))
+    assert result['success']
+    assert result['response'] == '收到，先准备鸡舍。\n\n材料已核对，尚未开始砍树。'

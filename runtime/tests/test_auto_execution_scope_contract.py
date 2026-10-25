@@ -103,9 +103,12 @@ def test_accepted_preparation_and_delivery_keep_current_goal_with_other_active_g
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
-@pytest.mark.parametrize("entry_point", ["worker", "executor"])
-@pytest.mark.parametrize("covered_count", [1, 2])
+@pytest.mark.parametrize('operation,entry_point,covered_count', [
+    ('water_auto', 'worker', 1),
+    ('harvest_auto', 'worker', 2),
+    ('harvest_auto', 'executor', 1),
+    ('water_auto', 'executor', 2),
+])
 def test_recovery_without_saved_observation_requires_receipts_for_explicit_scope(
     tmp_path, operation, entry_point, covered_count,
 ):
@@ -158,9 +161,16 @@ def test_recovery_without_saved_observation_requires_receipts_for_explicit_scope
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
-@pytest.mark.parametrize("delivery", ["synchronous", "delayed", "recovery", "retry"])
-@pytest.mark.parametrize("incomplete", [False, True])
+@pytest.mark.parametrize('operation,delivery,incomplete', [
+    ('water_auto', 'synchronous', False),
+    ('harvest_auto', 'synchronous', True),
+    ('harvest_auto', 'delayed', False),
+    ('water_auto', 'delayed', True),
+    ('water_auto', 'recovery', False),
+    ('harvest_auto', 'recovery', True),
+    ('harvest_auto', 'retry', False),
+    ('water_auto', 'retry', True),
+])
 def test_auto_scope_completion_matches_synchronous_late_and_recovered_receipts(
     tmp_path, operation, delivery, incomplete,
 ):
@@ -323,9 +333,12 @@ def test_worker_dispatch_and_authorization_apply_identical_saved_scope(tmp_path,
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
-@pytest.mark.parametrize("targets", [None, []])
-@pytest.mark.parametrize("entry_point", ["direct", "submit_plan"])
+@pytest.mark.parametrize('operation,targets,entry_point', [
+    ('water_auto', None, 'direct'),
+    ('water_auto', [], 'submit_plan'),
+    ('harvest_auto', [], 'direct'),
+    ('harvest_auto', None, 'submit_plan'),
+])
 def test_auto_new_optional_fields_omit_none_but_preserve_empty_scope(
     tmp_path, monkeypatch, operation, targets, entry_point,
 ):

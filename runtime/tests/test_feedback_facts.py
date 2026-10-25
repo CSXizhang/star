@@ -286,11 +286,11 @@ def test_control_receipt_is_queued_and_refresh_reads_new_native_facts_without_so
         scheduler = CompanionScheduler(run_dir=tmp_path)
         scheduler.get_status = AsyncMock(side_effect=AssertionError('life tool must not open command socket'))
         server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface='life')
-        _, receipt = await server.call_tool('manage_companion', {'action':'pause'})
+        _, receipt = await server.call_tool("manage_arrangements", {"change": {"manage_companion": {'action':'pause'}}})
         assert receipt['accepted'] and receipt['status']=='queued'
         assert receipt['nativeOutcomeConfirmed'] is False
         snapshot(2, 8)  # the native action continued before pause was applied
-        _, fresh = await server.call_tool('get_work_overview', {})
+        _, fresh = await server.call_tool("query_game", {"query": {"get_work_overview": {}}})
         assert fresh['worldRevision'] == 2
         assert fresh['observedFacts']['inventory']['items'][0]['count'] == 8
         assert fresh['observedFacts']['farmWork']['cropWaterFacts']['unwateredNonHarvestableCount'] == 1
@@ -299,7 +299,7 @@ def test_control_receipt_is_queued_and_refresh_reads_new_native_facts_without_so
             state.tasks = [Task('job', '', 'harvest', status='cancelled', steps=[
                 Step('step', 'harvest_auto', status='unknown', command_id='active-native')])]
         store._mutate('farm', unconfirmed)
-        _, pending = await server.call_tool('get_work_overview', {'detail': True})
+        _, pending = await server.call_tool("query_game", {"query": {"get_work_overview": {"detail": True}}})
         facts = pending['observedFacts']
         assert facts['observationStatus'] == 'pending_native_result'
         assert facts['inventory'] == facts['resources'] == facts['farmWork'] == 'unknown'
@@ -310,8 +310,19 @@ def test_control_receipt_is_queued_and_refresh_reads_new_native_facts_without_so
                 effects=[{'state':'harvested'} for _ in range(3)])]
         store._mutate('farm', confirmed)
         snapshot(3, 11)
-        _, terminal = await server.call_tool('get_work_overview', {})
+        _, terminal = await server.call_tool("query_game", {"query": {"get_work_overview": {}}})
         assert terminal['observedFacts']['inventory']['items'][0]['count'] == 11
         assert terminal['observedFacts']['confirmedExecutionTotals']['effectCounts'] == {'harvested':3}
         scheduler.get_status.assert_not_called()
     asyncio.run(scenario())
+
+
+def test_unreachable_receipt_requests_obstacle_decision_without_choosing_an_action():
+    from stardew_ai_runtime.job_feedback import compact_job_feedback
+    result = compact_job_feedback({"effects": [{"state": "skipped", "reason": "unreachable"}],
+                                   "skippedCount": 1}, operation="refill_watering_can", status="partial")
+    assert result["skipReasons"] == {"unreachable": 1}
+    assert "player preservation" in result["obstacleAssessment"]
+    assert "does not prove removable" in result["obstacleAssessment"]
+    assert result["nextBusiness"] == "new_model_decision_required"
+    assert "obstacleAssessment" not in compact_job_feedback({"reasonCode": "OUT_OF_STAMINA"})

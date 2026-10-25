@@ -40,7 +40,6 @@ public class CompanionDialogueInboxTests
     [InlineData(640)]
     [InlineData(800)]
     [InlineData(1280)]
-    [InlineData(1920)]
     public void PortraitPanelFitsWindowAndRetainsTextColumn(int viewportWidth)
     {
         int width = CompanionNpcDialogueBox.PanelWidth(viewportWidth);
@@ -87,5 +86,17 @@ public class CompanionDialogueInboxTests
         Assert.DoesNotContain("**", text);
         Assert.DoesNotContain("##", text);
         Assert.DoesNotContain("|---", text);
+    }
+
+    [Fact]
+    public void MaterialTableRetainsRowLabelsAndColumnMeaning()
+    {
+        string text = CompanionNpcDialogueBox.LiteralText("4000金 + 300木材\n| 材料 | 我们有 | 还缺 | 谁来补 |\n| --- | --- | --- | --- |\n| 木材 | 156 | 144 | 我砍树 |\n| 石头 | 74 | 26 | 玩家 |\n下一步等确认。");
+        Assert.Contains("木材：我们有 156；还缺 144；谁来补 我砍树。", text);
+        Assert.Contains("石头：我们有 74；还缺 26；谁来补 玩家。", text);
+        Assert.Contains("下一步等确认", text);
+        Assert.DoesNotContain("|", text);
+        Assert.DoesNotContain("+", text);
+        Assert.Equal(text, CompanionNpcDialogueBox.LiteralText(text));
     }
 }

@@ -21,7 +21,7 @@ def test_execution_status_and_overview_match_life_water_observation(tmp_path, qu
         expected = water_can_resources(native)
         for tool in ("get_status", "get_work_overview"):
             for detail in (False, True):
-                _, result = await server.call_tool(tool, {"detail": detail})
+                _, result = await server.call_tool(tool, {"detail": detail}) if tool == "get_status" else await server.call_tool("query_game", {"query": {tool: {"detail": detail}}})
                 companion = result["companion"]
                 assert companion["waterCan"] == expected
                 assert "waterCanLevel" not in companion and "maxWaterCanLevel" not in companion

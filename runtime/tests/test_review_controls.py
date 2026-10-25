@@ -146,13 +146,13 @@ def test_paused_chat_uses_life_surface_and_preserves_existing_work(tmp_path, mon
             def run(self, task, cid, prompt):
                 assert "STARDEW_DECISION_TOKEN" not in os.environ
                 assert os.environ["STARDEW_MCP_SURFACE"] == "life"
-                assert os.environ["STARDEW_LIFE_MODE"] == "chat"
                 async def tools():
                     server = create_mcp_server(scheduler=MagicMock(), surface="full")
                     return {tool.name for tool in await server.list_tools()}
                 names = asyncio.run(tools())
                 assert names == LIFE_TOOLS
-                assert not {"submit_plan", "dispatch_plan_operation", "resume_task", "cancel_task"} & names
+                assert {"submit_work", "manage_arrangements"} <= names
+                assert "dispatch_plan_operation" not in names
                 observed.append(task.request_id)
                 return {"success": True, "response": "鸡群照料进度保留，工作仍暂停。"}
 

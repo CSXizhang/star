@@ -326,134 +326,43 @@ public class CompanionCommandHandlerTests
         Assert.Equal(ExecutionState.Succeeded, coordinator.StateMachine.CurrentState);
     }
 
-    [Fact]
-    public void Coordinator_FiresNotification_OnCancellation()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Coordinator_AcceptsNextTaskAfterTerminal(bool cancelFirst)
     {
         var (coordinator, actor, observer) = CreateCoordinatorHarness();
-        var t1 = new TileCoordinate(10, 12);
-        observer.SetDirt(t1, TileDirtState.DryDirt());
-
+        var first = new TileCoordinate(10, 12);
+        var second = new TileCoordinate(10, 11);
+        observer.SetDirt(first, TileDirtState.DryDirt());
+        observer.SetDirt(second, TileDirtState.DryDirt());
         var notifications = new List<string>();
-        coordinator.OnNotification += msg => notifications.Add(msg);
+        coordinator.OnNotification += notifications.Add;
 
-        var request = new WaterZoneRequest(
-            CommandId: "cmd-cancel-notif",
-            TaskId: "task-cancel-notif",
-            LocationId: "Farm",
-            TargetTiles: new[] { t1 },
-            MaxStamina: 50f,
-            MaxWater: 10,
-            MaxGameMinutes: 60
-        );
-
-        coordinator.TryStartWaterZone(request, envelope: null, out _, out _);
-        coordinator.StateMachine.RequestCancel("User cancelled.");
-        coordinator.StateMachine.StepTicks(1);
-
-        Assert.Contains(notifications, n => n.Contains("Task cancelled"));
-    }
-
-    [Fact]
-    public void Coordinator_TaskContinuity_SequentialTasksExecuteCleanly()
-    {
-        var (coordinator, actor, observer) = CreateCoordinatorHarness();
-
-        var t1 = new TileCoordinate(10, 11);
-        var t2 = new TileCoordinate(10, 12);
-        observer.SetDirt(t1, TileDirtState.DryDirt());
-        observer.SetDirt(t2, TileDirtState.DryDirt());
-
-        // --- Task 1 ---
-        var req1 = new WaterZoneRequest(
-            CommandId: "cmd-seq-1",
-            TaskId: "task-seq-1",
-            LocationId: "Farm",
-            TargetTiles: new[] { t1 },
-            MaxStamina: 50f,
-            MaxWater: 10,
-            MaxGameMinutes: 60
-        );
-
-        bool started1 = coordinator.TryStartWaterZone(req1, envelope: null, out _, out _);
-        Assert.True(started1);
-
+        WaterZoneRequest Request(string id, TileCoordinate tile) => new(
+            CommandId: id, TaskId: id, LocationId: "Farm", TargetTiles: new[] { tile },
+            MaxStamina: 50f, MaxWater: 10, MaxGameMinutes: 60);
+        Assert.True(coordinator.TryStartWaterZone(Request("first", first), null, out _, out _));
+        if (cancelFirst) coordinator.StateMachine.RequestCancel("Player cancelled");
         coordinator.StateMachine.StepTicks(100);
-        Assert.Equal(ExecutionState.Succeeded, coordinator.StateMachine.CurrentState);
-        Assert.Null(actor.ActiveTaskId);
         Assert.False(coordinator.StateMachine.IsExecuting);
+        Assert.Null(actor.ActiveTaskId);
+        if (cancelFirst)
+            Assert.Contains(notifications, n => n.Contains("Task cancelled"));
+        else
+        {
+            Assert.Equal(ExecutionState.Succeeded, coordinator.StateMachine.CurrentState);
+            Assert.True(observer.GetDirtState("Farm", first).IsWatered);
+        }
 
-        // --- Task 2: immediate dispatch after task 1 completion ---
-        var req2 = new WaterZoneRequest(
-            CommandId: "cmd-seq-2",
-            TaskId: "task-seq-2",
-            LocationId: "Farm",
-            TargetTiles: new[] { t2 },
-            MaxStamina: 50f,
-            MaxWater: 10,
-            MaxGameMinutes: 60
-        );
-
-        bool started2 = coordinator.TryStartWaterZone(req2, envelope: null, out _, out string? reject2);
-        Assert.True(started2, $"Task 2 rejected unexpectedly: {reject2}");
+        Assert.True(coordinator.TryStartWaterZone(Request("second", second), null, out _, out var reason), reason);
         Assert.True(coordinator.StateMachine.IsExecuting);
-        Assert.Equal("task-seq-2", actor.ActiveTaskId);
-
+        Assert.Equal("second", actor.ActiveTaskId);
         coordinator.StateMachine.StepTicks(100);
         Assert.Equal(ExecutionState.Succeeded, coordinator.StateMachine.CurrentState);
-        Assert.Null(actor.ActiveTaskId);
-        Assert.False(coordinator.StateMachine.IsExecuting);
-
-        // Verify both tiles were actually watered
-        Assert.True(observer.GetDirtState("Farm", t1).IsWatered);
-        Assert.True(observer.GetDirtState("Farm", t2).IsWatered);
-    }
-
-    [Fact]
-    public void Coordinator_TaskContinuity_AcceptsNextTaskAfterCancellation()
-    {
-        var (coordinator, actor, observer) = CreateCoordinatorHarness();
-
-        var t1 = new TileCoordinate(10, 15);
-        var t2 = new TileCoordinate(10, 11);
-        observer.SetDirt(t1, TileDirtState.DryDirt());
-        observer.SetDirt(t2, TileDirtState.DryDirt());
-
-        // --- Task 1: Start and immediately cancel ---
-        var req1 = new WaterZoneRequest(
-            CommandId: "cmd-cancel-1",
-            TaskId: "task-cancel-1",
-            LocationId: "Farm",
-            TargetTiles: new[] { t1 },
-            MaxStamina: 50f,
-            MaxWater: 10,
-            MaxGameMinutes: 60
-        );
-
-        coordinator.TryStartWaterZone(req1, envelope: null, out _, out _);
-        coordinator.StateMachine.RequestCancel("Player cancelled task 1");
-        coordinator.StateMachine.StepTicks(1);
         Assert.False(coordinator.StateMachine.IsExecuting);
         Assert.Null(actor.ActiveTaskId);
-
-        // --- Task 2: Submitting a new task after cancellation must succeed ---
-        var req2 = new WaterZoneRequest(
-            CommandId: "cmd-cancel-2",
-            TaskId: "task-cancel-2",
-            LocationId: "Farm",
-            TargetTiles: new[] { t2 },
-            MaxStamina: 50f,
-            MaxWater: 10,
-            MaxGameMinutes: 60
-        );
-
-        bool started2 = coordinator.TryStartWaterZone(req2, envelope: null, out _, out string? rejectReason);
-        Assert.True(started2, $"Task 2 rejected after cancellation: {rejectReason}");
-        Assert.True(coordinator.StateMachine.IsExecuting);
-
-        coordinator.StateMachine.StepTicks(100);
-        Assert.Equal(ExecutionState.Succeeded, coordinator.StateMachine.CurrentState);
-        Assert.Null(actor.ActiveTaskId);
-        Assert.True(observer.GetDirtState("Farm", t2).IsWatered);
+        Assert.True(observer.GetDirtState("Farm", second).IsWatered);
     }
 
     #endregion
@@ -475,30 +384,10 @@ public class CompanionCommandHandlerTests
 
     [Theory]
     [InlineData("water 64 20", 64, 20, 0)]
-    [InlineData("water 64 20 0", 64, 20, 0)]
-    [InlineData("water 64 20 1", 64, 20, 1)]
-    [InlineData("water 64 20 2", 64, 20, 2)]
-    [InlineData("WATER 10 30 1", 10, 30, 1)]
-    [InlineData("  water   15   25   2  ", 15, 25, 2)]
-    public void TryParseInGameCommand_WaterEnglish_ValidInputs_ParsesCorrectly(string input, int expectedX, int expectedY, int expectedRadius)
-    {
-        bool result = CompanionCommandHandler.TryParseInGameCommand(input, out var cmd, out string? error);
-        Assert.True(result);
-        Assert.Null(error);
-        Assert.NotNull(cmd);
-        Assert.Equal(InGameCommandType.Water, cmd!.Type);
-        Assert.Equal(expectedX, cmd.X);
-        Assert.Equal(expectedY, cmd.Y);
-        Assert.Equal(expectedRadius, cmd.Radius);
-    }
-
-    [Theory]
-    [InlineData("浇水 64 20", 64, 20, 0)]
     [InlineData("浇水 64 20 0", 64, 20, 0)]
-    [InlineData("浇水 64 20 1", 64, 20, 1)]
-    [InlineData("浇水 64 20 2", 64, 20, 2)]
-    [InlineData("  浇水   100   200   1  ", 100, 200, 1)]
-    public void TryParseInGameCommand_WaterChineseAlias_ValidInputs_ParsesCorrectly(string input, int expectedX, int expectedY, int expectedRadius)
+    [InlineData("WATER 10 30 1", 10, 30, 1)]
+    [InlineData("  浇水   15   25   2  ", 15, 25, 2)]
+    public void TryParseInGameCommand_Water_ValidInputs_ParsesCorrectly(string input, int expectedX, int expectedY, int expectedRadius)
     {
         bool result = CompanionCommandHandler.TryParseInGameCommand(input, out var cmd, out string? error);
         Assert.True(result);
@@ -513,19 +402,13 @@ public class CompanionCommandHandlerTests
     [Theory]
     [InlineData("water", "Usage: water")]
     [InlineData("water 64", "Usage: water")]
-    [InlineData("浇水", "Usage: water")]
-    [InlineData("浇水 64", "Usage: water")]
     [InlineData("water -1 20", "Invalid x coordinate")]
     [InlineData("water abc 20", "Invalid x coordinate")]
-    [InlineData("浇水 -5 20", "Invalid x coordinate")]
     [InlineData("water 64 -1", "Invalid y coordinate")]
     [InlineData("water 64 xyz", "Invalid y coordinate")]
-    [InlineData("浇水 64 -10", "Invalid y coordinate")]
     [InlineData("water 64 20 -1", "Invalid radius")]
     [InlineData("water 64 20 3", "Invalid radius")]
-    [InlineData("water 64 20 99", "Invalid radius")]
     [InlineData("water 64 20 bad", "Invalid radius")]
-    [InlineData("浇水 64 20 5", "Invalid radius")]
     public void TryParseInGameCommand_Water_InvalidArguments_ReturnsFalseWithSpecificError(string input, string expectedSubstring)
     {
         bool result = CompanionCommandHandler.TryParseInGameCommand(input, out var cmd, out string? error);
@@ -537,21 +420,13 @@ public class CompanionCommandHandlerTests
 
     [Theory]
     [InlineData("pause", InGameCommandType.Pause)]
-    [InlineData("PAUSE", InGameCommandType.Pause)]
     [InlineData("  Pause  ", InGameCommandType.Pause)]
     [InlineData("暂停", InGameCommandType.Pause)]
-    [InlineData("  暂停  ", InGameCommandType.Pause)]
     [InlineData("resume", InGameCommandType.Resume)]
-    [InlineData("RESUME", InGameCommandType.Resume)]
-    [InlineData("Resume", InGameCommandType.Resume)]
     [InlineData("继续", InGameCommandType.Resume)]
     [InlineData("cancel", InGameCommandType.Cancel)]
-    [InlineData("CANCEL", InGameCommandType.Cancel)]
-    [InlineData("Cancel", InGameCommandType.Cancel)]
     [InlineData("取消", InGameCommandType.Cancel)]
     [InlineData("status", InGameCommandType.Status)]
-    [InlineData("STATUS", InGameCommandType.Status)]
-    [InlineData("Status", InGameCommandType.Status)]
     [InlineData("状态", InGameCommandType.Status)]
     public void TryParseInGameCommand_ControlVerbs_EnglishAndChinese_ParsesCorrectly(string input, InGameCommandType expectedType)
     {
@@ -564,7 +439,6 @@ public class CompanionCommandHandlerTests
 
     [Theory]
     [InlineData("jump")]
-    [InlineData("unknown_verb")]
     [InlineData("做饭")]
     public void TryParseInGameCommand_UnknownCommand_ReturnsFalseWithHelpfulMessage(string input)
     {

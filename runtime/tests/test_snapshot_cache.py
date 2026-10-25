@@ -82,7 +82,7 @@ def test_new_published_lease_rejects_old_mcp_turn(tmp_path, monkeypatch):
         await server.call_tool("get_status", {})
         bridge._life_turn_lease("B", "farm")
         with pytest.raises(ToolError, match="STALE_CONVERSATION"):
-            await server.call_tool("manage_milestones", {"action": "propose", "title": "Old turn"})
+            await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "propose", "title": "Old turn"}}})
     asyncio.run(exercise())
 
 

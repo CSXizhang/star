@@ -32,7 +32,7 @@ def mcode_tool_schema(name: str, schema: dict[str, Any], parameter_shapes: dict[
                            field, seen | {ref})
         result = {}
         for key, part in value.items():
-            if key in {"$defs", "definitions"}:
+            if key in {"$defs", "definitions", "title"} or key == "default" and part is None:
                 continue
             if key == "properties":
                 result[key] = {prop: resolve(shape, prop, seen) for prop, shape in part.items()}
@@ -42,6 +42,11 @@ def mcode_tool_schema(name: str, schema: dict[str, Any], parameter_shapes: dict[
         # An anyOf(array, XML-wrapper) hides items from mcode's shallow converter
         # and turns nested coordinate/count values into strings. The canonical
         # parser still accepts bounded legacy wrappers, but new calls are typed.
+        variants = result.get("anyOf")
+        if variants:
+            concrete = [v for v in variants if v.get("type") != "null"]
+            if len(concrete) == 1:
+                result = {**{k: v for k, v in result.items() if k != "anyOf"}, **concrete[0]}
         return result
 
     return resolve(root)

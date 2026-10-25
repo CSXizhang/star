@@ -4,7 +4,7 @@ The installed game provider profile (.kimi-code/mcp.json, written by
 tools/register-mcp.ps1) always launches the server with ``--surface light``.
 The life-chat bridge injects ``STARDEW_MCP_SURFACE=life`` into the model backend
 environment, so the MCP server spawned for a life turn must expose exactly the
-read-only LIFE_TOOLS despite the CLI flag. When the env var is absent,
+shared LIFE_TOOLS with cached admission despite the CLI flag. When the env var is absent,
 ``--surface light`` keeps its original behaviour.
 """
 from __future__ import annotations
@@ -45,17 +45,17 @@ def _server_from_argv(argv: list[str], scheduler):
 
 
 def test_env_life_overrides_cli_surface_light(mock_scheduler, tmp_path, monkeypatch):
-    """argv --surface light + STARDEW_MCP_SURFACE=life => exactly the read-only set."""
+    """argv --surface light + STARDEW_MCP_SURFACE=life => cached admission with the same tool set."""
     monkeypatch.setenv("STARDEW_MCP_SURFACE", "life")
     server = _server_from_argv(
         ["--run-dir", str(tmp_path), "--surface", "light"], mock_scheduler
     )
     names = {t.name for t in server._tool_manager.list_tools()}
     assert names == set(LIFE_TOOLS)
-    # No write entry points, no autonomy controls, no capability indirection.
-    assert "submit_plan" not in names
-    assert "remember_intent" not in names
-    assert "set_autonomy" not in names
+    # Admission changes without changing available tool declarations.
+    assert "submit_work" in names
+    assert "manage_arrangements" in names
+    assert len(names) == 8
     assert "call_capability" not in names
     assert "discover_capabilities" not in names
     assert server.exposure_surface == "life"
@@ -68,8 +68,8 @@ def test_cli_surface_light_unchanged_when_env_unset(mock_scheduler, tmp_path, mo
     )
     names = {t.name for t in server._tool_manager.list_tools()}
     assert names == set(LIGHT_TOOLS)
-    assert "submit_plan" in names
-    assert "remember_intent" in names
+    assert "submit_work" in names
+    assert "manage_arrangements" in names
     assert server.exposure_surface == "light"
 
 

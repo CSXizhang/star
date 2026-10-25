@@ -129,8 +129,8 @@ def test_mcp_server_stdio_startup_and_tools_list(tmp_path: Path) -> None:
     light_tools, _, stderr_light = _launch_and_list_tools(complex_dir, surface="light")
     light_names = {t["name"] for t in light_tools}
     assert light_names == set(LIGHT_TOOLS), f"unexpected lightweight surface: {sorted(light_names)}"
-    assert "water_auto" in light_names
-    assert "submit_plan" in light_names
+    assert "query_game" in light_names
+    assert "submit_work" in light_names
     assert "purchase_items" not in light_names
     assert "run_next_step" not in light_names
 

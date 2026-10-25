@@ -16,7 +16,7 @@ def test_farm_animals_are_observed_even_when_snapshot_is_from_shop():
         scheduler._execute_native_action = AsyncMock(return_value={"details": {"livestock": native}})
         proxy = MagicMock()
         proxy.query_livestock = scheduler.query_livestock
-        server = create_mcp_server(scheduler=proxy, surface="light")
+        server = create_mcp_server(scheduler=proxy, surface="full")
         _, result = await server.call_tool("call_capability", {"tool": "observe_livestock", "params": {"location_id": "Farm"}})
         observed = result["result"]
         assert observed["animalCount"] == 10 and observed["roamingScopeLocationId"] == "Farm"

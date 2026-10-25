@@ -796,7 +796,8 @@ public sealed record PlayerDecisionDto(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("message")] string Message,
     [property: JsonPropertyName("status")] string Status,
-    [property: JsonPropertyName("goalId")] string? GoalId = null);
+    [property: JsonPropertyName("goalId")] string? GoalId = null,
+    [property: JsonPropertyName("choices")] List<string>? Choices = null);
 
 public sealed record ActiveGoalDto(
     [property: JsonPropertyName("id")] string Id,

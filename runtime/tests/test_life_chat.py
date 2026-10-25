@@ -8,7 +8,6 @@ from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
 from stardew_ai_runtime.life_chat import (
     LifeChatService,
     _life_session_key,
-    make_life_env,
 )
 from stardew_ai_runtime.mcp_server import LIFE_TOOLS, create_mcp_server
 from stardew_ai_runtime.plan_executor import (
@@ -31,14 +30,6 @@ def _sent_payloads(ws) -> list[dict]:
 def test_chat_and_work_share_provider_save_key() -> None:
     assert _life_session_key("kimi", "Save1") == "kimi:Save1"
     assert _life_session_key("mcode", "Save1") != _life_session_key("kimi", "Save1")
-
-
-def test_make_life_env_injects_surface_and_strips_token(monkeypatch) -> None:
-    monkeypatch.setenv("STARDEW_DECISION_TOKEN", "work-token")
-    monkeypatch.setenv("STARDEW_MCP_SURFACE", "internal")
-    env = make_life_env({})
-    assert env["STARDEW_MCP_SURFACE"] == "life"
-    assert "STARDEW_DECISION_TOKEN" not in env
 
 
 def test_life_session_survives_revision_change(tmp_path) -> None:
@@ -122,7 +113,6 @@ def test_life_legacy_context_retains_unknown_turn_checkpoint_fallback(tmp_path) 
     assert restarted.rotate_if_needed("Save1", 0, 0) == "cid-1"
 
 
-
 def test_life_system_prompt_contains_profile_memory_and_work() -> None:
     profile = {"companionName": "小星", "personality": "tsundere", "playStyle": "earn"}
     memory = {"agreements": [{"text": "每天浇水"}], "preferences": []}
@@ -133,7 +123,6 @@ def test_life_system_prompt_contains_profile_memory_and_work() -> None:
     assert "嘴硬心软" in facts["profile"]["personalityStyle"]
     assert facts["memory"] == memory and facts["work"] == work
     assert prompt == LifeChatService.build_system_prompt(profile, memory, work, mode="plan")
-
 
 
 def test_plan_prompt_contains_current_milestones_as_data() -> None:
@@ -161,29 +150,17 @@ def test_milestone_care_prompt_mentions_node_details() -> None:
 
 
 # ---------------------------------------------------------------- mcp life surface
-def test_mcp_life_surface_is_readonly() -> None:
-    async def run() -> None:
-        server = create_mcp_server(scheduler=MagicMock(), surface="life")
-        tools = {t.name for t in await server.list_tools()}
-        assert tools == LIFE_TOOLS
-        for forbidden in (
-            "submit_plan", "remember_intent", "set_autonomy", "autonomy_status",
-            "pause_task", "resume_task", "cancel_task", "call_capability",
-            "discover_capabilities", "run_next_step", "dispatch_plan_operation",
-            "water_auto", "harvest_auto", "purchase_items", "plant_crop_workflow",
-        ):
-            assert forbidden not in tools, forbidden
-        for expected in (
-            "get_work_overview", "get_status", "work_plan_overview",
-            "manage_companion", "query_wiki", "manage_milestones",
-        ):
-            assert expected in tools, expected
-
+def test_chat_and_work_expose_the_same_tools() -> None:
+    async def run():
+        chat = create_mcp_server(scheduler=MagicMock(), surface="life")
+        work = create_mcp_server(scheduler=MagicMock(), surface="light")
+        assert {t.name for t in await chat.list_tools()} == {t.name for t in await work.list_tools()} == LIFE_TOOLS
+        assert "submit_work" in LIFE_TOOLS and "query_game" in LIFE_TOOLS
+        assert "dispatch_plan_operation" not in LIFE_TOOLS
     asyncio.run(run())
 
 
-# ---------------------------------------------------------------- env / no dispatch
-def test_life_turn_injects_life_surface_and_never_decision_token(tmp_path, monkeypatch) -> None:
+def test_readonly_round_has_no_decision_token(tmp_path, monkeypatch) -> None:
     async def run() -> None:
         bridge = _bridge(tmp_path)
         captured: dict[str, object] = {}
@@ -200,11 +177,12 @@ def test_life_turn_injects_life_surface_and_never_decision_token(tmp_path, monke
         begin_decision = MagicMock()
         monkeypatch.setattr(bridge._work_store, "begin_decision", begin_decision)
         monkeypatch.setenv("STARDEW_DECISION_TOKEN", "work-token")
+        monkeypatch.setenv("STARDEW_MCP_SURFACE", "internal")
         with patch("stardew_ai_runtime.compatibility.assert_native_compatible"):
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 bridge._execute_life_turn,
-                ActiveChatTask(request_id="life-1", save_id="Save1"),
+                ActiveChatTask(request_id="life-1", save_id="Save1", read_only=True),
                 None,
                 "prompt",
             )
@@ -214,6 +192,7 @@ def test_life_turn_injects_life_surface_and_never_decision_token(tmp_path, monke
         assert begin_decision.call_count == 0
         # The surrounding work-token env is restored after the life turn.
         assert os.environ.get("STARDEW_DECISION_TOKEN") == "work-token"
+        assert os.environ.get("STARDEW_MCP_SURFACE") == "internal"
         # Scheduler/autonomy state untouched: no autonomy state file was created.
         assert not (tmp_path / "data" / "autonomy-state.json").exists()
 
@@ -771,7 +750,7 @@ def test_life_turn_injects_life_mode_env_and_restores(tmp_path, monkeypatch) -> 
             )
         assert result["success"] is True
         assert captured["mode"] == "plan"
-        assert captured["surface"] == "life"
+        assert captured["surface"] == "light"
         # The surrounding chat-mode env value is restored after the life turn.
         assert os.environ.get("STARDEW_LIFE_MODE") == "chat"
 
@@ -1116,7 +1095,7 @@ def test_preparation_keeps_pause_and_unrelated_active_work(tmp_path):
     asyncio.run(run())
 
 
-def test_life_provider_never_borrows_native_socket_even_on_failure(tmp_path):
+def test_idle_dialogue_releases_shared_execution_socket_even_on_failure(tmp_path):
     async def run():
         for mode, fails in [("chat", False), ("plan", False), ("plan", True)]:
             bridge = _bridge(tmp_path / f"{mode}-{fails}")
@@ -1127,9 +1106,9 @@ def test_life_provider_never_borrows_native_socket_even_on_failure(tmp_path):
             bridge._plan_worker = worker
             bridge._work_store.recover = MagicMock()
             def provider(*args, worker=worker, bridge=bridge, fails=fails):
-                worker.client.close.assert_not_awaited()
-                assert not bridge._execution_lock.locked()
-                worker.set_provider_active.assert_not_called()
+                worker.client.close.assert_awaited_once()
+                assert bridge._execution_lock.locked()
+                worker.set_provider_active.assert_called_with(True)
                 if fails:
                     raise RuntimeError("provider failed after taking socket")
                 return {"success": True, "response": "我看到了现在的农场。"}
@@ -1141,13 +1120,12 @@ def test_life_provider_never_borrows_native_socket_even_on_failure(tmp_path):
                     "request_id": "socket-life", "save_id": "S", "mode": mode, "text": "看看农场",
                 })
             assert not bridge._execution_lock.locked()
-            worker.set_provider_active.assert_not_called()
-            worker.notify.assert_not_called()
-            bridge._work_store.recover.assert_not_called()
+            worker.set_provider_active.assert_called_with(False)
+            worker.notify.assert_called_once()
+            bridge._work_store.recover.assert_called_once()
             terminal = _sent_payloads(ws)[-1]["payload"]
             assert terminal["status"] == ("failed" if fails else "completed")
     asyncio.run(run())
-
 
 
 def test_continuation_updates_current_facts_and_deduplicates_core(tmp_path):
@@ -1170,13 +1148,12 @@ def test_continuation_updates_current_facts_and_deduplicates_core(tmp_path):
     second = svc.build_turn_prompt("S", "cid", profile, {"agreements": []}, {"paused": True}, **options)
     sent, _ = delivery.prepare("fake:S", "cid", second, core)
     assert core not in sent
-    from test_prompt_delivery_delta import apply
+    from support.prompt_reference import apply
     facts = apply(sent, json.loads(first.split("实时上下文：", 1)[1]))
     assert facts["live"]["resources"]["player"]["money"] == "unknown"
     assert facts["work"]["paused"] is True and facts["milestones"] == []
     assert facts["memory"]["agreements"] == [] and "不卖木材" not in sent
     assert delivery.prepare("fake:S", "different-session", second, core)[0].count(core) == 1
-
 
 
 def test_only_acknowledged_provider_prompt_suppresses_repeated_guidance(tmp_path):
@@ -1217,4 +1194,16 @@ def test_memory_correction_and_deletion_reinitialize_without_old_text(tmp_path):
         assert "旧约定标记" in seen[0][1]
         assert "旧约定标记" not in seen[1][1] and "新约定标记" in seen[1][1]
         assert "旧约定标记" not in seen[2][1] and "新约定标记" not in seen[2][1]
+    asyncio.run(run())
+
+def test_long_reply_reaches_game_without_silent_truncation(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        text = '完整消息。' * 500 + '最后一句也要送达。'
+        ws = AsyncMock()
+        with patch.object(bridge, '_execute_life_turn', return_value={'success': True, 'response': text}):
+            await bridge._run_life_chat_turn(ws, {'request_id': 'long', 'save_id': 'S', 'text': '详细说说'})
+        replies = [r['payload'] for r in _sent_payloads(ws) if r['messageType'] == 'life.chat.reply']
+        assert replies[-1]['status'] == 'completed'
+        assert replies[-1]['replyText'] == text
     asyncio.run(run())

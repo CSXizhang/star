@@ -60,6 +60,28 @@ public sealed class CompanionDialogueInbox
     {
         // Render legacy/model formatting as speech, retaining its actual words.
         string clean = Regex.Replace(text, @"\[([^\]]+)\]\(([^)]+)\)", "$1（$2）");
+        var lines = clean.Replace("\r", "").Split('\n');
+        var speech = new List<string>();
+        string[]? headers = null;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string line = lines[i].Trim();
+            if (line.Contains('|') && i + 1 < lines.Length &&
+                Regex.IsMatch(lines[i + 1].Trim(), @"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$"))
+            {
+                headers = line.Trim('|').Split('|').Select(c => c.Trim()).ToArray();
+                i++;
+                continue;
+            }
+            if (headers != null && line.Contains('|'))
+            {
+                var cells = line.Trim('|').Split('|').Select(c => c.Trim()).ToArray();
+                speech.Add(cells[0] + "：" + string.Join("；", cells.Skip(1).Select((c, n) =>
+                    (n + 1 < headers.Length ? headers[n + 1] + " " : "") + c)) + "。");
+            }
+            else { headers = null; speech.Add(lines[i]); }
+        }
+        clean = string.Join("\n", speech);
         clean = Regex.Replace(clean, @"(?m)^\s*(?:#{1,6}\s+|[-*•]\s+|\d+[.)]\s+)", "");
         clean = Regex.Replace(clean, @"(?m)^\s*\|?\s*:?-{3,}.*$", "");
         return clean.Replace("**", "").Replace("`", "").Replace("|", "，").Trim();
@@ -276,7 +298,24 @@ public sealed class CompanionDialogueController
         _f8Active = true;
         _f8Flow.Begin(_state);
         _refresh();
-        ShowF8Unread();
+        ShowF8Choices();
+    }
+
+    public void OpenDecision(StardewAI.Companion.Mod.Domain.CompanionConversationEntry entry,
+        Action<string?, bool> reply)
+    {
+        if (Game1.activeClickableMenu != null || Game1.eventUp) return;
+        var options = (entry.Choices ?? Array.Empty<string>()).Take(6).ToArray();
+        var responses = options.Select((text, i) => new Response(i.ToString(), text)).ToList();
+        responses.Add(new Response("chat", "在聊天栏回答"));
+        responses.Add(new Response("later", "稍后再说"));
+        Ask("", responses.ToArray(), key =>
+        {
+            if (!_state.PendingDecisions.Any(e => e.DecisionId == entry.DecisionId)) return;
+            if (key == "chat") reply(null, false);
+            else if (int.TryParse(key, out int index) && index >= 0 && index < options.Length)
+                reply(options[index], true);
+        }, CompanionNpcDialogueBox.LiteralText(entry.Text));
     }
 
     public void ReturnToF8Choices()

@@ -41,6 +41,7 @@ from stardew_ai_runtime.companion_milestones import (
 from stardew_ai_runtime.companion_profile import CompanionProfileStore
 from stardew_ai_runtime.decision_context import water_can_resources
 from stardew_ai_runtime.decision_policy import project_context
+from stardew_ai_runtime.game_tools import GAME_TOOLS, register_game_tools
 from stardew_ai_runtime.mcode_wire_schema import mcode_tool_schema
 from stardew_ai_runtime.plan_executor import (
     PlanExecutor,
@@ -687,7 +688,10 @@ BASE_TOOLS = frozenset(
         "call_capability",
     }
 )
-LIGHT_TOOLS = BASE_TOOLS
+LEGACY_GAME_TOOLS = BASE_TOOLS | {"work_plan_overview", "query_wiki", "read_guidance",
+                            "manage_milestones", "manage_companion"}
+
+LIGHT_TOOLS = GAME_TOOLS
 
 # Harness-only additions on top of the game surface (never shown to the model).
 # ``dispatch_plan_operation`` is the worker's write path: it runs one validated
@@ -695,14 +699,15 @@ LIGHT_TOOLS = BASE_TOOLS
 # command id actually reaches the real scheduler/native command (``call_capability``
 # rejects the harness-only ``command_id`` parameter, which is exactly the round6
 # STEP_DISPATCH_FAILED root cause).
-INTERNAL_TOOLS = LIGHT_TOOLS | {"reconcile_plan_command", "dispatch_plan_operation", "cancel_plan_command"}
+INTERNAL_TOOLS = LEGACY_GAME_TOOLS | {"reconcile_plan_command", "dispatch_plan_operation", "cancel_plan_command"}
 
-# Unified dialogue: cached observation, durable accepted goals, and control
-# intents. Never opens the native action socket or dispatches a physical job.
-LIFE_TOOLS = frozenset({
-    "read_reload_history",
-    "get_work_overview", "get_status", "work_plan_overview", "query_wiki",
-    "read_guidance", "manage_milestones", "manage_companion",
+# Same declarations on every event; admission controls native access.
+LIFE_TOOLS = LIGHT_TOOLS
+# Only these implementations can run without the native execution connection.
+CACHED_TURN_TOOLS = frozenset({
+    "read_reload_history", "get_work_overview", "get_status", "work_plan_overview",
+    "query_wiki", "read_guidance", "manage_milestones", "manage_companion",
+    "discover_capabilities", "call_capability", "remember_intent", "request_player_decision", "record_decision_note", "answer_player_decision",
 })
 
 # Base tools grouped for on-demand disclosure.
@@ -1532,7 +1537,8 @@ def create_mcp_server(
         return overview if detail or resolved_surface == "internal" else compact_work_overview(overview)
 
     @mcp.tool()
-    async def request_player_decision(goal_id: str, message: str) -> dict[str, Any]:
+    async def request_player_decision(goal_id: str, message: str,
+                                      choices: Annotated[list[str] | None, Field(min_length=2, max_length=6)] = None) -> dict[str, Any]:
         """Notify the player explicitly about a needed decision or significant discussion.
 
         Routine progress belongs in the execution log. Identical notices deduplicate
@@ -1542,7 +1548,7 @@ def create_mcp_server(
         """
         sid = await current_save_id()
         try:
-            return work_for_run().request_player_decision(sid, goal_id, message)
+            return work_for_run().request_player_decision(sid, goal_id, message, choices)
         except WorkStateError as ex:
             raise ToolError(str(ex)) from None
 
@@ -1737,8 +1743,8 @@ def create_mcp_server(
         while paused. bedtime is the COMPANION IN-BED DEADLINE, HHMM 1800..2500 (midnight 2400), ten-minute steps. Finish work and walk home beforehand. The player chooses their own sleep time; never promise to send the player home. In player mode (actorMode=player) there is no companion bedtime at all: sleeping is managed by the sleep tool/native sleep flow, so bedtime is refused there.
         The bridge applies this intent without letting chat own native execution.
         """
-        if resolved_surface != "life":
-            raise ToolError("This tool belongs to the direct player conversation.")
+        if not os.environ.get("STARDEW_LIFE_TURN_ID"):
+            raise ToolError("This tool requires a current player message.")
         sid = await current_save_id()
         lease_path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-turn.json"
         # Serialize authority validation and durable writes with bridge revocation.
@@ -2128,7 +2134,24 @@ def create_mcp_server(
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
-    async def record_decision_note(goal_id: str, note: str, category: str, location_id: str,
+    async def answer_player_decision(notice_id: str) -> dict[str, Any]:
+        """Resolve the linked question only when the current player's message answers it.
+
+        No extra confirmation is needed. Unrelated chat or a clarifying question does not resolve it.
+        The bridge stores the original player text; do not invent or paraphrase their answer.
+        """
+        directory = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data"
+        with cache_lock(directory / "life-turn.json"):
+            assert_life_turn_current(allow_control=True, lease_locked=True)
+            lease = json.loads((directory / "life-turn.json").read_text(encoding="utf-8"))
+            if (not os.environ.get("STARDEW_LIFE_TURN_ID") or lease.get("noticeId") != notice_id
+                    or not lease.get("playerText")):
+                raise ToolError("DECISION_REPLY_NOT_LINKED: this turn is not an answer to that question")
+            work_for_run().answer_player_notice(lease["saveId"], notice_id, lease["playerText"], lease["requestId"])
+        return {"answeredNoticeId": notice_id}
+
+    @mcp.tool()
+    async def record_decision_note(goal_id: str, note: str, category: Literal["observation", "hypothesis", "intent", "failure"], location_id: str,
                                    basis_command_id: str | None = None) -> dict[str, Any]:
         """Keep a dated note on an active goal. An optional basis_command_id links
         native evidence; notes without that evidence remain unverified model
@@ -2148,7 +2171,7 @@ def create_mcp_server(
     @mcp.tool()
     async def remember_intent(
         intent: str,
-        kind: str = "goal",
+        kind: Literal["goal", "todo"] = "goal",
         goal_id: str | None = None,
         priority: int = 0,
         trigger: dict[str, Any] | None = None,
@@ -4510,6 +4533,16 @@ def create_mcp_server(
             return await fn(*args, **kwargs)
         return guarded
 
+    def admit_turn(name, fn):
+        @functools.wraps(fn)
+        async def guarded(*args, **kwargs):
+            if resolved_surface == "life" and name not in CACHED_TURN_TOOLS:
+                raise ToolError("WORK_DISPATCH_UNAVAILABLE: current work or player control owns execution. "
+                                "Use cached get_status/work_plan_overview; retain the player's next instruction. "
+                                "Do not retry dispatch or wait for tools to reload in this turn.")
+            return await fn(*args, **kwargs)
+        return guarded
+
     readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "read_guidance", "read_reload_history", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
     declared_tools = {t.name: t for t in mcp._tool_manager.list_tools()}
     wire_param_shapes = {}
@@ -4546,7 +4579,7 @@ def create_mcp_server(
         tool.annotations = ToolAnnotations(readOnlyHint=passive, destructiveHint=not passive,
                                            openWorldHint=tool.name in {"query_wiki", "call_capability"})
         tool.description = "Stardew Valley (SMAPI), current saved game. " + tool.description
-        exempt = {"player_control", "request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "record_decision_note", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command", "work_plan_overview"}
+        exempt = {"answer_player_decision", "player_control", "request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "record_decision_note", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command", "work_plan_overview"}
         if tool.name not in exempt and tool.name not in readonly and not tool.name.startswith(("query_", "get_", "list_", "discover_", "observe_")):
             tool.fn = protect_job(tool.name, tool.fn)
         if tool.name.startswith(("query_", "observe_")) and tool.name != "query_wiki":
@@ -4561,6 +4594,17 @@ def create_mcp_server(
         if os.environ.get("STARDEW_MCP_WIRE_STYLE") == "mcode":
             tool.parameters = mcode_tool_schema(tool.name, tool.parameters,
                 wire_param_shapes if tool.name in {"submit_plan", "call_capability", "manage_plan"} else None)
+    for tool in mcp._tool_manager.list_tools():
+        tool.fn = admit_turn(tool.name, tool.fn)
+    base_tools = {name: admit_turn(name, fn) for name, fn in base_tools.items()}
+    if resolved_surface in {"light", "life"}:
+        register_game_tools(mcp, base_tools, declared_tools, _PLAN_OPERATION_CALLS,
+                            current_save=current_save_id, store_for_run=work_for_run,
+                            read_only=resolved_surface == "life")
+        if os.environ.get("STARDEW_MCP_WIRE_STYLE") == "mcode":
+            for tool in mcp._tool_manager.list_tools():
+                if tool.name in GAME_TOOLS:
+                    tool.parameters = mcode_tool_schema(tool.name, tool.parameters)
     if resolved_surface == "light":
         allowed = LIGHT_TOOLS | ({"begin_game_turn", "work_plan_overview"} if external_codex else set())
     elif resolved_surface == "internal":

@@ -1092,6 +1092,7 @@ class McodeBackend:
         proc: Any = None
         requested_session = session_id
         started = False
+        visible_messages: dict[str, str] = {}
         invocation_unix = time.time()
         terminal_error: Any = None
         # A file-backed stdin avoids both Windows command-line limits and a
@@ -1184,7 +1185,9 @@ class McodeBackend:
                 elif kind == "item.completed":
                     item = event.get("item") or {}
                     if item.get("type") == "agent_message" and item.get("content"):
-                        reply = str(item["content"])
+                        text = str(item["content"])
+                        visible_messages[str(item.get("id") or text)] = text
+                        reply = "\n\n".join(visible_messages.values())
                     elif item.get("type") == "tool_call":
                         call = item.get("toolCall") or {}
                         if self.progress:
@@ -1198,7 +1201,9 @@ class McodeBackend:
                         terminal_error = result["error"]
                         errors.append(str(result["error"]))
                     if result.get("output"):
-                        reply = str(result["output"])
+                        output = str(result["output"])
+                        if output != reply and output not in visible_messages.values():
+                            reply = "\n\n".join([*visible_messages.values(), output])
                     usage = self._usage(result.get("usage")) or usage
                     if usage and result.get("usageIncomplete"):
                         usage["partial"] = True

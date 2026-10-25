@@ -20,7 +20,7 @@ def setup_game(tmp_path, monkeypatch):
     scheduler.get_status = AsyncMock(return_value={"saveId": "save"})
     store = WorkStore(tmp_path / "data" / "work-state.json")
     store.begin_decision("save", "decision")
-    return store, create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="light")
+    return store, create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="full")
 
 
 @pytest.mark.parametrize("wrapped_steps", [True, False])
@@ -51,7 +51,7 @@ def test_mcode_schema_inlines_references_and_advertises_canonical_arrays(tmp_pat
         assert canonical["items"]["properties"]["dependencies"]["maxItems"] == 0
         observation = tools["observe_farm_space"].inputSchema
         assert "$ref" not in str(observation)
-        region = observation["properties"]["region"]["anyOf"][0]
+        region = observation["properties"]["region"]
         assert region["properties"]["width"]["minimum"] == 1
         assert region["properties"]["x"]["type"] == "integer"
 

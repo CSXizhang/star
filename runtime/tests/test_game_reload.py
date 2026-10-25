@@ -89,16 +89,29 @@ def test_reload_history_is_complete_paginated_and_scoped(tmp_path):
     assert reload_context(tmp_path, "farm")["goals"] == [{"text": "新目标"}]
 
 
-def test_bridge_reload_retains_provider_session_and_does_not_repeat_on_reconnect(tmp_path):
+def test_bridge_reload_hands_off_to_new_session_but_reconnect_keeps_it(tmp_path):
     async def scenario():
         bridge = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)
         bridge._life_chat.record_session_id("farm", "existing-dialogue")
         bridge._life_chat.record_fingerprint("farm", bridge._profile_revision("farm"), bridge._memory_instruction_revision("farm"))
+        bridge._life_chat.record_discussion("farm", "chat", "不要砍树", "已记住，明天再核对材料。")
+        bridge._sessions["life:fake:farm"] = "legacy-dialogue"
+        bridge._sessions["fake:other"] = "other-save"
         request(tmp_path)
         await bridge._prepare_game_load("farm", "new-session")
-        assert bridge._life_chat.rotate_if_needed("farm", bridge._profile_revision("farm"), bridge._memory_instruction_revision("farm")) == "existing-dialogue"
+        assert bridge.get_conversation_id("farm") is None
+        assert bridge._life_chat.get_session_id("farm") is None
+        assert bridge.get_conversation_id("other") == "other-save"
+        summary = reload_context(tmp_path, "farm")["conversationHandoff"]
+        assert summary["recentDialogue"][0]["text"] == "不要砍树"
+        assert "旧回复" in summary["instruction"]
+        bridge.record_conversation_id("farm", "fresh-dialogue")
         bridge._work_store.add_goal("farm", "new goal after reload")
         await bridge._prepare_game_load("farm", "new-session")
+        assert bridge._life_chat.get_session_id("farm") == "fresh-dialogue"
+        restarted = ChatBridge(run_dir=tmp_path, backend="fake", enable_plan_worker=False)
+        await restarted._prepare_game_load("farm", "new-session")
+        assert restarted.get_conversation_id("farm") == "fresh-dialogue"
         assert bridge._work_store.state("farm").goals[0].text == "new goal after reload"
         bridge._send_reply = AsyncMock()
     asyncio.run(scenario())

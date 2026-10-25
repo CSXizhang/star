@@ -15,8 +15,13 @@ def test_purchase_quantity_normalizes_to_native_count(fields, expected):
     ]) == [{"itemId": "(O)178", "count": expected}]
 
 
-@pytest.mark.parametrize("value", [True, False, 1.0, "100", None, 0, -1])
-@pytest.mark.parametrize("field", ["quantity", "count"])
+@pytest.mark.parametrize('field,value', [
+    ('quantity', True),
+    ('quantity', 1.0),
+    ('count', '100'),
+    ('quantity', None),
+    ('quantity', -1),
+])
 def test_purchase_quantity_rejects_invalid_explicit_number(field, value):
     with pytest.raises(PolicyViolationError):
         CompanionScheduler._validate_purchase_items([

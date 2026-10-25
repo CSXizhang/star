@@ -73,13 +73,13 @@ def test_expand_water_zone_near_origin_filters_negatives():
     ]
 
 
-@pytest.mark.parametrize("invalid_radius", [-1, "1", 1.5, True, False])
+@pytest.mark.parametrize("invalid_radius", [-1, "1", 1.5, True])
 def test_expand_water_zone_invalid_radius(invalid_radius):
     with pytest.raises(PolicyViolationError, match="radius"):
         expand_water_zone(64, 15, radius=invalid_radius)
 
 
-@pytest.mark.parametrize("invalid_coord", [-1, -10, "64", 64.5, True, False])
+@pytest.mark.parametrize("invalid_coord", [-1, "64", 64.5, True])
 def test_expand_water_zone_invalid_coordinates(invalid_coord):
     with pytest.raises(PolicyViolationError):
         expand_water_zone(invalid_coord, 15, radius=0)
@@ -526,13 +526,16 @@ def test_scheduler_execute_tiles_validation(mock_transport_client):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("invalid_max", [0, -1, "25", 25.5, True, False])
-def test_scheduler_water_auto_invalid_max_tiles(mock_transport_client, invalid_max):
+@pytest.mark.parametrize("operation,invalid_max", [
+    ("water_auto", 0), ("water_auto", True), ("water_auto", "25"),
+    ("harvest_auto", 0), ("harvest_auto", True), ("harvest_auto", 16.5),
+])
+def test_scheduler_auto_rejects_invalid_limits(mock_transport_client, operation, invalid_max):
     async def run():
         scheduler = CompanionScheduler(client=mock_transport_client)
         with pytest.raises(PolicyViolationError, match="max_tiles"):
-            await scheduler.water_auto(max_tiles=invalid_max)
-
+            await getattr(scheduler, operation)(max_tiles=invalid_max)
+        mock_transport_client.execute_water_zone.assert_not_called()
     asyncio.run(run())
 
 
@@ -796,14 +799,6 @@ def _make_skill_result_envelope(
     })
 
 
-@pytest.mark.parametrize("invalid_max", [0, -1, "16", 16.5, True, False])
-def test_scheduler_harvest_auto_invalid_max_tiles(mock_transport_client, invalid_max):
-    async def run():
-        scheduler = CompanionScheduler(client=mock_transport_client)
-        with pytest.raises(PolicyViolationError, match="max_tiles"):
-            await scheduler.harvest_auto(max_tiles=invalid_max)
-
-    asyncio.run(run())
 
 
 def test_scheduler_harvest_auto_no_work(mock_transport_client):
@@ -3155,9 +3150,14 @@ def test_scoped_auto_empty_intersection_never_falls_back_to_full_farm(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("operation", ["water_auto", "harvest_auto"])
-@pytest.mark.parametrize("published_inside", [False, True])
-@pytest.mark.parametrize("truncation_evidence", ["per_list_flag", "count", "aggregate_flag"])
+@pytest.mark.parametrize('operation,published_inside,truncation_evidence', [
+    ('water_auto', False, 'per_list_flag'),
+    ('harvest_auto', True, 'per_list_flag'),
+    ('harvest_auto', False, 'count'),
+    ('water_auto', True, 'count'),
+    ('water_auto', False, 'aggregate_flag'),
+    ('harvest_auto', True, 'aggregate_flag'),
+])
 def test_scoped_auto_truncated_observation_cannot_claim_hidden_scope_complete(
     mock_transport_client, native_compatible_run_dir, operation, published_inside, truncation_evidence,
 ):

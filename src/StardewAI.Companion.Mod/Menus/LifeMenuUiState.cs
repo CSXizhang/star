@@ -40,6 +40,7 @@ public sealed class LifeMenuUiState
         if (UnreadReplyCount == 0) return;
         for (int i = 0; i < _conversation.Count; i++)
             if (entryId == null || _conversation[i].Id == entryId) _conversation[i] = _conversation[i] with { Unread = false };
+        _unreadCareHints.RemoveAll(h => _conversation.Any(e => e.Id == "care:" + h.EventKey && !e.Unread));
         ConversationChanged?.Invoke();
     }
     private readonly HashSet<string> _decisionNoticeKeys = new(StringComparer.Ordinal);
@@ -65,13 +66,37 @@ public sealed class LifeMenuUiState
         ConversationChanged?.Invoke();
     }
 
+    public void ReconcileDecisionIds(IEnumerable<string> currentIds)
+    {
+        var ids = currentIds.ToHashSet();
+        foreach (var entry in PendingDecisions)
+            if (!ids.Contains(entry.DecisionId!)) SetDecisionStatus(entry.DecisionId!, "expired");
+    }
+
     /// <summary>Independent, save-scoped important messages; never changes a chat command's state.</summary>
-    public bool TryAddDecisionNotice(string currentSaveId, string? noticeSaveId, string noticeId, string gameDate, string text)
+    public bool TryAddDecisionNotice(string currentSaveId, string? noticeSaveId, string noticeId, string gameDate, string text,
+        IReadOnlyList<string>? choices = null)
     {
         if (string.IsNullOrWhiteSpace(currentSaveId) || !string.Equals(currentSaveId, noticeSaveId, StringComparison.Ordinal)
             || string.IsNullOrWhiteSpace(noticeId) || string.IsNullOrWhiteSpace(text)) return false;
-        if (_conversation.Any(e => e.DecisionId == noticeId) || !_decisionNoticeKeys.Add(currentSaveId + ":" + noticeId)) return false;
+        int existing = _conversation.FindIndex(e => e.DecisionId == noticeId);
+        if (existing >= 0)
+        {
+            if (choices != null && !choices.SequenceEqual(_conversation[existing].Choices ?? Array.Empty<string>()))
+            {
+                _conversation[existing] = _conversation[existing] with { Choices = choices.ToArray() };
+                ConversationChanged?.Invoke();
+            }
+            return false;
+        }
+        if (!_decisionNoticeKeys.Add(currentSaveId + ":" + noticeId)) return false;
         RecordConversation("decision:" + noticeId, CompanionName, text, gameDate, false, true, decisionId: noticeId);
+        if (choices != null)
+        {
+            int added = _conversation.FindIndex(e => e.DecisionId == noticeId);
+            _conversation[added] = _conversation[added] with { Choices = choices.ToArray() };
+            ConversationChanged?.Invoke();
+        }
         AddUnreadCareHint(new PendingCareHint("decision:" + noticeId, gameDate, "player-decision", text));
         return true;
     }
@@ -313,8 +338,10 @@ public sealed class LifeMenuUiState
         int profileRevision,
         int memoryRevision)
     {
-        if (!_pendingChats.ContainsKey(requestId)) return false;
         bool terminal = status is "completed" or "failed";
+        if (!_pendingChats.ContainsKey(requestId))
+            return terminal && _conversation.Any(e => e.IsPlayer && e.Id == requestId + ":player")
+                && !_conversation.Any(e => e.Id == requestId + ":companion");
         if (terminal) _pendingChats.Remove(requestId);
         if (!string.Equals(PendingChatRequestId, requestId, StringComparison.Ordinal))
             return terminal; // Persist an older receipt without changing current status.
@@ -455,6 +482,9 @@ public sealed class LifeMenuUiState
     /// <summary>Adds an unread care hint to the pending list (capped at 5).</summary>
     public void AddUnreadCareHint(PendingCareHint hint)
     {
+        if (string.IsNullOrWhiteSpace(hint.Text)) return;
+        if (hint.Kind != "player-decision")
+            RecordConversation("care:" + hint.EventKey, CompanionName, hint.Text, hint.GameDate, false, unread: true);
         if (_recentCareHints.Any(h => h.EventKey == hint.EventKey))
             return;
         while (_recentCareHints.Count >= CareHintController.MaxPendingCount)

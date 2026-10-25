@@ -102,6 +102,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         helper.Events.GameLoop.DayStarted += OnDayStarted;
         helper.Events.GameLoop.DayEnding += OnDayEnding;
         helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
+        helper.Events.GameLoop.UpdateTicking += (_, _) => TickNativeChatInput();
         helper.Events.GameLoop.TimeChanged += OnTimeChanged;
         helper.Events.Display.RenderedWorld += OnRenderedWorld;
         helper.Events.Display.RenderedHud += OnRenderedHud;
@@ -113,6 +114,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         helper.Events.GameLoop.ReturnedToTitle += OnReturnedToTitle;
         AppDomain.CurrentDomain.ProcessExit += OnGameProcessExit;
         helper.Events.Input.ButtonPressed += OnButtonPressed;
+        InstallNativeChat();
 
         helper.ConsoleCommands.Add("ai_water",
             "Waters tilled unwatered tiles centered at <x> <y> with optional [radius] (0-2, default 0) on the Farm.\nUsage: ai_water <x> <y> [radius]",
@@ -149,7 +151,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         if (PlayerModeEnabled)
         {
             InitializePlayerMode();
-            Game1.addHUDMessage(new HUDMessage($"AI 自己玩：F8 随时指导，{_config.TakeoverKey} 开始托管 / 接管。", HUDMessage.newQuest_type));
+            Game1.addHUDMessage(new HUDMessage($"AI 自己玩：聊天栏随时指导，{_config.TakeoverKey} 开始托管 / 接管。", HUDMessage.newQuest_type));
         }
         else InitializeCompanion();
     }
@@ -803,10 +805,12 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             AbortLifeStart("等待确认超时。");
 
         // 2d. Drain deferred care hints once nothing blocks the HUD.
+        PumpNativeChat();
         if (Game1.activeClickableMenu == null && !Game1.eventUp)
         {
             foreach (var hint in _careHintController.TryDrainDeferred())
-                Game1.addHUDMessage(new HUDMessage("阿星想和你聊聊 — 打开生活菜单查看"));
+                if (_lifeMenuUiState.Conversation.Any(e => e.Id == "care:" + hint.EventKey && e.Unread))
+                    Game1.addHUDMessage(new HUDMessage($"{_lifeMenuUiState.CompanionName}有新消息 · 请看聊天栏"));
         }
 
         if (Game1.activeClickableMenu is CompanionCommandMenu && !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl && _coordinator != null && _coordinator.GetActivityStatus() != "idle")
@@ -910,6 +914,9 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private void OnReturnedToTitle(object? sender, ReturnedToTitleEventArgs e)
     {
+        _nativeChatSave = null;
+        _nativeChatDecisionSave = null;
+        _unsentChatText = null;
         ReleasePlayerControl("unload");
         StopOwnedBridgeLauncher();
         ChineseUiLocale.Restore();
@@ -1004,6 +1011,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private void OnRenderedHud(object? sender, RenderedHudEventArgs e)
     {
+        DrawNativeChatSend(e.SpriteBatch);
         _companionHudBounds = Microsoft.Xna.Framework.Rectangle.Empty;
         if (!Context.IsWorldReady || _actor == null || _coordinator == null)
             return;
@@ -1044,7 +1052,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             if (_thinking?.FailureReason is string failureReason)
                 state = "程序停止·时间已保护暂停（" + failureReason + "）";
             stateLine = (agentOwns ? "玩家由 AI 控制" : "玩家由你控制") + " · " + state;
-            hintLine = agentOwns ? $"F8 对话 · {_config.TakeoverKey} 接管" : $"F8 对话 · {_config.TakeoverKey} 交还 AI";
+            hintLine = agentOwns ? $"F8 记录 · {_config.TakeoverKey} 接管" : $"F8 记录 · {_config.TakeoverKey} 交还 AI";
         }
         else
         {
@@ -1132,13 +1140,21 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
-        if (Context.IsWorldReady && _actor != null && _coordinator != null
+        if (Context.IsWorldReady && !Context.IsMultiplayer && e.Button == SButton.T
+            && Game1.activeClickableMenu == null && !Game1.eventUp && Game1.chatBox?.isActive() == false)
+        {
+            Game1.chatBox.activate();
+            Helper.Input.Suppress(e.Button);
+            return;
+        }
+
+        if (Context.IsWorldReady && (PlayerModeEnabled || (_actor != null && _coordinator != null))
             && Game1.activeClickableMenu == null && !Game1.eventUp && Game1.displayHUD
             && e.Button == SButton.MouseLeft
             && _companionHudBounds.Contains(Game1.getMouseX(true), Game1.getMouseY(true)))
         {
             Helper.Input.Suppress(e.Button);
-            OpenCompanionOptions("HUD click");
+            Game1.chatBox?.activate();
             return;
         }
         if (PlayerModeEnabled && Context.IsWorldReady && e.Button.ToString() == _config.TakeoverKey) {
@@ -1152,7 +1168,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             {
                 _playerControlApproved = true;
                 _authority.RequestAgent("human-explicit-handoff");
-                Game1.addHUDMessage(new HUDMessage("已交还控制权给 AI：按 F8 告诉它今天要做什么。", HUDMessage.newQuest_type));
+                Game1.addHUDMessage(new HUDMessage("已交还控制权给 AI：在聊天栏告诉它今天要做什么。", HUDMessage.newQuest_type));
             }
             Helper.Input.Suppress(e.Button); return;
         }
@@ -1426,7 +1442,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         {
             CompanionCommandMenu.CurrentActionText = reply.Status == "selected" ? "短作业等待原生执行" : null;
             CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Color.DarkGreen, BuildUsageLine(reply, "本轮用量")));
-            if (reply.CommandComplete == true) Game1.addHUDMessage(new HUDMessage("AI 伙伴已回复，按 F8 查看。"));
+            if (reply.CommandComplete == true) Game1.addHUDMessage(new HUDMessage("AI 伙伴已回复，请看聊天栏。"));
             return;
         }
         if (reply.Status == "processing")
@@ -1442,18 +1458,18 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         if (reply.Status == "cancelled")
         {
             CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Color.DarkGoldenrod, tokenInfo));
-            Game1.addHUDMessage(new HUDMessage("AI 伙伴任务已取消，按 F8 查看。"));
+            Game1.addHUDMessage(new HUDMessage("AI 伙伴任务已取消，请看聊天栏。"));
         }
         else if (reply.Status == "completed")
         {
             CompanionCommandMenu.ChatHistory.Add(new ChatMessage("伙伴", reply.ReplyText, Color.DarkGreen, tokenInfo));
-            if (reply.CommandComplete != false) Game1.addHUDMessage(new HUDMessage("AI 伙伴已回复，按 F8 查看。"));
+            if (reply.CommandComplete != false) Game1.addHUDMessage(new HUDMessage("AI 伙伴已回复，请看聊天栏。"));
         }
         else
         {
             string err = !string.IsNullOrEmpty(reply.Error) ? reply.Error : reply.ReplyText;
             CompanionCommandMenu.ChatHistory.Add(new ChatMessage("系统", $"任务未完成: {err}", Color.Red, tokenInfo));
-            Game1.addHUDMessage(new HUDMessage("AI 伙伴任务未完成，按 F8 查看。", HUDMessage.error_type));
+            Game1.addHUDMessage(new HUDMessage("AI 伙伴任务未完成，请看聊天栏。", HUDMessage.error_type));
         }
     }
 
@@ -2477,7 +2493,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                         if (!visible)
                         {
                             Game1.playSound("newArtifact");
-                            Game1.addHUDMessage(new HUDMessage($"{_lifeMenuUiState.CompanionName}回复了你 · 按 F8 查看", HUDMessage.newQuest_type));
+                            Game1.addHUDMessage(new HUDMessage($"{_lifeMenuUiState.CompanionName}回复了你 · 请看聊天栏", HUDMessage.newQuest_type));
                         }
                     }
                     DispatchLifeProfileRefresh();
@@ -2513,10 +2529,15 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 state.Work.RecentTodos?.Select(todo => todo.Intent) ?? Enumerable.Empty<string>(),
                 state.Work.WaitingConditions ?? Enumerable.Empty<string>(),
                 state.Work.PlanWaitReason, state.Work.Mode, state.Work.Paused);
+            if (state.Work.PlayerDecisions != null)
+            {
+                _lifeMenuUiState.ReconcileDecisionIds(state.Work.PlayerDecisions.Select(d => d.Id));
+                _nativeChatDecisionSave = saveId;
+            }
             foreach (var decision in state.Work.PlayerDecisions ?? Enumerable.Empty<PlayerDecisionDto>())
             {
                 if (decision.Status == "pending")
-                    _lifeMenuUiState.TryAddDecisionNotice(saveId, saveId, decision.Id, GetCurrentGameDate(), decision.Message);
+                    _lifeMenuUiState.TryAddDecisionNotice(saveId, saveId, decision.Id, GetCurrentGameDate(), decision.Message, decision.Choices);
                 if (!_decisionEdits.Values.Any(p => p.ContainsKey(decision.Id)))
                     _lifeMenuUiState.SetDecisionStatus(decision.Id, decision.Status);
             }
@@ -2670,7 +2691,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 // Add to life-menu unread list
                 _lifeMenuUiState.AddUnreadCareHint(hint);
                 // Show low-intrusion HUD message
-                Game1.addHUDMessage(new HUDMessage($"阿星想和你聊聊 — 打开生活菜单查看"));
+                if (_lifeMenuUiState.Conversation.Any(e => e.Id == "care:" + hint.EventKey && e.Unread))
+                    Game1.addHUDMessage(new HUDMessage($"{_lifeMenuUiState.CompanionName}有新消息 · 请看聊天栏"));
             }
             else if (blocked && _careHintController.PendingHints.Any(h => h.EventKey == care.EventKey))
             {

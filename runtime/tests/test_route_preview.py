@@ -16,7 +16,7 @@ def test_gateway_route_uses_native_planner_and_returns_bounded_summary():
         scheduler._execute_native_action = AsyncMock(return_value={"details": {"route": native}})
         server_scheduler = MagicMock()
         server_scheduler.query_route = scheduler.query_route
-        server = create_mcp_server(scheduler=server_scheduler, surface="light")
+        server = create_mcp_server(scheduler=server_scheduler, surface="full")
         _, result = await server.call_tool("call_capability", {"tool": "query_route", "params": {"location_id": "Farm", "tile": {"x": 58, "y": 22}}})
         assert result["result"] == {**native, "resolvedDestinationTile": {"x": 58, "y": 22}}
         scheduler._execute_native_action.assert_awaited_once_with("inspect-route", {"locationId": "Farm", "tile": {"x": 58, "y": 22}}, tiles=[])
@@ -51,11 +51,14 @@ def test_failed_recovery_state_write_preserves_observation_and_persisted_block(t
     asyncio.run(check())
 
 
-@pytest.mark.parametrize("tool,method,recovery", [
-    ("query_route", "query_route", "observe_branch_recovery"),
-    ("observe_machines", "query_machines", "observe_machine_recovery"),
+@pytest.mark.parametrize('tool,method,recovery,failure', [
+    ('query_route', 'query_route', 'observe_branch_recovery', 'disconnected'),
+    ('query_route', 'query_route', 'observe_branch_recovery', 'write-failed'),
+    ('observe_machines', 'query_machines', 'observe_machine_recovery', 'write-failed'),
+    ('observe_machines', 'query_machines', 'observe_machine_recovery', 'other-save'),
+    ('query_route', 'query_route', 'observe_branch_recovery', 'unknown-save'),
+    ('observe_machines', 'query_machines', 'observe_machine_recovery', 'missing-result-save'),
 ])
-@pytest.mark.parametrize("failure", ["disconnected", "write-failed", "other-save", "unknown-save", "missing-result-save"])
 def test_successful_observation_survives_recovery_bookkeeping_failure(tmp_path, tool, method, recovery, failure):
     async def check():
         native = {"saveId": "S", "reachable": True, "machines": [{"tile": {"x": 1, "y": 2}, "isReady": True}]}

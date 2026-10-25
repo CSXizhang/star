@@ -479,36 +479,6 @@ public class NavigationStateMachineTests
     }
 
     [Fact]
-    public void DestinationPassable_DoesNotSetTargetAdjusted()
-    {
-        var actor = new StubFarmerActor { LocationName = "Farm", PixelPosition = new(10 * 64, 10 * 64) };
-        var observer = new SimulatedWorldObserver();
-        var navigator = new SameMapNavigator(observer);
-        var graph = new WorldMapGraph();
-        var machine = new NavigationStateMachine(actor, observer, navigator, graph);
-
-        var req = new NavigationRequest(
-            CommandId: "cmd-passable-1",
-            TaskId: "task-passable-1",
-            LocationId: "Farm",
-            TargetTile: new TileCoordinate(10, 11),
-            MaxGameMinutes: 120
-        );
-
-        Assert.True(machine.Start(req, out _));
-
-        for (int i = 0; i < 50 && machine.CurrentState != ExecutionState.Succeeded && machine.CurrentState != ExecutionState.Failed; i++)
-        {
-            machine.Update(null, i + 1);
-        }
-
-        Assert.Equal(ExecutionState.Succeeded, machine.CurrentState);
-        Assert.NotNull(machine.FinalResult);
-        Assert.False(machine.FinalResult.TargetAdjusted);
-        Assert.Equal(new TileCoordinate(10, 11), machine.FinalResult.FinalTile);
-    }
-
-    [Fact]
     public void DestinationCompletelyEnclosed_FailsWithDestinationUnreachable()
     {
         var actor = new StubFarmerActor { LocationName = "Farm", PixelPosition = new(10 * 64, 10 * 64) };

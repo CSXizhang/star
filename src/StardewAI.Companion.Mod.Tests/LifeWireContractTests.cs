@@ -14,7 +14,12 @@ namespace StardewAI.Companion.Mod.Tests;
 /// </summary>
 public class LifeWireContractTests
 {
-    private static string ExportFixtures()
+    // Every case reads the same immutable wire fixtures; export once per test run.
+    private static readonly Lazy<string> Fixtures = new(CreateFixtures);
+
+    private static string ExportFixtures() => Fixtures.Value;
+
+    private static string CreateFixtures()
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (root != null && !File.Exists(Path.Combine(root.FullName, "tools", "export-life-wire-test.py")))

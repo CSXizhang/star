@@ -33,11 +33,11 @@ def test_two_real_tool_commits_are_consumed_in_order(tmp_path, monkeypatch, acti
         bridge, server = setup(tmp_path, monkeypatch)
         bridge._autonomy.set_paused("farm", True)
         for action in actions:
-            await server.call_tool("manage_companion", {"action": action, **({"bedtime": 2300} if action == "bedtime" else {})})
+            await server.call_tool("manage_arrangements", {"change": {"manage_companion": {"action": action, **({"bedtime": 2300} if action == "bedtime" else {})}}})
         assert len(list((tmp_path / "data" / "life-controls").glob("*.json"))) == 2
         if paused:
             with pytest.raises(ToolError, match="WORK_STOPPED"):
-                await server.call_tool("manage_milestones", {"action": "propose", "title": "抢在暂停前派工", "preparation": ["water"]})
+                await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "propose", "title": "抢在暂停前派工", "preparation": ["water"]}}})
         await bridge._apply_life_intent(AsyncMock(), "two-controls", "farm")
         assert bridge._autonomy.state("farm").paused is paused
         if "bedtime" in actions:
@@ -45,8 +45,8 @@ def test_two_real_tool_commits_are_consumed_in_order(tmp_path, monkeypatch, acti
         assert not list((tmp_path / "data" / "life-controls").glob("*.json"))
         if paused:
             with pytest.raises(ToolError, match="WORK_STOPPED"):
-                await server.call_tool("manage_milestones", {"action": "propose", "title": "迟到派工", "preparation": ["water"]})
-            await server.call_tool("manage_companion", {"action": "resume"})
+                await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "propose", "title": "迟到派工", "preparation": ["water"]}}})
+            await server.call_tool("manage_arrangements", {"change": {"manage_companion": {"action": "resume"}}})
             await bridge._apply_life_intent(AsyncMock(), "two-controls", "farm")
             assert not bridge._autonomy.state("farm").paused
     asyncio.run(scenario())
@@ -55,8 +55,8 @@ def test_two_real_tool_commits_are_consumed_in_order(tmp_path, monkeypatch, acti
 def test_new_player_control_during_ack_does_not_resurrect_old_lease(tmp_path, monkeypatch):
     async def scenario():
         bridge, server = setup(tmp_path, monkeypatch)
-        await server.call_tool("manage_companion", {"action": "resume"})
-        await server.call_tool("manage_companion", {"action": "bedtime", "bedtime": 2300})
+        await server.call_tool("manage_arrangements", {"change": {"manage_companion": {"action": "resume"}}})
+        await server.call_tool("manage_arrangements", {"change": {"manage_companion": {"action": "bedtime", "bedtime": 2300}}})
         async def new_player_action(*args, **kwargs):
             bridge._life_turn_lease(None, "farm")
         bridge._handle_autonomy_control = AsyncMock(side_effect=new_player_action)
@@ -72,17 +72,17 @@ def test_paused_arrangement_can_be_revised_without_resuming_old_work(tmp_path, m
     async def scenario():
         bridge, server = setup(tmp_path, monkeypatch)
         monkeypatch.setenv("STARDEW_LIFE_MODE", "chat")
-        _, proposed = await server.call_tool("manage_milestones", {
+        _, proposed = await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {
             "action": "propose", "title": "照料原田", "target_date": "1:spring:2", "preparation": ["harvest", "water"],
-        })
+        }}})
         node_id = proposed["node"]["id"]
-        _, adopted = await server.call_tool("manage_milestones", {"action": "adopt", "node_id": node_id})
-        await server.call_tool("manage_companion", {"action": "pause"})
+        _, adopted = await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "adopt", "node_id": node_id}}})
+        await server.call_tool("manage_arrangements", {"change": {"manage_companion": {"action": "pause"}}})
         if stop_applied:
             await bridge._apply_life_intent(AsyncMock(), "two-controls", "farm")
-        _, revised = await server.call_tool("manage_milestones", {
+        _, revised = await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {
             "action": "revise", "node_id": node_id, "preparation": ["water"], "summary": "今天只浇缺水幼苗",
-        })
+        }}})
         assert revised["node"]["summary"] == "今天只浇缺水幼苗"
         state = WorkStore(tmp_path / "data/work-state.json").state("farm")
         assert state.goals[0].id == adopted["goalId"]
@@ -91,8 +91,8 @@ def test_paused_arrangement_can_be_revised_without_resuming_old_work(tmp_path, m
         assert bridge._autonomy.state("farm").paused
         assert WorkStore(tmp_path / "data/work-state.json").state("farm").paused
         with pytest.raises(ToolError, match="WORK_STOPPED"):
-            await server.call_tool("manage_milestones", {"action": "propose", "title": "新工作"})
+            await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "propose", "title": "新工作"}}})
         bridge._life_turn_lease(None, "farm")
         with pytest.raises(ToolError, match="STALE_CONVERSATION"):
-            await server.call_tool("manage_milestones", {"action": "revise", "node_id": node_id, "summary": "过期修改"})
+            await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "revise", "node_id": node_id, "summary": "过期修改"}}})
     asyncio.run(scenario())

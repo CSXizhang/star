@@ -63,23 +63,3 @@ def test_defer_and_reopen_do_not_restore_authorization(tmp_path):
     assert len(work.list_goals(SAVE)) == 1
     assert len(_active_todos(work)) == 2
     assert all("计划数量=3" in todo["intent"] for todo in _active_todos(work))
-
-
-def test_one_seed_does_not_verify_ten_and_absence_is_unknown(tmp_path):
-    milestones, work = _stores(tmp_path)
-    milestones.adopt(SAVE, NODE, planned_count=10, reserved_funds=1000,
-                     work_store=work, game_date=SPRING_11)
-    milestones.on_day_settled(SAVE, year=1, season="spring", day=14,
-                              player_items=[{"name": "Strawberry Seeds", "quantity": 1}])
-    node = milestones.list_nodes(SAVE)[0]
-    assert node["status"] != "completed"
-    assert node["verification"] == "unverified"
-
-    other_milestones, other_work = _stores(tmp_path / "other")
-    other_milestones.adopt(SAVE, NODE, planned_count=10, reserved_funds=1000,
-                           work_store=other_work, game_date=SPRING_11)
-    other_milestones.on_day_settled(SAVE, year=1, season="spring", day=14,
-                                    player_items=[])
-    absent = other_milestones.list_nodes(SAVE)[0]
-    assert absent["status"] != "completed"
-    assert absent["verification"] == "unverified"

@@ -1774,7 +1774,12 @@ class ChatBridge:
             await self._plan_worker.stop()
 
     async def _prepare_game_load(self, save_id: str | None, session_id: str | None) -> None:
-        from .game_reload import mark_game_load_applied, pending_game_load, restore_game_load
+        from .game_reload import (
+            mark_game_load_applied,
+            pending_game_load,
+            restore_game_load,
+            rotate_provider_sessions,
+        )
 
         if self.run_dir is None or not save_id:
             return
@@ -1798,6 +1803,7 @@ class ChatBridge:
         if active is not None and active is not asyncio.current_task():
             await asyncio.gather(active, return_exceptions=True)
         restore_game_load(self.run_dir, request)
+        rotate_provider_sessions(self.run_dir, request, self._sessions, self._sessions_file)
         self._latest_snapshot_payload = None
         self._latest_snapshot_observed_at = None
         self._latest_snapshot_revision = None
@@ -2617,6 +2623,7 @@ class ChatBridge:
             "recentTodos": todos,
             "recentExecutions": self._work_store.recent_execution_summary(save_id) if self._work_store else [],
             "playerDecisions": [{"id": n["id"], "message": n["message"], "goalId": n.get("goalId"),
+                                 "choices": n.get("choices", []),
                                  "status": "answered" if n.get("answeredAt") else "dismissed" if n.get("dismissedAt") else "pending"}
                                 for n in (self._work_store.state(save_id).notices if self._work_store else [])],
             # Contract §1.3 declares [str]; rows from WorkStore.wait_conditions()
@@ -3107,11 +3114,12 @@ class ChatBridge:
             "worldRevision": self._latest_snapshot_revision,
             "payload": self._latest_snapshot_payload})
 
-    def _life_turn_lease(self, request_id: str | None, save_id: str, *, player_text: str | None = None) -> None:
+    def _life_turn_lease(self, request_id: str | None, save_id: str, *, player_text: str | None = None,
+                         notice_id: str | None = None) -> None:
         if self.run_dir is None:
             return
         path = self.run_dir / "data" / "life-turn.json"
-        write_cache(path, {"requestId": request_id, "saveId": save_id, "playerText": player_text})
+        write_cache(path, {"requestId": request_id, "saveId": save_id, "playerText": player_text, "noticeId": notice_id})
 
     async def _apply_life_intent(self, ws: WebSocketClient | None, request_id: str, save_id: str) -> None:
         if self.run_dir is None or not re.fullmatch(r"[A-Za-z0-9_-]+", request_id):
@@ -3321,9 +3329,38 @@ class ChatBridge:
             self._prompt_delivery = PromptDelivery(delivery_root / "prompt-delivery.json")
         key = f"{self.backend_name}:{active_task.save_id}:{getattr(self, 'actor_mode', '')}:{(self._latest_snapshot_payload or {}).get('actorMultiplayerId', 'unknown')}"
         key += f":{getattr(self, '_player_session_id', None) or 'unknown-session'}"
+        # All event sources share one state schema. The player suffix is opaque.
+        marker = re.search(r"(?m)^(?:玩家说：|玩家指令：)", prompt)
+        boundary = marker.start() if marker else len(prompt)
+        prefix, player = prompt[:boundary], prompt[boundary:]
+        context = model_decision_context(self._decision_context(active_task.save_id, origin="game"))
+        context["workDispatchAvailable"] = not active_task.read_only
+        if self._profile_store and active_task.save_id:
+            context["profile"] = (self._profile_store.get(active_task.save_id) or {}).get("profile")
+        context["milestones"] = self._life_milestone_summary(active_task.save_id, "chat")
+        # Event metadata is not world state: retain it when canonicalizing snapshots.
+        event = {}
+        for match in re.finditer(r"(?m)^实时上下文：([^\n]*)", prefix):
+            original = json.loads(match.group(1))
+            for field in ("projectScope", "objective", "wakeReason", "acceptedArrangement",
+                          "boxRange", "idlePreference", "idleHelpEnabled", "autonomyMode"):
+                if field in original:
+                    event[field] = original[field]
+        decision = context.get("decision") or {}
+        event.update(requestId=active_task.request_id, workDispatchAvailable=not active_task.read_only)
+        event["goalId"] = decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope
+        # These are already represented in the current state; don't inject duplicates from reload.
+        if isinstance(context.get("reloadSummary"), dict):
+            context["reloadSummary"] = {k: v for k, v in context["reloadSummary"].items()
+                                        if k not in {"goals", "agreementsAndPreferences", "decisions"}}
+        replacement = "实时上下文：" + render_decision_context(context)
+        prefix = re.sub(r"(?m)^实时上下文：[^\n]*", lambda _: replacement, prefix)
+        prompt = prefix + "\n本轮任务：" + json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n" + player
         sent, pending = self._prompt_delivery.prepare(
             key, conversation_id, prompt,
             load_instruction_bundle(getattr(self, "actor_mode", None)).text)
+        logger.info("Turn payload stateBytes=%s eventBytes=%s sentBytes=%s",
+                    len(replacement.encode()), len(json.dumps(event, ensure_ascii=False).encode()), len(sent.encode()))
         return key, sent, pending
 
     def _acknowledge_prompt_delivery(self, key: str, pending: dict[str, Any],
@@ -3337,96 +3374,29 @@ class ChatBridge:
         prompt: str,
         mode: str = "chat",
     ) -> dict[str, Any]:
-        """Run one conversation with cached reads and durable intent tools.
-
-        It receives no decision token and cannot dispatch native actions. Legacy
-        chat/plan mode names remain wire-compatible but have identical authority.
-        Player intent determines whether to discuss, commit work, or control it.
-        """
-        if active_task.cancelled:
-            return {"success": False, "response": "对话已中断。", "error": "CHAT_CHANNEL_CLOSED"}
-        if self.backend_name == "kimi" and type(self._execute_agy_turn).__module__.startswith("unittest.mock"):
-            return self._execute_agy_turn(active_task, conversation_id, prompt)
-        from stardew_ai_runtime.compatibility import assert_native_compatible
-        assert_native_compatible(self.run_dir)
-        env = os.environ
-        previous_token = env.get("STARDEW_DECISION_TOKEN")
-        previous_surface = env.get("STARDEW_MCP_SURFACE")
-        previous_mode = env.get("STARDEW_LIFE_MODE")
-        previous_proposal = env.get("STARDEW_LIFE_PROPOSAL_ID")
-        previous_save = env.get("STARDEW_LIFE_SAVE_ID")
-        env["STARDEW_LIFE_SAVE_ID"] = active_task.save_id or ""
-        previous_turn = env.get("STARDEW_LIFE_TURN_ID")
-        env["STARDEW_LIFE_TURN_ID"] = active_task.request_id
-        env.pop("STARDEW_DECISION_TOKEN", None)
-        env["STARDEW_MCP_SURFACE"] = "life"
-        env["STARDEW_LIFE_MODE"] = mode if mode in {"chat", "plan"} else "chat"
-        proposal = self._current_life_proposal(active_task.save_id) if mode == "plan" else None
-        env["STARDEW_LIFE_PROPOSAL_ID"] = proposal["id"] if proposal else ""
+        """Legacy UI adapter; conversation and work use the same model round."""
+        keys = ("STARDEW_LIFE_SAVE_ID", "STARDEW_LIFE_TURN_ID", "STARDEW_LIFE_MODE")
+        previous = {key: os.environ.get(key) for key in keys}
+        os.environ.update(dict(zip(keys, (active_task.save_id or "", active_task.request_id, mode), strict=True)))
+        start = get_max_gen_idx(conversation_id) if self.backend_name == "agy" else -1
+        active_task.start_max_idx = start
+        active_task.start_max_step_idx = get_max_step_idx(conversation_id) if self.backend_name == "agy" else -1
+        offset = wire_offset(conversation_id, cwd=project_root()) if self.backend_name == "kimi" else 0
         try:
-            backend = self._get_backend()
-            if isinstance(backend, (KimiBackend, CodexBackend, DshBackend, McodeBackend)):
-                backend.progress = getattr(self, "_backend_progress_callback", None)
-            start_idx = get_max_gen_idx(conversation_id) if self.backend_name == "agy" else -1
-            active_task.start_max_idx = start_idx
-            active_task.start_max_step_idx = get_max_step_idx(conversation_id) if self.backend_name == "agy" else -1
-            offset = wire_offset(conversation_id, cwd=project_root()) if self.backend_name == "kimi" else 0
-            delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
-                active_task, conversation_id, prompt, backend)
-            turn_native_session = getattr(self, "_player_session_id", None)
-            result = backend.run(active_task, conversation_id, sent_prompt)
-            if (conversation_id and result.get("error") == "MCODE_SESSION_UNAVAILABLE"
-                    and not active_task.cancelled):
-                # The provider confirmed that no turn started on this session.
-                # Rebuild from the complete current context, not an old delta.
-                self._rotate_provider_session(active_task.save_id, reason="MCODE_SESSION_UNAVAILABLE")
-                conversation_id = None
-                delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
-                    active_task, None, prompt, backend)
-                result = backend.run(active_task, None, sent_prompt)
-            delivered_session = result.get("conversation_id")
-            if delivered_session and not active_task.cancelled and not result.get("error"):
-                self._acknowledge_prompt_delivery(delivery_key, pending_prompt, active_task.save_id, str(delivered_session))
-                if self.actor_mode == "player":
-                    self._work_reload_context(active_task.save_id, str(delivered_session), delivered=True,
-                                              expected_game_session_id=turn_native_session)
-            logger.info("Prompt delivery save=%s session=%s version=%s originalBytes=%s newBytes=%s",
-                        active_task.save_id, delivered_session, pending_prompt["version"],
-                        pending_prompt["originalPromptBytes"], pending_prompt["newPromptBytes"])
+            result = self._execute_turn(active_task, conversation_id, prompt)
             cid = result.get("conversation_id") or conversation_id
-            if cid != conversation_id:
-                start_idx = -1
-            if self.backend_name == "kimi":
+            if self.backend_name == "agy":
+                result["usage"] = (get_command_usage_delta(cid, start if cid == conversation_id else -1)
+                                   if cid else None) or result.get("usage")
+            elif self.backend_name == "kimi":
                 result["usage"] = read_usage_since(cid, offset, cwd=project_root())
-            elif self.backend_name == "agy":
-                result["usage"] = (get_command_usage_delta(cid, start_idx) if cid else None) or (
-                    result.get("usage") if conversation_id is None else None)
             return result
         finally:
-            if previous_save is None:
-                env.pop("STARDEW_LIFE_SAVE_ID", None)
-            else:
-                env["STARDEW_LIFE_SAVE_ID"] = previous_save
-            if previous_turn is None:
-                env.pop("STARDEW_LIFE_TURN_ID", None)
-            else:
-                env["STARDEW_LIFE_TURN_ID"] = previous_turn
-            if previous_token is None:
-                env.pop("STARDEW_DECISION_TOKEN", None)
-            else:
-                env["STARDEW_DECISION_TOKEN"] = previous_token
-            if previous_surface is None:
-                env.pop("STARDEW_MCP_SURFACE", None)
-            else:
-                env["STARDEW_MCP_SURFACE"] = previous_surface
-            if previous_mode is None:
-                env.pop("STARDEW_LIFE_MODE", None)
-            else:
-                env["STARDEW_LIFE_MODE"] = previous_mode
-            if previous_proposal is None:
-                env.pop("STARDEW_LIFE_PROPOSAL_ID", None)
-            else:
-                env["STARDEW_LIFE_PROPOSAL_ID"] = previous_proposal
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     async def _join_interrupted_provider(self, active_task: ActiveChatTask, future: asyncio.Future) -> None:
         """Keep the model slot until its executor has restored turn-local state."""
@@ -3577,7 +3547,7 @@ class ChatBridge:
                     command_id=request_id,
                     prompt=text,
                     async_task=asyncio.current_task(),
-                    read_only=bool(item.get("midflight")),
+                    read_only=self._delivery_read_only(save_id) or self._job_in_flight(save_id),
                 )
                 self._configure_backend_progress(ws, request_id, save_id)
                 await self._send_reply(ws, Envelope.create_life_chat_reply(
@@ -3590,8 +3560,30 @@ class ChatBridge:
                     activity={"phase": "planning", "summary": "伙伴正在结合眼前情况想下一步。", "nextStep": "已有工作照常进行。"} if mode == "plan" else None,
                 ))
                 self._write_life_snapshot(save_id)
-                self._life_turn_lease(request_id, save_id, player_text=text)
-                result = await self._await_life_provider(active_task, existing_cid, prompt, mode)
+                self._life_turn_lease(request_id, save_id, player_text=text, notice_id=notice_id)
+                execution_claimed = False
+                result = {}
+                previous_active = self._active_task
+                self._active_task = active_task
+                try:
+                    if not active_task.read_only:
+                        execution_claimed = await self._claim_execution(save_id)
+                        if self._work_store and text.strip():
+                            self._work_store.record_request(save_id, request_id, text, origin="player")
+                    result = await self._await_life_provider(active_task, existing_cid, prompt, mode)
+                    if result.get("success") and not active_task.read_only and self._work_store:
+                        selected = self._work_store.state(save_id).decision
+                        if selected.get("selected") and not selected.get("finished"):
+                            self._active_player_requests[save_id] = request_id
+                            self._job_reply_binding = (request_id, save_id, selected.get("taskId"), ws, request_id)
+                finally:
+                    if (not result.get("success") or active_task.cancelled) and active_task.decision_token and self._work_store:
+                        if self._work_store.state(save_id).decision.get("token") == active_task.decision_token:
+                            self._work_store.revoke_decision(save_id)
+                    if self._active_task is active_task:
+                        self._active_task = previous_active
+                    if execution_claimed:
+                        await self._release_execution(save_id)
                 if generation != self._life_control_generation.get(save_id, 0):
                     await self._send_reply(ws, Envelope.create_life_chat_reply(
                         self.instance_id, request_id, save_id, status="completed", reply_text="这条旧请求已被新的工作控制撤销。",
@@ -3602,6 +3594,9 @@ class ChatBridge:
                 success = bool(result.get("success"))
                 if success and notice_id and item.get("resolve_notice") and self._work_store is not None:
                     self._work_store.answer_player_notice(save_id, notice_id, text, request_id)
+                resolved_notice = notice_id if success and notice_id and self._work_store and any(
+                    n.get("id") == notice_id and n.get("answerRequestId") == request_id
+                    for n in self._work_store.state(save_id).notices) else None
                 self._record_command(
                     request_id=request_id, save_id=save_id,
                     conversation_id=result.get("conversation_id") or existing_cid,
@@ -3642,8 +3637,8 @@ class ChatBridge:
                         request_id=request_id,
                         save_id=save_id,
                         status="completed",
-                        reply_text=str(result.get("response") or "")[:2000] or None,
-                        answered_notice_id=notice_id if item.get("resolve_notice") else None,
+                        reply_text=str(result.get("response") or "") or None,
+                        answered_notice_id=resolved_notice,
                         profile_revision=self._profile_revision(save_id),
                         memory_revision=self._memory_revision(save_id),
                     )
@@ -3653,7 +3648,7 @@ class ChatBridge:
                         request_id=request_id,
                         save_id=save_id,
                         status="failed",
-                        reply_text=str(result.get("response") or "")[:2000] or None,
+                        reply_text=str(result.get("response") or "") or None,
                         profile_revision=self._profile_revision(save_id),
                         memory_revision=self._memory_revision(save_id),
                         error=str(result.get("error") or "TURN_FAILED"),
@@ -3916,7 +3911,7 @@ class ChatBridge:
                 save_id=save_id,
                 kind=kind,
                 event_key=event_key,
-                text=text[:300],
+                text=text,
                 game_date=game_date,
             ))
         except Exception:
@@ -3977,6 +3972,7 @@ class ChatBridge:
                 active_task = ActiveChatTask(
                     request_id=f"care-{uuid.uuid4().hex[:8]}", save_id=save_id,
                     command_id="", prompt=prompt, async_task=asyncio.current_task())
+                active_task.read_only = True
                 result = await self._await_life_provider(active_task, existing_cid, prompt)
                 cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat:
@@ -5747,7 +5743,9 @@ class ChatBridge:
         task.add_done_callback(_clear)
 
     def _delivery_read_only(self, save_id: str) -> bool:
-        """Paused, bedtime or an in-flight selection: report facts only."""
+        """Current native ownership, not the event source, gates execution."""
+        if self.actor_mode == "player" and self.control_owner != "agent":
+            return True
         if self._preset_business_blocked(save_id):
             return True
         if self._work_store is not None and self._work_store.state(save_id).paused:
@@ -5939,8 +5937,6 @@ class ChatBridge:
         conversation_id: str | None,
         prompt: str,
     ) -> dict[str, Any]:
-        if active_task.read_only:
-            return self._execute_life_turn(active_task, conversation_id, prompt, mode="chat")
         """Dispatch one turn to the configured provider adapter."""
         # Preserve the legacy test/integration seam when callers explicitly
         # replace _execute_agy_turn; normal production dispatch remains solely
@@ -5951,7 +5947,7 @@ class ChatBridge:
         assert_native_compatible(self.run_dir)
         token = uuid.uuid4().hex
         save_id = active_task.save_id
-        if save_id and self._work_store is not None:
+        if save_id and self._work_store is not None and not active_task.read_only:
             scope = active_task.goal_scope or (self._autonomy.state(save_id).goal_scope
                      if self._autonomy and active_task.request_id.startswith("autonomy-") else None)
             state = self._work_store.state(save_id)
@@ -5960,7 +5956,7 @@ class ChatBridge:
             source = next((r for r in state.requests if r.get("id") == source_id), None)
             if source:
                 prompt += "\n玩家原始指令（保留动作限制、汇报要求与统计范围；当前已采纳范围以目标为准）：" + json.dumps(
-                    {"requestId": source_id, "text": source["text"]}, ensure_ascii=False)
+                    {"text": source["text"]}, ensure_ascii=False)
             self._work_store.begin_decision(
                 save_id, token, goal_scope=scope, goal_default=active_task.goal_default,
                 request_id=source_id if source else active_task.command_id or active_task.request_id,
@@ -5973,7 +5969,13 @@ class ChatBridge:
             active_task.decision_token = token
             active_task.decision_day = self._work_store.state(save_id).last_settled_day
         previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
-        os.environ["STARDEW_DECISION_TOKEN"] = token
+        previous_surface = os.environ.get("STARDEW_MCP_SURFACE")
+        # Capability discovery stays fixed; only cached reads/execution admission differ.
+        os.environ["STARDEW_MCP_SURFACE"] = "life" if active_task.read_only else "light"
+        if active_task.read_only:
+            os.environ.pop("STARDEW_DECISION_TOKEN", None)
+        else:
+            os.environ["STARDEW_DECISION_TOKEN"] = token
         try:
             backend = self._get_backend()
             if isinstance(backend, (KimiBackend, CodexBackend, DshBackend, McodeBackend)):
@@ -5993,6 +5995,10 @@ class ChatBridge:
                         pending_prompt["originalPromptBytes"], pending_prompt["newPromptBytes"])
             return result
         finally:
+            if previous_surface is None:
+                os.environ.pop("STARDEW_MCP_SURFACE", None)
+            else:
+                os.environ["STARDEW_MCP_SURFACE"] = previous_surface
             if previous_token is None:
                 os.environ.pop("STARDEW_DECISION_TOKEN", None)
             else:

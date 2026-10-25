@@ -16,7 +16,16 @@ _PROGRESS_KEYS = (
     "finalLocation", "finalTile", "requestedTile", "targetAdjusted", "hopCount",
     # This is the operation's observed scope, not completion of its milestone.
     "goalSatisfied", "knownNoWork", "scopeObservationIncomplete",
+    "resultUncertain", "verificationRequired", "reconciliation",
 )
+
+
+def timed_out_receipt(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    error = raw.get("error")
+    code = raw.get("reasonCode") or (error.get("code") if isinstance(error, dict) else "")
+    return "TIMEOUT" in str(code).upper() or "TIMED_OUT" in str(code).upper()
 
 
 def _known_no_work(raw: dict[str, Any], status: str | None) -> bool:
@@ -137,7 +146,22 @@ def compact_job_feedback(result: Any, *, operation: str = "", status: str | None
         feedback = {"operation": operation, "status": feedback["status"], "nextBusiness": "new_model_decision_required",
                     "reasonCode": raw.get("reasonCode"), "message": raw.get("message"),
                     "effectCount": len(effects), "detailsTruncated": True, **essential}
+    if timed_out_receipt(raw):
+        feedback["resultUncertain"] = True
+        feedback["verificationRequired"] = "Read current inventory and the affected location before choosing remaining work; absent effects do not establish zero output."
+        if not effects:
+            actual_summary = "动作超时，实际变化尚未确认；不代表没有产出"
     feedback["actualSummary"] = actual_summary
+    reasons = [str(raw.get("reasonCode", "")), *feedback.get("skipReasons", {}),
+               *feedback.get("failureReasons", {})]
+    if any("unreachable" in reason.lower() or reason.upper() in {
+        "PATH_BLOCKED", "NO_PATH", "PATH_NOT_FOUND", "NATIVE_COLLISION"
+    } for reason in reasons):
+        feedback["obstacleAssessment"] = (
+            "Inspect the blocked area first. Decide whether identified obstacles should be cleared "
+            "using available tools/stamina, clearing value and player preservation preferences. "
+            "Unreachable does not prove removable. Choose another route or target if clearing is unsuitable."
+        )
     # Planned observations used to settle as a generic effect-free command and
     # lose their actual facts. The next turn then had to re-read (or substitute
     # its old local tile sample). Keep a bounded, provenance-labelled receipt.

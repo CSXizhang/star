@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from test_release_package import ROOT, package_at
+from support.release_fixture import ROOT, package_at
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher")
 

@@ -432,23 +432,29 @@ def test_execute_agy_turn_quota_exhaustion() -> None:
 
 
 def test_execute_agy_turn_rate_limit_notifies_and_is_not_quota() -> None:
-    bridge = ChatBridge()
-    failure_codes: list[str] = []
-    bridge._backend_failure_callback = failure_codes.append
-    with patch("subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.returncode = 1
-        _mock_agy_stream(mock_proc, "", "429 Too Many Requests: rate limit exceeded")
-        mock_popen.return_value = mock_proc
+    for error_text in (
+        "429 Too Many Requests: rate limit exceeded",
+        "Error 429: rate limit exceeded. Please retry later.",
+    ):
+        bridge = ChatBridge()
+        failure_codes: list[str] = []
+        bridge._backend_failure_callback = failure_codes.append
+        with patch("subprocess.Popen") as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.returncode = 1
+            _mock_agy_stream(mock_proc, "", error_text)
+            mock_popen.return_value = mock_proc
 
-        res = bridge._execute_agy_turn(
-            active_task=ActiveChatTask(request_id="r2", save_id="s1"),
-            conversation_id=None,
-            prompt="种胡萝卜",
-        )
+            res = bridge._execute_agy_turn(
+                active_task=ActiveChatTask(request_id="r2", save_id="s1"),
+                conversation_id=None,
+                prompt="种胡萝卜",
+            )
 
-    assert res["error"] == "RATE_LIMIT_EXCEEDED"
-    assert failure_codes == ["RATE_LIMIT_EXCEEDED"]
+        assert res["error"] == "RATE_LIMIT_EXCEEDED"
+        assert failure_codes == ["RATE_LIMIT_EXCEEDED"]
+        assert res["success"] is False
+        assert "Rate Limit" in res["response"]
 
 
 def test_handle_chat_submit_player_preempts_old_job_with_fake_provider(tmp_path: Path) -> None:
@@ -490,7 +496,6 @@ def test_handle_chat_cancel_immediate_abort() -> None:
         assert bridge._active_task is None
 
     asyncio.run(run())
-
 
 
 def test_get_command_usage_delta_calculation(tmp_path: Path) -> None:
@@ -583,22 +588,6 @@ def test_old_stdout_error_ignored_on_successful_turn() -> None:
         res = bridge._execute_agy_turn(task, conversation_id="cid-hist-1", prompt="浇水")
         assert res["success"] is True
         assert res["response"] == "胡萝卜浇水完成！"
-
-
-def test_rate_limit_distinguished_from_quota() -> None:
-    """Differentiate transient 429 rate limit from hard quota exhaustion."""
-    bridge = ChatBridge()
-    with patch("subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.returncode = 1
-        _mock_agy_stream(mock_proc, "", "Error 429: rate limit exceeded. Please retry later.")
-        mock_popen.return_value = mock_proc
-
-        task = ActiveChatTask(request_id="r1", save_id="s1")
-        res = bridge._execute_agy_turn(task, conversation_id=None, prompt="浇水")
-        assert res["success"] is False
-        assert res["error"] == "RATE_LIMIT_EXCEEDED"
-        assert "Rate Limit" in res["response"]
 
 
 def test_cancel_race_pre_and_post_spawn() -> None:
@@ -1764,7 +1753,6 @@ def test_chat_bridge_uncaught_exception_flushed_to_file(
         assert "Traceback" in content
     finally:
         remove_chat_bridge_file_logging()
-
 
 
 @pytest.mark.parametrize("conversation_id", [None, "existing-session"])

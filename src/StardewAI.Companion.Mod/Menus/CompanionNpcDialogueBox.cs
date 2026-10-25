@@ -73,7 +73,7 @@ public sealed class CompanionNpcDialogueBox : DialogueBox
         return CompanionDialogueInbox.PlainText(text).Replace('$', '＄').Replace('#', '＃')
             .Replace('%', '％').Replace('@', '＠').Replace('^', '＾').Replace('¦', '｜')
             .Replace('{', '｛').Replace('}', '｝').Replace('[', '［').Replace(']', '］')
-            .Replace('*', '＊').Replace("\r", "").Replace('\n', ' ');
+            .Replace('*', '＊').Replace('+', '＋').Replace('=', '＝').Replace("\r", "").Replace('\n', ' ');
     }
 
     public static int PanelWidth(int viewportWidth) => Math.Min(1200, Math.Max(512, viewportWidth - 64));

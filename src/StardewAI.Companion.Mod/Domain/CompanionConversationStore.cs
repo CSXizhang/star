@@ -5,7 +5,8 @@ using System.Text.Json;
 namespace StardewAI.Companion.Mod.Domain;
 
 public sealed record CompanionConversationEntry(string Id, string Speaker, string Text, string GameDate, bool IsPlayer, bool Unread = false,
-    string? DecisionId = null, string? DecisionStatus = null, string? ReplyToDecisionId = null, bool RolledBack = false);
+    string? DecisionId = null, string? DecisionStatus = null, string? ReplyToDecisionId = null, bool RolledBack = false,
+    IReadOnlyList<string>? Choices = null);
 public sealed record CompanionConversationArchive(string SaveId, List<CompanionConversationEntry> Entries);
 
 /// <summary>Visible conversation only, isolated by save and written on receipt rather than game-day save.</summary>

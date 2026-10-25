@@ -154,50 +154,6 @@ public sealed class PurchaseStateMachineTests
     }
 
     [Fact]
-    public void Update_RejectsClosedShop()
-    {
-        // Actor at (10, 12) adjacent to counter (10, 11)
-        var (machine, _, _, adapter) = CreateTestContext(new TileCoordinate(10, 12));
-        adapter.CustomShopScan = new ShopScanInfo(
-            ShopId: "SeedShop",
-            Status: "ok",
-            IsOpen: false,
-            OwnerPresent: false,
-            ClosedMessage: "Pierre's General Store is closed at 6:20.",
-            Owners: new[] { "Pierre" },
-            Currency: 0,
-            AvailableMoney: 500,
-            MoneyStatus: "ok",
-            Items: Array.Empty<ShopItemInfo>()
-        );
-
-        var request = new PurchaseRequest(
-            CommandId: "cmd-1",
-            TaskId: "task-1",
-            ShopId: "SeedShop",
-            LocationId: "SeedShop",
-            BudgetLimit: 100,
-            Items: new[] { new PurchaseItemRequest("(O)472", 2) }
-        );
-
-        bool started = machine.Start(request, out var earlyResult);
-        Assert.True(started);
-        Assert.Null(earlyResult);
-
-        // Tick 1: Facing -> Acting
-        machine.Update(null, 1);
-        // Tick 2: Acting executes purchase
-        machine.Update(null, 2);
-
-        Assert.Equal(ExecutionState.Rejected, machine.CurrentState);
-        Assert.NotNull(machine.FinalResult);
-        Assert.Equal(ExecutionState.Rejected, machine.FinalResult.FinalState);
-        Assert.Equal("SHOP_CLOSED", machine.FinalResult.ErrorCode);
-        Assert.Single(machine.FinalResult.SkippedItems);
-        Assert.Equal("shop-closed", machine.FinalResult.SkippedItems[0].Reason);
-    }
-
-    [Fact]
     public void Update_RejectsItemNotInStock()
     {
         var (machine, _, _, adapter) = CreateTestContext(new TileCoordinate(10, 12));

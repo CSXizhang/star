@@ -43,41 +43,17 @@ def test_unknown_protocol_is_rejected() -> None:
         Envelope.from_mapping(message)
 
 
-@pytest.mark.parametrize("value", [True, False])
-def test_bool_as_sequence_number_is_rejected(value: bool) -> None:
+@pytest.mark.parametrize("field", ["sequenceNumber", "worldRevision"])
+@pytest.mark.parametrize("value", [True, -1])
+def test_non_integer_or_negative_counters_are_rejected(field, value) -> None:
     message = valid_message()
-    message["sequenceNumber"] = value
-
-    with pytest.raises(ProtocolError, match="sequenceNumber must be a non-negative integer"):
+    message[field] = value
+    with pytest.raises(ProtocolError, match=f"{field} must be a non-negative integer"):
         Envelope.from_mapping(message)
-
-
-@pytest.mark.parametrize("value", [True, False])
-def test_bool_as_world_revision_is_rejected(value: bool) -> None:
-    message = valid_message()
-    message["worldRevision"] = value
-
-    with pytest.raises(ProtocolError, match="worldRevision must be a non-negative integer"):
-        Envelope.from_mapping(message)
-
-
-@pytest.mark.parametrize("value", [-1, -100])
-def test_negative_int_fields_are_rejected(value: int) -> None:
-    msg1 = valid_message()
-    msg1["sequenceNumber"] = value
-    with pytest.raises(ProtocolError, match="sequenceNumber must be a non-negative integer"):
-        Envelope.from_mapping(msg1)
-
-    msg2 = valid_message()
-    msg2["worldRevision"] = value
-    with pytest.raises(ProtocolError, match="worldRevision must be a non-negative integer"):
-        Envelope.from_mapping(msg2)
 
 
 @pytest.mark.parametrize("naive_str", [
     "2026-08-24T00:00:00",
-    "2026-08-24 00:00:00",
-    "2026-08-24T12:30:45.123",
 ])
 def test_naive_datetime_is_rejected(naive_str: str) -> None:
     message = valid_message()

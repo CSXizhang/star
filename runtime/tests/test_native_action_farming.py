@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from support.native_transport import _snapshot_env, _client
+
 from stardew_ai_runtime.mcp_server import (
     _PLAN_OPERATION_CALLS,
     _native_action_response,
@@ -30,90 +32,6 @@ from stardew_ai_runtime.scheduler import (
     SchedulerError,
 )
 from stardew_ai_runtime.work_state import WorkStateError, WorkStore
-
-
-def _snapshot_env(payload_extra: dict | None = None) -> Envelope:
-    payload = {
-        "capturedRevision": 5,
-        "companion": {
-            "locationId": "Farm",
-            "tileX": 64,
-            "tileY": 15,
-            "facingDirection": 2,
-            "stamina": 250.0,
-            "maxStamina": 270.0,
-            "waterCanLevel": 3,
-            "maxWaterCanLevel": 40,
-            "hasWateringCan": True,
-            "activity": "idle",
-        },
-        "world": {
-            "currentLocation": "Farm",
-            "timeOfDay": 610,
-            "season": "spring",
-            "dayOfMonth": 1,
-            "isRaining": False,
-        },
-    }
-    if payload_extra:
-        payload.update(payload_extra)
-    return Envelope.from_mapping(
-        {
-            "protocolVersion": "0.1",
-            "messageType": "world.snapshot",
-            "messageId": "snap-native-1",
-            "saveId": "mock-save-id-001",
-            "gameSessionId": "mock-session-001",
-            "senderInstanceId": "mod-instance-001",
-            "sequenceNumber": 1,
-            "worldRevision": 5,
-            "sentAt": "2026-09-16T00:00:00Z",
-            "payload": payload,
-        }
-    )
-
-
-def _client(snapshot: Envelope | None = None) -> MagicMock:
-    client = MagicMock()
-    client.is_connected = True
-    client.save_id = "mock-save-id-001"
-    client.game_session_id = "mock-session-001"
-    client.world_revision = 5
-    client.connect = AsyncMock()
-    client.handshake = AsyncMock()
-    client.close = AsyncMock()
-    env = snapshot or _snapshot_env()
-    client.latest_snapshot = env
-    client.wait_for_snapshot = AsyncMock(return_value=env)
-    client.execute_native_action = AsyncMock(return_value="cmd-native-1")
-    client.wait_for_result = AsyncMock(
-        return_value=Envelope.from_mapping(
-            {
-                "protocolVersion": "0.1",
-                "messageType": "skill.result",
-                "messageId": "res-1",
-                "correlationId": "msg-exec-1",
-                "saveId": "mock-save-id-001",
-                "gameSessionId": "mock-session-001",
-                "senderInstanceId": "mod-instance-001",
-                "sequenceNumber": 1,
-                "worldRevision": 6,
-                "sentAt": "2026-09-16T00:00:01Z",
-                "payload": {
-                    "commandId": "cmd-native-1",
-                    "taskId": "task-native-1",
-                    "terminalState": "succeeded",
-                    "completedCount": 1,
-                    "skippedCount": 0,
-                    "failedCount": 0,
-                    "finalWorldRevision": 6,
-                    "effects": [{"state": "fertilized"}],
-                    "skillId": "apply-fertilizer",
-                },
-            }
-        )
-    )
-    return client
 
 
 def test_native_action_parameter_contract() -> None:
@@ -564,13 +482,13 @@ def test_discover_capabilities_exposes_memory_write_schema(tmp_path: Path) -> No
     import asyncio
 
     async def run():
-        server = create_mcp_server(run_dir=tmp_path, scheduler=MagicMock(), surface="light")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=MagicMock(), surface="full")
         light_names = {t.name for t in await server.list_tools()}
         # Grouped observation and refill are directly visible on the game surface.
         assert {"observe_farming_helpers", "observe_machines", "observe_livestock", "refill_watering_can"} <= light_names
-        # The action tools stay behind grouped discovery (progressive disclosure).
-        assert "apply_fertilizer" not in light_names
-        assert "insert_machine" not in light_names
+        # The full operator surface retains direct actions and discovery.
+        assert "apply_fertilizer" in light_names
+        assert "insert_machine" in light_names
 
         _, discovered = await server.call_tool("discover_capabilities", {"group": "memory"})
         schema = discovered["memoryWriteSchema"]
@@ -629,7 +547,7 @@ def test_refill_public_tool_forwards_optional_explicit_native_tile(tmp_path: Pat
             "skippedCount": 1, "effects": [{"state": "skipped", "reason": "not-refillable"}]})
         store = WorkStore(tmp_path / "data" / "work-state.json")
         store.begin_decision("mock-save-123", "decision-rf")
-        server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="light")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="full")
         tiles = [{"x": 64, "y": 19}]
         with patch.dict(os.environ, {"STARDEW_DECISION_TOKEN": "decision-rf"}):
             _, result = await server.call_tool(

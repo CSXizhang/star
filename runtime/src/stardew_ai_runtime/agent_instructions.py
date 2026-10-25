@@ -29,14 +29,14 @@ def _tool_links(text: str) -> str:
     text = re.sub(r"\[核心指令\]\([^)]*agent-core-instructions-draft\.md[^)]*\)", "核心指令", text)
     for topic in GUIDANCE_TOPICS:
         text = re.sub(r"\[([^\]]+)\]\((?:[^)]*/)?" + re.escape(topic) + r"\.md[^)]*\)",
-                      r"\1（read_guidance: " + topic + "）", text)
+                      r"\1（consult.read_guidance: " + topic + "）", text)
     return text
 
 
 PLAYER_MODE_SECTION = (
     "\n当前为玩家模式：你控制存档中的玩家角色，按玩家委托经营与探索。"
     "结合当天状态安排工作、休息和原生睡眠。"
-    "F8 新要求优先于旧安排；询问进度只回答，不改任务。"
+    "聊天栏与 F8 新要求优先于旧安排；询问进度只回答，不改任务。"
     "玩家接管后只交流，等明确交还控制权再行动；不要自行 claim。"
 )
 

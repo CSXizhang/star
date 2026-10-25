@@ -19,7 +19,7 @@ def setup_server(tmp_path):
         async def get_status(self):
             return {"saveId": "save"}
 
-    return create_mcp_server(scheduler=Scheduler(), run_dir=tmp_path, surface="light")
+    return create_mcp_server(scheduler=Scheduler(), run_dir=tmp_path, surface="full")
 
 
 @pytest.mark.parametrize("task", [

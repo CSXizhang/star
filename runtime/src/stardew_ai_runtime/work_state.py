@@ -732,7 +732,7 @@ class WorkStore:
             self._load()
             return self._states.setdefault(save_id, SaveWorkState())
 
-    def request_player_decision(self, save_id: str, goal_id: str, message: str) -> dict[str, Any]:
+    def request_player_decision(self, save_id: str, goal_id: str, message: str, choices: list[str] | None = None) -> dict[str, Any]:
         """Explicit model signal, separate from routine completion text."""
         text = message.strip()
         if not text or len(text) > 1000:
@@ -742,7 +742,8 @@ class WorkStore:
             previous = next((n for n in state.notices if n["goalId"] == goal_id and n["message"] == text and not n.get("answeredAt")), None)
             if previous:
                 return dict(previous)
-            notice = {"id": _new_id("notice"), "goalId": goal_id, "message": text, "delivered": False}
+            notice = {"id": _new_id("notice"), "goalId": goal_id, "message": text, "delivered": False,
+                      "choices": list(choices or [])}
             state.notices.append(notice)
             # Both pending questions and answered receipts are durable. A client
             # may miss the confirmation and reconnect much later; pruning its

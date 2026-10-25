@@ -263,3 +263,30 @@ def _clear_backoff(state, task_id: str, step_id: str) -> None:
         # measured from created_at + backoffSeconds.
         step.wait.retry_after = time.time() - 1.0
         step.wait.created_at = "2000-01-01T00:00:00+00:00"
+
+
+def test_timeout_reconciles_same_command_without_replaying(tmp_path):
+    from unittest.mock import AsyncMock
+    store = _store(tmp_path)
+    _plan(store, operation='chop_tree')
+    dispatch = AsyncMock(return_value={'terminalState': 'partial', 'reasonCode': 'TIMEOUT', 'effects': []})
+    reconcile = AsyncMock(return_value={'terminalState': 'succeeded', 'effects': [{'state': 'chopped'}]})
+    worker = PlanExecutor(store, dispatch, reconcile=reconcile)
+    result = _run(worker.run_once('Save1', 'timeout-worker'))
+    assert result.outcome == 'completed'
+    assert dispatch.await_count == 1
+    assert reconcile.await_args.args[0] == dispatch.await_args.args[2]
+    assert result.result['reconciliation'] == 'same_command_terminal_receipt'
+
+
+def test_timeout_keeps_missing_effects_unknown_even_with_zero_completed():
+    from stardew_ai_runtime.job_feedback import compact_job_feedback, compact_task_feedback
+    from types import SimpleNamespace
+    raw = {'terminalState': 'partial', 'reasonCode': 'TIMEOUT', 'effects': [], 'completedCount': 0}
+    feedback = compact_job_feedback(raw, operation='chop_tree', status='partial')
+    assert feedback['resultUncertain'] is True
+    assert '不代表没有产出' in feedback['actualSummary']
+    task = SimpleNamespace(steps=[SimpleNamespace(id='s', operation='chop_tree', status='partial',
+        outcome='partial', effects=[], feedback=feedback)], status='partial')
+    summary = compact_task_feedback(task, raw, operation='chop_tree', status='partial')
+    assert summary['stepResults'][0]['verificationRequired']

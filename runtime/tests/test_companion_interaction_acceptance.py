@@ -147,7 +147,7 @@ def test_manage_companion_real_registered_call_uses_cache_without_native_connect
         arguments = {"action": action}
         if bedtime is not None:
             arguments["bedtime"] = bedtime
-        await server.call_tool("manage_companion", arguments)
+        await server.call_tool("manage_arrangements", {"change": {"manage_companion": arguments}})
         intent = json.loads(next((data / "life-controls").glob("accepted-control--*.json")).read_text(encoding="utf-8"))
         assert intent["saveId"] == "farm"
         assert intent["action"] == action
@@ -170,10 +170,10 @@ def test_conversation_cache_rejects_switching_to_another_loaded_save(tmp_path, m
         }), encoding="utf-8")
         server = create_mcp_server(run_dir=tmp_path, surface="life")
         with pytest.raises(ToolError, match="SAVE_CHANGED"):
-            await server.call_tool("manage_companion", {"action": "pause"})
+            await server.call_tool("manage_arrangements", {"change": {"manage_companion": {"action": "pause"}}})
         assert not list((data / "life-controls").glob("old-farm-turn*.json"))
         with pytest.raises(ToolError, match="SAVE_CHANGED"):
-            await server.call_tool("manage_milestones", {"action": "propose", "title": "浇水", "preparation": ["water"]})
+            await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "propose", "title": "浇水", "preparation": ["water"]}}})
 
     asyncio.run(scenario())
 

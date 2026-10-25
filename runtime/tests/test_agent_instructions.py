@@ -16,18 +16,14 @@ def test_guidance_is_readable_without_a_game_write_token(monkeypatch):
     monkeypatch.delenv("STARDEW_MCP_SURFACE", raising=False)
     async def run():
         game = create_mcp_server(scheduler=MagicMock(), surface="light")
-        catalog = await game.call_tool("discover_capabilities", {"group": "knowledge"})
-        assert "read_guidance" in str(catalog)
-        result = await game.call_tool("call_capability", {
-            "tool": "read_guidance", "params": {"topic": "crop-selection"}})
-        assert result[1]["result"]["topic"] == "crop-selection"
-        assert "净收益" in result[1]["result"]["text"]
+        result = await game.call_tool("consult", {"request": {"read_guidance": {"topic": "crop-selection"}}})
+        assert result[1]["topic"] == "crop-selection"
+        assert "净收益" in result[1]["text"]
         with pytest.raises(ToolError, match="Unknown guidance topic"):
-            await game.call_tool("call_capability", {
-                "tool": "read_guidance", "params": {"topic": "../../config/auth.json"}})
+            await game.call_tool("consult", {"request": {"read_guidance": {"topic": "../../config/auth.json"}}})
         life = create_mcp_server(scheduler=MagicMock(), surface="life")
-        assert "read_guidance" in {t.name for t in await life.list_tools()}
-        await life.call_tool("read_guidance", {"topic": "daily-rhythm"})
+        assert "consult" in {t.name for t in await life.list_tools()}
+        await life.call_tool("consult", {"request": {"read_guidance": {"topic": "daily-rhythm"}}})
     asyncio.run(run())
 
 

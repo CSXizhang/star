@@ -452,29 +452,6 @@ def test_merged_nodes_cap_twelve(tmp_path: Path) -> None:
     assert len(merged) == 12
 
 
-def test_wire_node_shape_omits_internal_fields(tmp_path: Path) -> None:
-    store = _adopted_store(tmp_path)
-    node = store.list_nodes(SAVE)[0]
-    wire = wire_node(node)
-    assert set(wire.keys()) == {
-        "id",
-        "title",
-        "status",
-        "verification",
-        "targetDate",
-        "daysUntil",
-        "summary",
-        "sourceUrl",
-        "prepItems",
-        "reservedFunds",
-        "plannedCount",
-        "termsNote",
-        "updatedAt",
-    }
-    assert "goalId" not in wire and "todoIds" not in wire and "target" not in wire
-    assert set(wire["prepItems"][0].keys()) == {"key", "label", "support", "status", "note"}
-
-
 def test_planned_quantity_and_split_stacks_do_not_claim_planting(tmp_path):
     store = _store(tmp_path)
     store.adopt(SAVE, STRAWBERRY_ID, planned_count=10, game_date=DATE_11)

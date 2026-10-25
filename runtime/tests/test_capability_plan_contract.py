@@ -13,7 +13,7 @@ from stardew_ai_runtime.work_state import WorkStore
 
 def test_discovery_separates_direct_navigation_aliases_from_step_contract():
     async def check():
-        server = create_mcp_server(scheduler=MagicMock(), surface="light")
+        server = create_mcp_server(scheduler=MagicMock(), surface="full")
         _, result = await server.call_tool("discover_capabilities", {"group": "movement"})
         entry = next(e for e in result["groups"]["movement"] if e["name"] == "navigate_to")
         assert {"tile_x", "tile_y", "x", "y"}.issubset(entry["directCall"]["parameters"])
@@ -38,7 +38,7 @@ def test_missing_destination_is_rejected_before_job_selection(tmp_path):
         job = {"goal_text": "照料鸡", "tasks": [{"title": "进鸡舍", "steps": [{"operation": "navigate_to",
                                 "params": {"location_id": "Farm", "landmark": "counter"}}]}]}
         with patch.dict("os.environ", {"STARDEW_DECISION_TOKEN": "nav"}):
-            server = create_mcp_server(run_dir=tmp_path, scheduler=sched, surface="light")
+            server = create_mcp_server(run_dir=tmp_path, scheduler=sched, surface="full")
             with pytest.raises(Exception, match="observed destination tile"):
                 await server.call_tool("submit_plan", job)
             assert not store.state("S").tasks
@@ -64,7 +64,7 @@ def test_animal_care_trip_is_one_bounded_business():
 
 def test_all_discovered_step_keys_share_dispatch_contract_and_shop_docs():
     async def check():
-        server = create_mcp_server(scheduler=MagicMock(), surface="light")
+        server = create_mcp_server(scheduler=MagicMock(), surface="full")
         entries = {}
         for group in CAPABILITY_GROUPS:
             _, result = await server.call_tool("discover_capabilities", {"group": group})
@@ -84,7 +84,7 @@ def test_all_discovered_step_keys_share_dispatch_contract_and_shop_docs():
 
 def test_discovery_gives_nested_required_shapes_and_valid_examples():
     async def check():
-        server = create_mcp_server(scheduler=MagicMock(), surface="light")
+        server = create_mcp_server(scheduler=MagicMock(), surface="full")
         _, index = await server.call_tool("discover_capabilities", {})
         assert index["groups"] == {}
         _, result = await server.call_tool("discover_capabilities", {"group": "farm"})
@@ -107,7 +107,7 @@ def test_mixed_cross_map_job_is_saved_with_each_operation_contract(tmp_path, mon
         store = WorkStore(tmp_path / "data/work-state.json")
         store.begin_decision("S", "choice")
         monkeypatch.setenv("STARDEW_DECISION_TOKEN", "choice")
-        server = create_mcp_server(run_dir=tmp_path, scheduler=sched, surface="light")
+        server = create_mcp_server(run_dir=tmp_path, scheduler=sched, surface="full")
         tiles = [{"x": i, "y": 5} for i in range(100)]
         steps = [{"operation": "navigate_to", "params": {"location_id": "FarmHouse", "tile": {"x": 1, "y": 1}}},
                  {"operation": "withdraw_from_chest", "params": {"location_id": "FarmHouse", "chest_x": 1, "chest_y": 1, "items": [{"itemId": "(O)475", "count": 100}]}},
@@ -122,3 +122,27 @@ def test_mixed_cross_map_job_is_saved_with_each_operation_contract(tmp_path, mon
         assert saved[1].params["location_id"] == "FarmHouse"
         assert saved[-1].params["tiles"] == tiles
     asyncio.run(check())
+
+
+def test_mixed_native_operations_remain_valid_serial_jobs():
+    # Planting, watering and refill.
+    WorkStore.validate_short_job([{"steps": [
+        {"operation": "plant_seeds", "params": {"tiles": [{"x": 69, "y": 18}, {"x": 64, "y": 23}]}},
+        {"operation": "water_auto", "params": {"max_tiles": 100}},
+        {"operation": "refill_watering_can", "params": {}},
+    ]}])
+
+    # Machine collection and delivery in both orders.
+    collect = {"operation": "collect_machine", "params": {"location_id": "Farm", "tiles": [{"x": 5, "y": 5}]}}
+    deposit = {"operation": "deposit_to_chest", "params": {"location_id": "FarmHouse", "chest_x": 7, "chest_y": 5, "item_ids": ["(O)306"]}}
+    insert = {"operation": "insert_machine", "params": {"location_id": "Farm", "tile": {"x": 10, "y": 10}, "item_id": "(O)176"}}
+    # Each native interaction checks its current world preconditions when dispatched.
+    WorkStore.validate_short_job([{"steps": [collect, deposit, insert]}])
+    WorkStore.validate_short_job([{"steps": [insert, collect, deposit]}])
+
+    # Arrival, observation and animal care.
+    steps = [{"operation": "navigate_to", "params": {"location_id": "AnimalShop"}},
+             {"operation": "observe_building_services", "params": {"location_id": "AnimalShop"}},
+             {"operation": "purchase_animal", "params": {"location_id": "Farm", "animal_type": "Chicken"}},
+             {"operation": "cut_grass", "params": {"location_id": "Farm", "tiles": [{"x": 5, "y": 5}]}}]
+    WorkStore.validate_short_job([{"steps": steps}])

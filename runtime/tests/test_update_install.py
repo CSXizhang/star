@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from test_release_package import package_at
+from support.release_fixture import package_at
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows updater")

@@ -3710,6 +3710,51 @@ public sealed class TestDriverMod : Mod
         Monitor.Log($"[TestDriver] Harness fixture {mode}: {count} reachable actual Farm targets recorded; no action result fabricated.", LogLevel.Info);
     }
 
+    private const string GrowthFixtureKey = "CSXizhang.StardewAICompanion.TestDriver/NativeGrowthFixture";
+
+    private void ArrangeNativeGrowthFixture(object modEntry, string outDir, string label)
+    {
+        AssertHarnessFixtureBoundary(modEntry);
+        ResolveCompanionActor(out _, out var farmer, out _, out _);
+        if (farmer?.currentLocation is not Farm farm)
+            throw new InvalidOperationException("Native growth fixture requires the actual actor on Farm.");
+        if (farm.furniture.Any(item => item.modData.ContainsKey(GrowthFixtureKey)))
+            throw new InvalidOperationException("Native growth fixture already exists; never reset an observed outcome.");
+        var chair = ItemRegistry.Create("(F)0") as StardewValley.Objects.Furniture
+            ?? throw new InvalidOperationException("Native oak chair item unavailable.");
+        if (chair.rotations.Value < 2)
+            throw new InvalidOperationException("Native chair does not support rotation.");
+        Vector2? selected = null;
+        foreach (var offset in new[] { new Vector2(1, 0), new Vector2(-1, 0), new Vector2(0, 1), new Vector2(0, -1) })
+        {
+            var tile = farmer.Tile + offset;
+            if (farm.objects.ContainsKey(tile) || farm.terrainFeatures.ContainsKey(tile)
+                || farm.furniture.Any(item => item.boundingBox.Value.Intersects(new Rectangle((int)tile.X * 64, (int)tile.Y * 64, 64, 64)))) continue;
+            if (farm.isCollidingPosition(new Rectangle((int)tile.X * 64 + 8, (int)tile.Y * 64 + 8, 48, 48),
+                    Game1.viewport, false, 0, false, farmer)) continue;
+            selected = tile;
+            break;
+        }
+        if (selected is not Vector2 target) throw new InvalidOperationException("No free adjacent native chair fixture tile.");
+        chair = new StardewValley.Objects.Furniture("0", target);
+        chair.modData[GrowthFixtureKey] = _runId ?? "isolated";
+        farm.furniture.Add(chair);
+        var observer = ReadNativeMember(modEntry, "_observer");
+        observer?.GetType().GetMethod("BumpRevision")?.Invoke(observer, null);
+        var revision = ReadNativeMember(observer, "WorldRevision");
+        var coordinator = ReadNativeMember(modEntry, "_coordinator");
+        var snapshot = coordinator?.GetType().GetMethod("CaptureCurrentSnapshot")?.Invoke(coordinator, new object?[] { revision });
+        var transport = ReadNativeMember(modEntry, "_transportServer");
+        if (snapshot != null) transport?.GetType().GetMethod("SendSnapshotAsync")?.Invoke(transport, new object?[] { snapshot, revision });
+        var fixture = new { runId = _runId, label, mode = "native-growth-furniture", actorId = farmer.UniqueMultiplayerID,
+            saveName = Constants.SaveFolderName, isolatedSavesPath = StardewValley.Program.GetSavesFolder(),
+            tile = new { x = (int)target.X, y = (int)target.Y }, item = chair.QualifiedItemId,
+            initialRotation = chair.currentRotation.Value, rotations = chair.rotations.Value,
+            provenance = "Initial isolated native furniture only; no rotate method invoked by TestDriver" };
+        File.WriteAllText(Path.Combine(outDir, $"native-growth-fixture-{label}.json"), JsonSerializer.Serialize(fixture));
+        WriteFreeModeNativeSnapshot(outDir, label);
+    }
+
     private void HandleLifeUiRequest(string outDir, JsonElement request)
     {
         string action = request.TryGetProperty("action", out var ap) ? ap.GetString() ?? "" : "";
@@ -3850,6 +3895,10 @@ public sealed class TestDriverMod : Mod
         else if (action == "harness-fixture")
         {
             ArrangeHarnessFixture(outDir, label, request);
+        }
+        else if (action == "native-growth-fixture")
+        {
+            ArrangeNativeGrowthFixture(modEntry, outDir, label);
         }
         else if (action == "harness-capture")
         {
@@ -8418,6 +8467,19 @@ public sealed class TestDriverMod : Mod
                 ["playerLocation"] = Game1.player.currentLocation?.NameOrUniqueName,
                 ["playerTile"] = new { x = (int)Game1.player.Tile.X, y = (int)Game1.player.Tile.Y },
                 ["companionObserved"] = companionFarmer != null,
+                ["companionFarmerId"] = companionFarmer?.UniqueMultiplayerID,
+                ["nativeGrowthFurniture"] = farm.furniture.Where(item => item.modData.ContainsKey(GrowthFixtureKey)).Select(item => new {
+                    itemId = item.QualifiedItemId, nativeType = item.GetType().FullName,
+                    tile = new { x = (int)item.TileLocation.X, y = (int)item.TileLocation.Y },
+                    rotation = item.currentRotation.Value, rotations = item.rotations.Value,
+                    actorAdjacent = companionFarmer?.currentLocation == farm && Math.Abs(companionFarmer.Tile.X - item.TileLocation.X)
+                        + Math.Abs(companionFarmer.Tile.Y - item.TileLocation.Y) <= 1,
+                    actorOverlaps = companionFarmer?.currentLocation == farm && item.boundingBox.Value.Intersects(companionFarmer.GetBoundingBox()),
+                    sourceRectangle = new { x = item.sourceRect.Value.X, y = item.sourceRect.Value.Y,
+                        width = item.sourceRect.Value.Width, height = item.sourceRect.Value.Height },
+                    bounds = new { x = item.boundingBox.Value.X, y = item.boundingBox.Value.Y,
+                        width = item.boundingBox.Value.Width, height = item.boundingBox.Value.Height },
+                    fixtureRunId = item.modData[GrowthFixtureKey] }).ToArray(),
                 ["companionObservation"] = observation.ToString(),
                 ["companionStamina"] = companionFarmer?.stamina,
                 ["animationFrames"] = _companionAnimationFrames.ToDictionary(pair => pair.Key, pair => pair.Value.OrderBy(frame => frame).ToArray()),
@@ -8543,15 +8605,15 @@ public sealed class TestDriverMod : Mod
             if (label.Length is < 1 or > 48 || !label.All(c => char.IsLetterOrDigit(c) || c is '-' or '_'))
                 throw new ArgumentException("Lifecycle request requires a safe label.");
             string action = request.RootElement.GetProperty("action").GetString() ?? "";
-            if (action is "return-title" or "save-title" or "save-exit")
+            if (action is "return-title" or "save-title" or "save-exit" or "save-current")
             {
                 _lifecycleSaveName = Constants.SaveFolderName ?? throw new InvalidOperationException("No loaded test save.");
-                if (action is "save-title" or "save-exit")
+                if (action is "save-title" or "save-exit" or "save-current")
                 {
                     var saver = SaveGame.Save();
                     while (saver.MoveNext()) { }
                 }
-                if (action != "save-exit") Game1.ExitToTitle();
+                if (action is "return-title" or "save-title") Game1.ExitToTitle();
             }
             else if (action == "reload")
             {

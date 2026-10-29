@@ -314,7 +314,8 @@ def test_native_farm_plan_operations_persist_and_match_real_dispatch(tmp_path: P
     from stardew_ai_runtime.mcp_server import _PLAN_OPERATION_CALLS
     from stardew_ai_runtime.work_state import ALLOWED_OPERATIONS, READ_ONLY_OPERATIONS
     # Both admission and dispatch must agree, including newly connected farm tools.
-    assert ALLOWED_OPERATIONS == (set(_PLAN_OPERATION_CALLS) - {"rest"}) | {"query_wiki"}
+    # Learned native actions execute immediately and never enter legacy queues.
+    assert ALLOWED_OPERATIONS == (set(_PLAN_OPERATION_CALLS) - {"rest", "learned_action"}) | {"query_wiki"}
     store = _store(tmp_path)
     tasks = store.create_plan("Save1", _goal(store), [
         {"id":"milk", "title":"collect", "steps":[{"operation":"collect_animal_produce", "params":{"animal_name":"cow"}}]},

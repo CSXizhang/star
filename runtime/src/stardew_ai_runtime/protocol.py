@@ -16,6 +16,10 @@ class ProtocolError(ValueError):
 # here, schedule, transport, MCP schema and the C# handler all validate the same
 # contract, and an unknown skill/parameter is rejected instead of being forwarded.
 NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
+    "discover-extension-api": frozenset({"locationId", "extensionModId", "extensionType", "extensionMember", "extensionOffset", "extensionLimit"}),
+    "list-extensions": frozenset({"locationId"}),
+    "load-extension": frozenset({"locationId", "extensionPackage", "extensionPersist"}),
+    "invoke-extension": frozenset({"locationId", "extensionId", "extensionVersion", "extensionKind", "extensionArguments"}),
     "rest": frozenset({"locationId", "targetStamina"}),
     "inspect-player-activities": frozenset({"locationId"}),
     "talk-npc": frozenset({"locationId", "npcName"}),
@@ -62,6 +66,10 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
 }
 
 NATIVE_ACTION_TASK_PREFIXES: dict[str, str] = {
+    "discover-extension-api": "task-api-",
+    "list-extensions": "task-abilities-",
+    "load-extension": "task-learn-load-",
+    "invoke-extension": "task-learn-use-",
     "inspect-location": "task-space-",
     "place-items": "task-place-",
     "remove-items": "task-remove-",

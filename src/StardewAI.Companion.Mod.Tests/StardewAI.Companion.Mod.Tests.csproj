@@ -17,6 +17,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Reference Include="SMAPI.Toolkit.CoreInterfaces"><HintPath>$(StardewGamePath)\smapi-internal\SMAPI.Toolkit.CoreInterfaces.dll</HintPath><Private>true</Private></Reference>
     <Reference Include="0Harmony">
       <HintPath>$(StardewGamePath)\smapi-internal\0Harmony.dll</HintPath>
       <Private>true</Private>

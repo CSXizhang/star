@@ -61,19 +61,19 @@ def register_game_tools(mcp, implementations, declarations, operations, *, execu
                 key: (field.annotation, deepcopy(field)) for key, field in source.model_fields.items()
                 if key in allowed})
             description = OPERATION_HELP.get(name) or " ".join(declarations[name].description.split("\n\n", 1)[0].split())
-            if name in {"save_memory", "save_method", "recall_memory", "forget_memory"}:
+            if name in {"save_memory", "save_method", "recall_memory", "forget_memory", "inspect_capabilities", "develop_capability", "manage_capability", "prepare_capability_builder"}:
                 description = " ".join(declarations[name].description.split())
             description = description.removeprefix("Stardew Valley (SMAPI), current saved game. ")
             fields[name] = (arguments | None, Field(default=None, description=description))
         return create_model(label, __base__=OneOperation, **fields)
 
     queries = {name for name in declarations if name.startswith(("query_", "observe_"))
-               and name != "query_wiki"} | {"work_plan_overview", "get_work_overview", "autonomy_status"}
+               and name != "query_wiki"} | {"work_plan_overview", "get_work_overview", "autonomy_status", "learned_query"}
     Query = model("GameQuery", queries)
     Action = model("GameAction", operations, plan=True)
-    Arrangement = model("Arrangement", {"manage_milestones", "manage_companion", "remember_intent", "manage_goal", "manage_todo", "set_autonomy"})
+    Arrangement = model("Arrangement", {"manage_milestones", "manage_companion", "remember_intent", "manage_goal", "manage_todo", "set_autonomy", "develop_capability", "manage_capability", "prepare_capability_builder"})
     Memory = model("Memory", {"save_memory", "save_method", "forget_memory", "record_decision_note", "answer_player_decision", "say_to_player"})
-    Reference = model("Reference", {"recall_memory", "query_wiki", "read_guidance"})
+    Reference = model("Reference", {"recall_memory", "query_wiki", "read_guidance", "inspect_capabilities"})
 
     async def invoke(value):
         name, args = value.selected()

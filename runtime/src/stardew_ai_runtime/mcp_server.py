@@ -33,6 +33,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_valida
 
 from stardew_ai_runtime.agent_instructions import read_guidance as load_guidance
 from stardew_ai_runtime.autonomy import AutonomyController
+from stardew_ai_runtime.capability_consent import learning_provenance
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config
 from stardew_ai_runtime.companion_memory import CompanionMemoryStore, resolve_companion_id
 from stardew_ai_runtime.companion_milestones import (
@@ -45,6 +46,7 @@ from stardew_ai_runtime.decision_context import water_can_resources
 from stardew_ai_runtime.decision_policy import project_context
 from stardew_ai_runtime.game_tools import GAME_TOOLS, register_game_tools
 from stardew_ai_runtime.mcode_wire_schema import mcode_tool_schema
+from stardew_ai_runtime.native_capabilities import CapabilityError, NativeCapabilityStore
 from stardew_ai_runtime.plan_executor import (
     PlanExecutor,
 )
@@ -545,6 +547,7 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
 # scheduler implementation. Unknown operations are rejected; unknown parameters
 # reject semantic parameters outside the operation contract before dispatch.
 _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
+    "learned_action": ("learned_action", frozenset({"capability", "version", "arguments"})),
     "observe_player_activities": ("observe_player_activities", frozenset()),
     "talk_npc": ("talk_npc", frozenset({"npc_name", "location_id"})),
     "interact_tile": ("interact_tile", frozenset({"tile", "location_id"})),
@@ -747,6 +750,7 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
     "movement": ("get_status", "query_route", "navigate_to"),
     "native_ui": ("get_status", "observe_player_activities", "talk_npc", "interact_tile", "fish", "attack", "native_menu_select", "native_advance", "native_answer"),
     "knowledge": ("read_guidance", "query_wiki"),
+    "learning": ("inspect_capabilities", "develop_capability", "prepare_capability_builder", "manage_capability", "learned_query", "learned_action"),
     "memory": ("save_memory", "save_method", "recall_memory", "forget_memory", "manage_goal", "manage_plan", "manage_todo", "record_decision_note", "work_plan_overview"),
 }
 
@@ -1053,6 +1057,31 @@ def create_mcp_server(
 
     def memory_for_run() -> CompanionMemoryStore:
         return CompanionMemoryStore(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "companion-memory.json")
+
+    capability_store = None
+
+    def capabilities_for_run() -> NativeCapabilityStore:
+        nonlocal capability_store
+        if capability_store is None:
+            capability_store = NativeCapabilityStore(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "abilities")
+        return capability_store
+
+    async def learning_permission(quote: str | None, notice_id: str | None = None, previous: dict | None = None) -> dict:
+        assert_life_turn_current(allow_control=True)
+        sid = await current_save_id()
+        path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-turn.json"
+        lease = read_cache(path) if path.exists() else {}
+        notice = next((n for n in work_for_run().state(sid).notices if n.get("id") == notice_id), None) if notice_id else None
+        return learning_provenance(save_id=sid, request_id=os.environ.get("STARDEW_LIFE_TURN_ID"),
+                                   lease=lease or {}, quote=quote, notice=notice, previous=previous)
+
+    async def extension_host_call(fn, *args, **kwargs):
+        previous = getattr(sched, "await_terminal_results", False)
+        sched.await_terminal_results = True
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            sched.await_terminal_results = previous
 
     def memory_context(save_id: str) -> dict[str, str]:
         root = Path(getattr(sched, "run_dir", None) or run_dir or ".")
@@ -4676,6 +4705,156 @@ def create_mcp_server(
         return guarded
 
     @mcp.tool()
+    async def inspect_capabilities(capability: str | None = None, version: str | None = None,
+                                   native_type: str | None = None, mod_id: str | None = None,
+                                   member: str | None = None, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+        """Discover learned native abilities, their source/guidance/schema, or actual game and SMAPI API signatures.
+
+        With capability/version, read that persisted package; omit version for its saved active version.
+        With native_type (e.g. Furniture) or mod_id, inspect the loaded native API, authoring interface
+        and C# example. Prefer an exact type name; ambiguous matches return candidate names.
+        Filter members by name with member, or continue with offset/limit when hasMore is true.
+        Without filters, list loaded abilities and available versions.
+        Discover an existing ability before developing a new one. API signatures describe available
+        calls; choose native gameplay methods and use the program-bound actor.
+        """
+        assert_life_turn_current(allow_control=True)
+        store = capabilities_for_run()
+        if capability:
+            result = store.inspect(capability, version)
+            package = store.package_path(capability, result["manifest"]["version"])
+            return {**result, "source": (package / "Adapter.cs").read_text(encoding="utf-8")}
+        if native_type or mod_id:
+            if offset < 0 or not 1 <= limit <= 40:
+                raise ToolError("Use offset >= 0 and limit from 1 to 40 to read API pages.")
+            discovery = await extension_host_call(sched.discover_extension_api, mod_id, native_type,
+                                                  member=member, offset=offset, limit=limit)
+            authoring = dict(discovery.get("authoring") or {})
+            # Build references stay local to the builder; the model needs the API contract.
+            authoring.pop("references", None)
+            authoring.pop("hostAssembly", None)
+            return {**discovery, "authoring": authoring}
+        packages = []
+        for package in store.list_packages():
+            if package.get("error"):
+                packages.append(package)
+                continue
+            manifest = package.get("manifest") or {}
+            packages.append({**{key: manifest.get(key) for key in ("id", "version", "title", "kind")},
+                             "status": (package.get("verification") or {}).get("status"),
+                             "details": "inspect_capabilities(capability=id, version=version)"})
+        return {"host": await extension_host_call(sched.list_extensions), "packages": packages}
+
+    @mcp.tool()
+    async def develop_capability(capability: str, version: str, title: str, kind: Literal["query", "action"],
+                                 source: str, entry_type: str, input_schema: dict[str, Any], guidance: str,
+                                 dependencies: list[dict[str, str]] | None = None,
+                                 permission_quote: str | None = None, notice_id: str | None = None) -> dict[str, Any]:
+        """Compile a missing native ability from C# source after discussing it with the player.
+
+        Use consult.inspect_capabilities to read the actual API and IGameExtension authoring example.
+        Source implements that interface; input_schema is a JSON object schema. Use native interactions,
+        current actor and observations. guidance explains purpose, conditions, inputs and actual effects.
+        Quote the player's explicit permission in permission_quote; a linked decision answer also works.
+        Existing permission covers revisions of the same ability and scope. Each build has a new version.
+        Compilation is separate from gameplay; on success use manage_capability(action='try'), invoke
+        learned_query/learned_action, then action='keep' to persist a successfully used version.
+        Compiler diagnostics support correction; earlier installed versions stay available.
+        """
+        store = capabilities_for_run()
+        previous = store.recent_learning_provenance(capability, save_id=await current_save_id(),
+                                                    kind=kind, dependencies=dependencies)
+        try:
+            old = store.inspect(capability)
+            if previous is None and old["manifest"]["kind"] == kind and old["manifest"].get("dependencies", []) == (dependencies or []):
+                previous = old.get("provenance")
+        except CapabilityError:
+            pass
+        provenance = await learning_permission(permission_quote, notice_id, previous)
+        discovery = await extension_host_call(sched.discover_extension_api)
+        authoring = discovery.get("authoring")
+        if not isinstance(authoring, dict):
+            raise ToolError("Native authoring information is unavailable; inspect the host result before retrying.")
+        result = await store.build({"id": capability, "version": version, "title": title, "kind": kind,
+            "source": source, "entryType": entry_type, "inputSchema": input_schema,
+            "guidance": guidance, "dependencies": dependencies or []}, authoring, provenance=provenance)
+        assert_life_turn_current(allow_control=True)
+        return result
+
+    @mcp.tool()
+    async def prepare_capability_builder(permission_quote: str, notice_id: str | None = None) -> dict[str, Any]:
+        """Prepare the local C# compiler once when develop_capability reports setup_required.
+
+        Uses an existing compatible SDK when available; otherwise downloads the official SDK into
+        the ability directory and checks its published checksum. Quote the player's agreement to
+        set up the learning environment. Subsequent builds reuse it.
+        """
+        await learning_permission(permission_quote, notice_id)
+        result = await capabilities_for_run().prepare_builder()
+        assert_life_turn_current(allow_control=True)
+        return result
+
+    @mcp.tool()
+    async def manage_capability(action: Literal["try", "keep", "rollback"], capability: str,
+                                version: str | None = None) -> dict[str, Any]:
+        """Load a compiled version for trial, keep its successful native use, or restore a previous version.
+
+        try requires version and hot-loads the agreed package in the current game. Execute it through
+        learned_query or learned_action and inspect the native result. keep saves that successfully
+        used version for subsequent games. rollback restores the previous saved working version.
+        Loading never completes the player's original goal; continue from current observations.
+        """
+        assert_life_turn_current()
+        store = capabilities_for_run()
+        if action == "rollback":
+            previous = store.catalog()["capabilities"].get(capability, {}).get("previousVersion")
+            if not previous:
+                raise ToolError("No previous saved version is available.")
+            version = previous
+        if not version:
+            raise ToolError("Choose the version returned by develop_capability or inspect_capabilities.")
+        package = store.inspect(capability, version)
+        if not package.get("provenance", {}).get("requestId"):
+            raise ToolError("This package has no recorded player discussion.")
+        store.verify_artifact(capability, version)
+        if action in {"keep", "rollback"} and (package.get("verification") or {}).get("status") != "used_successfully":
+            raise ToolError("Try this version and inspect a successful native invocation before keeping it.")
+        receipt = await extension_host_call(sched.load_extension, f"{capability}/{version}", action != "try")
+        if action == "try":
+            verification = store.record_native_load(capability, version, receipt)
+        else:
+            verification = store.record_native_persist(capability, version, receipt)
+        return {"capability": capability, "version": version, "native": receipt, "verification": verification}
+
+    async def invoke_learned(capability: str, version: str, arguments: dict[str, Any], kind: str) -> dict[str, Any]:
+        import jsonschema
+
+        assert_life_turn_current(allow_control=kind == "query")
+        store = capabilities_for_run()
+        manifest = store.verify_artifact(capability, version)
+        if manifest["kind"] != kind:
+            raise ToolError(f"This capability is a {manifest['kind']}; use its corresponding learned operation.")
+        try:
+            jsonschema.validate(arguments, manifest["inputSchema"])
+        except (jsonschema.ValidationError, jsonschema.SchemaError) as ex:
+            raise ToolError(f"Invalid capability arguments: {ex.message}") from None
+        result = await extension_host_call(sched.invoke_extension, capability, version, arguments, kind)
+        receipt = result.get("details") or {}
+        if receipt.get("succeeded") is True:
+            result = {**result, "learning": store.record_native_validation(capability, version, receipt)}
+        return result
+
+    @mcp.tool()
+    async def learned_query(capability: str, version: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Read through a loaded query ability. Get its version, input schema and guidance from consult.inspect_capabilities."""
+        return await invoke_learned(capability, version, arguments, "query")
+
+    @mcp.tool()
+    async def learned_action(capability: str, version: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Execute a loaded native ability as the current actor. Read its schema/guidance first; returns the native terminal result and observations."""
+        return await invoke_learned(capability, version, arguments, "action")
+
+    @mcp.tool()
     async def say_to_player(text: str) -> dict[str, Any]:
         """Speak naturally to the player now. Use for conversation or a needed question, not action progress; progress is already on the HUD."""
         assert_life_turn_current(allow_control=True)
@@ -4727,7 +4906,7 @@ def create_mcp_server(
 
     readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "read_guidance", "read_reload_history", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
     declared_tools = {t.name: t for t in mcp._tool_manager.list_tools()}
-    readonly.add("recall_memory")
+    readonly.update({"recall_memory", "inspect_capabilities", "learned_query"})
     native_tools = {name: tool.fn for name, tool in declared_tools.items()}
     wire_param_shapes = {}
     def wire_type(shape):
@@ -4765,7 +4944,7 @@ def create_mcp_server(
                                            openWorldHint=tool.name in {"query_wiki", "call_capability"})
         tool.description = "Stardew Valley (SMAPI), current saved game. " + tool.description
         exempt = {"say_to_player", "answer_player_decision", "player_control", "request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "record_decision_note", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command", "work_plan_overview"}
-        exempt.update({"save_memory", "save_method", "forget_memory"})
+        exempt.update({"save_memory", "save_method", "forget_memory", "develop_capability", "manage_capability", "prepare_capability_builder"})
         if tool.name not in exempt and tool.name not in readonly and not tool.name.startswith(("query_", "get_", "list_", "discover_", "observe_")):
             tool.fn = protect_job(tool.name, tool.fn)
         if tool.name.startswith(("query_", "observe_")) and tool.name != "query_wiki":

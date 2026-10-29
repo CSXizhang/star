@@ -541,6 +541,17 @@ public sealed record WaterZoneParameters(
     public int? Facing { get; init; }
     [JsonPropertyName("targetStamina")]
     public float? TargetStamina { get; init; }
+    [JsonPropertyName("extensionId")] public string? ExtensionId { get; init; }
+    [JsonPropertyName("extensionVersion")] public string? ExtensionVersion { get; init; }
+    [JsonPropertyName("extensionKind")] public string? ExtensionKind { get; init; }
+    [JsonPropertyName("extensionPersist")] public bool ExtensionPersist { get; init; }
+    [JsonPropertyName("extensionPackage")] public string? ExtensionPackage { get; init; }
+    [JsonPropertyName("extensionMember")] public string? ExtensionMember { get; init; }
+    [JsonPropertyName("extensionOffset")] public int ExtensionOffset { get; init; }
+    [JsonPropertyName("extensionLimit")] public int ExtensionLimit { get; init; } = 20;
+    [JsonPropertyName("extensionType")] public string? ExtensionType { get; init; }
+    [JsonPropertyName("extensionModId")] public string? ExtensionModId { get; init; }
+    [JsonPropertyName("extensionArguments")] public JsonObject? ExtensionArguments { get; init; }
 }
 
 public sealed record ExecutionBudgets(

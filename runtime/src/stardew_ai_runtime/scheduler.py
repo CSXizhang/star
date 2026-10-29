@@ -3119,6 +3119,42 @@ class CompanionScheduler:
             pre_dispatch=pre_dispatch,
         )
 
+    async def discover_extension_api(self, mod_id: str | None = None, native_type: str | None = None,
+                                     *, member: str | None = None, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+        parameters = {"extensionOffset": offset, "extensionLimit": limit}
+        if mod_id:
+            parameters["extensionModId"] = mod_id
+        if native_type:
+            parameters["extensionType"] = native_type
+        if member:
+            parameters["extensionMember"] = member
+        result = await self._extension_command("discover-extension-api", parameters)
+        return (result.get("details") or {}).get("extension") or result
+
+    async def list_extensions(self) -> dict[str, Any]:
+        result = await self._extension_command("list-extensions", {})
+        return (result.get("details") or {}).get("extension") or result
+
+    async def load_extension(self, package: str, persist: bool = False) -> dict[str, Any]:
+        result = await self._extension_command("load-extension", {"extensionPackage": package, "extensionPersist": persist})
+        return (result.get("details") or {}).get("extension") or result
+
+    async def learned_action(self, capability: str, version: str, arguments: dict[str, Any], command_id: str | None = None) -> dict[str, Any]:
+        return await self.invoke_extension(capability, version, arguments, "action", command_id)
+
+    async def invoke_extension(self, capability: str, version: str, arguments: dict[str, Any], kind: str,
+                               command_id: str | None = None) -> dict[str, Any]:
+        return await self._extension_command("invoke-extension", {
+            "extensionId": capability, "extensionVersion": version, "extensionArguments": arguments,
+            "extensionKind": kind}, command_id=command_id)
+
+    async def _extension_command(self, skill: str, parameters: dict[str, Any], command_id: str | None = None) -> dict[str, Any]:
+        status = await self.get_status()
+        location = (status.get("companion") or {}).get("locationId")
+        if not isinstance(location, str) or not location:
+            raise SchedulerError("Current actor location is unavailable")
+        return await self._execute_native_action(skill, {"locationId": location, **parameters}, tiles=[], command_id=command_id)
+
     async def observe_player_activities(self, command_id: str | None = None) -> dict[str, Any]:
         """Current public NPCs, map actions and shore geometry, never future loot."""
         await self.ensure_connected()

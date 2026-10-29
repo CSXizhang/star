@@ -267,6 +267,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             hoeAdapter: new NormalHoeAdapter(_observer, Monitor), plantAdapter: new NormalPlantAdapter(_observer, Monitor),
             shippingAdapter: new NormalShippingAdapter(_observer, Monitor), purchaseAdapter: new NormalPurchaseAdapter(_observer, Monitor),
             nativeActionAdapter: new NormalNativeActionAdapter(_observer, Monitor));
+        _coordinator.ConfigureExtensions(Path.Combine(Helper.DirectoryPath, "data", "abilities", "packages"), Helper.ModRegistry, Helper.DirectoryPath);
         _coordinator.PlayerAuthority = _authority;
         _coordinator.ProgramHoldProvider = () =>
             _thinking?.CurrentHold is { Active: true } hold
@@ -580,6 +581,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 harvestAdapter: _harvestAdapter, chestAdapter: _chestAdapter, hoeAdapter: _hoeAdapter, plantAdapter: _plantAdapter,
                 shippingAdapter: _shippingAdapter, purchaseAdapter: _purchaseAdapter, mapGraph: new WorldMapGraph(null, Monitor.Log),
                 nativeActionAdapter: _nativeActionAdapter);
+            _coordinator.ConfigureExtensions(Path.Combine(Helper.DirectoryPath, "data", "abilities", "packages"), Helper.ModRegistry, Helper.DirectoryPath);
             _coordinator.Rest.Bedtime = CompanionBedtime.Normalize(activeState.PreferredBedtime);
             if (activeState.SleepDay == Game1.Date.TotalDays && activeState.SleepStartedAt is { } sleepTime)
                 _coordinator.Rest.RestoreSleep(sleepTime, activeState.SleepIsDaytime);
@@ -937,6 +939,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
             _actor = null;
             _avatar = null;
+            _coordinator?.ShutdownExtensions();
             _coordinator = null;
             _preset = null; // re-armed per save load; the persisted marker survives for resume
             _localPauseMachine = null;

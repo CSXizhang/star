@@ -35,6 +35,7 @@ from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 
 def test_native_action_parameter_contract() -> None:
     assert set(NATIVE_ACTION_SKILLS) == {
+        "discover-extension-api", "list-extensions", "load-extension", "invoke-extension",
         "inspect-machines", "inspect-production", "eat-food", "cut-grass", "rest",
         "inspect-planting", "inspect-route", "inspect-livestock", "inspect-shop",
         "inspect-building-services", "build-building", "upgrade-building", "purchase-animal",

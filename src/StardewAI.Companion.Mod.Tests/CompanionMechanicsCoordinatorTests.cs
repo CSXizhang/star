@@ -64,6 +64,33 @@ public class CompanionMechanicsCoordinatorTests
     }
 
     [Fact]
+    public void ExtensionDiscoveryCannotStealRunningActionReceiptOrCancellation()
+    {
+        var (coordinator, actor, observer) = CreateHarness();
+        string root=Path.Combine(Path.GetTempPath(),"star-busy-extension-"+Guid.NewGuid().ToString("N"));
+        try {
+            coordinator.ConfigureExtensions(root,null!);
+            observer.SetDirt(new TileCoordinate(10,12),TileDirtState.DryDirt());
+            var original=new SkillExecutePayload("water-command","water-task","water-zone","0.1",1,
+                new WaterZoneParameters("Farm",new() { new(10,12) }),new ExecutionBudgets(60,50,20),"safe-point","test");
+            var envelope=CreateEnvelope("skill.execute","water-message");
+            Assert.True(coordinator.TryAcceptSkillExecute(original,envelope,out _));
+            coordinator.ActiveMachine!.RequestPause();
+            foreach (string skill in new[] { "discover-extension-api", "list-extensions" }) {
+                var query=original with { CommandId="query-command",TaskId="query-task",SkillId=skill };
+                Assert.False(coordinator.TryAcceptSkillExecute(query,CreateEnvelope("skill.execute","query-message"),out var reject));
+                Assert.Equal("ACTOR_BUSY",reject!.Error!.Code);
+                Assert.Null(coordinator.LastSkillResultPayload);
+            }
+            coordinator.OnCancelSkill(new SkillCancelPayload(original.CommandId,"player cancelled",true,"safe-point"),envelope);
+            coordinator.StateMachine.StepTicks(2);
+            Assert.False(coordinator.StateMachine.IsExecuting);
+            Assert.Null(actor.ActiveTaskId);
+            Assert.Equal(original.CommandId,coordinator.LastSkillResultPayload!.CommandId);
+        } finally { coordinator.ShutdownExtensions(); Directory.Delete(root,true); }
+    }
+
+    [Fact]
     public void SourceHandoffRejectsLateActionsUntilConfirmed()
     {
         var (coordinator, actor, _) = CreateHarness();

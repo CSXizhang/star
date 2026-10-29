@@ -108,6 +108,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         get
         {
+            if (extensionMachine?.IsExecuting == true) return extensionMachine;
             if (_fishingMachine?.IsExecuting == true) return _fishingMachine;
             if (_combatMachine?.IsExecuting == true) return _combatMachine;
             if (_eatingMachine?.IsExecuting == true) return _eatingMachine;
@@ -248,6 +249,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     /// </summary>
     public void Update(GameTime? time, long tickCount)
     {
+        extensionMachine?.Update(time, tickCount);
         if (_actor is PlayerActor binding && !binding.BindingValid) { _eatingMachine?.Update(time, tickCount); PlayerAuthority?.Release("actor-binding-lost"); return; }
         if (!ActorGuards.IsPlayerBound(_actor)) Rest.Update(time, tickCount, ActiveMachine);
         if (_restRequest != null)
@@ -760,6 +762,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items")) {
                 rejectResult=BuildRejection(payload,uiCode,uiMessage,true,NativeUiDetails()); return false;
             }
+            if (skillId is "discover-extension-api" or "list-extensions" or "load-extension" or "invoke-extension") return TryAcceptExtension(payload,envelope,out rejectResult);
             if (skillId is "talk-npc" or "interact-tile" or "fish" or "attack")
                 return TryAcceptPlayerInteraction(payload,envelope,out rejectResult);
             if (skillId == "eat-food" && _actor is PlayerActor eatingPlayer)

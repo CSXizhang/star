@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sqlite3
 
 import pytest
@@ -17,9 +18,10 @@ def original(tmp_path):
     data = tmp_path / "provider-data"
     db = data / "v2/sqlite/runtime-state.sqlite"
     db.parent.mkdir(parents=True)
-    executable = tmp_path / "bin/mcode.cmd"
+    executable = tmp_path / "bin" / ("mcode.cmd" if os.name == "nt" else "mcode")
     executable.parent.mkdir()
-    executable.write_text("@echo off\n", encoding="utf-8")
+    executable.write_text("@echo off\n" if os.name == "nt" else "#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
     package = executable.parent / "node_modules/@minimax-ai/code/package.json"
     package.parent.mkdir(parents=True)
     package.write_text(json.dumps({"name": "@minimax-ai/code", "version": "0.6.2"}))
@@ -153,6 +155,6 @@ def test_legacy_primary_alias_does_not_silently_change_execution_owner(original)
 def test_corrupt_role_reports_safe_error_without_parser_private_text(original):
     binding, _, role, _ = original
     role.write_text("---\nname: [PRIVATE INVALID ROLE\n---\n", encoding="utf-8")
-    with pytest.raises(IdentityVerificationError) as error:
+    with pytest.raises(IdentityVerificationError, match="元数据格式") as error:
         verify_session_identity(binding)
     assert "PRIVATE" not in str(error.value)

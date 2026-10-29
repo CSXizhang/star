@@ -63,6 +63,23 @@ def test_invalid_actions_never_execute(tmp_path, mock_scheduler, action):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('action, hint', [
+    ({}, 'empty object does not select'),
+    ({'items': [{'itemId': '(O)24', 'count': 1}]}, 'action.ship_items.items'),
+    ({'ship_items': {'items': [{'itemId': '(O)24', 'count': 'not-a-number'}]}}, 'ship_items.items.0.count'),
+])
+def test_malformed_shipping_locates_the_error_without_executing(tmp_path, mock_scheduler, action, hint):
+    _grant_decision(tmp_path, mock_scheduler)
+    mock_scheduler.execute_ship_items = AsyncMock()
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='light')
+        with pytest.raises(ToolError) as error:
+            await server.call_tool('submit_work', {'action': action})
+        assert hint in str(error.value)
+        mock_scheduler.execute_ship_items.assert_not_awaited()
+    asyncio.run(run())
+
+
 def test_mcode_declares_fixed_typed_operations_without_generic_params(tmp_path, monkeypatch, mock_scheduler):
     monkeypatch.setenv('STARDEW_MCP_WIRE_STYLE', 'mcode')
     async def run():
@@ -89,7 +106,9 @@ def test_mcode_declares_fixed_typed_operations_without_generic_params(tmp_path, 
         memory = tools['remember'].inputSchema['properties']['entry']['properties']
         assert memory['record_decision_note']['properties']['category']['enum'] == ['observation', 'hypothesis', 'intent', 'failure']
         # Typed arguments plus a short semantic description for every operation.
-        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 56000
+        # Useful examples and memory operations may grow modestly; catch an
+        # accidental full legacy-schema expansion rather than shave guidance.
+        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 62000
     asyncio.run(run())
 
 

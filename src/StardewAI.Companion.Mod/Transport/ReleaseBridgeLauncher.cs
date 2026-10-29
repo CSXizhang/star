@@ -5,8 +5,10 @@ namespace StardewAI.Companion.Mod.Transport;
 /// <summary>Launch only the runtime shipped beside this installed Mod.</summary>
 public static class ReleaseBridgeLauncher
 {
-    public static ProcessStartInfo? CreateStartInfo(string modDirectory)
+    public static ProcessStartInfo? CreateStartInfo(string modDirectory, string connectionSource = "builtin")
     {
+        if (connectionSource is not ("builtin" or "external"))
+            throw new ArgumentException("Unknown conversation source.", nameof(connectionSource));
         string root = Path.GetFullPath(modDirectory);
         string script = Path.Combine(root, "tools", "start-companion.ps1");
         if (!File.Exists(Path.Combine(root, "release-manifest.json")) || !File.Exists(script)) return null;
@@ -27,6 +29,7 @@ public static class ReleaseBridgeLauncher
             "-OwnerProcessId", Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture) })
             start.ArgumentList.Add(argument);
         start.Environment["STARDEW_BRIDGE_STOP_FILE"] = Path.Combine(Path.GetTempPath(), "stardew-bridge-stop-" + Guid.NewGuid().ToString("N"));
+        start.Environment["STARDEW_CONNECTION_SOURCE"] = connectionSource;
         return start;
     }
 

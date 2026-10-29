@@ -935,7 +935,10 @@ def test_autonomy_chat_channel_lifecycle_replays_initial_snapshot_and_enable(tmp
     # Autonomous public replies and usage telemetry both reach the game.
     families = [json.loads(message)["messageType"] for message in sent]
     assert "chat.reply" in families
-    assert set(families) <= {"life.profile.state", "autonomy.state", "chat.reply"}
+    assert set(families) <= {"life.profile.state", "autonomy.state", "chat.reply", "connection.state"}
+    connection = next(json.loads(message)["payload"] for message in sent
+                      if json.loads(message)["messageType"] == "connection.state")
+    assert connection["source"] == "builtin"
     assert "autonomy.state" in families, "terminal usage telemetry remains visible"
 
 
@@ -1808,3 +1811,47 @@ def test_stop_uses_game_owned_command_without_saved_work_queue(tmp_path):
         assert packet['gameSessionId'] == 'game-session'
         assert not bridge._work_store.state('save-1').tasks
     asyncio.run(run())
+
+
+def test_recalled_memory_uses_current_message_scene_and_original_session(tmp_path):
+    from stardew_ai_runtime.companion_memory import CompanionMemoryStore, resolve_companion_id
+
+    bridge = ChatBridge(sessions_file=tmp_path / "sessions.json")
+    bridge.run_dir = tmp_path
+    bridge._memory_store = CompanionMemoryStore(tmp_path / "memory.json")
+    bridge.record_conversation_id("farm", "original-session")
+    bridge._current_game_day_key = "1:spring:5"
+    bridge._latest_snapshot_payload = {"world": {"location": "Farm"}}
+    partner = resolve_companion_id(bridge.run_dir, "farm", provider=bridge.backend_name,
+                                  session_id="original-session")
+    status, saved = bridge._memory_store.save_note("farm", "蜂蜜放在屋里箱", companion_id=partner,
+                                                 game_date="1:spring:5", title="蜂蜜")
+    assert status == "confirmed"
+    prompt = bridge._format_agent_prompt("蜂蜜怎么处理", "farm")
+    assert "蜂蜜放在屋里箱" in prompt
+    bridge._memory_store.save_note("farm", "蜂蜜留给玩家", companion_id=partner,
+                                  game_date="1:spring:5", note_id=saved["note"]["id"], title="蜂蜜")
+    corrected = bridge._format_agent_prompt("蜂蜜怎么处理", "farm")
+    assert "蜂蜜留给玩家" in corrected
+    assert "蜂蜜放在屋里箱" not in corrected
+    assert bridge.get_conversation_id("farm") == "original-session"
+
+
+def test_session_discovery_is_persisted_before_tools_without_replacing_binding(tmp_path):
+    from stardew_ai_runtime.agent_backends import BackendProgress
+
+    with patch("asyncio.get_running_loop", return_value=MagicMock()):
+        bridge = ChatBridge(sessions_file=tmp_path / "sessions.json")
+        bridge.run_dir = tmp_path
+        bridge._active_task = ActiveChatTask(request_id="current", save_id="farm", command_id="current", prompt="hi")
+        bridge._configure_backend_progress(None, "current", "farm")
+        callback = bridge._backend_progress_callback
+        callback(BackendProgress(bridge.backend_name, "session_ready", "new-session"))
+        assert bridge.get_conversation_id("farm") == "new-session"
+        assert "new-session" in (tmp_path / "sessions.json").read_text(encoding="utf-8")
+        callback(BackendProgress(bridge.backend_name, "session_ready", "different-session"))
+        assert bridge.get_conversation_id("farm") == "new-session"
+        bridge._life_turn_lease("current", "farm")
+        lease = json.loads((tmp_path / "data" / "life-turn.json").read_text(encoding="utf-8"))
+        assert lease["memoryProvider"] == bridge.backend_name
+        assert lease["memoryConnectionSource"] == "builtin"

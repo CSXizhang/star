@@ -77,7 +77,11 @@ public sealed class WebSocketTransportServer : ITransportServer
     private long _lastSnapshotRevision;
 
     public bool IsChatConnected => _chatSocket is { State: WebSocketState.Open };
+    public long ChatGeneration => Interlocked.Read(ref _chatSocketGeneration);
     public event Action<ChatReplyPayload>? OnChatReplyReceived;
+    public event Action<ConnectionStatePayload>? OnConnectionStateReceived;
+    public Task<bool> SendConnectionSourceAsync(string requestId, string source) => SendChatEnvelopeAsync(
+        CreateEnvelope("connection.source.set", new JsonObject { ["requestId"] = requestId, ["source"] = source }));
     public event Action<AutonomyStatePayload>? OnAutonomyStateReceived;
     public event Action<string?, string?, string>? OnChatChannelProblem;
     public string ActorMode { get; set; } = "companion";
@@ -1655,7 +1659,13 @@ public sealed class WebSocketTransportServer : ITransportServer
 
                         bool hasPayload = root.TryGetProperty("payload", out var payloadElem);
 
-                        if (string.Equals(msgType, "autonomy.state", StringComparison.OrdinalIgnoreCase) && hasPayload)
+                        if (msgType == "connection.state" && hasPayload)
+                        {
+                            if (gen != Interlocked.Read(ref _chatSocketGeneration)) continue;
+                            var state = payloadElem.Deserialize<ConnectionStatePayload>(JsonOptions);
+                            if (state != null) OnConnectionStateReceived?.Invoke(state);
+                        }
+                        else if (string.Equals(msgType, "autonomy.state", StringComparison.OrdinalIgnoreCase) && hasPayload)
                         {
                             var state = payloadElem.Deserialize<AutonomyStatePayload>(JsonOptions);
                             if (state != null) OnAutonomyStateReceived?.Invoke(state);

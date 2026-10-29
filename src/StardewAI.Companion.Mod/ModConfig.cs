@@ -7,6 +7,10 @@ namespace StardewAI.Companion.Mod;
 /// </summary>
 public sealed class ModConfig
 {
+    /// <summary>Who owns the conversation, independent of the controlled actor mode.</summary>
+    public string ConnectionSource { get; set; } = "builtin";
+    public bool ConnectionSourceChosen { get; set; }
+
     /// <summary>
     /// Operating mode: <c>"companion"</c> (default; the separate companion farmer with
     /// checkpoints, avatar and rest controller — legacy behavior, zero change) or

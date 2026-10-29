@@ -159,9 +159,9 @@ def mark_game_load_applied(run_dir: Path, request: dict[str, Any]) -> None:
     _write(path, document)
 
 
-def rotate_provider_sessions(run_dir: Path, request: dict[str, Any],
-                             sessions: dict[str, str], sessions_file: Path) -> None:
-    """Checkpoint a bounded handoff before detaching old provider histories.
+def preserve_provider_sessions(run_dir: Path, request: dict[str, Any],
+                               sessions: dict[str, str], sessions_file: Path) -> None:
+    """Checkpoint world-reload context without replacing the companion session.
 
     Saved goals, agreements and decisions already live in reload_context; do not
     copy provider reasoning/tool transcripts or pay for another model generation.
@@ -188,12 +188,9 @@ def rotate_provider_sessions(run_dir: Path, request: dict[str, Any],
     summary = summaries.setdefault(save_id, {})
     summary["conversationHandoff"] = {
         "recentDialogue": checkpoint.get("recentDialogue", []),
-        "instruction": "新游戏会话：沿用已保存目标、约定和决定；摘录仅供衔接交流，旧回复中的行动和数量不作当前事实。完整原文按需分页读取。",
+        "instruction": "存档已重新载入，继续原伙伴会话；沿用已保存目标、约定和决定，以当前游戏观察重新核对进度。摘录仅供衔接交流，旧回复中的行动和数量不作当前事实。完整原文按需分页读取。",
     }
     _write(run_dir / "data/reload-context.json", summaries)
-    for name in old:
-        sessions.pop(name, None)
-    _write(sessions_file, sessions)
 
 
 def reload_context(run_dir: Path | None, save_id: str | None) -> dict[str, Any] | None:

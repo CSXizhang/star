@@ -78,9 +78,7 @@ public sealed partial class CompanionMechanicsCoordinator
         foreach (var pair in loc.objects.Pairs)
         {
             var item = pair.Value;
-            if (!item.CanBeGrabbed || item.IsWeeds() || item.IsBreakableStone() || item.IsTwig()
-                || item is StardewValley.Objects.Chest { giftbox.Value: true }
-                || item.QualifiedItemId is "(O)590" or "(O)SeedSpot") continue;
+            if (!NormalNativeActionAdapter.IsPickupGroundObject(item)) continue;
             groundItems.Add(new { tile = new { x = (int)pair.Key.X, y = (int)pair.Key.Y },
                 itemId = item.QualifiedItemId, kind = "native-grabbable-object", observedStack = item.Stack });
         }

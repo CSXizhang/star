@@ -455,6 +455,15 @@ try {
         $presetConfig = Join-Path $prodDest 'config'
         New-Item -ItemType Directory -Path $presetConfig -Force | Out-Null
         Write-Utf8File (Join-Path $presetConfig 'chat-backend.json') '{"backend":"mcode","effort":"default","model":""}'
+        # This suite explicitly exercises the built-in entry. Keep the choice
+        # inside its isolated Mod copy; never change the player's installation.
+        $presetModConfigPath = Join-Path $prodDest 'config.json'
+        $presetModConfig = if (Test-Path -LiteralPath $presetModConfigPath) {
+            Get-Content -LiteralPath $presetModConfigPath -Raw | ConvertFrom-Json
+        } else { [pscustomobject]@{} }
+        $presetModConfig | Add-Member -NotePropertyName ConnectionSource -NotePropertyValue 'builtin' -Force
+        $presetModConfig | Add-Member -NotePropertyName ConnectionSourceChosen -NotePropertyValue $true -Force
+        Write-Utf8File $presetModConfigPath ($presetModConfig | ConvertTo-Json -Depth 20)
     }
 
     # 6b. TestDriver Mod

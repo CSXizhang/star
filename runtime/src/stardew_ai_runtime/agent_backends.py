@@ -247,6 +247,8 @@ class CodexBackend:
                 kind = event.get("type")
                 if kind == "thread.started":
                     session_id = event.get("thread_id") or session_id
+                    if session_id and self.progress:
+                        self.progress(BackendProgress(self.name, "session_ready", session_id))
                 elif kind == "item.completed":
                     item = event.get("item") or {}
                     if item.get("type") == "agent_message":
@@ -404,9 +406,11 @@ class KimiBackend:
         kind = str(event.get("type") or "")
         if kind == "session.resume_hint" and event.get("session_id"):
             session[0] = str(event["session_id"])
+            self._emit("session_ready", session[0])
             return None
         if event.get("session_id") and not session[0]:
             session[0] = str(event["session_id"])
+            self._emit("session_ready", session[0])
         usage = self._usage(event)
         if usage:
             return usage
@@ -763,6 +767,7 @@ class DshBackend:
             patch, env = self._prepare(surface)
             self._start(active_task, surface, patch, env)
             if self.progress:
+                self.progress(BackendProgress(self.name, "session_ready", session_id))
                 self.progress(BackendProgress(self.name, "started", "正在想下一步"))
             request_id = self._send("session/prompt", {"sessionId": session_id,
                 "contentBlocks": [{"type": "text", "text": prompt}]})
@@ -1192,6 +1197,8 @@ class McodeBackend:
                     started = True
                 if kind in {"session.started", "session.resumed"}:
                     session_id = event.get("sessionId") or session_id
+                    if session_id and self.progress:
+                        self.progress(BackendProgress(self.name, "session_ready", session_id))
                 elif kind == "turn.completed":
                     usage = self._usage(event.get("usage")) or usage
                 elif kind == "item.started":
@@ -1270,10 +1277,8 @@ class McodeBackend:
                                      self.name, time.monotonic() - start).as_dict()
             if (requested_session and not started and usage is None
                     and re.search(r"session (?:not found|is archived|workspace does not match)", detail, re.IGNORECASE)):
-                # A rotated or archived session must not strand the game loop.
-                # This is checked before the generic exit-code mapping because
-                # the CLI reports it as an ordinary runtime failure.
-                return BackendResult(False, "mcode 无法恢复这段对话。", None, usage,
+                # Preserve identity on failure; only the player may replace it.
+                return BackendResult(False, "mcode 无法恢复原对话，请修复连接；未创建替代会话。", requested_session, usage,
                                      {"code": "MCODE_SESSION_UNAVAILABLE", "message": detail},
                                      self.name, time.monotonic() - start).as_dict()
             if proc.returncode in self.exit_codes:

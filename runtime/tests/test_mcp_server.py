@@ -44,6 +44,7 @@ def test_mcp_server_tool_registration(mock_scheduler):
         assert set(tool_names) == set("""
             say_to_player
             read_reload_history record_decision_note answer_player_decision
+            save_memory save_method recall_memory forget_memory
             observe_player_activities talk_npc interact_tile attack native_menu_select fish
             apply_fertilizer autonomy_status build_building call_capability cancel_task cancel_plan_command
             chop_tree clear_debris collect_animal_produce collect_machine craft_items

@@ -27,8 +27,8 @@ Mod 开源免费。聊天与自动工作都会调用所选模型，费用取决�
 - **Codex（GPT）**：先在本机安装 Codex CLI 并完成登录。向导中的模型可以留空，沿用本机 Codex 配置；伙伴工具只绑定到当前游戏运行，不需要修改全局 MCP 配置。
 - **dsh（DeepSeek）**：先安装并登录本机 dsh，再在向导中选择 `dsh`，模型填 `deepseek-flash`（V4.1 Flash），默认 low 推理。伙伴使用 dsh 的会话协议与临时游戏工具；复用本机已保存的 DeepSeek 凭据，也支持 `DEEPSEEK_API_KEY`。向导不读取展示、复制或写入你的账号密钥。切换后端前先退出游戏与伙伴服务，再重新启动。
 - **MiniMax Code（mcode）**：先安装 MiniMax Code CLI（Windows 可用官方安装器，或 `npm install -g @minimax-ai/code`），并完成 `mcode login`；本机已登录 MiniMax Code 桌面端时可直接复用。先在 mcode 中选择当前账号可用的模型，向导中模型留空即可沿用；推理档位默认也沿用客户端设置。伙伴每轮用一次 `mcode exec`，只把那一次的游戏工具写进本次游戏运行目录，不修改你的全局 MCP 配置。切换后端前先退出游戏与伙伴服务，再重新启动。绑定细节见[接入文档](mcp.md#minimax-code-的工具绑定方式)。
-- **外部 Codex 对话**：安装后也可将工具和伙伴技能注册到自己的 Codex 项目，直接沿用外部对话接入游戏，见 [Codex 直接接入](mcp.md#codex-直接接入)。同一时间选一个入口派工，保留自动启动的伙伴服务，不重复启动。
-- **外部 MiniMax Code 对话**：MiniMax Code 的 MCP 服务保存在数据目录的 `mcp.json`（默认 `%USERPROFILE%\.minimax\mcp.json`），桌面端与 CLI 共用。用 `tools\register-mcp.ps1 -Agent mcode -Install` 可合并写入该文件（保留其他服务），或在 MiniMax Code 里用内置 MCP 工具注册同名 stdio 服务。游戏内后端每轮自己绑定工具，两者互不干扰。
+- **外部 Codex 对话**：可将工具和伙伴技能注册到自己的项目，作为[手动工具入口](mcp.md#codex-直接接入)；它不自动接收游戏聊天。游戏选择外部来源后，只保留一个实际派工入口。
+- **外部 MiniMax Code 原伙伴**：当前源码新增[原会话常驻适配器](mcp.md#已有-minimax-code-伙伴主动连接)，从原客户端侧发起连接，保留既有人格，并把游戏消息送回原会话；连接期间让原窗口闲置。单纯注册 MCP 只提供手动工具，不等于原会话自动接入；该新增功能尚未发布到 0.3.21 下载包。
 
 工具读取当前存档需要游戏已通过 SMAPI 启动并进入存档。遇到尚未连接游戏的提示，可以先完成登录，再进游戏检查。模型名称应使用客户端实际支持的标识。
 

@@ -4,6 +4,14 @@ using System.Text.Json.Serialization;
 
 namespace StardewAI.Companion.Mod.Transport;
 
+public sealed record ConnectionStatePayload(
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("requestId")] string? RequestId = null,
+    [property: JsonPropertyName("clientName")] string? ClientName = null,
+    [property: JsonPropertyName("conversationName")] string? ConversationName = null
+);
+
 public sealed record TileCoord(
     [property: JsonPropertyName("x")] int X,
     [property: JsonPropertyName("y")] int Y

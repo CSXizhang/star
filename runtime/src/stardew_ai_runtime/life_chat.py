@@ -64,8 +64,12 @@ class LifeChatService:
         fingerprints_file: Path,
         context_limit: int = 100000,
         request_checkpoint: int = 20,
+        session_resolver=None,
+        session_recorder=None,
     ) -> None:
         self.backend_name = backend_name
+        self._session_resolver = session_resolver
+        self._session_recorder = session_recorder
         self._sessions = sessions
         self._sessions_file = sessions_file
         self._fingerprints = fingerprints
@@ -104,6 +108,8 @@ class LifeChatService:
         temporary.replace(self._context_path)
 
     def get_session_id(self, save_id: str) -> str | None:
+        if self._session_resolver is not None:
+            return self._session_resolver(save_id)
         key = _life_session_key(self.backend_name, save_id)
         if key not in self._sessions:
             legacy = self._sessions.get(f"life:{key}")
@@ -113,6 +119,9 @@ class LifeChatService:
         return self._sessions.get(key)
 
     def record_session_id(self, save_id: str, conversation_id: str) -> None:
+        if self._session_recorder is not None:
+            self._session_recorder(save_id, conversation_id)
+            return
         key = _life_session_key(self.backend_name, save_id)
         self._sessions[key] = conversation_id
         self._save_sessions()

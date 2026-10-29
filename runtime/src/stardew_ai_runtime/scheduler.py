@@ -58,7 +58,6 @@ class NoActiveTaskError(SchedulerError):
 
 
 COMMON_GAME_PATHS: list[str] = [
-    r"E:\Game\steam\steamapps\common\Stardew Valley",
     r"C:\Program Files (x86)\Steam\steamapps\common\Stardew Valley",
     r"C:\Program Files\Steam\steamapps\common\Stardew Valley",
     r"D:\SteamLibrary\steamapps\common\Stardew Valley",

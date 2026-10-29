@@ -306,7 +306,7 @@ public sealed class CompanionSetupMenu : IClickableMenu
             _playStyle = _liveState.PlayStyle;
             _personality = _liveState.Personality;
             _careFrequency = _liveState.CareFrequency;
-            _nameBox!.Text = _liveState.CompanionName;
+            _nameBox!.Text = _liveState.ProfileCompanionName;
         }
 
         // Background tint

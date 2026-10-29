@@ -148,8 +148,7 @@ def test_ui_chat_dispatches_once_and_midflight_reply_keeps_same_session(tmp_path
 
 
 @pytest.mark.parametrize("entry", ["chat", "work"])
-@pytest.mark.parametrize("recovery_succeeds", [True, False])
-def test_dead_session_retries_once_with_full_context_and_never_restores_dead_id(tmp_path, monkeypatch, entry, recovery_succeeds):
+def test_unavailable_session_retains_binding_without_new_session_retry(tmp_path, monkeypatch, entry):
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda *a: None)
@@ -160,31 +159,32 @@ def test_dead_session_retries_once_with_full_context_and_never_restores_dead_id(
             calls.append((session, prompt))
             if len(calls) == 1:
                 return {"success": True, "conversation_id": "dead", "response": "你好"}
-            if session == "dead" or not recovery_succeeds:
-                return {"success": False, "conversation_id": session, "error": "MCODE_SESSION_UNAVAILABLE"}
-            return {"success": True, "conversation_id": "fresh", "response": "收到"}
+            assert session == "dead", "A recovery must never create a replacement session"
+            return {"success": False, "conversation_id": session, "error": "MCODE_SESSION_UNAVAILABLE"}
     monkeypatch.setattr(bridge, "_get_backend", Backend)
 
     async def run():
         ws = AsyncMock()
         await bridge._run_life_chat_turn(ws, {"request_id": "warmup", "save_id": "S", "text": "你好"})
         assert bridge.get_conversation_id("S") == "dead"
+        baseline = (tmp_path / "prompt-delivery.json").read_bytes()
         if entry == "chat":
             await bridge._run_life_chat_turn(ws, {"request_id": "next", "save_id": "S", "text": "先浇水，别砍树"})
-            assert bridge.get_conversation_id("S") == ("fresh" if recovery_succeeds else None)
         else:
             result = bridge._execute_turn(ActiveChatTask(request_id="work", save_id="S"), "dead",
                                           runtime_instructions() + '\n实时上下文：{}\n玩家说：先浇水，别砍树')
-            assert result["success"] is recovery_succeeds
-            assert result["session_retried"]
-            assert bridge.get_conversation_id("S") != "dead"
-        assert [cid for cid, _ in calls] == [None, "dead", None]
+            assert result["success"] is False
+            assert result["error"] == "MCODE_SESSION_UNAVAILABLE"
+            assert result["conversation_id"] == "dead"
+            assert not result.get("session_retried")
+        assert bridge.get_conversation_id("S") == "dead"
+        assert bridge._life_chat.get_session_id("S") == "dead"
+        assert [cid for cid, _ in calls] == [None, "dead"]
         assert "上下文增量：" in calls[1][1]
-        assert "实时上下文：" in calls[2][1]
-        assert "你是《星露谷物语》里的伙伴" in calls[2][1]
-        assert "先浇水，别砍树" in calls[2][1]
+        assert "先浇水，别砍树" in calls[1][1]
+        assert (tmp_path / "prompt-delivery.json").read_bytes() == baseline
         restarted = ChatBridge(run_dir=tmp_path, backend="mcode", enable_plan_worker=False)
-        assert restarted.get_conversation_id("S") != "dead"
+        assert restarted.get_conversation_id("S") == "dead"
     asyncio.run(run())
 
 

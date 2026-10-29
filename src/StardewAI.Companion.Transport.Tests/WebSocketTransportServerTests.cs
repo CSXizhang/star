@@ -13,6 +13,33 @@ namespace StardewAI.Companion.Mod.Transport.Tests;
 public class WebSocketTransportServerTests
 {
     [Fact]
+    public async Task SourceSelectionAndOriginalConversationStatusUseTheExistingChatChannel()
+    {
+        using var server = new WebSocketTransportServer(0, "connection-token", new TestTransportHandler());
+        server.Start();
+        var received = new TaskCompletionSource<ConnectionStatePayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        server.OnConnectionStateReceived += state => received.TrySetResult(state);
+        using var client = new ClientWebSocket();
+        client.Options.SetRequestHeader("Authorization", "Bearer connection-token");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{server.Port}/chat"), timeout.Token);
+        while (!server.IsChatConnected) await Task.Delay(10, timeout.Token);
+        Assert.True(await server.SendConnectionSourceAsync("source-1", "external"));
+        var request = await ReceiveEnvelopeAsync(client);
+        Assert.Equal("connection.source.set", request.MessageType);
+        Assert.Equal("external", request.Payload["source"]!.GetValue<string>());
+        await SendRawJsonAsync(client, JsonSerializer.Serialize(new {
+            messageType = "connection.state",
+            payload = new { requestId = "source-1", source = "external", status = "connected", clientName = "mcode", conversationName = "原伙伴" }
+        }));
+        var state = await received.Task.WaitAsync(timeout.Token);
+        Assert.Equal("source-1", state.RequestId);
+        Assert.Equal("原伙伴", state.ConversationName);
+        Assert.Equal("mcode", state.ClientName);
+        client.Abort();
+    }
+
+    [Fact]
     public async Task LifeRequestPublishesNativeObservationFirstAndRetainsItsCaptureTime()
     {
         var handler = new TestTransportHandler();

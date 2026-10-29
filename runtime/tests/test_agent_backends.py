@@ -464,8 +464,8 @@ def test_mcode_forwards_harness_result_without_tool_error_replay(tmp_path: Path,
 def test_mcode_session_unavailable_passthrough_without_retry(tmp_path: Path) -> None:
     """A dead resume session surfaces MCODE_SESSION_UNAVAILABLE with no retry.
 
-    The backend reports the failure once; the chat bridge rotates the session
-    honestly and retries once with the full instructions.
+    The backend reports the failure once and retains the original session so
+    recovery cannot silently replace the partner.
     """
     failed = _mcode_proc([], returncode=4, stderr="mcode exec failed: session not found\n")
     with patch("stardew_ai_runtime.agent_backends.McodeBackend._executable", return_value="mcode.exe"), \
@@ -473,7 +473,7 @@ def test_mcode_session_unavailable_passthrough_without_retry(tmp_path: Path) -> 
         result = McodeBackend(tmp_path).run(_task(), "gone-1", "继续")
     assert result["success"] is False
     assert result["error"] == "MCODE_SESSION_UNAVAILABLE"
-    assert result["conversation_id"] is None
+    assert result["conversation_id"] == "gone-1"
     assert popen.call_count == 1
 
 

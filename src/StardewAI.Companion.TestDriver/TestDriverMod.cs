@@ -1584,6 +1584,27 @@ public sealed class TestDriverMod : Mod
         var farm = Game1.getFarm();
         Monitor.Log($"[TestDriver] Arranging scenario '{_scenario}' on Farm...", LogLevel.Info);
 
+        if (Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1")
+        {
+            if (_scenario != "free-mode-control" || _evidenceDir == null)
+                throw new InvalidOperationException("Continuity resume requires isolated free-mode-control evidence.");
+            // Restore observer coordinates only. The loaded save remains authoritative;
+            // no crop, item, stamina, clock, or inventory fixture is applied on restart.
+            using var saved = JsonDocument.Parse(File.ReadAllText(Path.Combine(_evidenceDir, "continuity-observer.json")));
+            var root = saved.RootElement;
+            if (root.GetProperty("runId").GetString() != _runId || root.GetProperty("saveName").GetString() != Constants.SaveFolderName)
+                throw new InvalidOperationException("Continuity observer metadata belongs to another run/save.");
+            _harnessFixtureMode = root.GetProperty("mode").GetString();
+            _harnessFixtureTiles.Clear();
+            foreach (var tile in root.GetProperty("targets").EnumerateArray())
+                _harnessFixtureTiles.Add(new Vector2(tile.GetProperty("x").GetInt32(), tile.GetProperty("y").GetInt32()));
+            var chest = root.GetProperty("chest");
+            _acceptanceChest = chest.ValueKind == JsonValueKind.Null ? null
+                : new Vector2(chest.GetProperty("x").GetInt32(), chest.GetProperty("y").GetInt32());
+            Monitor.Log("[TestDriver] Continuity: restored observation metadata only; loaded world preserved.", LogLevel.Info);
+            return;
+        }
+
         // Record pre-action player resources to prove invariant
         _initialPlayerStamina = Game1.player.stamina;
         _initialPlayerMoney = Game1.player.Money;
@@ -3746,8 +3767,8 @@ public sealed class TestDriverMod : Mod
         else if (action == "host-sleep")
         {
             if (!Context.IsWorldReady || Game1.currentLocation is not StardewValley.Locations.FarmHouse house
-                || Game1.activeClickableMenu != null || Game1.fadeToBlack || Game1.fadeIn)
-                throw new InvalidOperationException("Native player sleep requires the ready farmhouse and no active menu/fade.");
+                || Game1.activeClickableMenu != null || Game1.fadeToBlack || Game1.fadeIn && Game1.fadeToBlackAlpha > 0.001f || !Game1.player.isInBed.Value)
+                throw new InvalidOperationException("Native player sleep requires actual bed occupancy and no active menu/fade; walk into bed and answer its native question.");
             var before = new { year = Game1.year, season = Game1.currentSeason, day = Game1.dayOfMonth, timeOfDay = Game1.timeOfDay };
             bool accepted = house.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
             File.WriteAllText(Path.Combine(outDir, $"native-host-sleep-{label}.json"), JsonSerializer.Serialize(new {
@@ -3761,6 +3782,18 @@ public sealed class TestDriverMod : Mod
                 provenance = "Native farmhouse Sleep_Yes handler; no calendar or clock assignment"
             }));
             if (!accepted) throw new InvalidOperationException("Native farmhouse rejected Sleep_Yes.");
+        }
+        else if (action == "host-walk-bed")
+        {
+            AssertHarnessFixtureBoundary(modEntry, requireAwake: false);
+            if (Game1.currentLocation is not StardewValley.Locations.FarmHouse house || Game1.activeClickableMenu != null
+                || Game1.fadeToBlack || Game1.fadeIn && Game1.fadeToBlackAlpha > 0.001f)
+                throw new InvalidOperationException("Wait for the native farmhouse arrival before walking to bed.");
+            var bed = house.GetPlayerBed() ?? throw new InvalidOperationException("Native player bed missing.");
+            var path = new StardewValley.Pathfinding.PathFindController(Game1.player, house, bed.GetBedSpot(), 2);
+            if (path.pathToEndPoint == null || path.pathToEndPoint.Count == 0)
+                throw new InvalidOperationException("Native player bed path unavailable.");
+            Game1.player.controller = path;
         }
         else if (action == "open-inventory") Game1.activeClickableMenu = new GameMenu();
         else if (action == "open-f8")
@@ -3823,6 +3856,40 @@ public sealed class TestDriverMod : Mod
             if (!_scenario.Equals("free-mode-control", StringComparison.OrdinalIgnoreCase) || Game1.activeClickableMenu != null)
                 throw new InvalidOperationException("Harness world capture requires the isolated scenario with no menu.");
             _harnessCaptureLabel = label;
+        }
+        else if (action == "open-connection")
+        {
+            modType.GetMethod("OpenConnectionSelection", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?.Invoke(modEntry, null);
+        }
+        else if (action == "takeover-key")
+        {
+            if (!Context.IsWorldReady || ReadNativeMember(ReadNativeMember(modEntry, "_config"), "Mode")?.ToString() != "player")
+                throw new InvalidOperationException("The production takeover key only applies to loaded player mode.");
+            string key = ReadNativeMember(ReadNativeMember(modEntry, "_config"), "TakeoverKey")?.ToString() ?? "F9";
+            if (!Enum.TryParse<SButton>(key, out var button)) throw new InvalidOperationException("Invalid configured takeover key.");
+            var inputGetter = Helper.Input.GetType().GetField("CurrentInputState", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?.GetValue(Helper.Input) as Delegate;
+            var inputState = inputGetter?.DynamicInvoke() ?? throw new InvalidOperationException("SMAPI input state unavailable.");
+            var constructor = typeof(ButtonPressedEventArgs).GetConstructors(BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance)
+                .Single(c => c.GetParameters().Length == 3);
+            var args = constructor.Invoke(new object[] { button, Helper.Input.GetCursorPosition(), inputState });
+            modType.GetMethod("OnButtonPressed", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(modEntry, new object?[] { this, args });
+        }
+        else if (action == "options-button")
+        {
+            if (menu?.GetType().Name != "CompanionOptionsMenu") throw new InvalidOperationException("No production options menu.");
+            string text = request.GetProperty("text").GetString() ?? "";
+            var choices = menu.GetType().GetField("_choices", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(menu) as Array;
+            var buttons = menu.GetType().GetField("_buttons", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(menu) as List<Rectangle>;
+            int index = choices == null ? -1 : Array.FindIndex(choices.Cast<object>().ToArray(),
+                item => item is System.Runtime.CompilerServices.ITuple tuple && tuple[0]?.ToString() == text);
+            if (index < 0 || buttons == null || index >= buttons.Count) throw new InvalidOperationException("Requested production option unavailable.");
+            var bounds = buttons[index];
+            if (menu.GetType().GetField("_body", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(menu) is not Rectangle body || !body.Contains(bounds))
+                throw new InvalidOperationException("Production option is outside the visible body; scroll before clicking.");
+            menu.receiveLeftClick(bounds.Center.X, bounds.Center.Y, playSound: false);
         }
         else if (action is "open-life" or "open-setup" or "open-conversation" or "open-directions" or "open-work" or "open-memory")
         {
@@ -3945,6 +4012,16 @@ public sealed class TestDriverMod : Mod
             ["timestampUtc"] = DateTime.UtcNow.ToString("o"),
             ["productionOwnedBridgeLaunchObserved"] = ReadNativeMember(modEntry, "_ownedBridgeLaunch") != null,
             ["productionChatConnected"] = ReadNativeMember(ReadNativeMember(modEntry, "_transportServer"), "IsChatConnected"),
+            ["connectionSource"] = ReadNativeMember(ReadNativeMember(modEntry, "_connectionState"), "Source"),
+            ["connectionStatus"] = ReadNativeMember(ReadNativeMember(modEntry, "_connectionState"), "Status"),
+            ["connectionPendingRequestId"] = ReadNativeMember(ReadNativeMember(modEntry, "_connectionState"), "PendingRequestId"),
+            ["connectionNeedsPersistence"] = ReadNativeMember(ReadNativeMember(modEntry, "_connectionState"), "NeedsPersistence"),
+            ["playerAuthorityAgentOwns"] = ReadNativeMember(ReadNativeMember(modEntry, "_authority"), "AgentOwns"),
+            ["playerControlApproved"] = ReadNativeMember(modEntry, "_playerControlApproved"),
+            ["actorMode"] = ReadNativeMember(ReadNativeMember(modEntry, "_config"), "Mode"),
+            ["worldReady"] = Context.IsWorldReady, ["nativeNewDay"] = Game1.newDay,
+            ["nativeFade"] = Game1.fadeToBlack || Game1.fadeIn && Game1.fadeToBlackAlpha > 0.001f,
+            ["playerIsInBed"] = Game1.player.isInBed.Value, ["playerNativePathing"] = Game1.player.controller != null,
             ["f8Active"] = ControllerField("_f8Active"), ["f8Next"] = ControllerCallback("_next"),
             ["f8AfterPages"] = ControllerCallback("_afterPages"), ["f8Pages"] = ControllerField("_pages")?.GetType().FullName,
             ["nativeExitCallback"] = menu?.exitFunction?.Method.Name,
@@ -3975,12 +4052,28 @@ public sealed class TestDriverMod : Mod
             ["hudMessages"] = Game1.hudMessages.Select(h => h.GetType().GetField("message", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(h)?.ToString()).ToArray(),
             ["profileRevision"] = Prop("ProfileRevision"), ["hasProfileState"] = Prop("HasProfileState"),
             ["onboarded"] = Prop("IsOnboarded"), ["skipped"] = Prop("IsSkipped"),
+            ["companionDisplayName"] = Prop("CompanionName"),
             ["playStyle"] = Prop("PlayStyle"), ["personality"] = Prop("Personality"),
             ["careFrequency"] = Prop("CareFrequency"), ["workMode"] = Prop("WorkMode"),
             ["memoryRevision"] = Prop("MemoryRevision"), ["memoryEntries"] = Prop("MemoryEntries"),
             ["milestoneNodes"] = Prop("MilestoneNodes"),
             ["unreadCareHints"] = Prop("UnreadCareHints")
         };
+        if (modEntry is Mod production)
+        {
+            string configPath = Path.Combine(production.Helper.DirectoryPath, "config.json");
+            if (File.Exists(configPath))
+            {
+                using var config = JsonDocument.Parse(File.ReadAllText(configPath));
+                foreach (var property in config.RootElement.EnumerateObject())
+                {
+                    if (property.Name.Equals("ConnectionSource", StringComparison.OrdinalIgnoreCase))
+                        snapshot["persistedConnectionSource"] = property.Value.GetString();
+                    if (property.Name.Equals("ConnectionSourceChosen", StringComparison.OrdinalIgnoreCase))
+                        snapshot["persistedConnectionSourceChosen"] = property.Value.GetBoolean();
+                }
+            }
+        }
         File.WriteAllText(Path.Combine(outDir, $"life-ui-{label}.json"),
             JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }),
             new System.Text.UTF8Encoding(false));
@@ -8450,10 +8543,15 @@ public sealed class TestDriverMod : Mod
             if (label.Length is < 1 or > 48 || !label.All(c => char.IsLetterOrDigit(c) || c is '-' or '_'))
                 throw new ArgumentException("Lifecycle request requires a safe label.");
             string action = request.RootElement.GetProperty("action").GetString() ?? "";
-            if (action == "return-title")
+            if (action is "return-title" or "save-title" or "save-exit")
             {
                 _lifecycleSaveName = Constants.SaveFolderName ?? throw new InvalidOperationException("No loaded test save.");
-                Game1.ExitToTitle();
+                if (action is "save-title" or "save-exit")
+                {
+                    var saver = SaveGame.Save();
+                    while (saver.MoveNext()) { }
+                }
+                if (action != "save-exit") Game1.ExitToTitle();
             }
             else if (action == "reload")
             {
@@ -8476,6 +8574,7 @@ public sealed class TestDriverMod : Mod
                 launcherPid, ownsLaunch = owned != null
             };
             File.WriteAllText(Path.Combine(_evidenceDir, $"lifecycle-{label}.json"), JsonSerializer.Serialize(snapshot), new System.Text.UTF8Encoding(false));
+            if (action == "save-exit") Game1.quit = true;
         }
         catch (Exception ex)
         {

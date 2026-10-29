@@ -223,7 +223,7 @@ public sealed partial class ModEntry
         Action back = () => { if (Context.IsWorldReady) OpenCompanionHub(2); else Game1.exitActiveMenu(); };
         string mode = _savedMode == "player" ? "AI 自己玩" : "伙伴模式";
         string message = $"游戏模式：{mode}" + (_savedMode != _config.Mode ? "（重启后生效）" : "") +
-            "\nF8 随时指导；自玩模式按 F9 接管或交还。\n" + _updateStatus;
+            "\n" + _connectionState.Description + "\nF8 随时指导；自玩模式按 F9 接管或交还。\n" + _updateStatus;
         var choices = new List<(string Label, Action Click)>();
         if (PlayerModeEnabled && _authority != null)
             choices.Add((_authority.AgentOwns ? "接管玩家" : "开始托管", () => {
@@ -232,6 +232,7 @@ public sealed partial class ModEntry
                 OpenGameSettings();
             }));
         choices.AddRange(new (string Label, Action Click)[] {
+            ("选择伙伴接入方式", OpenConnectionSelection),
             ("切换为" + (_savedMode == "player" ? "伙伴模式" : "AI 自己玩"), ChangeGameMode),
             (_updateBusy ? "正在处理更新…" : _preparedUpdateRequest != null ? "安装已下载更新" : _availableUpdate != null ? "查看更新" : "检查更新",
                 () => { if (_updateBusy) return; if (_preparedUpdateRequest != null || _availableUpdate != null) ShowUpdate(OpenGameSettings); else CheckUpdates(true); }),

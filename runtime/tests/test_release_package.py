@@ -159,6 +159,34 @@ def test_builder_allowlists_production_inputs():
     assert "pip" not in module.TOOL_FILES
 
 
+def test_builder_removes_machine_bound_bin_launchers_without_touching_libraries(tmp_path):
+    import csv
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_release", ROOT / "tools/build-release.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    python = tmp_path / "python.exe"
+    site = tmp_path / "Lib/site-packages"
+    metadata = site / "fixture.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "entry_points.txt").write_text("[console_scripts]\nmcp = mcp.cli:app\n", encoding="utf-8")
+    (site / "bin").mkdir()
+    wrapper = site / "bin/mcp.exe"
+    wrapper.write_bytes(b"MZ-launcher\n#!" + str(python.resolve()).encode("utf-8") + b"\nPK-main")
+    library = site / "bin/native-helper.dll"
+    library.write_bytes(b"native dependency")
+    record = metadata / "RECORD"
+    record.write_text("bin/mcp.exe,sha256=machine-specific,123\nbin/native-helper.dll,sha256=stable,17\n"
+                      "fixture.dist-info/RECORD,,\n", encoding="utf-8")
+    module.remove_machine_bound_scripts(site, python)
+    assert not wrapper.exists()
+    assert library.read_bytes() == b"native dependency"
+    with record.open(encoding="utf-8", newline="") as stream:
+        assert list(csv.reader(stream)) == [["bin/native-helper.dll", "sha256=stable", "17"],
+                                         ["fixture.dist-info/RECORD", "", ""]]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows installer")
 @pytest.mark.parametrize("explicit_effort", [None, "default"])
 @pytest.mark.parametrize("previous", [None, {"backend": "mcode", "model": "", "effort": "high"},

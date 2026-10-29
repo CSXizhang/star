@@ -8,6 +8,66 @@ namespace StardewAI.Companion.Mod.Tests;
 public class LifeMenuUiStateTests
 {
     [Fact]
+    public void AcknowledgedSourceNamesNewMessagesWithoutRewritingProfileOrHistory()
+    {
+        var state = new LifeMenuUiState();
+        state.ApplyProfileState(true, false, "小星", "earn", "gentle", "moderate", 5, "command", false, 0);
+        state.RecordCompanionReply("builtin-before", "今天先照料田地。", "1:spring:1");
+        var connection = new CompanionConnectionState();
+        void Project() => state.ApplyConnectionName(connection.Source, connection.ConversationName);
+        connection.Begin("switch", "external");
+        Assert.False(connection.Apply(new("external", "connected", "stale", ConversationName: "错的伙伴")));
+        Project();
+        Assert.Equal("小星", state.CompanionName);
+        Assert.True(connection.Apply(new("external", "connected", "switch", ConversationName: "麦穗")));
+        Project();
+        state.RecordCompanionReply("external", "我还记得我们的约定。", "1:spring:1");
+        state.ReceiveWorkResult("delivery", "收获已放进箱子。", "1:spring:1");
+        state.TryAddDecisionNotice("save", "save", "choice", "1:spring:1", "明天去哪里？");
+        state.AddUnreadCareHint(new PendingCareHint("evening", "1:spring:1", "evening", "该休息了。"));
+        // A later built-in profile refresh updates the editor backing value only.
+        state.ApplyProfileState(true, false, "小满", "earn", "gentle", "moderate", 6, "command", false, 0);
+        Assert.Equal("麦穗", state.CompanionName);
+        Assert.Equal("小满", state.ProfileCompanionName);
+        Assert.Equal("小星", state.Conversation[0].Speaker);
+        Assert.All(state.Conversation.Skip(1), entry => Assert.Equal("麦穗", entry.Speaker));
+        connection.Begin("return", "builtin");
+        Assert.True(connection.Apply(new("builtin", "connected", "return")));
+        Project();
+        state.RecordCompanionReply("builtin-after", "我继续照料。", "1:spring:1");
+        Assert.Equal("小满", state.CompanionName);
+        Assert.Equal("小满", state.Conversation.Last().Speaker);
+        Assert.Equal("麦穗", state.Conversation[1].Speaker);
+        var restored = new LifeMenuUiState();
+        restored.ApplyConnectionName("external", "另一个显示名");
+        restored.RestoreConversation(state.Conversation);
+        Assert.Equal(state.Conversation.Select(entry => entry.Speaker), restored.Conversation.Select(entry => entry.Speaker));
+    }
+
+    [Fact]
+    public void UnnamedExternalConnectionUsesNeutralNameAndResetDropsOnlyItsDisplayAlias()
+    {
+        var state = new LifeMenuUiState();
+        state.ApplyProfileState(true, false, "小星", "earn", "gentle", "moderate", 5, "command", false, 0);
+        var connection = new CompanionConnectionState();
+        connection.Initialize("external");
+        state.ApplyConnectionName(connection.Source, connection.ConversationName);
+        state.RecordCompanionReply("unnamed", "我在这里。", "1:spring:1");
+        Assert.Equal("已有伙伴", Assert.Single(state.Conversation).Speaker);
+        connection.Apply(new("external", "connected", ConversationName: " 麦穗 "));
+        state.ApplyConnectionName(connection.Source, connection.ConversationName);
+        state.RecordCompanionReply("named", "还是同一个我。", "1:spring:1");
+        Assert.Equal("麦穗", state.Conversation.Last().Speaker);
+        state.Reset();
+        Assert.Equal("小星", state.CompanionName);
+        Assert.Equal(5, state.ProfileRevision);
+        connection.ResetConnection();
+        state.ApplyConnectionName(connection.Source, connection.ConversationName);
+        state.RecordCompanionReply("reconnect", "正在重新连接。", "1:spring:1");
+        Assert.Equal("已有伙伴", Assert.Single(state.Conversation).Speaker);
+    }
+
+    [Fact]
     public void WorkResult_ReplacesSettledReplyAndIsDeduplicated()
     {
         var state = new LifeMenuUiState();

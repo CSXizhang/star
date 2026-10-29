@@ -64,6 +64,25 @@ public class CompanionMechanicsCoordinatorTests
     }
 
     [Fact]
+    public void SourceHandoffRejectsLateActionsUntilConfirmed()
+    {
+        var (coordinator, actor, _) = CreateHarness();
+        actor.Stamina = 25;
+        bool switching = true;
+        coordinator.ConnectionActionsAllowed = () => !switching;
+        var request = new SkillExecutePayload("switch-rest", "rest-task", "rest", "0.1", 1,
+            new WaterZoneParameters("FarmHouse", new()) { TargetStamina = 80 },
+            new ExecutionBudgets(0, 0, 0), "safe-point", "test");
+        var envelope = CreateEnvelope("skill.execute", "switch-message");
+        Assert.False(coordinator.TryAcceptSkillExecute(request, envelope, out var rejected));
+        Assert.NotNull(rejected);
+        Assert.False(coordinator.Rest.IsResting);
+        switching = false;
+        Assert.True(coordinator.TryAcceptSkillExecute(request, envelope, out _));
+        Assert.True(coordinator.Rest.IsResting);
+    }
+
+    [Fact]
     public void RestCommandReturnsItsTargetResultAndCanBeCancelled()
     {
         var (coordinator, actor, _) = CreateHarness();

@@ -106,6 +106,7 @@ public sealed class CompanionDialogueController
     private readonly Action? _records;
     private readonly Action? _hubSettings;
     private readonly Action? _replyInput;
+    private readonly Func<bool> _usesExistingCompanion;
     private readonly CompanionF8Flow _f8Flow = new();
     private bool _f8Active;
     private string? _directionRequest;
@@ -119,7 +120,7 @@ public sealed class CompanionDialogueController
     private string? _meetingFeedback;
     private bool _helpAfterFeedback;
     private DateTime _meetingSentAt;
-    private string DisplayName => _state.ProfileRevision == 0 && !_state.IsOnboarded && !_state.IsSkipped
+    private string DisplayName => _usesExistingCompanion() ? _state.CompanionName : _state.ProfileRevision == 0 && !_state.IsOnboarded && !_state.IsSkipped
         ? "新伙伴" : _state.CompanionName;
     private RenderTarget2D? _portrait;
     private readonly CompanionDialogueInbox _inbox = new();
@@ -152,7 +153,7 @@ public sealed class CompanionDialogueController
         Action refresh, Action settings, Action memory, Func<Farmer?> farmer,
         Func<LifeProfilePatchDto, string?> saveProfile, Func<string, string?> savePreference, Func<bool> canHelp,
         Action progress, Func<string?>? connectionProblem = null, Action? conversation = null,
-        Action? records = null, Action? hubSettings = null, Action? replyInput = null)
+        Action? records = null, Action? hubSettings = null, Action? replyInput = null, Func<bool>? usesExistingCompanion = null)
     {
         _state = state;
         _submit = submit;
@@ -169,6 +170,7 @@ public sealed class CompanionDialogueController
         _records = records;
         _hubSettings = hubSettings;
         _replyInput = replyInput;
+        _usesExistingCompanion = usesExistingCompanion ?? (() => false);
     }
 
     public void Reset()
@@ -507,6 +509,7 @@ public sealed class CompanionDialogueController
         }
         else if (_meetingProfileRequest != null || _meetingMemoryRequest != null)
             ShowSpeech("我正在记下我们的约定，稍等一下。", false);
+        else if (_usesExistingCompanion() && _conversation != null) _conversation();
         else if (!_state.HasProfileState)
             ShowSpeech("伙伴服务已连接，正在读取你的设置。稍后再来聊聊吧。", false);
         else if (CompanionFirstMeeting.NeedsMeeting(_state)) ShowFirstMeeting();

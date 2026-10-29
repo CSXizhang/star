@@ -748,6 +748,12 @@ def _attach_companion_memory(
             layers[label] = [dict(r) for r in rows if isinstance(r, dict)]
     if layers:
         context["sharedMemory"] = layers
+    notes = memory.get("relevantNotes")
+    if isinstance(notes, list):
+        context["relevantNotes"] = [dict(note) for note in notes if isinstance(note, dict)]
+    preferences = memory.get("preferences")
+    if isinstance(preferences, list) and preferences:
+        context["preferences"] = [dict(note) for note in preferences if isinstance(note, dict)]
     agreements = memory.get("agreements")
     if isinstance(agreements, list) and agreements:
         context["agreements"] = [
@@ -817,7 +823,7 @@ def render_decision_context(context: dict[str, Any]) -> str:
 _INCREMENTAL_SLICES = (
     "lastResult", "decision", "currentTask", "waitingConditions",
     "duePreparation", "anomalies", "blockedBranches", "plantingEvidence", "dayChoice",
-    "lastSettledDay",
+    "lastSettledDay", "sharedMemory", "agreements", "preferences", "recentSharedEvents", "relevantNotes",
 )
 
 
@@ -907,7 +913,8 @@ def build_incremental_context(
         value = context.get(key)
         digest = _slice_digest(value)
         slices[key] = digest
-        if value is not None and prev_slices.get(key) != digest:
+        memory_slice = key in {"sharedMemory", "agreements", "preferences", "recentSharedEvents", "relevantNotes"}
+        if prev_slices.get(key) != digest and (value is not None or (memory_slice and key in prev_slices)):
             changes[key] = value
     incremental = {"summary": build_compact_summary(context)}
     if changes:

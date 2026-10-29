@@ -85,6 +85,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     private bool _sleepCompletionBound;
     private string _sleepSkillId = "sleep";
     public Func<bool>? PresetBusinessAllowed { get; set; }
+    public Func<bool>? ConnectionActionsAllowed { get; set; }
     public IFarmerActor Actor => _actor;
     public CompanionAvatar? Avatar => _avatar;
     public WaterZoneStateMachine StateMachine => _stateMachine;
@@ -715,6 +716,11 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         lock (_taskLock)
         {
             string skillId = payload.SkillId ?? "";
+            if (ConnectionActionsAllowed?.Invoke() == false && !skillId.StartsWith("inspect-"))
+            {
+                rejectResult = BuildRejection(payload, "CONNECTION_SWITCH_PENDING", "Conversation source handoff is not confirmed; no new action is allowed.", true);
+                return false;
+            }
             if (PresetBusinessAllowed is not null && !skillId.StartsWith("inspect-") && !PresetBusinessAllowed())
             {
                 rejectResult = BuildRejection(payload, "PRESET_DAY_LIMIT", "Independent preset day budget ended; only observation/reporting is allowed. NewRun starts a fresh budget.", false);

@@ -4753,7 +4753,8 @@ def create_mcp_server(
         """Compile a missing native ability from C# source after discussing it with the player.
 
         Use consult.inspect_capabilities to read the actual API and IGameExtension authoring example.
-        Source implements that interface; input_schema is a JSON object schema. Use native interactions,
+        Both query and action kinds implement the same IGameExtension interface; there is no separate query interface.
+        input_schema is a JSON object schema. Use native interactions,
         current actor and observations. guidance explains purpose, conditions, inputs and actual effects.
         Quote the player's explicit permission in permission_quote; a linked decision answer also works.
         Existing permission covers revisions of the same ability and scope. Each build has a new version.

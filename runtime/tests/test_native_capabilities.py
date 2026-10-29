@@ -231,3 +231,22 @@ def test_build_reports_setup_required_for_sdk_without_net6_pack(tmp_path):
         'entryType': 'Adapter', 'inputSchema': {'type': 'object'}, 'source': 'class Adapter {}'}, {}))
     assert result['status'] == 'setup_required'
     assert not store.list_packages()
+
+
+
+def test_self_contained_reference_filter_uses_sdk_names_not_game_directory_or_prefix(tmp_path):
+    from stardew_ai_runtime.native_capabilities import _adapter_references
+    compiler = _fake_dotnet(tmp_path / 'sdk', sdk='6.0.428', targeting_pack=True, runtime=True)
+    private_xml = compiler.parent / 'shared/Microsoft.NETCore.App/6.0.36/System.Private.Xml.dll'
+    private_xml.write_bytes(b'framework implementation behind facade')
+    game = tmp_path / 'self-contained-game'
+    game.mkdir()
+    names = ['System.Text.Json.dll', 'System.Private.CoreLib.dll', 'System.Private.Xml.dll',
+             'Stardew Valley.dll', 'StardewModdingAPI.dll', 'MonoGame.Framework.dll',
+             'Netcode.dll', 'System.CustomGame.dll']
+    for name in names:
+        (game / name).write_bytes(b'reference marker')
+    references = [str(game / name) for name in names]
+    selected = _adapter_references(str(compiler), references + references[-1:])
+    assert {Path(p).name for p in selected} == set(names[3:])
+    assert len(selected) == len(names[3:])

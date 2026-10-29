@@ -14,7 +14,8 @@ internal sealed class NativeAssemblyReferenceResolver
 
     public (string[] References,string[] Missing) Resolve(IEnumerable<Assembly> assemblies)
     {
-        string framework=Path.GetDirectoryName(typeof(object).Assembly.Location)!;
+        // A self-contained game puts framework and gameplay DLLs in the same directory.
+        // Return actual identities; the compiler can deduplicate its own reference pack.
         var paths=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
         var missing=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var assembly in assemblies)
@@ -24,7 +25,7 @@ internal sealed class NativeAssemblyReferenceResolver
             string path=assembly.Location;
             if (File.Exists(path))
             {
-                if (!string.Equals(Path.GetDirectoryName(path),framework,StringComparison.OrdinalIgnoreCase)) paths[identity]=path;
+                paths[identity]=path;
             }
             else if (cache.TryGetValue(identity,out string? cached) && File.Exists(cached)) paths[identity]=cached;
             else missing.Add(identity);

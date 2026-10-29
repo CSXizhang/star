@@ -66,10 +66,15 @@ def test_documented_memory_operations_match_published_game_tool_schema():
     for path in (root / "docs/agent-core-instructions-draft.md",
                  root / "agent-skills/stardew-companion/SKILL.md"):
         guidance = path.read_text(encoding="utf-8").split("## 共同经历与方法", 1)[1]
-        references = re.findall(r"`([a-z_]+)\.([a-z_]+)`", guidance)
+        references = re.findall(r"`([a-z_]+)\.([a-z_]+)(?:\.([a-z_]+))?`", guidance)
         assert references
-        for tool_name, operation in references:
+        for tool_name, wrapper_or_operation, nested_operation in references:
             assert tool_name in GAME_TOOLS and tool_name in tools
             schema = tools[tool_name].parameters
-            assert any(operation in definition.get("properties", {})
-                       for definition in schema.get("$defs", {}).values()), (path, tool_name, operation)
+            if nested_operation:
+                wrapper = schema["properties"][wrapper_or_operation]
+                definition = schema["$defs"][wrapper["$ref"].rsplit("/", 1)[-1]]
+                assert nested_operation in definition["properties"], (path, tool_name, nested_operation)
+            else:
+                assert any(wrapper_or_operation in definition.get("properties", {})
+                           for definition in schema.get("$defs", {}).values()), (path, tool_name, wrapper_or_operation)

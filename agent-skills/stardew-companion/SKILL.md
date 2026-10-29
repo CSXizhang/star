@@ -56,6 +56,6 @@ description: 通过 stardew-companion MCP 与玩家一起经营星露谷农场�
 
 ## 学习原生能力
 
-经历和约定用记忆保存，已有动作的组合用自然语言方法记录；真正缺少操作时，先通过 `consult` 的 `request.inspect_capabilities` 查已有能力，或用 `native_type` / `mod_id` 读取当前游戏类型、SMAPI 公开接口与 `IGameExtension` 作者契约。与你的玩家商量玩法、资源与试用范围后，依据真实接口生成 C#，通过 `manage_arrangements` 的 `change.develop_capability` 提交源码、入口类型、输入 schema 和指导，由独立进程编译；`permission_quote` 引用玩家同意的原话，或关联其决策回答，同一能力范围内修订沿用约定。
+经历和约定用记忆保存，已有动作的组合用自然语言方法记录；真正缺少操作时，先通过 `consult.request.inspect_capabilities` 查已有能力，或用 `native_type` / `mod_id` 读取当前游戏类型、SMAPI 公开接口与 `IGameExtension` 作者契约。与你的玩家商量玩法、资源与试用范围后，依据真实接口生成 C#，通过 `manage_arrangements.change.develop_capability` 提交源码、入口类型、输入 schema 和指导，由独立进程编译；`permission_quote` 引用玩家同意的原话，或关联其决策回答，同一能力范围内修订沿用约定。
 
-编译成功后用 `change.manage_capability(action="try", capability=..., version=...)` 在当前游戏热加载，通过 `submit_work` 的 `action.learned_action` 或 `query_game` 的 `query.learned_query` 传入能力、版本与 `arguments`，核对原生结果并继续原目标；成功使用后用 `keep` 保存，后续需要时用 `rollback` 恢复上一已保存版本。新能力使用程序绑定的角色和原生玩法方法，按作者契约处理结束与取消，沿用当前执行器和 F9 接管；缺少 SDK 返回 `setup_required` 时，与玩家约定本地准备环境后调用 `change.prepare_capability_builder`，随后继续构建。
+编译成功后用 `manage_arrangements.change.manage_capability`（`action="try"`，指定能力与版本） 在当前游戏热加载，通过 `submit_work.action.learned_action` 或 `query_game.query.learned_query` 传入能力、版本与 `arguments`，核对原生结果并继续原目标；成功使用后用 `keep` 保存，后续需要时用 `rollback` 恢复上一已保存版本。新能力使用程序绑定的角色和原生玩法方法，按作者契约处理结束与取消，沿用当前执行器和 F9 接管；缺少 SDK 返回 `setup_required` 时，与玩家约定本地准备环境后调用 `manage_arrangements.change.prepare_capability_builder`，随后继续构建。

@@ -8,6 +8,42 @@ namespace StardewAI.Companion.Mod.Tests;
 public class GameExtensionHostTests
 {
     [Fact]
+    public void DiscoveryReferencesCompileNativeAuthoringContractInIndependentSdkProcess()
+    {
+        string root=Path.Combine(Path.GetTempPath(),"star-native-compile-"+Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
+        try {
+            string game=Environment.GetEnvironmentVariable("STARDEW_GAME_PATH") ?? throw new InvalidOperationException("Game references required.");
+            var netcode=typeof(StardewValley.Game1).Assembly;
+            Assert.NotNull(netcode.GetType("Netcode.NetInt"));
+            var gameData=System.Reflection.Assembly.LoadFrom(Path.Combine(game,"StardewValley.GameData.dll"));
+            using var host=new GameExtensionHost(Path.Combine(root,"packages"),System.Reflection.DispatchProxy.Create<StardewModdingAPI.IModRegistry,EmptyRegistry>());
+            var data=JsonSerializer.SerializeToNode(host.Discover(null,null))!;
+            var references=data["authoring"]!["references"]!.AsArray().Select(x=>x!.GetValue<string>()).ToArray();
+            foreach(string path in new[] { typeof(StardewValley.Game1).Assembly.Location,typeof(GameTime).Assembly.Location,typeof(StardewModdingAPI.IModRegistry).Assembly.Location,netcode.Location,gameData.Location,typeof(IGameExtension).Assembly.Location }) Assert.Contains(path,references);
+            // Real loaded corelib and game DLLs must both survive reference collection;
+            // their common directory in a self-contained install is not a BCL classifier.
+            string shared=Path.Combine(root,"self-contained"); Directory.CreateDirectory(shared);
+            string gameCopy=Path.Combine(shared,Path.GetFileName(typeof(StardewValley.Game1).Assembly.Location));
+            File.Copy(typeof(StardewValley.Game1).Assembly.Location,gameCopy);
+            string coreCopy=Path.Combine(shared,Path.GetFileName(typeof(object).Assembly.Location)); File.Copy(typeof(object).Assembly.Location,coreCopy);
+            var byteGame=System.Reflection.Assembly.Load(File.ReadAllBytes(gameCopy));
+            var resolver=new NativeAssemblyReferenceResolver(shared,gameCopy);
+            Assert.Contains(gameCopy,resolver.Resolve(new[] {byteGame,typeof(object).Assembly}).References);
+            string source="using System.Text.Json.Nodes; using Microsoft.Xna.Framework; using StardewValley; using StardewAI.Companion.Mod.Extensions; public sealed class Example : IGameExtension { public IExtensionExecution Begin(ExtensionContext c, JsonObject a) => new Run(c); sealed class Run : IExtensionExecution { readonly ExtensionContext c; public Run(ExtensionContext c) { this.c=c; } public ExtensionOutcome? Tick(GameTime time) { Farmer? farmer=c.Actor.GameFarmer; Netcode.NetInt? observed=null; return new ExtensionOutcome(true,new JsonObject { [\"location\"]=farmer?.currentLocation?.Name,[\"observed\"]=observed!=null }); } public void Cancel(){} public void Dispose(){} } }";
+            string? repo=AppContext.BaseDirectory; while(repo!=null && !File.Exists(Path.Combine(repo,"Directory.Build.props"))) repo=Path.GetDirectoryName(repo.TrimEnd(Path.DirectorySeparatorChar));
+            string dotnet=Environment.GetEnvironmentVariable("STAR_DOTNET_PATH") ?? Path.Combine(repo!,".local","dotnet","dotnet.exe");
+            File.WriteAllText(Path.Combine(root,"input.json"),JsonSerializer.Serialize(new { spec=new { id="contract-smoke",version="1",kind="query",entryType="Example",source,inputSchema=new {type="object"},guidance="Observe actor through the native SDK." },authoring=data["authoring"] }));
+            string script="import asyncio,json,sys\nfrom pathlib import Path\nsys.path.insert(0,str(Path(sys.argv[1])/'runtime'/'src'))\nfrom stardew_ai_runtime.native_capabilities import NativeCapabilityStore\npayload=json.loads(Path('input.json').read_text(encoding='utf-8'))\nstore=NativeCapabilityStore(Path('built'),dotnet=sys.argv[2])\nresult=asyncio.run(store.build(payload['spec'],payload['authoring']))\nprint(json.dumps(result))\nsys.exit(0 if (Path('built')/'packages'/'contract-smoke'/'1'/'adapter.dll').is_file() else 1)\n";
+            File.WriteAllText(Path.Combine(root,"build.py"),script);
+            var info=new System.Diagnostics.ProcessStartInfo(Path.Combine(repo!,"runtime",".venv","Scripts","python.exe")) { WorkingDirectory=root,UseShellExecute=false,RedirectStandardOutput=true,RedirectStandardError=true,CreateNoWindow=true };
+            foreach(string arg in new[] { "build.py",repo!,dotnet }) info.ArgumentList.Add(arg);
+            using var process=System.Diagnostics.Process.Start(info)!;
+            var stdout=process.StandardOutput.ReadToEndAsync(); var stderr=process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(60000)) { process.Kill(true); throw new TimeoutException("SDK authoring smoke build timed out."); }
+            Assert.True(process.ExitCode==0,stdout.GetAwaiter().GetResult()+stderr.GetAwaiter().GetResult());
+        } finally { Directory.Delete(root,true); }
+    }
+    [Fact]
     public void ByteLoadedHostAndModApiRecoverCompileReferencesWithoutUsingGeneratedPackages()
     {
         string root=Path.Combine(Path.GetTempPath(),"star-byte-api-"+Guid.NewGuid().ToString("N"));
@@ -30,9 +66,9 @@ public class GameExtensionHostTests
             var resolver=new NativeAssemblyReferenceResolver(root,hostPath);
             var result=resolver.Resolve(new[] { hostAssembly,apiAssembly,excludedAssembly,typeof(object).Assembly });
             Assert.Contains(hostPath,result.References); Assert.Contains(apiPath,result.References);
-            Assert.DoesNotContain(excludedPath,result.References); Assert.DoesNotContain(typeof(object).Assembly.Location,result.References);
+            Assert.DoesNotContain(excludedPath,result.References); Assert.Contains(typeof(object).Assembly.Location,result.References);
             Assert.Equal(excludedAssembly.FullName,Assert.Single(result.Missing));
-            Assert.Equal(result.References,resolver.Resolve(new[] {hostAssembly,apiAssembly}).References);
+            Assert.Equal(result.References.OrderBy(x=>x),resolver.Resolve(new[] {hostAssembly,apiAssembly,typeof(object).Assembly}).References.OrderBy(x=>x));
         } finally { Directory.Delete(root,true); }
         static void WriteApi(string name,string path)
         {
@@ -106,7 +142,7 @@ public class GameExtensionHostTests
             var fuzzy=JsonSerializer.SerializeToNode(host.Discover(null,"Furnit"))!;
             Assert.Empty(fuzzy["nativeTypes"]!.AsArray()); Assert.NotEmpty(fuzzy["candidateTypes"]!.AsArray());
             var references=filtered["authoring"]!["references"]!.AsArray().Select(x=>x!.GetValue<string>()).ToArray();
-            Assert.DoesNotContain(typeof(object).Assembly.Location,references);
+            Assert.Contains(typeof(object).Assembly.Location,references);
             Assert.Contains(typeof(StardewValley.Objects.Furniture).Assembly.Location,references);
             Assert.Contains(typeof(IGameExtension).Assembly.Location,references);
         } finally { Directory.Delete(root,true); }

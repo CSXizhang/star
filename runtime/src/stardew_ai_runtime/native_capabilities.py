@@ -61,6 +61,30 @@ def dotnet6_sdk_version(executable: str | Path | None) -> str | None:
     return max(sdk_versions, key=lambda version: tuple(map(int, version.split("."))))
 
 
+def _adapter_references(executable: str, references: list[str]) -> list[str]:
+    """Use SDK framework references, preserving every distinct game/Mod assembly.
+
+    Self-contained games place BCL implementations beside game assemblies. Match
+    exact names from the selected SDK's real .NET 6 packs/runtime, not directory
+    location or System.* prefixes. Runtime names also cover Private.CoreLib and
+    private implementations whose public types are supplied by reference facades.
+    """
+    root = Path(executable).resolve().parent
+    framework_names = {path.name.casefold()
+        for pattern in ("packs/Microsoft.NETCore.App.Ref/6.*/ref/net6.0/*.dll",
+                        "shared/Microsoft.NETCore.App/6.*/*.dll")
+        for path in root.glob(pattern)}
+    seen = set()
+    result = []
+    for reference in references:
+        path = Path(reference).resolve()
+        key = str(path).casefold() if os.name == "nt" else str(path)
+        if path.name.casefold() not in framework_names and key not in seen:
+            seen.add(key)
+            result.append(str(path))
+    return result
+
+
 def discover_dotnet(search_root: Path | None = None) -> str | None:
     """Find a complete local .NET 6 SDK; runtime-only and newer SDKs do not qualify."""
     executable = "dotnet.exe" if os.name == "nt" else "dotnet"
@@ -139,6 +163,7 @@ class NativeCapabilityStore:
         references = authoring.get("references", [])
         if not references or any(not isinstance(p, str) or not Path(p).is_file() or Path(p).suffix.lower() != ".dll" for p in references):
             raise CapabilityError("Native host reference assemblies are missing")
+        references = _adapter_references(self.dotnet, references)
         self._builds.add(key)
         attempt = self.root / "learning" / uuid.uuid4().hex
         attempt.mkdir(parents=True)
@@ -161,7 +186,8 @@ class NativeCapabilityStore:
             (attempt / "compiler.log").write_text(diagnostics, encoding="utf-8")
             artifact = attempt / "out/adapter.dll"
             if process.returncode != 0 or not artifact.is_file():
-                record.update(status="build_failed", diagnostics=diagnostics[-16000:])
+                record.update(status="build_failed", diagnostics=diagnostics[-16000:],
+                              recovery="Use these compiler diagnostics to revise source through develop_capability. If native host references are missing, report that condition to the player; do not repair the host through shell commands.")
                 _write_json(attempt / "build.json", record)
                 return record
             manifest = {k: spec[k] for k in ("id", "version", "kind", "entryType", "inputSchema")}
@@ -188,7 +214,8 @@ class NativeCapabilityStore:
             _write_json(attempt / "build.json", record)
             raise
         except OSError as exc:
-            record.update(status="build_failed", diagnostics=str(exc))
+            record.update(status="build_failed", diagnostics=str(exc),
+                          recovery="Report the local compiler or reference problem to the player. Use game tools to revise and rebuild when ready; do not repair the host through shell commands.")
             _write_json(attempt / "build.json", record)
             return record
         finally:

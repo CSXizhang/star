@@ -27,13 +27,11 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +44,71 @@ from stardew_ai_runtime.agent_backends import (
 )
 from stardew_ai_runtime.agent_instructions import instructions_revision, load_instruction_bundle
 from stardew_ai_runtime.agy_process import run_agy_process, terminate_agy_process
+from stardew_ai_runtime.agy_usage import (
+    _decode_varint as _decode_varint,
+)
+from stardew_ai_runtime.agy_usage import (
+    _parse_protobuf as _parse_protobuf,
+)
+from stardew_ai_runtime.agy_usage import (
+    _parse_usage_from_gen_metadata as _parse_usage_from_gen_metadata,
+)
+from stardew_ai_runtime.agy_usage import (
+    check_new_quota_error as check_new_quota_error,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_command_usage_delta as get_command_usage_delta,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_conversation_db_path as get_conversation_db_path,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_max_gen_idx as get_max_gen_idx,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_max_step_idx as get_max_step_idx,
+)
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_BACKUP_COUNT as CHAT_BRIDGE_LOG_BACKUP_COUNT,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_DATEFMT as CHAT_BRIDGE_LOG_DATEFMT,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_ENCODING as CHAT_BRIDGE_LOG_ENCODING,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_FILENAME as CHAT_BRIDGE_LOG_FILENAME,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_FORMAT as CHAT_BRIDGE_LOG_FORMAT,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_MAX_BYTES as CHAT_BRIDGE_LOG_MAX_BYTES,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    configure_chat_bridge_file_logging as configure_chat_bridge_file_logging,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    get_chat_bridge_fallback_log_dir as get_chat_bridge_fallback_log_dir,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    get_chat_bridge_log_path as get_chat_bridge_log_path,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    has_chat_bridge_file_logging as has_chat_bridge_file_logging,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    remove_chat_bridge_file_logging as remove_chat_bridge_file_logging,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    resolve_chat_bridge_run_dir as resolve_chat_bridge_run_dir,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    switch_chat_bridge_file_logging as switch_chat_bridge_file_logging,
+)
 from stardew_ai_runtime.codex_game_profile import CODEX_GAME_TOOL_PROFILE_VERSION
 from stardew_ai_runtime.companion_care import CompanionCareService
 from stardew_ai_runtime.companion_memory import CompanionMemoryStore, resolve_companion_id
@@ -93,7 +154,6 @@ from stardew_ai_runtime.protocol import (
 )
 from stardew_ai_runtime.scheduler import (
     DiscoveryError,
-    get_candidate_discovery_paths,
     resolve_discovery,
 )
 from stardew_ai_runtime.snapshot_cache import cache_lock, write_cache
@@ -112,357 +172,6 @@ from stardew_ai_runtime.work_state import (
 )
 
 logger = logging.getLogger("stardew_ai_runtime.chat_bridge")
-
-CHAT_BRIDGE_LOG_FILENAME = "chat-bridge.log"
-CHAT_BRIDGE_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-CHAT_BRIDGE_LOG_BACKUP_COUNT = 3
-CHAT_BRIDGE_LOG_ENCODING = "utf-8"
-CHAT_BRIDGE_LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
-CHAT_BRIDGE_LOG_DATEFMT = "%H:%M:%S"
-
-
-def resolve_chat_bridge_run_dir(run_dir: str | Path | None = None) -> Path | None:
-    """Resolves the active run directory, consulting explicit path, environment, and auto-discovery."""
-    if run_dir:
-        return Path(run_dir).resolve()
-    env_dir = os.getenv("STARDEW_RUN_DIR")
-    if env_dir and env_dir.strip():
-        return Path(env_dir.strip()).resolve()
-    try:
-        candidate_meta = project_root() / "config" / "installed-candidate.json"
-        if candidate_meta.is_file():
-            meta = json.loads(candidate_meta.read_text(encoding="utf-8"))
-            mod_dir = meta.get("modDirectory")
-            if mod_dir and Path(mod_dir).is_dir():
-                return Path(mod_dir).resolve()
-    except Exception:
-        pass
-    try:
-        for cand in get_candidate_discovery_paths(None):
-            if cand.is_file():
-                parent = cand.parent
-                mod_dir = parent.parent if parent.name.lower() == "data" else parent
-                return mod_dir.resolve()
-            parent = cand.parent
-            cand_mod = parent.parent if parent.name.lower() == "data" else parent
-            if cand_mod.is_dir():
-                return cand_mod.resolve()
-    except Exception:
-        pass
-    return None
-
-
-def get_chat_bridge_fallback_log_dir() -> Path:
-    """Returns the fallback directory for logs when run-dir cannot be resolved."""
-    env_override = os.getenv("STARDEW_FALLBACK_LOG_DIR")
-    if env_override and env_override.strip():
-        return Path(env_override.strip())
-    return Path.home() / ".gemini" / "antigravity-cli" / "logs"
-
-
-def get_chat_bridge_log_path(run_dir: str | Path | None = None) -> Path:
-    """Determines the destination path for chat-bridge.log."""
-    resolved = resolve_chat_bridge_run_dir(run_dir)
-    if resolved is not None:
-        return resolved / "logs" / CHAT_BRIDGE_LOG_FILENAME
-    return get_chat_bridge_fallback_log_dir() / CHAT_BRIDGE_LOG_FILENAME
-
-
-def has_chat_bridge_file_logging() -> bool:
-    """Checks whether a ChatBridge RotatingFileHandler is currently attached to the root logger."""
-    root_logger = logging.getLogger()
-    for h in root_logger.handlers:
-        if getattr(h, "_is_chat_bridge_handler", False):
-            return True
-    return False
-
-
-def configure_chat_bridge_file_logging(
-    run_dir: str | Path | None = None,
-) -> tuple[RotatingFileHandler, Path]:
-    """Attaches a 5MB x 3 UTF-8 RotatingFileHandler to the root logger."""
-    log_path = get_chat_bridge_log_path(run_dir)
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-    except Exception as ex:
-        fallback_path = get_chat_bridge_fallback_log_dir() / CHAT_BRIDGE_LOG_FILENAME
-        try:
-            fallback_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path = fallback_path
-        except Exception:
-            logger.warning("Failed to create log directories (%s); falling back to current working directory", ex)
-            log_path = Path.cwd() / "logs" / CHAT_BRIDGE_LOG_FILENAME
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    root_logger = logging.getLogger()
-    for h in root_logger.handlers:
-        if getattr(h, "_is_chat_bridge_handler", False) and isinstance(h, RotatingFileHandler):
-            try:
-                if Path(h.baseFilename).resolve() == log_path.resolve():
-                    return h, log_path
-            except Exception:
-                pass
-
-    handler = RotatingFileHandler(
-        str(log_path),
-        maxBytes=CHAT_BRIDGE_LOG_MAX_BYTES,
-        backupCount=CHAT_BRIDGE_LOG_BACKUP_COUNT,
-        encoding=CHAT_BRIDGE_LOG_ENCODING,
-    )
-    handler.setLevel(logging.INFO)
-    handler._is_chat_bridge_handler = True  # type: ignore[attr-defined]
-    formatter = logging.Formatter(
-        CHAT_BRIDGE_LOG_FORMAT,
-        datefmt=CHAT_BRIDGE_LOG_DATEFMT,
-    )
-    handler.setFormatter(formatter)
-    root_logger.addHandler(handler)
-    if root_logger.level > logging.INFO or root_logger.level == logging.NOTSET:
-        root_logger.setLevel(logging.INFO)
-    return handler, log_path
-
-
-def switch_chat_bridge_file_logging(
-    new_run_dir: str | Path | None,
-) -> tuple[RotatingFileHandler, Path]:
-    """Switches the active chat_bridge file handler to a newly discovered run directory."""
-    log_path = get_chat_bridge_log_path(new_run_dir)
-    root_logger = logging.getLogger()
-    for h in list(root_logger.handlers):
-        if getattr(h, "_is_chat_bridge_handler", False) and isinstance(h, RotatingFileHandler):
-            try:
-                if Path(h.baseFilename).resolve() == log_path.resolve():
-                    return h, log_path
-                h.close()
-                root_logger.removeHandler(h)
-            except Exception:
-                pass
-    return configure_chat_bridge_file_logging(new_run_dir)
-
-
-def remove_chat_bridge_file_logging() -> None:
-    """Closes and removes all chat_bridge file handlers from the root logger."""
-    root_logger = logging.getLogger()
-    for h in list(root_logger.handlers):
-        if getattr(h, "_is_chat_bridge_handler", False):
-            try:
-                h.close()
-            except Exception:
-                pass
-            root_logger.removeHandler(h)
-
-
-def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
-    res = 0
-    shift = 0
-    while offset < len(data):
-        b = data[offset]
-        offset += 1
-        res |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return res, offset
-        shift += 7
-    return res, offset
-
-
-def _parse_protobuf(data: bytes) -> dict[int, list[tuple[int, Any]]]:
-    offset = 0
-    fields: dict[int, list[tuple[int, Any]]] = {}
-    while offset < len(data):
-        try:
-            tag_val, offset = _decode_varint(data, offset)
-        except Exception:
-            break
-        tag = tag_val >> 3
-        wire = tag_val & 7
-        if wire == 0:
-            val, offset = _decode_varint(data, offset)
-        elif wire == 2:
-            length, offset = _decode_varint(data, offset)
-            val = data[offset : offset + length]
-            offset += length
-        elif wire == 1:
-            val = data[offset : offset + 8]
-            offset += 8
-        elif wire == 5:
-            val = data[offset : offset + 4]
-            offset += 4
-        else:
-            break
-        fields.setdefault(tag, []).append((wire, val))
-    return fields
-
-
-def _parse_usage_from_gen_metadata(data: bytes) -> dict[str, int]:
-    usage = {
-        "prompt_tokens": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "thinking_tokens": 0,
-        "total_tokens": 0,
-    }
-    if not data:
-        return usage
-    f = _parse_protobuf(data)
-    if 1 not in f:
-        return usage
-    wire, val = f[1][0]
-    if wire != 2 or not isinstance(val, bytes):
-        return usage
-    gen_meta = _parse_protobuf(val)
-    if 4 not in gen_meta:
-        return usage
-    wire4, val4 = gen_meta[4][0]
-    if wire4 != 2 or not isinstance(val4, bytes):
-        return usage
-    u = _parse_protobuf(val4)
-    usage["prompt_tokens"] = u.get(1, [(0, 0)])[0][1]
-    usage["input_tokens"] = u.get(2, [(0, 0)])[0][1]
-    usage["output_tokens"] = u.get(3, [(0, 0)])[0][1]
-    usage["cache_read_tokens"] = u.get(5, [(0, 0)])[0][1]
-    usage["thinking_tokens"] = u.get(9, [(0, 0)])[0][1]
-    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
-    usage["input_context_measured"] = any(key in u for key in (2, 5))
-    return usage
-
-
-def get_conversation_db_path(conversation_id: str) -> Path:
-    return (
-        Path.home()
-        / ".gemini"
-        / "antigravity-cli"
-        / "conversations"
-        / f"{conversation_id}.db"
-    )
-
-
-def get_max_gen_idx(conversation_id: str | None) -> int:
-    """Returns the maximum gen_metadata.idx recorded for conversation_id, or -1 if none."""
-    if not conversation_id:
-        return -1
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return -1
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute("SELECT MAX(idx) FROM gen_metadata")
-        row = cur.fetchone()
-        con.close()
-        return row[0] if (row and row[0] is not None) else -1
-    except Exception as ex:
-        logger.debug("Failed getting max gen idx for %s: %s", conversation_id, ex)
-        return -1
-
-
-def get_command_usage_delta(conversation_id: str | None, start_idx: int) -> dict[str, Any] | None:
-    """Calculates exact usage delta for generations strictly after start_idx."""
-    if not conversation_id:
-        return None
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return None
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute(
-            "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx",
-            (start_idx,),
-        )
-        rows = cur.fetchall()
-        con.close()
-        if not rows:
-            return None
-
-        inp = 0
-        out = 0
-        cache = 0
-        thinking = 0
-        for _, data in rows:
-            u = _parse_usage_from_gen_metadata(data)
-            inp += u.get("input_tokens", 0)
-            out += u.get("output_tokens", 0)
-            cache += u.get("cache_read_tokens", 0)
-            thinking += u.get("thinking_tokens", 0)
-
-        latest = _parse_usage_from_gen_metadata(rows[-1][1])
-        measured = latest.get("input_context_measured", False)
-        return {
-            "input_tokens": inp,
-            "output_tokens": out,
-            "cache_read_tokens": cache,
-            "thinking_tokens": thinking,
-            "total_tokens": inp + out,
-            "generations_count": len(rows),
-            "start_idx": start_idx + 1,
-            "end_idx": rows[-1][0],
-            "source": "db_gen_metadata_delta",
-            "input_includes_cache": False,
-            "input_context_measured": measured,
-            "latestRequestInputContext": latest["input_tokens"] + latest["cache_read_tokens"] if measured else None,
-        }
-    except Exception as ex:
-        logger.warning(
-            "Failed calculating usage delta for %s (start_idx=%d): %s",
-            conversation_id,
-            start_idx,
-            ex,
-        )
-        return None
-
-
-def get_max_step_idx(conversation_id: str | None) -> int:
-    """Returns the maximum steps.idx recorded for conversation_id, or -1 if none."""
-    if not conversation_id:
-        return -1
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return -1
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute("SELECT coalesce(max(idx), -1) FROM steps")
-        row = cur.fetchone()
-        con.close()
-        return row[0] if (row and row[0] is not None) else -1
-    except Exception as ex:
-        logger.debug("Failed getting max step idx for %s: %s", conversation_id, ex)
-        return -1
-
-
-def check_new_quota_error(conversation_id: str | None, start_step_idx: int) -> tuple[bool, str]:
-    """Checks if any new step with idx > start_step_idx and step_type == 17 has RESOURCE_EXHAUSTED."""
-    if not conversation_id:
-        return False, ""
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return False, ""
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute(
-            "SELECT idx, step_payload FROM steps WHERE idx > ? AND step_type = 17 ORDER BY idx",
-            (start_step_idx,),
-        )
-        rows = cur.fetchall()
-        con.close()
-        for _idx, payload in rows:
-            text = (
-                payload.decode("utf-8", errors="replace")
-                if isinstance(payload, bytes)
-                else str(payload)
-            )
-            if (
-                "RESOURCE_EXHAUSTED" in text
-                or "Individual quota reached" in text
-                or "quota exceeded" in text
-            ):
-                return True, text
-        return False, ""
-    except Exception as ex:
-        logger.debug("Failed checking new steps for quota error: %s", ex)
-        return False, ""
 
 
 class InternalMcpPlanClient:

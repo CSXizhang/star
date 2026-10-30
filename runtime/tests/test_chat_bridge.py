@@ -549,7 +549,7 @@ def test_get_command_usage_delta_calculation(tmp_path: Path) -> None:
     con.commit()
     con.close()
 
-    with patch("stardew_ai_runtime.chat_bridge.get_conversation_db_path", return_value=db_path):
+    with patch("stardew_ai_runtime.agy_usage.get_conversation_db_path", return_value=db_path):
         assert get_max_gen_idx("test-conv-123") == 2
 
         # Delta for new command starting after idx 0: should ONLY sum idx 1 and 2!
@@ -767,7 +767,7 @@ def test_resume_ignores_old_cumulative_quota_error(tmp_path: Path) -> None:
     })
 
     with patch("subprocess.Popen") as mock_popen, \
-         patch("stardew_ai_runtime.chat_bridge.get_conversation_db_path", return_value=db_path):
+         patch("stardew_ai_runtime.agy_usage.get_conversation_db_path", return_value=db_path):
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         _mock_agy_stream(mock_proc, mock_stdout, "")
@@ -806,7 +806,7 @@ def test_resume_detects_genuine_new_step17_quota_error(tmp_path: Path) -> None:
     })
 
     with patch("subprocess.Popen") as mock_popen, \
-         patch("stardew_ai_runtime.chat_bridge.get_conversation_db_path", return_value=db_path):
+         patch("stardew_ai_runtime.agy_usage.get_conversation_db_path", return_value=db_path):
         mock_proc = MagicMock()
         mock_proc.returncode = 1
         _mock_agy_stream(mock_proc, mock_stdout, "")
@@ -1688,7 +1688,7 @@ def test_chat_bridge_file_logging_fallback_when_run_dir_missing(
     monkeypatch.setenv("STARDEW_FALLBACK_LOG_DIR", str(fallback_dir))
     monkeypatch.delenv("STARDEW_RUN_DIR", raising=False)
     monkeypatch.setattr(
-        "stardew_ai_runtime.chat_bridge.resolve_chat_bridge_run_dir",
+        "stardew_ai_runtime.chat_bridge_logging.resolve_chat_bridge_run_dir",
         lambda r=None: None,
     )
 

@@ -106,7 +106,7 @@ def test_map_image_is_mcp_content_and_rejects_arbitrary_file(tmp_path, monkeypat
 
     from mcp.server.fastmcp.exceptions import ToolError
 
-    import stardew_ai_runtime.mcp_server as mcp_module
+    import stardew_ai_runtime.mcp_native_tools as mcp_module
     from stardew_ai_runtime.mcp_server import create_mcp_server
 
     monkeypatch.setattr(mcp_module.tempfile, "gettempdir", lambda: str(tmp_path))

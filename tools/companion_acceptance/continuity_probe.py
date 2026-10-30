@@ -100,6 +100,17 @@ class Probe:
         await self.r.request("close")
         before = await self.r.native()
         assert native_finished(before), "Refuse to sleep during an active action"
+        # A mid-day reload may restore the player inside the bed. Leave it
+        # first so native re-entry can open a fresh sleep question.
+        if before.get("playerIsInBed"):
+            await self.r.request("leave-player-bed")
+            for _ in range(30):
+                ui = await self.r.request("snapshot")
+                if not ui.get("playerIsInBed") and not ui.get("nativeFade"):
+                    break
+                await asyncio.sleep(.5)
+            else:
+                raise TimeoutError("Player did not leave the restored bed")
         await self.r.request("host-go-bed")
         await asyncio.sleep(2)
         await self.r.request("host-walk-bed")

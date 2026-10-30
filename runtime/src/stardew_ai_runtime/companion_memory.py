@@ -15,15 +15,15 @@ terminal state. op=add does NOT accept kind=event.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
-import os
 import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from stardew_ai_runtime.file_lock import lock_file, unlock_file
 
 KIND_VALUES = frozenset({"preference", "agreement", "event"})
 SOURCE_VALUES = frozenset({"player", "companion", "system"})
@@ -111,26 +111,9 @@ class CompanionMemoryStore:
         except (FileNotFoundError, OSError, ValueError, TypeError):
             self._data = {}
 
-    @staticmethod
-    def _lock(lock: Any) -> None:
-        if os.name == "nt":
-            import msvcrt
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    _lock = staticmethod(lock_file)
 
-    @staticmethod
-    def _unlock(lock: Any) -> None:
-        with contextlib.suppress(Exception):
-            if os.name == "nt":
-                import msvcrt
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    _unlock = staticmethod(unlock_file)
 
     def _write_unlocked(self) -> None:
         temp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
@@ -156,9 +139,6 @@ class CompanionMemoryStore:
                 self._unlock(lock)
 
     # ---------------------------------------------------------------- helpers
-    @staticmethod
-    def _count_kind(entries: list[dict[str, Any]], kind: str) -> int:
-        return sum(1 for e in entries if isinstance(e, dict) and e.get("kind") == kind)
 
     @staticmethod
     def _entry_id() -> str:

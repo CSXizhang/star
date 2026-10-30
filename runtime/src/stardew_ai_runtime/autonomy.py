@@ -7,7 +7,6 @@ execution to the existing scheduler/MCP path.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import os
@@ -16,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from stardew_ai_runtime.file_lock import lock_file, unlock_file
 
 DEFAULT_BREAKER_THRESHOLD = 3
 DEFAULT_BREAKER_COOLDOWN_SECONDS = 300.0
@@ -130,26 +131,9 @@ class AutonomyController:
             finally:
                 self._unlock(lock)
 
-    @staticmethod
-    def _lock(lock: Any) -> None:
-        if os.name == "nt":
-            import msvcrt
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    _lock = staticmethod(lock_file)
 
-    @staticmethod
-    def _unlock(lock: Any) -> None:
-        with contextlib.suppress(Exception):
-            if os.name == "nt":
-                import msvcrt
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    _unlock = staticmethod(unlock_file)
 
     def _write_unlocked(self) -> None:
         temp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")

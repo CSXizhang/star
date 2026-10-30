@@ -3258,15 +3258,6 @@ class ChatBridge:
         # Reserve an hour for the current safe action and the actual route home.
         return isinstance(now, int) and now // 100 * 60 + now % 100 >= bedtime // 100 * 60 + bedtime % 100 - 60
 
-    def _near_midnight_hint(self, snapshot: dict[str, Any] | None = None) -> str | None:
-        """Player-mode 'approaching midnight' context note (≥ 23:30)."""
-        if getattr(self, "actor_mode", None) != "player":
-            return None
-        snapshot = snapshot or self._latest_snapshot_payload or {}
-        clock = (snapshot.get("world") or {}).get("timeOfDay")
-        if isinstance(clock, int) and not isinstance(clock, bool) and clock >= self.PLAYER_NEAR_MIDNIGHT:
-            return "临近午夜：优先安排回屋用 sleep 工具原生睡觉结束当天，避免在外昏倒。"
-        return None
 
     def _write_life_snapshot(self, save_id: str | None) -> None:
         if self.run_dir is None or not save_id or self._latest_snapshot_payload is None:
@@ -3654,29 +3645,18 @@ class ChatBridge:
     async def _await_work_provider(
         self, active_task: ActiveChatTask, conversation_id: str | None, prompt: str,
     ) -> dict[str, Any]:
-        future = asyncio.get_running_loop().run_in_executor(
-            None, self._execute_turn, active_task, conversation_id, prompt)
-        try:
-            async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
-                while not future.done():
-                    await asyncio.wait({future}, timeout=0.1)
-                    await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
-                return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await self._join_interrupted_provider(active_task, future)
-            raise
-        finally:
-            await self._settle_turn_messages(active_task, {})
+        return await self._await_provider(active_task, self._execute_turn, conversation_id, prompt)
 
     async def _await_life_provider(
         self, active_task: ActiveChatTask, conversation_id: str | None,
         prompt: str, mode: str | None = None,
     ) -> dict[str, Any]:
-        """Keep provider ownership until its thread has restored turn-local state."""
-        args = (active_task, conversation_id, prompt)
-        if mode is not None:
-            args += (mode,)
-        future = asyncio.get_running_loop().run_in_executor(None, self._execute_life_turn, *args)
+        args = (conversation_id, prompt) if mode is None else (conversation_id, prompt, mode)
+        return await self._await_provider(active_task, self._execute_life_turn, *args)
+
+    async def _await_provider(self, active_task: ActiveChatTask, execute, *args) -> dict[str, Any]:
+        """Join the owned executor before releasing turn state, even on cancellation."""
+        future = asyncio.get_running_loop().run_in_executor(None, execute, active_task, *args)
         try:
             async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
                 while not future.done():
@@ -3684,10 +3664,7 @@ class ChatBridge:
                     await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
                 return await asyncio.shield(future)
         except asyncio.CancelledError:
-            # Cancelling an executor await does not stop the executor thread.
-            # Wait for this owned turn before releasing the model/native slot.
             await self._join_interrupted_provider(active_task, future)
-            logger.info("Life provider [%s] interrupted by channel shutdown", active_task.request_id)
             raise
         finally:
             await self._settle_turn_messages(active_task, {})
@@ -4479,9 +4456,6 @@ class ChatBridge:
             state["maxInputContext"] = max(state.get("maxInputContext") or 0, context_tokens)
         return None
 
-    def _note_session_tokens(self, save_id: str | None, usage: dict[str, Any] | None) -> bool:
-        """Compatibility diagnostic; the harness owns context maintenance."""
-        return self._note_session_context(save_id, usage) is not None
 
     async def _settle_day_advance(self, save_id: str | None, world: dict[str, Any]) -> None:
         """Settle current game progress at the native day boundary."""
@@ -4594,24 +4568,6 @@ class ChatBridge:
             status=phase, reply_text=f"{labels[phase]}：{title}。{detail[:400]}", save_id=save_id,
             command_id=command_id, command_complete=command_complete))
 
-    def _plan_status_line(self) -> str | None:
-        """Short F8-visible line: last plan action and the current wait reason."""
-        worker = self._plan_worker
-        if worker is None:
-            return None
-        parts: list[str] = []
-        last = worker.last_result
-        if last is not None and last.status == "executed":
-            parts.append(
-                f"动作 {last.operation}（{last.outcome or 'unknown'}）"
-            )
-        if worker.pending_reasons:
-            parts.append(f"等待原因 {worker.pending_reasons[-1]}")
-        if not parts and self._last_day_settlement:
-            parts.append(f"日结 {self._last_day_settlement.get('reasonCode')}")
-        if not parts:
-            return None
-        return "计划状态：" + "；".join(parts)
 
     def _autonomy_state_payload(self, save_id: str, state: Any, *, overview: dict[str, Any] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -6225,11 +6181,6 @@ class ChatBridge:
         if not self._connection_ready():
             return {"success": False, "response": "等待原伙伴连接；未启动替代会话。",
                     "conversation_id": conversation_id, "error": "EXTERNAL_CONNECTION_WAITING"}
-        # Preserve the legacy test/integration seam when callers explicitly
-        # replace _execute_agy_turn; normal production dispatch remains solely
-        # controlled by backend_name.
-        if self.backend_name == "kimi" and type(self._execute_agy_turn).__module__.startswith("unittest.mock"):
-            return self._execute_agy_turn(active_task, conversation_id, prompt)
         from stardew_ai_runtime.compatibility import assert_native_compatible
         assert_native_compatible(self.run_dir)
         token = uuid.uuid4().hex

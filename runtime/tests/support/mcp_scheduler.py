@@ -455,18 +455,6 @@ def mock_scheduler():
         "error": None,
     })
 
-    scheduler.plant_crop_workflow = AsyncMock(return_value={
-        "status": "succeeded",
-        "crop": "Parsnip",
-        "seedId": "(O)472",
-        "seedsPlanted": 3,
-        "tilesHoed": 3,
-        "tilesWatered": 3,
-        "targetTiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}, {"x": 66, "y": 14}],
-        "withdrawnFromChest": None,
-        "remainingSeedsInBackpack": 0,
-        "pendingDecision": None,
-        "effects": [{"tile": {"x": 64, "y": 14}, "state": "planted"}],
-    })
+    scheduler.plant_crop_workflow = AsyncMock(side_effect=AssertionError("Retired composite must not dispatch"))
 
     return scheduler

@@ -109,6 +109,7 @@ Kimi 用户首次使用还需在**安装后的伙伴文件夹**运行 `kimi`，�
 - [模型与 MCP 接入](docs/mcp.md)：从外部模型客户端观察和操作游戏。普通游戏内聊天用户无需手动配置 MCP。
 - [其他 Agent 自行接入指南](docs/agent-self-integration.md)：配置连接后自然交流即可，工具用法由技能和工具说明提供。
 - [参与开发](CONTRIBUTING.md)：源码构建、测试与贡献。
+- [清理与兼容边界](docs/maintenance-cleanup.md)：旧组合种植接口迁移及仍保留的兼容入口。
 - [可重复实机验收](docs/repeatable-companion-acceptance.md)：固定任务、隔离存档、实际结果与 trace 报告。
 - [通信协议](protocol/README.md)：工具与消息约定。
 

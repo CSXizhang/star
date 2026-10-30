@@ -642,26 +642,11 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
 }
 
 
-# Lightweight game surface. Base tools stay reachable through
-# discover_capabilities/call_capability.
-#
-# Selection is explicit so the generic MCP entry stays fully compatible:
-#   * ``--surface full`` (default, and ``STARDEW_MCP_SURFACE=full``) lists every
-#     tool exactly as before this change, including the legacy ``manage_*`` and
-#     ``run_next_step`` harness tools;
-#   * ``--surface light`` (or ``--light`` / ``STARDEW_MCP_SURFACE=light``) lists
-#     only this set: the common actions the model should call directly, the two
-#     write entry points, player controls and group discovery. It is what the game
-#     provider profile (.kimi-code/mcp.json) requests.
-#   * ``--surface internal`` is the ChatBridge plan worker's surface: light plus
-#     the read-only reconcile tool, never exposed to the model. It always wins
-#     over an inherited env var (the worker must keep its reconcile tool).
-#
-# An explicitly set ``STARDEW_MCP_SURFACE`` env var wins over the CLI
-# ``--surface`` argument: the life-chat bridge injects ``STARDEW_MCP_SURFACE=life``
-# into the model backend environment, and that forced read-only surface must
-# hold even though the installed game profile passes ``--surface light``.
-# The light set is not a fixed tool count; it is this named set.
+# Compatibility tool groups used by full/internal callers. The game surface is
+# the fixed eight GAME_TOOLS, registered over these canonical implementations.
+# full remains the generic default; internal serves the optional legacy worker.
+# light and the legacy life alias share live tools and execution-time admission.
+# An explicit environment surface overrides the CLI, except internal workers.
 BASE_TOOLS = frozenset(
     {
         # overview / status
@@ -918,22 +903,12 @@ def create_mcp_server(
     full: bool | None = None,
     surface: str | None = None,
 ) -> FastMCP:
-    """Creates and configures a FastMCP server backed by CompanionScheduler.
+    """Create the one scheduler-backed server with explicit compatibility surfaces.
 
-    By default the complete legacy tool list is exposed (generic compatibility).
-    Pass ``surface="light"`` (or ``--surface light`` / ``STARDEW_MCP_SURFACE=light``)
-    for the game surface, where the common actions plus the two write entry points
-    are listed directly and every other base operation stays reachable through
-    ``discover_capabilities``/``call_capability`` (same real implementation).
-    ``surface="internal"`` adds the harness-only reconcile tool for the plan worker.
-    ``surface="life"`` (``STARDEW_MCP_SURFACE=life``) is the companion life-chat
-    surface: cached status, durable milestone intents and player controls.
-    It never opens native transport, dispatches work or exposes call_capability.
-    ``full=True``/``STARDEW_MCP_FULL=1`` forces the full list.
-
-    An explicitly set ``STARDEW_MCP_SURFACE`` env var overrides the ``surface``
-    argument (except ``internal``, which always wins); when the env var is unset
-    the argument behaves exactly as before.
+    full is the generic legacy default; internal retains worker dispatch and
+    reconciliation. light exposes the eight game tools with immediate execution;
+    life is an alias for light, including native access when authority permits.
+    The environment overrides the CLI surface except for internal workers.
     """
     resolved_surface = resolve_surface(full, surface)
     if resolved_surface == "life":  # Legacy CLI/config name; same live game tools.
@@ -3793,35 +3768,8 @@ def create_mcp_server(
         location_id: str = "Farm",
         detail: bool = False,
     ) -> dict[str, Any]:
-        """Legacy composite interface retained for parameter compatibility.
-
-        Model calls select no job and execute nothing. Submit independent
-        withdraw_from_chest, hoe_tiles, plant_seeds and water_tiles steps instead,
-        with navigation as needed; legal atomic operations may freely combine.
-        The scheduler's existing direct workflow API remains available to callers.
-        """
-        crop_param = seed_item_id or crop_name_or_id
-        if not crop_param or not isinstance(crop_param, str):
-            raise ToolError("Must provide seed_item_id or crop_name_or_id as a non-empty string.")
-        try:
-            res = await sched.plant_crop_workflow(
-                crop_name_or_id=crop_param.strip(),
-                count=count,
-                target_tiles=target_tiles,
-                auto_till=auto_till,
-                water=auto_water,
-                withdraw_from_chest=withdraw_from_chest,
-                chest_tile=chest_tile,
-                location_id=location_id,
-            )
-            if not detail and "effects" in res:
-                res = dict(res)
-                res.pop("effects", None)
-            return res
-        except (PolicyViolationError, SchedulerError) as ex:
-            raise ToolError(f"Plant crop workflow rejected: {ex}") from None
-        except Exception as ex:
-            raise ToolError(f"Plant crop workflow failed: {ex}") from None
+        """Retired composite entry: preserve the signature and explicit migration error."""
+        raise ToolError(PLANT_WORKFLOW_PLAN_ERROR)
 
     @mcp.tool()
     async def observe_farming_helpers(location_id: str = "Farm") -> dict[str, Any]:

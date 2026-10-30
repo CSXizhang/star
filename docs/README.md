@@ -9,6 +9,7 @@
 ## 开发与验证
 
 - [参与开发](../CONTRIBUTING.md) · [通信协议](../protocol/README.md)
+- [清理与兼容边界](maintenance-cleanup.md)
 - [当前提示词来源](agent-prompt-integration-notes.md) · [核心指令](agent-core-instructions-draft.md) · [领域指导](agent-domain-guidance-draft.md)
 - [伙伴实机回归](repeatable-companion-acceptance.md) · [双路径、记忆与能力验证](dual-connection-validation.md)
 - [成长设计与实施进度](companion-efficiency-and-play-design.md)

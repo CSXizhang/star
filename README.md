@@ -21,7 +21,7 @@ F8 设置可选择伙伴或 AI 自己玩，重启生效；自玩仅限单人，�
 
 伙伴的普通消息直接显示在游戏聊天栏，按 T 或点击左侧状态栏输入，回车或点击“发送”提交指导与回复。需要选择时使用 NPC 选项，也可在聊天栏作答；F8 保留任务、记录和设置。
 
-当前源码支持在游戏内启动伙伴，或让已有 MiniMax Code 会话主动连接；读档与重连恢复所选来源的原会话，沿用人格、记忆与约定，接入方法见[原伙伴接入](docs/mcp.md#已有-minimax-code-伙伴主动连接)。伙伴也能保存可复用的方法，并在商量后自行查询原生接口、编写编译扩展、当场试用、保存到后续游戏；旋转家具的自主学习、热升级与读档复用已完成实机验证。这些改动尚未发布到现有下载包，详见[成长设计](docs/companion-efficiency-and-play-design.md)与[验证记录](docs/dual-connection-validation.md)。
+0.3.22 支持在游戏内启动伙伴，或让已有 MiniMax Code 会话主动连接；读档与重连恢复所选来源的原会话，沿用人格、记忆与约定，接入方法见[原伙伴接入](docs/mcp.md#已有-minimax-code-伙伴主动连接)。伙伴也能保存可复用的方法，并在商量后自行查询原生接口、编写编译扩展、当场试用、保存到后续游戏；旋转家具的自主学习、热升级与读档复用已完成实机验证。这些能力已随 0.3.22 发布，详见[成长设计](docs/companion-efficiency-and-play-design.md)与[验证记录](docs/dual-connection-validation.md)。
 
 已有伙伴接入可独立于内置后端配置启动；中途追加要求按确认送达状态接续，休息也响应暂停、恢复和取消。自学习能力提供调用报告与游戏观察，由伙伴判断效果和是否保留，保存版本以游戏宿主记录为准。
 
@@ -38,7 +38,7 @@ F8 设置可选择伙伴或 AI 自己玩，重启生效；自玩仅限单人，�
 
 ### 2. 下载并安装
 
-1. 打开 [Releases](https://github.com/CSXizhang/star/releases/latest)，在 **Assets** 下载 `StardewAI.Companion.Mod-0.3.21-windows-x64.zip`。
+1. 打开 [Releases](https://github.com/CSXizhang/star/releases/latest)，在 **Assets** 下载 `StardewAI.Companion.Mod-0.3.22-windows-x64.zip`。
 2. 完整解压，进入 `StardewAI.Companion.Mod` 文件夹。关闭游戏，双击 **设置星露谷伙伴.cmd**。
 3. 选择游戏目录，也就是能看到 `StardewModdingAPI.exe` 的文件夹；左侧选模型客户端，右侧填模型，然后点 **安装并应用设置**。
 4. **Codex 和 MiniMax Code 的模型可以留空**，沿用客户端当前配置。其他后端按账号实际可用模型填写。

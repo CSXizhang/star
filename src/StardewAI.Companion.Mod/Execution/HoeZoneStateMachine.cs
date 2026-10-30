@@ -17,8 +17,6 @@ namespace StardewAI.Companion.Mod.Execution;
 /// </summary>
 public sealed class HoeZoneStateMachine : ISkillExecutionMachine
 {
-    private const float WalkPixelsPerTick = 4f;
-    private const int MaxReplansPerTarget = 3;
     private const long MaxNoProgressTicks = 3600;
     private const int ActionDurationTicks = 18;
     private const int MaxToolAnimationTicks = 90;
@@ -26,7 +24,7 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
     private readonly IFarmerActor _actor;
     private readonly CompanionAvatar? _avatar;
     private readonly IWorldObserver _observer;
-    private readonly SameMapNavigator _navigator;
+    private readonly AdjacentTargetWalk _walk;
     private readonly IHoeAdapter _adapter;
     private readonly Action<string, LogLevel>? _log;
 
@@ -36,9 +34,6 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
     private List<TileCoordinate> _pendingTargets = new();
     private int _currentTargetIndex;
     private TileCoordinate _currentTargetTile;
-    private List<PathStep> _currentPath = new();
-    private int _currentPathIndex;
-    private int _replanCount;
     private int _actionTicks;
     private bool _actionEffectExecuted;
     private HoeTileResult? _lastHoeResult;
@@ -86,7 +81,7 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
     {
         _actor = actor ?? throw new ArgumentNullException(nameof(actor));
         _observer = observer ?? throw new ArgumentNullException(nameof(observer));
-        _navigator = navigator ?? throw new ArgumentNullException(nameof(navigator));
+        _walk = new AdjacentTargetWalk(_actor, _observer, navigator ?? throw new ArgumentNullException(nameof(navigator)));
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _avatar = avatar;
         _log = log;
@@ -108,7 +103,7 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
             _waterUsed = 0;
             _elapsedTicks = 0;
             _progressWatchdog.Reset();
-            _replanCount = 0;
+            _walk.Reset();
             _actionTicks = 0;
             _actionEffectExecuted = false;
             _lastHoeResult = null;
@@ -325,8 +320,7 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
             return;
         }
 
-        var pathResult = _navigator.FindPathToInteract(_actor, _currentRequest!.LocationId, _currentTargetTile);
-        if (!pathResult.Success || pathResult.Steps.Count == 0)
+        if (!_walk.Plan(_currentRequest!.LocationId, _currentTargetTile))
         {
             _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "unreachable"));
             _currentTargetIndex++;
@@ -334,81 +328,33 @@ public sealed class HoeZoneStateMachine : ISkillExecutionMachine
             return;
         }
 
-        _currentPath = pathResult.Steps.ToList();
-        _currentPathIndex = 0;
-        _replanCount = 0;
         CurrentState = ExecutionState.Navigating;
     }
 
     private void HandleNavigating()
     {
-        if (_currentPathIndex >= _currentPath.Count)
+        switch (_walk.Tick(_currentRequest!.LocationId, _currentTargetTile))
         {
-            _actor.Halt();
-            if (_actor.Tile.IsAdjacentTo(_currentTargetTile))
-            {
+            case AdjacentWalkState.Facing:
                 CurrentState = ExecutionState.Facing;
-            }
-            else
-            {
+                break;
+            case AdjacentWalkState.Preparing:
                 CurrentState = ExecutionState.Preparing;
-            }
-            return;
+                break;
+            case AdjacentWalkState.Unreachable:
+                SkipWalkingTarget("unreachable");
+                break;
+            case AdjacentWalkState.PlayerObstruction:
+                SkipWalkingTarget("player-obstruction");
+                break;
         }
+    }
 
-        var targetStep = _currentPath[_currentPathIndex];
-        var targetTile = targetStep.Tile;
-        if (ActorGuards.HasReachedWalkingTile(_actor, targetTile)) {
-            _actor.Halt(); _currentPathIndex++; return;
-        }
-        var targetPixel = ActorGuards.WalkingTargetPixel(_actor, targetTile);
-        var currentPixel = _actor.PixelPosition;
-
-        if (_observer.IsPlayerOnTile(_currentRequest!.LocationId, targetTile))
-        {
-            _actor.Halt();
-            _replanCount++;
-            if (_replanCount > MaxReplansPerTarget)
-            {
-                _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "player-obstruction"));
-                _currentTargetIndex++;
-                CurrentState = ExecutionState.Preparing;
-                return;
-            }
-
-            var replan = _navigator.FindPathToInteract(_actor, _currentRequest!.LocationId, _currentTargetTile);
-            if (!replan.Success || replan.Steps.Count == 0)
-            {
-                _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, "unreachable"));
-                _currentTargetIndex++;
-                CurrentState = ExecutionState.Preparing;
-                return;
-            }
-
-            _currentPath = replan.Steps.ToList();
-            _currentPathIndex = 0;
-            return;
-        }
-
-        var diff = targetPixel - currentPixel;
-        float dist = diff.Length();
-
-        if (ActorGuards.IsPlayerBound(_actor))
-        {
-            _actor.MovePixels(diff.X, diff.Y);
-            return;
-        }
-        if (dist <= WalkPixelsPerTick)
-        {
-            if (!ActorGuards.TryFinishWalkingStep(_actor, targetPixel)) return;
-            _currentPathIndex++;
-        }
-        else
-        {
-            diff.Normalize();
-            _actor.Facing = targetStep.Facing;
-            _actor.MovePixels(diff.X * WalkPixelsPerTick, diff.Y * WalkPixelsPerTick);
-        }
+    private void SkipWalkingTarget(string reason)
+    {
+        _skippedTiles.Add(new SkippedTileInfo(_currentTargetTile, reason));
+        _currentTargetIndex++;
+        CurrentState = ExecutionState.Preparing;
     }
 
     private void HandleFacing()

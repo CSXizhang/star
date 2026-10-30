@@ -112,6 +112,51 @@ def test_persistence_requires_host_receipt_and_reload_preserves_evidence(tmp_pat
     assert NativeCapabilityStore(tmp_path).inspect('test.capability')['verification']['status'] == 'used_successfully'
 
 
+def test_saved_native_version_wins_after_index_write_failure_and_restart(tmp_path, monkeypatch):
+    from stardew_ai_runtime import native_capabilities as native
+
+    store = NativeCapabilityStore(tmp_path)
+    one = _package(store)
+    store.record_native_validation('test.capability', '1', _receipt(one))
+    store.record_native_persist('test.capability', '1', {**one, 'loaded': True, 'persisted': True})
+    two = _package(store, '2')
+    store.record_native_validation('test.capability', '2', _receipt(two))
+    # Same location and contents written by GameExtensionHost.Persist, before
+    # the bridge can update its secondary index.
+    active = store.root / 'packages/active.json'
+    active.write_text(json.dumps(['test.capability/2']))
+    original_write = native._write_json
+    def fail_index(path, data):
+        if path.name == 'catalog.json':
+            raise PermissionError('Index temporarily locked')
+        original_write(path, data)
+    monkeypatch.setattr(native, '_write_json', fail_index)
+    kept = store.record_native_persist('test.capability', '2', {**two, 'loaded': True, 'persisted': True})
+    assert 'indexWarning' in kept
+    restarted = NativeCapabilityStore(tmp_path)
+    assert restarted.inspect('test.capability')['manifest']['version'] == '2'
+    assert restarted.catalog()['capabilities']['test.capability']['previousVersion'] == '1'
+    monkeypatch.setattr(native, '_write_json', original_write)
+    restarted.record_native_persist('test.capability', '2', {**two, 'loaded': True, 'persisted': True})
+    # A successful native rollback is reflected even if the bridge exits before
+    # recording its receipt. A later keep retains the reverse rollback target.
+    active.write_text(json.dumps(['test.capability/1']))
+    assert restarted.inspect('test.capability')['manifest']['version'] == '1'
+    assert restarted.catalog()['capabilities']['test.capability']['previousVersion'] == '2'
+
+
+def test_adapter_report_is_not_presented_as_independent_effect_verification(tmp_path):
+    store = NativeCapabilityStore(tmp_path)
+    manifest = _package(store)
+    receipt = {**_receipt(manifest), 'evidence': {'message': 'Nothing needed changing'}}
+    store.record_native_validation('test.capability', '1', receipt)
+    store.record_native_persist('test.capability', '1', {**manifest, 'loaded': True, 'persisted': True})
+    report = NativeCapabilityStore(tmp_path).inspect('test.capability')['verification']
+    assert report['effectVerifiedByHost'] is False
+    assert report['evidenceSource'] == 'adapter'
+    assert report['receipt']['evidence'] == receipt['evidence']
+
+
 def test_cancelling_build_kills_only_owned_compiler(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock, Mock
     store = NativeCapabilityStore(tmp_path, dotnet=str(_fake_dotnet(tmp_path / 'compiler', sdk='6.0.428', targeting_pack=True, runtime=True)))

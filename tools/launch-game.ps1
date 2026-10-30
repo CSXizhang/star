@@ -63,6 +63,13 @@ foreach ($d in @($testRunsDir, $infraArtifactsDir)) {
 
 # --- SAFETY HELPER FUNCTIONS ---
 
+function Assert-ChildEnvironmentOverride([string]$name) {
+    if ($name -in @('STARDEW_AI_ISOLATED_SAVES', 'STARDEW_AI_SESSION_CONFIG',
+        'STARDEW_AI_EVIDENCE_DIR', 'STARDEW_AI_EVIDENCE_OUTPUT', 'STARDEW_AI_RUN_ID')) {
+        throw "Run isolation environment cannot be overridden: $name"
+    }
+}
+
 function Assert-NoExistingGameProcesses {
     $existingProcs = Get-Process -Name "Stardew Valley", "StardewModdingAPI" -ErrorAction SilentlyContinue
     if ($existingProcs) {
@@ -172,21 +179,21 @@ function Assert-GoldenFixtureManifest([string]$goldenDir, [string]$manifestFile)
 
 function Get-FolderHashes([string]$folderPath) {
     $hashes = @{}
-    if (Test-Path -LiteralPath $folderPath) {
+    if (Test-Path -LiteralPath $folderPath -ErrorAction Stop) {
         if ($PresetAcceptance -and $folderPath -eq $dailyModsDir) {
             # The isolated --mods-path never loads this tree. Check installed mod
             # entry files without traversing unrelated caches and bundled runtimes.
-            $files = @(Get-ChildItem -LiteralPath $folderPath -File)
-            foreach ($modDir in Get-ChildItem -LiteralPath $folderPath -Directory) {
+            $files = @(Get-ChildItem -LiteralPath $folderPath -File -ErrorAction Stop)
+            foreach ($modDir in Get-ChildItem -LiteralPath $folderPath -Directory -ErrorAction Stop) {
                 if ($modDir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
-                $files += @(Get-ChildItem -LiteralPath $modDir.FullName -File)
+                $files += @(Get-ChildItem -LiteralPath $modDir.FullName -File -ErrorAction Stop)
             }
         } else {
-            $files = Get-ChildItem -LiteralPath $folderPath -Recurse -File | Sort-Object FullName
+            $files = Get-ChildItem -LiteralPath $folderPath -Recurse -File -ErrorAction Stop | Sort-Object FullName
         }
         foreach ($f in $files) {
             if ($folderPath -eq $dailyModsDir -and $f.FullName -match '[\\/]logs[\\/][^\\/]+\.log$') { continue }
-            $h = Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256
+            $h = Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop
             $rel = $f.FullName.Substring($folderPath.Length).TrimStart('\', '/')
             $hashes[$rel] = $h.Hash
         }
@@ -259,6 +266,7 @@ $timedOut = $false
 $preSavesHashes = $null
 $preModsHashes = $null
 $preGoldenHashes = $null
+$preCustomHashes = $null
 $orchestratorProc = $null
 
 $dailyAppData = [Environment]::GetFolderPath('ApplicationData')
@@ -303,9 +311,6 @@ try {
     # 4. PRE-LAUNCH INTEGRITY BASELINES (Daily Saves, Daily Mods, Golden/Custom Source)
     Write-Host "`n>>> STEP 4: Capturing Pre-Launch Hashes <<<"
     $preSavesHashes = Get-FolderHashes $dailySavesDir
-    if ($preSavesHashes.Count -eq 0) {
-        throw "PRE-CHECK VIOLATION: Daily saves directory has 0 files or does not exist: $dailySavesDir"
-    }
     Write-Host "Daily saves files count before launch: $($preSavesHashes.Count)"
     $savesBaselineFile = Join-Path $runEvidenceDir "daily-saves-pre.sha256"
     $preSavesLines = @()
@@ -313,9 +318,6 @@ try {
     Write-Utf8File $savesBaselineFile (($preSavesLines -join "`n") + "`n")
 
     $preModsHashes = Get-FolderHashes $dailyModsDir
-    if ($preModsHashes.Count -eq 0) {
-        throw "PRE-CHECK VIOLATION: Daily mods directory has 0 files or does not exist: $dailyModsDir"
-    }
     Write-Host "Daily mods files count before launch: $($preModsHashes.Count)"
     $modsBaselineFile = Join-Path $runEvidenceDir "daily-mods-pre.sha256"
     $preModsLines = @()
@@ -523,6 +525,7 @@ try {
     $psi.EnvironmentVariables['STARDEW_AI_EVIDENCE_OUTPUT'] = $evidenceFile
     $psi.EnvironmentVariables['STARDEW_AI_RUN_ID'] = $RunId
     foreach ($key in $EnvironmentOverrides.Keys) {
+        Assert-ChildEnvironmentOverride $key
         $psi.EnvironmentVariables[$key] = [string]$EnvironmentOverrides[$key]
         Write-Host "Applying child environment override: $key=$($EnvironmentOverrides[$key])"
     }
@@ -533,6 +536,7 @@ try {
         if ($name -like 'STARDEW_AI_ENV_*') {
             $target = $name.Substring('STARDEW_AI_ENV_'.Length)
             if ($target) {
+                Assert-ChildEnvironmentOverride $target
                 $psi.EnvironmentVariables[$target] = [string]$entry.Value
                 Write-Host "Forwarding child environment override: $target=$($entry.Value)"
             }
@@ -664,7 +668,8 @@ finally {
 
     # 4. Verify and Write Daily Saves Post Hashes
     try {
-        if ($preSavesHashes) {
+        if ($null -eq $preSavesHashes) { throw 'Daily saves baseline was not captured.' }
+        if ($null -ne $preSavesHashes) {
             $postSavesHashes = Get-FolderHashes $dailySavesDir
             $postSavesLines = @()
             foreach ($k in $postSavesHashes.Keys) { $postSavesLines += "$($postSavesHashes[$k])  $k" }
@@ -685,12 +690,14 @@ finally {
             }
         }
     } catch {
+        $violations.Add("Daily saves integrity check incomplete: $_")
         Write-Warning "Note checking daily saves integrity: $_"
     }
 
     # 5. Verify and Write Daily Mods Post Hashes
     try {
-        if ($preModsHashes) {
+        if ($null -eq $preModsHashes) { throw 'Daily mods baseline was not captured.' }
+        if ($null -ne $preModsHashes) {
             $postModsHashes = Get-FolderHashes $dailyModsDir
             $postModsLines = @()
             foreach ($k in $postModsHashes.Keys) { $postModsLines += "$($postModsHashes[$k])  $k" }
@@ -711,11 +718,15 @@ finally {
             }
         }
     } catch {
+        $violations.Add("Daily mods integrity check incomplete: $_")
         Write-Warning "Note checking daily mods integrity: $_"
     }
 
     # 6. Verify and Write Golden / Custom Source Post Hashes
     try {
+        if (($CustomSavePath -and $null -eq $preCustomHashes) -or (-not $CustomSavePath -and $null -eq $preGoldenHashes)) {
+            throw 'Source save baseline was not captured.'
+        }
         if ($preGoldenHashes) {
             $postGoldenHashes = Get-FolderHashes $goldenV1Save
             $postGoldenLines = @()
@@ -747,6 +758,7 @@ finally {
             }
         }
     } catch {
+        $violations.Add("Source save integrity check incomplete: $_")
         Write-Warning "Note checking source save integrity: $_"
     }
 
@@ -758,7 +770,8 @@ finally {
             Write-Warning "CRITICAL INTEGRITY VIOLATION: $v"
         }
     } else {
-        Write-Host "INTEGRITY VERIFIED: Daily saves, daily mods, and Golden source are 100% pristine and untouched."
+        $modScope = if ($PresetAcceptance) { 'installed mod entry files' } else { 'daily mods' }
+        Write-Host "INTEGRITY VERIFIED: Daily saves, $modScope, and source save match their captured baselines."
     }
 }
 

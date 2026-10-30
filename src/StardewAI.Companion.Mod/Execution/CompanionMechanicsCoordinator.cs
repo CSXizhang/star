@@ -78,6 +78,30 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     private readonly HashSet<string> _cancelledTaskIds = new();
 
     public CompanionRestController Rest { get; }
+    public bool HasRestTask => _restRequest != null;
+
+    public bool PauseRestTask()
+    {
+        if (_restRequest == null || Rest.TaskPaused) return false;
+        Rest.TaskPaused = true;
+        _actor.Halt();
+        return true;
+    }
+
+    public bool ResumeRestTask()
+    {
+        if (_restRequest == null || !Rest.TaskPaused) return false;
+        Rest.TaskPaused = false;
+        return true;
+    }
+
+    public bool CancelRestTask()
+    {
+        if (_restRequest == null) return false;
+        Rest.Wake();
+        FinishRest("cancelled");
+        return true;
+    }
     public StardewAI.Companion.Mod.PlayerMode.PlayerControlAuthority? PlayerAuthority { get; set; }
     private PlayerSleepStateMachine? _sleepMachine;
     private PlayerChestObservationMachine? _chestObservation;
@@ -1542,8 +1566,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 ? envelope.CorrelationId : payload.CommandId;
             if (_restRequest is { } rest && (target == rest.CommandId || target == rest.TaskId))
             {
-                Rest.Wake();
-                FinishRest("cancelled");
+                CancelRestTask();
                 return;
             }
             var active = ActiveMachine;
@@ -1559,7 +1582,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         lock (_taskLock)
         {
-            ActiveMachine?.RequestPause();
+            if (HasRestTask) PauseRestTask();
+            else ActiveMachine?.RequestPause();
         }
     }
 
@@ -1567,7 +1591,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         lock (_taskLock)
         {
-            ActiveMachine?.Resume();
+            if (HasRestTask) ResumeRestTask();
+            else ActiveMachine?.Resume();
         }
     }
 
@@ -1666,7 +1691,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 WaterCanLevel: _actor.WaterLeft,
                 MaxWaterCanLevel: _actor.MaxWater,
                 HasWateringCan: true,
-                Activity: Rest.IsResting ? Rest.State : activeMachine is not null ? DescribeActivity(activeMachine) : "idle",
+                Activity: Rest.IsResting ? GetActivityStatus() : activeMachine is not null ? DescribeActivity(activeMachine) : "idle",
                 AvailableMoney: companionMoney,
                 MoneyStatus: companionMoneyStatus,
                 RestState: Rest.State,
@@ -2162,7 +2187,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
 
     public string GetActivityStatus()
     {
-        if (Rest.IsResting) return Rest.State;
+        if (Rest.IsResting) return Rest.Paused || Rest.TaskPaused ? "paused" : Rest.State;
         var machine = ActiveMachine;
         if (machine is null) return "idle";
         string activity = DescribeActivity(machine);

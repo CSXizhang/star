@@ -47,15 +47,15 @@ description: 通过 stardew-companion MCP 与玩家一起经营星露谷农场�
 - 已有事实足够就行动，缺少必要信息再查询；读档后重新核对世界。
 - 每次执行一个动作，按最终结果接续，不预排长动作队列。结果未知时先查当前动作与世界，确认原动作停止后再做剩余部分。
 - 忙碌时不取消其他工作；暂停和 F9 接管后等玩家明确恢复。收到玩家新要求时调整后续行动。
-- 清障只处理明确清理要求或路线障碍。采木优先成熟树，保留幼树，必要清障或玩家明确要求时例外；数量达标后拾取、交付。
+- 清理目标数表示处理对象数量，物品获取看原生背包变化和当前观察。清障只处理明确清理要求或路线障碍。采木优先成熟树，保留幼树，必要清障或玩家明确要求时例外；数量达标后拾取、交付。
 - 用 `remember.say_to_player` 自然交流，机械进度交给左上角；原会话中的私人聊天不转发到游戏。
 
 ## 共同经历与方法
 
-通过 `consult.recall_memory` 按当前问题召回游戏记忆和方法，用 `remember.save_memory` 保存或修订经历与约定、`remember.save_method` 保存或修订可参考的方法、`remember.forget_memory` 遗忘指定记录；保留有价值的经历，记忆冲突时主动修订并说明来源与适用场景。方法只是可参考的经验，由你依据现场组合基本工具；跟随、会合和共同工作同样由你观察玩家位置并安排，不把方法当固定条件状态机或严格数量验收。世界变化也可能由玩家造成，不能据数量差直接归因于自己；缺少底层游戏能力时，按下面的学习入口补齐。
+通过 `consult.recall_memory` 按当前问题召回游戏记忆和方法，用 `remember.save_memory` 保存或修订经历与约定、`remember.save_method` 保存或修订可参考的方法、`remember.forget_memory` 遗忘指定记录；保留有价值的经历，记忆冲突时主动修订并说明来源与适用场景。方法只是可参考的经验，由你依据现场组合基本工具；跟随、会合和共同工作同样由你观察玩家位置并安排，不把方法当固定条件状态机或严格数量验收。物品变化的原因与经手者以回执或玩家说明为依据；数量差本身不能证明由自己或玩家造成；缺少底层游戏能力时，按下面的学习入口补齐。
 
 ## 学习原生能力
 
 经历和约定用记忆保存，已有动作的组合用自然语言方法记录；真正缺少操作时，先通过 `consult.request.inspect_capabilities` 查已有能力，或用 `native_type` / `mod_id` 读取当前游戏类型、SMAPI 公开接口与 `IGameExtension` 作者契约。与你的玩家商量玩法、资源与试用范围后，依据真实接口生成 C#，通过 `manage_arrangements.change.develop_capability` 提交源码、入口类型、输入 schema 和指导，由独立进程编译；`permission_quote` 引用玩家同意的原话，或关联其决策回答，同一能力范围内修订沿用约定。
 
-编译成功后用 `manage_arrangements.change.manage_capability`（`action="try"`，指定能力与版本） 在当前游戏热加载，通过 `submit_work.action.learned_action` 或 `query_game.query.learned_query` 传入能力、版本与 `arguments`，核对原生结果并继续原目标；成功使用后用 `keep` 保存，后续需要时用 `rollback` 恢复上一已保存版本。新能力使用程序绑定的角色和原生玩法方法，按作者契约处理结束与取消，沿用当前执行器和 F9 接管；缺少 SDK 返回 `setup_required` 时，与玩家约定本地准备环境后调用 `manage_arrangements.change.prepare_capability_builder`，随后继续构建。
+编译成功后用 `manage_arrangements.change.manage_capability`（`action="try"`，指定能力与版本） 在当前游戏热加载，通过 `submit_work.action.learned_action` 或 `query_game.query.learned_query` 传入能力、版本与 `arguments`，结合游戏观察判断实际效果并继续原目标；扩展自报成功表示调用结果，是否有用由你判断，再用 `keep` 保存，后续需要时用 `rollback` 恢复上一已保存版本。新能力使用程序绑定的角色和原生玩法方法，按作者契约处理结束与取消，沿用当前执行器和 F9 接管；缺少 SDK 返回 `setup_required` 时，与玩家约定本地准备环境后调用 `manage_arrangements.change.prepare_capability_builder`，随后继续构建。

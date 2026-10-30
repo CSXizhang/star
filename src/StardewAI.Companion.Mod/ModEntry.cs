@@ -1861,6 +1861,12 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private bool RequestPause(out string message)
     {
+        if (Context.IsWorldReady && _coordinator?.HasRestTask == true)
+        {
+            bool changed = _coordinator.PauseRestTask();
+            message = changed ? "Pause requested for active task." : "Task is already paused.";
+            return changed;
+        }
         var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
         if (machine == null)
         {
@@ -1881,6 +1887,12 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private bool RequestResume(out string message)
     {
+        if (Context.IsWorldReady && _coordinator?.HasRestTask == true)
+        {
+            bool changed = _coordinator.ResumeRestTask();
+            message = changed ? "Resumed active task." : "Task is not paused.";
+            return changed;
+        }
         var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
         if (machine == null)
         {
@@ -1913,6 +1925,11 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private bool RequestCancel(string source, out string message)
     {
+        if (Context.IsWorldReady && _coordinator?.CancelRestTask() == true)
+        {
+            message = "Cancellation requested for active task.";
+            return true;
+        }
         var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
         if (machine == null)
         {

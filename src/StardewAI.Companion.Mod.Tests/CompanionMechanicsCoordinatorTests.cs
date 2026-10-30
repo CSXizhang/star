@@ -110,6 +110,48 @@ public class CompanionMechanicsCoordinatorTests
     }
 
     [Fact]
+    public void RestUsesSkillPauseResumeAndLocalCancellationWithoutReviving()
+    {
+        var (coordinator, actor, _) = CreateHarness();
+        actor.Stamina = 25;
+        var request = new SkillExecutePayload("rest-controls", "rest-task", "rest", "0.1", 1,
+            new WaterZoneParameters("FarmHouse", new()) { TargetStamina = 80 },
+            new ExecutionBudgets(0, 0, 0), "safe-point", "test");
+        var envelope = CreateEnvelope("skill.execute", "rest-controls-message");
+        Assert.True(coordinator.TryAcceptSkillExecute(request, envelope, out _));
+        coordinator.Rest.RestoreSleep(900, daytime: true);
+        coordinator.OnPauseSkill(new SkillPausePayload(request.CommandId, "player"), envelope);
+        Assert.Equal("paused", coordinator.GetActivityStatus());
+        actor.Stamina = 80;
+        for (int tick = 1; tick <= 20; tick++) coordinator.Update(null, tick);
+        Assert.Null(coordinator.LastSkillResultPayload);
+        coordinator.OnResumeSkill(new SkillResumePayload(request.CommandId), envelope);
+        coordinator.Update(null, 2);
+        Assert.Equal("succeeded", coordinator.LastSkillResultPayload!.TerminalState);
+
+        actor.Stamina = 25;
+        Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-cancel" }, envelope, out _));
+        var restNavigation = (NavigationStateMachine)typeof(CompanionRestController)
+            .GetField("_navigation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(coordinator.Rest)!;
+        Assert.True(restNavigation.Start(new NavigationRequest("rest-route", "rest-task", "Farm", new(15, 10), 120), out _));
+        restNavigation.Update(null, 30);
+        Assert.True(coordinator.PauseRestTask());
+        var pausedTile = actor.Tile;
+        var pausedState = restNavigation.CurrentState;
+        for (int tick = 31; tick <= 60; tick++) coordinator.Update(null, tick);
+        Assert.Equal(pausedTile, actor.Tile);
+        Assert.Equal(pausedState, restNavigation.CurrentState);
+        Assert.True(coordinator.CancelRestTask());
+        Assert.False(restNavigation.IsExecuting);
+        Assert.False(coordinator.ResumeRestTask());
+        for (int tick = 61; tick <= 90; tick++) coordinator.Update(null, tick);
+        Assert.Equal(pausedTile, actor.Tile);
+        Assert.Equal("cancelled", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("awake", coordinator.Rest.State);
+        Assert.False(coordinator.HasRestTask);
+    }
+
+    [Fact]
     public void RestCommandReturnsItsTargetResultAndCanBeCancelled()
     {
         var (coordinator, actor, _) = CreateHarness();

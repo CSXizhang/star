@@ -524,7 +524,7 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
     else:
         outcome, reason = "failed", str(error.get("code") or "FAILED")
 
-    return {
+    response = {
         "skill": skill,
         "outcome": outcome,
         "goalSatisfied": outcome == "completed",
@@ -533,6 +533,8 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
         "taskId": res.get("taskId"),
         "effects": effects,
         "completedCount": completed_count,
+        "completedCountUnit": "action-targets",
+        "completionScope": "This submitted action; material delivery and the player's wider goal are separate.",
         "skippedCount": res.get("skippedCount", 0),
         "failedCount": res.get("failedCount", 0),
         "remaining": details.get("skipped") if outcome == "partial" else None,
@@ -540,7 +542,17 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
         "reasonMessage": error.get("message"),
         "playerActionRequired": bool(res.get("playerActionRequired")),
         "snapshotRevision": res.get("worldRevision"),
+        "details": {key: value for key, value in details.items() if key not in {"completed", "skipped", "failed"}},
     }
+    for key in ("commandId", "resources", "inventoryDelta", "resourceDelta"):
+        if res.get(key) is not None:
+            response[key] = res[key]
+    if skill in {"clear-debris", "chop-tree", "cut-grass"}:
+        response["quantityMeaning"] = (
+            "completedCount counts processed targets. effects itemId/stack identify the affected objects, "
+            "not materials obtained. details.inventoryDelta, when provided, is the measured command-interval backpack change; "
+            "afterWork shows current inventory and collectible drops. Neither proves who caused every change.")
+    return response
 
 
 # Plan steps may only invoke these existing operations, through their real
@@ -2193,7 +2205,8 @@ def create_mcp_server(
                     scope=scope, title=title, note_id=note_id, supersedes=supersedes, valid_on=valid_on)
             except ValueError as ex:
                 raise ToolError(str(ex)) from None
-        return {"status": status, "saveId": sid, **result}
+        return {"status": status, "saveId": sid, **result,
+                "recordingMeaning": "confirmed confirms the note was saved, not that its contents were verified in the game."}
 
     @mcp.tool()
     async def save_memory(text: str, scope: str | None = None, note_id: str | None = None,
@@ -2201,8 +2214,12 @@ def create_mcp_server(
         """Remember a preference, agreement, experience or current understanding in natural language.
 
         Preserve context: '雨天想一起去海边，今天先休息' is a note, not an action trigger.
-        scope describes where/when it applies, e.g. 长期 or 这次出门. For a single game
-        day, valid_on is year:season:day (e.g. 1:spring:3). Omit it for lasting notes.
+        scope describes where/when it applies, e.g. 长期约定 or 昨日整理后的箱子观察.
+        Omitted scope leaves applicability unspecified. Inventory/positions are dated
+        observations or handoff context; keep uncertain explanations as guesses.
+        For a single game day, valid_on is year:season:day (e.g. 1:spring:3).
+        Without valid_on the note remains available for recall; that is not a claim
+        that the recorded world state is still current. Reusable approaches use save_method.
         To correct a note, pass its note_id and the updated text; supersedes replaces
         a list of notes while retaining history. A temporary exception can be its own
         note. Notes support reasoning and do not create work or prove world effects.
@@ -2814,6 +2831,8 @@ def create_mcp_server(
         """Query farm chests: coordinates, capacity, freeSlots, items.
         Supports filtering by item_id, name, is_seed, and pagination (default 20/page).
         Concise summary by default (items truncated per chest); full if detail=True.
+        Positions identify currently observed chests, not persistent chest identities
+        or a history of who moved a chest or removed its contents.
         """
         try:
             res = await sched.query_chests()
@@ -2900,6 +2919,7 @@ def create_mcp_server(
 
             return {
                 "chests": paged_chests,
+                "observationScope": "Current Farm chest positions and contents; movement and item-transfer history are not observed here.",
                 "totalChests": len(all_chests),
                 "matchingChests": len(filtered_chests),
                 "page": safe_page,
@@ -3805,11 +3825,13 @@ def create_mcp_server(
 
     @mcp.tool()
     async def observe_farming_helpers(location_id: str = "Farm") -> dict[str, Any]:
-        """Observe the farming-help group only: native refill-water tiles, ground items, fertilized tiles, choppable trees.
+        """Observe nearby refill tiles, collectible groundItems, standing groundObjects and choppable trees.
 
-        This is the on-demand group surface: it never dumps the backpack or chests.
-        Use it to choose explicit tiles for refill_watering_can / clear_debris /
-        pickup_items / chop_tree.
+        groundItems are existing drops/collectibles for pickup_items. groundObjects
+        are weeds, stones, twigs or placed objects; their stack describes the object,
+        not a material yield. Use their clearTool when choosing clearance work.
+        For map-wide collectible items use observe_production. This nearby scan
+        also provides refill_watering_can/chop_tree targets and carried tools.
         """
         try:
             return await sched.query_farming_helpers(location_id=location_id)
@@ -4148,6 +4170,8 @@ def create_mcp_server(
         """Pick up dropped debris / spawned items on explicitly selected tiles.
 
         Uses the native debris collect path and the native ground-item check action.
+        completedCount counts handled targets; effects.collectedItems reports accepted
+        items with their own itemId, quality and stack, including partial collection.
         """
         try:
             res = await sched.pickup_items(tiles=_tile_dicts(tiles), location_id=location_id)
@@ -4742,6 +4766,7 @@ def create_mcp_server(
             manifest = package.get("manifest") or {}
             packages.append({**{key: manifest.get(key) for key in ("id", "version", "title", "kind")},
                              "status": (package.get("verification") or {}).get("status"),
+                             "effectVerifiedByHost": False,
                              "details": "inspect_capabilities(capability=id, version=version)"})
         return {"host": await extension_host_call(sched.list_extensions), "packages": packages}
 
@@ -4804,11 +4829,14 @@ def create_mcp_server(
         learned_query or learned_action and inspect the native result. keep saves that successfully
         used version for subsequent games. rollback restores the previous saved working version.
         Loading never completes the player's original goal; continue from current observations.
+        Invocation success is the adapter's report. Use game observations to judge its effect and
+        whether to keep it; other players may also change the world during the operation.
         """
         assert_life_turn_current()
         store = capabilities_for_run()
+        saved_before = store.catalog()["capabilities"].get(capability)
         if action == "rollback":
-            previous = store.catalog()["capabilities"].get(capability, {}).get("previousVersion")
+            previous = (saved_before or {}).get("previousVersion")
             if not previous:
                 raise ToolError("No previous saved version is available.")
             version = previous
@@ -4824,13 +4852,14 @@ def create_mcp_server(
         if action == "try":
             verification = store.record_native_load(capability, version, receipt)
         else:
-            verification = store.record_native_persist(capability, version, receipt)
+            verification = store.record_native_persist(capability, version, receipt, saved_before=saved_before)
         return {"capability": capability, "version": version, "native": receipt, "verification": verification}
 
     async def invoke_learned(capability: str, version: str, arguments: dict[str, Any], kind: str) -> dict[str, Any]:
         import jsonschema
 
-        assert_life_turn_current(allow_control=kind == "query")
+        # Both operations run native adapter code and honor the player's stop.
+        assert_life_turn_current()
         store = capabilities_for_run()
         manifest = store.verify_artifact(capability, version)
         if manifest["kind"] != kind:
@@ -4847,7 +4876,11 @@ def create_mcp_server(
 
     @mcp.tool()
     async def learned_query(capability: str, version: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Read through a loaded query ability. Get its version, input schema and guidance from consult.inspect_capabilities."""
+        """Run a loaded native query adapter, honoring pause/control like other native executions.
+
+        Get its version, input schema and guidance from consult.inspect_capabilities.
+        Query describes its purpose; the adapter runs native code, not a read-only snapshot.
+        """
         return await invoke_learned(capability, version, arguments, "query")
 
     @mcp.tool()

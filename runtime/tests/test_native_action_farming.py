@@ -259,6 +259,8 @@ def test_scheduler_query_farming_projects_companion_tools_and_obstacles() -> Non
                     "location": "Farm",
                     "refillWaterTiles": [],
                     "groundItems": [
+                        {"tile": {"x": 64, "y": 37}, "kind": "dropped", "itemId": "(O)388",
+                         "stack": 3, "isDropped": True, "canBeGrabbed": True},
                         {
                             "tile": {"x": 62, "y": 18},
                             "kind": "stone",
@@ -296,7 +298,8 @@ def test_scheduler_query_farming_projects_companion_tools_and_obstacles() -> Non
         scheduler = CompanionScheduler(client=_client(snapshot))
         farming = await scheduler.query_farming_helpers(location_id="Farm")
         assert farming["companionTools"] == ["Axe", "Hoe", "MilkPail", "Pickaxe", "Shears", "WateringCan"]
-        kinds = {item["kind"]: item["clearTool"] for item in farming["groundItems"]}
+        assert [(item["itemId"], item["stack"]) for item in farming["groundItems"]] == [("(O)388", 3)]
+        kinds = {item["kind"]: item["clearTool"] for item in farming["groundObjects"]}
         assert kinds == {"stone": "pickaxe", "twig": "axe"}
         assert [t["kind"] for t in farming["choppableTrees"]] == ["tree", "stump"]
         assert farming["choppableTreesTruncated"] is False

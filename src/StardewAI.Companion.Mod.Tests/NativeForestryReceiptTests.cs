@@ -16,6 +16,100 @@ namespace StardewAI.Companion.Mod.Tests;
 [Collection("Native tool ambient location")]
 public sealed class NativeForestryReceiptTests
 {
+    private static int collectionCalls;
+    private static bool refuseSecondCollection;
+
+    // Isolate the native inventory acceptance boundary; the production adapter
+    // still selects real Debris/Chunk objects on this tile and removes only
+    // accepted chunks. No game content manager is needed for this receipt test.
+    private static bool AcceptCollection(ref bool __result)
+    {
+        __result = !(refuseSecondCollection && ++collectionCalls == 2);
+        return false;
+    }
+
+    private static bool NotHostPaused(ref bool __result) { __result = false; return false; }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void MixedDropsOnOneTileKeepTheirIdentitiesThroughTheTerminalReceipt(bool rejectSecond)
+    {
+        using var world = new ForestryWorld();
+        var harmony = new Harmony("StardewAI.Tests.MixedPickupReceipt");
+        var collect = AccessTools.Method(typeof(Debris), nameof(Debris.collect), new[] { typeof(Farmer), typeof(Chunk) });
+        harmony.Patch(collect, prefix: new HarmonyMethod(typeof(NativeForestryReceiptTests), nameof(AcceptCollection)));
+        var hostPaused = AccessTools.PropertyGetter(typeof(Game1), nameof(Game1.HostPaused));
+        harmony.Patch(hostPaused, prefix: new HarmonyMethod(typeof(NativeForestryReceiptTests), nameof(NotHostPaused)));
+        var oldPlayer = Game1.player;
+        var playerField = AccessTools.GetDeclaredFields(typeof(Game1)).Single(field => field.FieldType == typeof(Farmer));
+        var game = AccessTools.Field(typeof(Game1), "game1").GetValue(null);
+        try
+        {
+            collectionCalls = 0;
+            refuseSecondCollection = rejectSecond;
+            playerField.SetValue(game, ((IFarmerActor)world.Actor).GameFarmer);
+            var wood = new Debris { item = new StardewValley.Object { ItemId = "388", Stack = 3, Quality = 0 } };
+            var forage = new Debris { item = new StardewValley.Object { ItemId = "16", Stack = 2, Quality = 2 } };
+            foreach (var drop in new[] { wood, forage })
+            {
+                drop.debrisType.Value = Debris.DebrisType.OBJECT;
+                var chunk = new Chunk();
+                chunk.position.Value = world.Tile * 64 + new Vector2(32, 32);
+                drop.Chunks.Add(chunk);
+                world.Location.debris.Add(drop);
+            }
+            var request = world.Request with { Kind = NativeActionKind.PickupItems, SkillId = "pickup-items" };
+            var result = world.Adapter.Execute(world.Actor, request, request.Targets[0]);
+            Assert.True(result.CollectedItems is not null, result.ErrorMessage + string.Join("\n", world.Monitor.LoggedMessages));
+            Assert.Equal(!rejectSecond, result.Success);
+            Assert.Null(result.ItemId); // No first-item identity carrying a mixed total.
+            Assert.Equal(0, result.ItemCount);
+            Assert.Equal(new NativeCollectedItem("(O)388", 0, 3), result.CollectedItems![0]);
+            Assert.DoesNotContain(wood, world.Location.debris);
+            if (rejectSecond)
+            {
+                Assert.Single(result.CollectedItems);
+                Assert.Contains(forage, world.Location.debris);
+            }
+            else
+            {
+                Assert.Equal(new NativeCollectedItem("(O)16", 2, 2), result.CollectedItems[1]);
+                Assert.Empty(world.Location.debris);
+            }
+
+            // Run the actual adapter receipt through the normal target-loop and
+            // wire projection, including an inventory refusal after partial pickup.
+            playerField.SetValue(game, oldPlayer);
+            var machine = new NativeActionStateMachine(world.Actor, world.Observer,
+                new SameMapNavigator(world.Observer), new ReturnedReceiptAdapter(result));
+            Assert.True(machine.Start(request, out _));
+            machine.StepTicks(150);
+            var payload = machine.FinalResult!.ToTransportPayload();
+            Assert.Equal(rejectSecond ? 0 : 1, payload.CompletedCount);
+            var effect = Assert.Single(payload.Effects);
+            Assert.False(effect.ContainsKey("itemId"));
+            var items = Assert.IsType<List<Dictionary<string, object>>>(effect["collectedItems"]);
+            Assert.Equal(rejectSecond ? 1 : 2, items.Count);
+            Assert.Equal("(O)388", items[0]["itemId"]);
+            Assert.Equal(3, items[0]["stack"]);
+            if (!rejectSecond) Assert.Equal(2, items[1]["quality"]);
+        }
+        finally
+        {
+            playerField.SetValue(game, oldPlayer);
+            harmony.Unpatch(collect, HarmonyPatchType.Prefix, harmony.Id);
+            harmony.Unpatch(hostPaused, HarmonyPatchType.Prefix, harmony.Id);
+        }
+    }
+
+    private sealed class ReturnedReceiptAdapter : INativeActionAdapter
+    {
+        private readonly NativeActionStepResult receipt;
+        public ReturnedReceiptAdapter(NativeActionStepResult receipt) => this.receipt = receipt;
+        public NativeActionStepResult Execute(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target) => receipt;
+    }
+
     [Theory]
     [InlineData("weed")]
     [InlineData("chest")]

@@ -306,3 +306,42 @@ def test_unreachable_receipt_requests_obstacle_decision_without_choosing_an_acti
     assert "does not prove removable" in result["obstacleAssessment"]
     assert result["nextBusiness"] == "new_model_decision_required"
     assert "obstacleAssessment" not in compact_job_feedback({"reasonCode": "OUT_OF_STAMINA"})
+
+
+def test_model_context_retains_totals_for_all_requests_offered_to_decision(tmp_path):
+    from stardew_ai_runtime.decision_context import model_decision_context
+
+    store = WorkStore(tmp_path / "work.json")
+    def seed(state):
+        state.requests = [{"id": name, "text": name, "origin": "player", "taskIds": [name]}
+                          for name in ("current", "offered", "unrelated")]
+        state.executions = [ExecutionEntry(name, name, "s", "harvest_auto", "completed",
+                                           effects=[{"state": "harvested", "stack": count}])
+                            for name, count in (("current", 3), ("offered", 8), ("unrelated", 5))]
+    store._mutate("farm", seed)
+    store.begin_decision("farm", "turn", request_id="current", request_ids=["offered"])
+    context = build_decision_context({"payload": {"world": {}}}, work=store.overview("farm"))
+    projected = model_decision_context(model_decision_context(context))
+    assert set(projected["confirmedRequestTotals"]) == {"current", "offered"}
+    assert projected["confirmedRequestTotals"]["offered"]["itemQuantities"]["harvested"]["count"] == 8
+    assert "unrelated" in context["confirmedRequestTotals"]
+
+
+def test_pickup_partial_failure_keeps_accepted_items_in_saved_feedback(tmp_path):
+    store = WorkStore(tmp_path / 'work.json')
+    def seed(state):
+        state.tasks = [Task('pickup', 'goal', '拾取并入箱', status='running', steps=[
+            Step('collect', 'pickup_items', {}, status='running', command_id='native-pickup')])]
+    store._mutate('farm', seed)
+    effects = [
+        {'state': 'picked-up', 'collectedItems': [
+            {'itemId': '(O)388', 'quality': 0, 'stack': 3},
+            {'itemId': '(O)16', 'quality': 2, 'stack': 2}]},
+        {'state': 'failed', 'reason': 'inventory-full', 'collectedItems': [
+            {'itemId': '(O)388', 'quality': 0, 'stack': 1}]}]
+    store.commit_step_result('farm', task_id='pickup', step_id='collect', command_id='native-pickup',
+                             outcome='failed', reason_code='inventory-full', effects=effects)
+    saved = WorkStore(store.state_path).state('farm')
+    assert saved.last_job['status'] == 'failed'
+    assert '已拾取 6 件' in saved.last_job['actualSummary']
+    assert saved.executions[-1].effects == effects

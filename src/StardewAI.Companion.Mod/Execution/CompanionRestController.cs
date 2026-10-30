@@ -19,6 +19,7 @@ public sealed class CompanionRestController
     private readonly CompanionBedtimeRouteEstimate _routeEstimate = new();
     private string? _recoveryFailure;
     public bool Paused { get; set; }
+    public bool TaskPaused { get; set; }
     public int Bedtime { get; set; } = CompanionBedtime.Default;
     public string State { get; private set; } = "awake";
     public string? Reason { get; private set; }
@@ -67,6 +68,7 @@ public sealed class CompanionRestController
             _navigation.Update(null, 0);
         }
         State = "awake";
+        TaskPaused = false;
         RecoveryTarget = null;
         Reason = null;
         SleepStartedAt = null;
@@ -120,7 +122,7 @@ public sealed class CompanionRestController
 
     public void Update(GameTime? time, long tick, ISkillExecutionMachine? work)
     {
-        if (Paused || Game1.paused || Game1.eventUp || CompanionMenuClock.HasBlockingMenu) return;
+        if (Paused || TaskPaused || Game1.paused || Game1.eventUp || CompanionMenuClock.HasBlockingMenu) return;
         // The same native time boundary applies to movement and resource recovery.
         if (time is not null && !Game1.shouldTimePass()) return;
         int now = Game1.timeOfDay;

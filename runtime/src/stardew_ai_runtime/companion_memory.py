@@ -502,13 +502,17 @@ class CompanionMemoryStore:
                     status = "rejected"
                     result["reason"] = "NOTE_NOT_FOUND"
                     return
+                if old.get("kind") == "event":
+                    status = "rejected"
+                    result["reason"] = "CANNOT_EDIT_EVENT"
+                    return
                 previous.append(old)
             if any(e in entries for e in previous) and any(n in notes for n in previous):
                 status = "rejected"
                 result["reason"] = "MIXED_SHARED_AND_PRIVATE_NOTES"
                 return
             original = next((n for n in previous if n.get("id") == note_id), None)
-            resolved_scope = scope if scope is not None else (original or {}).get("scope", "长期")
+            resolved_scope = scope if scope is not None else (original or {}).get("scope", "未指定；按记录语境判断")
             resolved_day = valid_on if valid_on is not None else (original or {}).get("validOn")
             note = {"id": self._entry_id(), "kind": kind, "title": title,
                     "text": text.strip(), "source": source, "scope": resolved_scope.strip(),

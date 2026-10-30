@@ -78,13 +78,16 @@ public sealed record NativeActionRequest(
     TileCoordinate? DestinationTile = null
 );
 
+public sealed record NativeCollectedItem(string ItemId, int Quality, int Count);
+
 public sealed record NativeActionEffect(
     string Target,
     string State,
     string? Reason = null,
     string? ItemId = null,
     int Count = 0,
-    TileCoordinate? Tile = null
+    TileCoordinate? Tile = null,
+    IReadOnlyList<NativeCollectedItem>? CollectedItems = null
 );
 
 public sealed class NativeActionResult
@@ -177,6 +180,8 @@ public sealed class NativeActionResult
                 entry["itemId"] = effect.ItemId!;
             if (effect.Count > 0)
                 entry["stack"] = effect.Count;
+            if (effect.CollectedItems is not null)
+                entry["collectedItems"] = DescribeCollectedItems(effect.CollectedItems);
             effects.Add(entry);
         }
 
@@ -249,6 +254,14 @@ public sealed class NativeActionResult
             entry["itemId"] = effect.ItemId!;
         if (effect.Count > 0)
             entry["count"] = effect.Count;
+        if (effect.CollectedItems is not null)
+            entry["collectedItems"] = DescribeCollectedItems(effect.CollectedItems);
         return entry;
     }
+
+    private static List<Dictionary<string, object>> DescribeCollectedItems(IReadOnlyList<NativeCollectedItem> items) =>
+        items.Select(item => new Dictionary<string, object>
+        {
+            ["itemId"] = item.ItemId, ["quality"] = item.Quality, ["stack"] = item.Count
+        }).ToList();
 }

@@ -528,7 +528,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         {
             // Resource deltas were already settled when the adapter returned
             // (see HandleActing); this stage only records the per-target effect.
-            _completed.Add(new NativeActionEffect(targetLabel, result.State, null, result.ItemId, result.ItemCount, _currentTarget.Tile));
+            _completed.Add(new NativeActionEffect(targetLabel, result.State, null, result.ItemId, result.ItemCount, _currentTarget.Tile, result.CollectedItems));
             EmitProgress("verifying", result.State);
             // Water tiles are alternative refill sources, not separate jobs.
             // Once the native adapter confirms a refill, the whole request is satisfied.
@@ -576,7 +576,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         }
         else
         {
-            _failed.Add(new NativeActionEffect(targetLabel, "failed", result.ErrorMessage, result.ItemId, 0, _currentTarget.Tile));
+            _failed.Add(new NativeActionEffect(targetLabel, "failed", result.ErrorMessage, result.ItemId, 0, _currentTarget.Tile, result.CollectedItems));
             // Resource deltas were already settled when the adapter returned
             // (see HandleActing), so the failure is recorded without dropping
             // or repeating the round's real consumption.

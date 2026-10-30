@@ -28,6 +28,16 @@ public static class SaveIsolationPatcher
             }
 
             var fullPath = Path.GetFullPath(isolatedSavesPath);
+            foreach (var dailyPath in new[] {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "StardewValley", "Saves"),
+                StardewValley.Program.GetSavesFolder(), Constants.SavesPath })
+            {
+                if (IsWithinDailySaves(fullPath, dailyPath))
+                {
+                    monitor.Log($"[TestDriver] FATAL: Save isolation path is inside daily saves: {fullPath}", LogLevel.Error);
+                    return false;
+                }
+            }
             Directory.CreateDirectory(fullPath);
             TargetIsolatedSavesPath = fullPath;
             PatcherState.TargetIsolatedPath = fullPath;
@@ -77,6 +87,14 @@ public static class SaveIsolationPatcher
             monitor.Log($"[TestDriver] FATAL: Failed to apply save isolation patches: {ex}", LogLevel.Error);
             return false;
         }
+    }
+
+    public static bool IsWithinDailySaves(string targetPath, string dailyPath)
+    {
+        var target = Path.GetFullPath(targetPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var daily = Path.GetFullPath(dailyPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return target.Equals(daily, StringComparison.OrdinalIgnoreCase)
+            || target.StartsWith(daily + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool VerifyIsolation(IMonitor monitor)

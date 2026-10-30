@@ -1078,6 +1078,7 @@ class ActiveChatTask:
     abort_reason: str | None = None
     start_time: float = field(default_factory=time.monotonic)
     recorded: bool = False
+    interrupted_result: dict[str, Any] | None = None
     decision_token: str | None = None
     decision_day: str | None = None
     provider_conversation_id: str | None = None
@@ -3619,7 +3620,7 @@ class ChatBridge:
                 logger.warning("Could not stop interrupted provider", exc_info=True)
         while True:
             try:
-                await asyncio.shield(future)
+                active_task.interrupted_result = await asyncio.shield(future)
                 break
             except asyncio.CancelledError:
                 # Repeated cancel/disconnect requests still cannot abandon an
@@ -3631,12 +3632,15 @@ class ChatBridge:
                 break
 
     async def _settle_turn_messages(self, active_task, result):
-        if not self.run_dir or not result.get("success"):
-            return result  # A failed delivery remains queued for the next normal turn.
+        if not self.run_dir:
+            return result
         from .turn_messages import exchange
         delivered = exchange(self.run_dir / "data" / "turn-messages.json",
                              active_task.request_id, active_task.save_id)
         ids = {message["requestId"] for message in delivered}
+        # Tool-boundary delivery is confirmed independently of the turn's outcome.
+        if self._work_store is not None:
+            self._work_store.mark_midflight_consumed(active_task.save_id, list(ids))
         for item in list(self._life_queue):
             if item["request_id"] not in ids or item["save_id"] != active_task.save_id:
                 continue
@@ -3657,10 +3661,12 @@ class ChatBridge:
                 while not future.done():
                     await asyncio.wait({future}, timeout=0.1)
                     await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
-                return await self._settle_turn_messages(active_task, await asyncio.shield(future))
+                return await asyncio.shield(future)
         except asyncio.CancelledError:
             await self._join_interrupted_provider(active_task, future)
             raise
+        finally:
+            await self._settle_turn_messages(active_task, {})
 
     async def _await_life_provider(
         self, active_task: ActiveChatTask, conversation_id: str | None,
@@ -3676,13 +3682,15 @@ class ChatBridge:
                 while not future.done():
                     await asyncio.wait({future}, timeout=0.1)
                     await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
-                return await self._settle_turn_messages(active_task, await asyncio.shield(future))
+                return await asyncio.shield(future)
         except asyncio.CancelledError:
             # Cancelling an executor await does not stop the executor thread.
             # Wait for this owned turn before releasing the model/native slot.
             await self._join_interrupted_provider(active_task, future)
             logger.info("Life provider [%s] interrupted by channel shutdown", active_task.request_id)
             raise
+        finally:
+            await self._settle_turn_messages(active_task, {})
 
     async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
         """Run one life-chat turn under the shared single-model-turn lock."""
@@ -3690,6 +3698,7 @@ class ChatBridge:
         save_id = str(item.get("save_id") or "")
         mode = str(item.get("mode") or "chat")
         text = str(item.get("text") or "")
+        active_task = None
         try:
             generation = item.get("control_generation", self._life_control_generation.get(save_id, 0))
             if generation != self._life_control_generation.get(save_id, 0):
@@ -3828,6 +3837,7 @@ class ChatBridge:
                     usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
                     error=result.get("error"), duration=time.monotonic() - active_task.start_time,
                 )
+                active_task.recorded = True
                 if success and self._milestone_store:
                     changed_arrangements = [node for node in self._milestone_store.list_nodes(save_id)
                                             if node.get("status") in {"suggested", "adopted"}
@@ -3903,6 +3913,31 @@ class ChatBridge:
                 reply.payload["activity"] = self._player_activity(save_id)
                 await self._send_reply(ws, reply)
                 self._pending_life_preparation.setdefault(save_id, preparation_before)
+        except asyncio.CancelledError:
+            # The provider await has joined its executor and the inner finally
+            # has released native ownership. Settle this life request too:
+            # the cancel handler's legacy chat.reply does not close life UI.
+            player_cancelled = bool(active_task and (active_task.abort_reason or "").startswith("Cancel requested:"))
+            if active_task is not None and not active_task.recorded:
+                interrupted = active_task.interrupted_result or {}
+                usage = self._codex_turn_usage(interrupted) if self.backend_name == "codex" else interrupted.get("usage")
+                self._record_command(
+                    request_id=request_id, save_id=save_id,
+                    conversation_id=active_task.provider_conversation_id or interrupted.get("conversation_id") or existing_cid,
+                    prompt=text, status="cancelled" if player_cancelled else "interrupted",
+                    start_idx=active_task.start_max_idx, end_idx=-1, usage=usage,
+                    missing_reason=None if usage else "interrupted",
+                    error="PLAYER_CANCELLED" if player_cancelled else active_task.abort_reason or "INTERRUPTED",
+                    duration=time.monotonic() - active_task.start_time,
+                )
+                active_task.recorded = True
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                self.instance_id, request_id, save_id,
+                status="completed" if player_cancelled else "failed",
+                reply_text="这次请求已由玩家取消。" if player_cancelled else "这次对话已中断。",
+                profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id),
+                error=None if player_cancelled else "INTERRUPTED"))
+            raise
         except Exception as ex:
             logger.error("Life chat turn [%s] failed: %s", request_id, ex, exc_info=True)
             await self._send_reply(ws, Envelope.create_life_chat_reply(

@@ -693,7 +693,7 @@ def build_decision_context(
             "boundaryIsNotStrategy": True,
             "remainingResources": "Use time/stamina/funds/inventory above; necessary farm work is not the entire day.",
             "nativeOptions": {
-                "travelAndForage": "movement + farming_helpers: observe one purposeful reachable area, pickup observed items",
+                "travelAndForage": "movement + farming_helpers: observe one purposeful reachable area, pickup existing drops/collectibles (isDropped/canBeGrabbed)",
                 "tradeAndCraft": "shopping/crafting: observed prices and unlocked recipes only",
                 "landAndResources": "farm/forestry: preserve doors/routes, compare regions including home/water distances",
                 "story": "native_ui: actual event/dialogue, legal advance/skip and observed choices",
@@ -781,10 +781,11 @@ def model_decision_context(context: dict[str, Any]) -> dict[str, Any]:
                 result.pop(alias, None)
     # Historical ledgers remain queryable; unrelated past requests are not part
     # of the current decision. Keep the uncertainty flag and the current request.
-    request_id = (result.get("decision") or {}).get("requestId")
+    decision = result.get("decision") or {}
+    request_ids = {decision.get("requestId"), *decision.get("requestIds", [])}
     totals = result.get("confirmedRequestTotals")
     if isinstance(totals, dict):
-        result["confirmedRequestTotals"] = {request_id: totals[request_id]} if request_id in totals else {}
+        result["confirmedRequestTotals"] = {key: value for key, value in totals.items() if key in request_ids}
     goals = result.get("goals") or []
     goal_ids = {g.get("id") for g in goals if isinstance(g, dict)}
     prep = result.get("duePreparation")

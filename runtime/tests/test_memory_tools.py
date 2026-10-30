@@ -110,6 +110,38 @@ def test_first_memory_call_waits_for_the_actual_provider_session(tmp_path, monke
         _, saved = await server.call_tool("remember", {"entry": {"save_memory": {"text": "叫玩家小禾。"}}})
         await arrival
         assert saved["status"] == "confirmed"
+        assert "saved" in saved["recordingMeaning"] and "not" in saved["recordingMeaning"]
+        assert saved["note"]["scope"] == "未指定；按记录语境判断"
         _, recalled = await server.call_tool("consult", {"request": {"recall_memory": {"query": "小禾"}}})
         assert recalled["notes"][0]["id"] == saved["note"]["id"]
+    asyncio.run(run())
+
+
+def test_clear_receipt_keeps_native_measurements_separate_from_targets(tmp_path, monkeypatch, mock_scheduler):
+    """Regression: clearing three weeds does not report three units of fiber."""
+    _grant_decision(tmp_path, mock_scheduler)
+    monkeypatch.setenv("STARDEW_DECISION_TOKEN", "decision-1")
+    mock_scheduler.clear_debris = AsyncMock(return_value={
+        "status": "executed", "terminalState": "succeeded", "completedCount": 3,
+        "effects": [
+            {"state": "cleared-weeds", "tile": {"x": 59, "y": 25}, "itemId": "(O)675", "stack": 1},
+            {"state": "cleared-weeds", "tile": {"x": 58, "y": 27}, "itemId": "(O)784", "stack": 1},
+            {"state": "cleared-weeds", "tile": {"x": 60, "y": 27}, "itemId": "(O)675", "stack": 1}],
+        "details": {"inventoryDelta": [], "inventoryDeltaObserved": True,
+                    "inventoryDeltaScope": "bound-native-player-command-interval"}})
+    mock_scheduler.query_production = AsyncMock(return_value={
+        "locationId": "Farm", "groundItems": [], "groundItemsTruncated": False})
+    mock_scheduler.query_inventory = AsyncMock(return_value={"items": []})
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+        _, result = await server.call_tool("submit_work", {"action": {"clear_debris": {
+            "tiles": [{"x": 59, "y": 25}, {"x": 58, "y": 27}, {"x": 60, "y": 27}]}}})
+        assert result["completedCount"] == 3 and result["completedCountUnit"] == "action-targets"
+        assert result["details"]["inventoryDelta"] == []
+        assert result["details"]["inventoryDeltaObserved"] is True
+        assert "not materials obtained" in result["quantityMeaning"]
+        assert result["afterWork"]["inventory"]["items"] == []
+        assert result["afterWork"]["ground"]["groundItems"] == []
+
     asyncio.run(run())

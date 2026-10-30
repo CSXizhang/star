@@ -528,7 +528,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             // Bind the detached receiver to this exact ordinary debris/chunk; never
             // route archaeological discoveries through the global player path.
             int collected = 0;
-            string? firstItemId = null;
+            var collectedItems = new List<NativeCollectedItem>();
             foreach (var debris in loc.debris.ToList())
             {
                 if (debris is null || !NativeAnimalHarvestInventoryScope.IsOrdinaryDebris(debris)) continue;
@@ -539,6 +539,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     if ((int)(pos.X / 64) != target.Tile.X || (int)(pos.Y / 64) != target.Tile.Y) continue;
                     string id = debris.item?.QualifiedItemId ?? debris.itemId.Value;
                     int expected = debris.item?.Stack ?? 1;
+                    int quality = debris.item?.Quality ?? debris.itemQuality;
                     bool accepted;
                     if (ReferenceEquals(actor.GameFarmer, Game1.player))
                         accepted = debris.collect(actor.GameFarmer, chunk);
@@ -548,22 +549,29 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     if (!accepted)
                         return collected == 0
                             ? NativeActionStepResult.Precondition("Native inventory refused the dropped item.", "inventory-full")
-                            : NativeActionStepResult.Failed($"Native pickup refused after accepting {collected} item(s) earlier in this call. Inspect current ground and inventory before continuing.");
+                            : NativeActionStepResult.Failed($"Native pickup refused after accepting {collected} item(s) earlier in this call. Inspect current ground and inventory before continuing.", collectedItems: collectedItems);
                     // This is the native caller's cleanup, not a replacement effect.
                     debris.Chunks.RemoveAt(i);
                     if (debris.Chunks.Count == 0) loc.debris.Remove(debris);
-                    firstItemId ??= id;
+                    collectedItems.Add(new NativeCollectedItem(id, quality, expected));
                     collected += expected;
                 }
             }
             if (collected > 0)
-                return NativeActionStepResult.Succeeded("picked-up", itemId: firstItemId, itemCount: collected);
+            {
+                bool oneItemKind = collectedItems.All(item => item.ItemId == collectedItems[0].ItemId
+                    && item.Quality == collectedItems[0].Quality);
+                return NativeActionStepResult.Succeeded("picked-up",
+                    itemId: oneItemKind ? collectedItems[0].ItemId : null,
+                    itemCount: oneItemKind ? collected : 0, collectedItems: collectedItems);
+            }
 
             // 2. Spawned object on the ground (forage / animal produce dropped by the game).
             if (loc.getObjectAtTile(target.Tile.X, target.Tile.Y) is StardewValley.Object spawned && IsPickupGroundObject(spawned))
             {
                 string spawnedId = spawned.QualifiedItemId ?? spawned.ItemId ?? "";
                 int stack = spawned.Stack;
+                int quality = spawned.Quality;
                 var tileLoc = new xTile.Dimensions.Location(target.Tile.X, target.Tile.Y);
                 bool groundEgg = loc is AnimalHouse && NativeAnimalHarvestInventoryScope.IsGroundEgg(spawned);
                 if (groundEgg && !ReferenceEquals(actor.GameFarmer.currentLocation, loc))
@@ -605,7 +613,8 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                 if (!gone)
                     return NativeActionStepResult.Failed(
                         $"Native ground pickup '{spawnedId}' at {target.Tile}: target remains. Inspect current ground and inventory before continuing.");
-                return NativeActionStepResult.Succeeded("picked-up", itemId: spawnedId, itemCount: stack);
+                return NativeActionStepResult.Succeeded("picked-up", itemId: spawnedId, itemCount: stack,
+                    collectedItems: new[] { new NativeCollectedItem(spawnedId, quality, stack) });
             }
 
             return NativeActionStepResult.Precondition($"Tile {target.Tile} currently has no loose drop or directly collectible ground item. An earlier drop may have moved or been collected while travelling; this does not identify who collected it. Any obstacle or placed object here was left untouched. Reobserve ground and inventory before choosing further work.", "no-item");

@@ -103,12 +103,15 @@ def test_mcode_declares_fixed_typed_operations_without_generic_params(tmp_path, 
         assert 'water-source tiles' in actions['refill_watering_can']['description']
         assert 'Does not refill' in actions['water_auto']['description']
         assert 'player' in actions['clear_debris']['description']
+        assert 'collectedItems' in actions['pickup_items']['description']
+        queries = tools['query_game'].inputSchema['properties']['query']['properties']
+        assert 'groundObjects' in queries['observe_farming_helpers']['description']
         memory = tools['remember'].inputSchema['properties']['entry']['properties']
         assert memory['record_decision_note']['properties']['category']['enum'] == ['observation', 'hypothesis', 'intent', 'failure']
         # Typed arguments plus a short semantic description for every operation.
         # Useful examples and memory operations may grow modestly; catch an
         # accidental full legacy-schema expansion rather than shave guidance.
-        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 62000
+        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 65000
     asyncio.run(run())
 
 

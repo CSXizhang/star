@@ -234,3 +234,54 @@ def test_mcode_check_only_reaches_cli_validation_before_python(tmp_path):
     assert result.returncode != 0
     assert "AI CLI mcode entry point is missing" in result.stderr
     assert "Portable runtime imports OK" not in result.stdout
+
+@pytest.mark.parametrize("check_only", [False, True])
+def test_external_launch_without_builtin_config_or_cli(tmp_path, check_only):
+    root = tmp_path / "package"
+    package_at(root)
+    probe = tmp_path / "bridge-probe.ps1"
+    probe.write_text("Write-Output ('BRIDGE_ARGS=' + ($args -join ' ')); $global:LASTEXITCODE=0", encoding="utf-8")
+    result = _powershell(tmp_path, f"""
+$env:STARDEW_CONNECTION_SOURCE='external'
+function Find-ReleaseAiCli {{ throw 'Built-in CLI must not be probed' }}
+$originalVerify = ${{function:Read-VerifiedRelease}}
+function Read-VerifiedRelease($Root, [switch]$FullVerify) {{
+    $package = & $originalVerify $Root -FullVerify:$FullVerify
+    $script:runtimeReady = $true
+    return $package
+}}
+$originalPath = ${{function:Get-ReleasePath}}
+function Get-ReleasePath($Root, $Relative) {{
+    if ($script:runtimeReady -and $Relative -eq 'runtime/python/python.exe') {{ return '{probe.as_posix()}' }}
+    & $originalPath $Root $Relative
+}}
+Start-ReleaseCompanion '{root.as_posix()}' {'-CheckOnly' if check_only else ''}
+""")
+    assert result.returncode == 0, result.stderr
+    assert "BRIDGE_ARGS=" in result.stdout
+    assert ("import sqlite3,ssl,mcp,win32job" if check_only else "-m stardew_ai_runtime.chat_bridge --run-dir") in result.stdout
+
+
+def test_external_check_reports_broken_bridge_dependencies(tmp_path):
+    root = tmp_path / "package"
+    package_at(root)
+    probe = tmp_path / "broken-python.ps1"
+    probe.write_text("$global:LASTEXITCODE=12", encoding="utf-8")
+    result = _powershell(tmp_path, f"""
+$env:STARDEW_CONNECTION_SOURCE='external'
+$originalVerify = ${{function:Read-VerifiedRelease}}
+function Read-VerifiedRelease($Root, [switch]$FullVerify) {{
+    $package = & $originalVerify $Root -FullVerify:$FullVerify
+    $script:runtimeReady = $true
+    return $package
+}}
+$originalPath = ${{function:Get-ReleasePath}}
+function Get-ReleasePath($Root, $Relative) {{
+    if ($script:runtimeReady -and $Relative -eq 'runtime/python/python.exe') {{ return '{probe.as_posix()}' }}
+    & $originalPath $Root $Relative
+}}
+Start-ReleaseCompanion '{root.as_posix()}' -CheckOnly
+""")
+    assert result.returncode != 0
+    assert "could not import runtime dependencies" in result.stderr
+    assert "verified" not in result.stdout

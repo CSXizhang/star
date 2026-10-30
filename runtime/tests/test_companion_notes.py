@@ -148,3 +148,22 @@ def test_continue_keeps_recent_context_without_crowding_out_agreements(tmp_path)
     assert context["agreements"][0]["text"] == "保留幼树"
     assert context["recentEvents"][0]["text"] == "完成了浇水"
     assert any(n["text"] == "刚决定把工具放回箱子" for n in context["relevantNotes"])
+
+
+def test_model_note_cannot_replace_or_merge_recorded_events(tmp_path):
+    path = tmp_path / "memory.json"
+    store = CompanionMemoryStore(path)
+    _, event = store.add("farm", "event", "实际收获三株", "system", "1:spring:5", 0,
+                         command_id="harvest")
+    _, note = store.save_note("farm", "收获的经验", companion_id="alice")
+    event_id, note_id = event["entry"]["id"], note["note"]["id"]
+    before = path.read_text(encoding="utf-8")
+    for targets in ({"note_id": event_id}, {"supersedes": [note_id, event_id]}):
+        status, result = store.save_note("farm", "实际收获三十株", companion_id="alice", **targets)
+        assert status == "rejected" and result["reason"] == "CANNOT_EDIT_EVENT"
+        assert path.read_text(encoding="utf-8") == before
+    status, _ = store.save_note("farm", "我认为还需要再收获", companion_id="alice")
+    assert status == "confirmed"
+    reopened = CompanionMemoryStore(path)
+    assert reopened.render_for_context("farm")["recentEvents"][0]["text"] == "实际收获三株"
+    assert len(reopened.recall("farm", companion_id="alice")["notes"]) == 2

@@ -110,19 +110,47 @@ class NativeCapabilityStore:
         return self.root / "packages" / _identifier(capability) / _identifier(version)
 
     def catalog(self) -> dict:
-        return _read_json(self.root / "catalog.json", {"capabilities": {}})
+        # The game owns the saved active versions. The Python index may lag
+        # behind a successful keep if its write failed or the bridge exited.
+        active_path = self.root / "packages/active.json"
+        try:
+            cached = _read_json(self.root / "catalog.json", {"capabilities": {}})
+        except (OSError, ValueError):
+            if not active_path.exists():
+                raise
+            cached = {"capabilities": {}}
+        if not active_path.exists():
+            return cached  # Compatibility with catalogs made before host persistence.
+        packages = _read_json(active_path)
+        if not isinstance(packages, list):
+            raise CapabilityError("Native active-version record is unreadable; inspect the host restore errors.")
+        entries = {}
+        for package in packages:
+            if not isinstance(package, str) or len(parts := package.replace("\\", "/").split("/")) != 2:
+                raise CapabilityError("Native active-version record contains an invalid package path.")
+            capability, version = parts
+            manifest = self.verify_artifact(capability, version)
+            previous = cached.get("capabilities", {}).get(capability, {})
+            entries[capability] = {
+                "version": version, "sha256": manifest["sha256"],
+                "previousVersion": previous.get("previousVersion") if previous.get("version") == version else previous.get("version"),
+            }
+        return {"capabilities": entries}
 
     def inspect(self, capability: str, version: str | None = None) -> dict:
         if version is None:
             entry = self.catalog()["capabilities"].get(capability)
             if not entry:
-                raise CapabilityError("Capability has no verified active version")
+                raise CapabilityError("Capability has no saved active version")
             version = entry["version"]
         path = self.package_path(capability, version)
         manifest = _read_json(path / "manifest.json")
         if not manifest:
             raise CapabilityError("Capability package does not exist")
-        return {"manifest": manifest, "verification": _read_json(path / "verification.json"),
+        verification = _read_json(path / "verification.json")
+        if verification and verification.get("status") == "used_successfully":
+            verification.update(evidenceSource="adapter", effectVerifiedByHost=False)
+        return {"manifest": manifest, "verification": verification,
                 "guidance": (path / "skill.md").read_text(encoding="utf-8"),
                 "provenance": _read_json(path / "provenance.json", {})}
 
@@ -228,7 +256,8 @@ class NativeCapabilityStore:
             raise CapabilityError("Native validation does not match the built artifact")
         if receipt.get("succeeded") is not True or not isinstance(receipt.get("evidence"), dict) or not receipt["evidence"]:
             raise CapabilityError("Successful native invocation with observed evidence is required")
-        verification = {"status": "used_successfully", "scope": "native_invocation_only", "receipt": receipt}
+        verification = {"status": "used_successfully", "scope": "native_invocation_only",
+                        "evidenceSource": "adapter", "effectVerifiedByHost": False, "receipt": receipt}
         _write_json(self.package_path(capability, version) / "verification.json", verification)
         return verification
 
@@ -313,7 +342,7 @@ class NativeCapabilityStore:
         self.dotnet = str(destination / "dotnet.exe")
         return {"status": "ready", "downloaded": True, "sdkVersion": version}
 
-    def record_native_persist(self, capability: str, version: str, receipt: dict) -> dict:
+    def record_native_persist(self, capability: str, version: str, receipt: dict, *, saved_before: dict | None = None) -> dict:
         """Commit the catalog only after the host persisted the verified package."""
         manifest = self.verify_artifact(capability, version)
         verification = self.inspect(capability, version)["verification"]
@@ -323,11 +352,17 @@ class NativeCapabilityStore:
             raise CapabilityError("A matching persisted native load receipt is required")
         catalog = self.catalog()
         previous = catalog["capabilities"].get(capability)
-        if previous and previous.get("version") == version:
-            return previous
-        entry = {"version": version, "sha256": manifest["sha256"], "previousVersion": previous.get("version") if previous else None}
+        entry = (previous if previous and previous.get("version") == version else
+                 {"version": version, "sha256": manifest["sha256"], "previousVersion": previous.get("version") if previous else None})
+        if saved_before and saved_before.get("version") != version:
+            entry["previousVersion"] = saved_before["version"]
         catalog["capabilities"][capability] = entry
-        _write_json(self.root / "catalog.json", catalog)
+        try:
+            _write_json(self.root / "catalog.json", catalog)
+        except OSError as exc:
+            # A native keep already succeeded. Report that truth, and read the
+            # host's authoritative record on subsequent calls/restarts.
+            return {**entry, "indexWarning": f"Native version saved; local index update failed: {exc}"}
         return entry
 
     def list_packages(self) -> list[dict]:

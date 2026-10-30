@@ -1978,6 +1978,8 @@ class WorkStore:
     @staticmethod
     def effect_summary(effects: list[dict[str, Any]]) -> str:
         """Describe every confirmed native category, without using the job title."""
+        pickup_effects = [e for e in effects if isinstance(e, dict)
+                          and (e.get("state") == "picked-up" or e.get("collectedItems"))]
         excluded = {"skipped", "unknown", "failed", "rejected"}
         navigation = [e for e in effects if isinstance(e, dict) and (
             e.get("state") in {"navigated", "arrived"} or
@@ -1989,7 +1991,7 @@ class WorkStore:
                          and e["endDay"] == e["startDay"] + 1]
         effects = [e for e in effects if isinstance(e, dict)
                    and e.get("state") is not None and e.get("state") not in excluded]
-        if not effects and not navigation and not native_sleeps:
+        if not effects and not navigation and not native_sleeps and not pickup_effects:
             return "未确认实际变化"
         states = [e.get("state") for e in effects]
         summaries = []
@@ -2028,9 +2030,23 @@ class WorkStore:
         tiles(("fertilized",), "已施肥")
         tiles(("harvested",), "已收获")
         tiles(("placed",), "已放置")
+        handled.add("picked-up")
+        picked_count = 0
+        unmeasured_pickups = 0
+        for effect in pickup_effects:
+            if isinstance(effect.get("collectedItems"), list):
+                picked_count += sum(item["stack"] for item in effect["collectedItems"])
+            elif effect.get("stack") is not None:
+                picked_count += int(effect["stack"])
+            else:
+                unmeasured_pickups += 1
+        if picked_count:
+            summaries.append(f"已拾取 {picked_count} 件")
+        if unmeasured_pickups:
+            summaries.append(f"另有 {unmeasured_pickups} 处拾取完成，物品数量未报告")
         for state, label in (("withdrawn", "已取出"), ("deposited", "已入箱"), ("shipped", "已出货"),
                              ("inserted", "已投入原料"), ("collected", "已收取"),
-                             ("picked-up", "已拾取"), ("crafted", "已制作"),
+                             ("crafted", "已制作"),
                              ("removed-and-recovered", "已回收")):
             items(state, label)
         handled.add("purchased")

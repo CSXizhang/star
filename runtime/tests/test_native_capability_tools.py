@@ -51,6 +51,8 @@ def capability_env(tmp_path, monkeypatch, mock_scheduler):
     async def load(package, persist):
         capability, version = package.split('/')
         manifest = store.verify_artifact(capability, version)
+        if persist:
+            (store.root / 'packages/active.json').write_text(json.dumps([package]))
         return {**{k: manifest[k] for k in ('id', 'version', 'sha256')}, 'loaded': True, 'persisted': persist}
     mock_scheduler.load_extension = AsyncMock(side_effect=load)
     async def invoke(capability, version, arguments, kind):
@@ -153,19 +155,21 @@ def test_failed_build_and_host_load_cannot_replace_kept_version(capability_env):
     asyncio.run(run())
 
 
-def test_paused_and_stale_turn_never_dispatch_learned_action(capability_env):
+@pytest.mark.parametrize('kind', ['action', 'query'])
+def test_paused_and_stale_turn_never_dispatch_native_adapter(capability_env, kind):
     root, work, store, builds, scheduler, lease = capability_env
     async def run():
         server = create_mcp_server(run_dir=root, scheduler=scheduler, surface='life')
-        await arrange(server, 'develop_capability', **develop())
+        await arrange(server, 'develop_capability', **develop(kind=kind))
         await trial(server)
         work.set_paused(SAVE, True)
+        lease.write_text(json.dumps({'requestId': 'learning-turn', 'saveId': SAVE, 'workBlocked': True}))
         with pytest.raises(ToolError, match='WORK_STOPPED'):
-            await use(server)
+            await use(server, kind)
         work.set_paused(SAVE, False)
         lease.write_text(json.dumps({'requestId': 'new-player-turn', 'saveId': SAVE}))
         with pytest.raises(ToolError, match='STALE_CONVERSATION'):
-            await use(server)
+            await use(server, kind)
         scheduler.invoke_extension.assert_not_awaited()
     asyncio.run(run())
 
@@ -197,4 +201,29 @@ def test_discovery_exposes_contract_without_private_build_references(capability_
         assert result['authoring']['targetFramework'] == 'net6.0'
         assert 'references' not in result['authoring'] and 'hostAssembly' not in result['authoring']
         scheduler.discover_extension_api.assert_awaited_once_with(None, 'Furniture', member=None, offset=0, limit=20)
+    asyncio.run(run())
+
+
+def test_next_upgrade_after_index_failure_can_roll_back_to_actual_saved_version(capability_env, monkeypatch):
+    from stardew_ai_runtime import native_capabilities as native
+
+    root, work, store, builds, scheduler, lease = capability_env
+    original_write = native._write_json
+    def fail_index(path, data):
+        if path.name == 'catalog.json':
+            raise PermissionError('Index temporarily locked')
+        original_write(path, data)
+    async def run():
+        server = create_mcp_server(run_dir=root, scheduler=scheduler, surface='life')
+        for version in ('1', '2', '3'):
+            await arrange(server, 'develop_capability', **develop(version))
+            await trial(server, version)
+            await use(server, version=version)
+            monkeypatch.setattr(native, '_write_json', fail_index if version == '2' else original_write)
+            result = await arrange(server, 'manage_capability', action='keep', capability='machine.insert', version=version)
+            assert result['native']['persisted'] is True
+            assert store.inspect('machine.insert')['manifest']['version'] == version
+        result = await arrange(server, 'manage_capability', action='rollback', capability='machine.insert')
+        assert result['version'] == '2'
+        assert NativeCapabilityStore(store.root).inspect('machine.insert')['manifest']['version'] == '2'
     asyncio.run(run())

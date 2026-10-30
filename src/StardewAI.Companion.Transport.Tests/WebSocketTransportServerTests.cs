@@ -13,6 +13,47 @@ namespace StardewAI.Companion.Mod.Transport.Tests;
 public class WebSocketTransportServerTests
 {
     [Fact]
+    public async Task ChatCancelWaitsForGameThreadAndRejectsStaleConnectionOrSession()
+    {
+        var handler = new TestTransportHandler();
+        using var server = new WebSocketTransportServer(0, "test-token", handler, saveId: "save-123", gameSessionId: "session-456");
+        server.Start();
+        using var client = new ClientWebSocket();
+        client.Options.SetRequestHeader("Authorization", "Bearer test-token");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{server.Port}/chat"), timeout.Token);
+        while (!server.IsChatConnected) await Task.Delay(10, timeout.Token);
+        var queue = (BoundedMessageQueue)typeof(WebSocketTransportServer)
+            .GetField("_pendingChatCommands", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(server)!;
+        async Task SendCancel(string command)
+        {
+            await SendRawJsonAsync(client, JsonSerializer.Serialize(new {
+                protocolVersion = "0.1", messageType = "skill.cancel", messageId = command,
+                saveId = "save-123", gameSessionId = "session-456", senderInstanceId = "test",
+                sequenceNumber = 1, worldRevision = 1, sentAt = DateTimeOffset.UtcNow,
+                payload = new { commandId = command, reason = "player", requestedByPlayer = true, cancelPolicy = "safe-point" }
+            }));
+            while (queue.TotalCount == 0) await Task.Delay(10, timeout.Token);
+        }
+        await SendCancel("first");
+        Assert.Equal(0, handler.CancelCount);
+        int updateThread = Environment.CurrentManagedThreadId;
+        server.Update();
+        Assert.Equal(1, handler.CancelCount);
+        Assert.Equal(updateThread, handler.LastCancelThreadId);
+        await SendCancel("old-session");
+        typeof(WebSocketTransportServer).GetField("_gameSessionId", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(server, "new-session");
+        server.Update();
+        Assert.Equal(1, handler.CancelCount);
+        typeof(WebSocketTransportServer).GetField("_gameSessionId", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(server, "session-456");
+        await SendCancel("old-connection");
+        typeof(WebSocketTransportServer).GetField("_chatSocketGeneration", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(server, server.ChatGeneration + 1);
+        server.Update();
+        Assert.Equal(1, handler.CancelCount);
+        client.Abort();
+    }
+
+    [Fact]
     public async Task SourceSelectionAndOriginalConversationStatusUseTheExistingChatChannel()
     {
         using var server = new WebSocketTransportServer(0, "connection-token", new TestTransportHandler());
@@ -220,6 +261,7 @@ public class WebSocketTransportServerTests
     {
         public int AcceptCount { get; private set; }
         public int CancelCount { get; private set; }
+        public int LastCancelThreadId { get; private set; }
         public int PauseCount { get; private set; }
         public int ResumeCount { get; private set; }
         public int DisconnectCount { get; private set; }
@@ -264,6 +306,7 @@ public class WebSocketTransportServerTests
 
         public void OnCancelSkill(SkillCancelPayload payload, EnvelopeDto envelope)
         {
+            LastCancelThreadId = Environment.CurrentManagedThreadId;
             CancelCount++;
             CancelPayloads.Add(payload);
             if (ActiveCommand == payload.CommandId)

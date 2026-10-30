@@ -3234,7 +3234,7 @@ class CompanionScheduler:
         return tiles[: max(1, max_tiles)]
 
     async def query_farming_helpers(self, location_id: str = "Farm") -> dict[str, Any]:
-        """Projects the farming observation group: refill tiles, ground items, fertilized tiles."""
+        """Project collectible items separately from objects requiring interaction/tools."""
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
         client = await self.ensure_connected()
@@ -3247,6 +3247,10 @@ class CompanionScheduler:
                 "World snapshot does not include a 'farming' section. The running game "
                 "build is too old; upgrade StardewAI.Companion.Mod."
             )
+        ground = farming.get("groundItems") or []
+        def collectible(item):
+            return bool(item.get("isDropped") or item.get("canBeGrabbed"))
+
         return {
             "location": farming.get("location", location_id),
             "refillWaterTiles": farming.get("refillWaterTiles", []),
@@ -3255,8 +3259,13 @@ class CompanionScheduler:
             "refillWaterCenter": farming.get("refillWaterCenter"),
             "refillWaterTilesTruncated": farming.get("refillWaterTilesTruncated", False),
             "refillWaterMapComplete": farming.get("refillWaterMapComplete", False),
-            "groundItems": farming.get("groundItems", []),
+            "groundItems": [item for item in ground if collectible(item)],
+            "groundObjects": [item for item in ground if not collectible(item)],
+            "groundItemsScope": "existing-drops-and-collectibles",
+            "groundObjectsScope": "standing-objects; itemId/stack describe the object, not its possible drops",
+            "groundObservationScope": "near-companion",
             "groundItemsTruncated": bool(farming.get("groundItemsTruncated", False)),
+            "groundObjectsTruncated": bool(farming.get("groundItemsTruncated", False)),
             "fertilizedTiles": farming.get("fertilizedTiles", []),
             # Choppable wild trees / giant stumps / hollow logs near the companion.
             "choppableTrees": farming.get("choppableTrees", []),

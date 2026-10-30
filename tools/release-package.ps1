@@ -210,19 +210,26 @@ function Start-ReleaseCompanion([string]$Root, [switch]$CheckOnly, [int]$OwnerPr
     $package = Read-VerifiedRelease $Root -FullVerify:$CheckOnly
     $python = Get-ReleasePath $Root $package.python
     if ($ForwardArgs | Where-Object { $_ -match '^--run-dir(=|$)' }) { throw 'Release is bound to its own Mod directory.' }
-    $configPath = Join-Path $Root 'config/chat-backend.json'
-    if (-not (Test-Path -LiteralPath $configPath)) { throw 'Run the setup entry first to select your AI backend and model.' }
-    $settings = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($settings.backend -notin @('kimi', 'agy', 'codex', 'dsh', 'mcode')) { throw 'Choose Kimi, agy, Codex, dsh, or mcode in setup first.' }
-    Write-ReleaseStartupDiagnostic $Root @{ event = 'startup'; backend = $settings.backend; powershell = (Get-Process -Id $PID).Path; appData = $env:APPDATA; windowsAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData) }
-    $cliBinary = Find-ReleaseAiCli $settings.backend -LogRoot $Root
-    Assert-ReleaseAiCli $cliBinary $settings.backend -LogRoot $Root
-    Write-ReleaseStartupDiagnostic $Root @{ event = 'cli-check-passed'; backend = $settings.backend; cli = $cliBinary }
-    $env:PATH = (Split-Path -Parent $cliBinary) + [IO.Path]::PathSeparator + $env:PATH
+    $connectionSource = $env:STARDEW_CONNECTION_SOURCE
+    if (-not $connectionSource) { $connectionSource = 'builtin' }
+    if ($connectionSource -notin @('builtin', 'external')) { throw 'Connection source must be builtin or external.' }
+    if ($connectionSource -eq 'builtin') {
+        $configPath = Join-Path $Root 'config/chat-backend.json'
+        if (-not (Test-Path -LiteralPath $configPath)) { throw 'Run the setup entry first to select your AI backend and model.' }
+        $settings = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($settings.backend -notin @('kimi', 'agy', 'codex', 'dsh', 'mcode')) { throw 'Choose Kimi, agy, Codex, dsh, or mcode in setup first.' }
+        Write-ReleaseStartupDiagnostic $Root @{ event = 'startup'; backend = $settings.backend; powershell = (Get-Process -Id $PID).Path; appData = $env:APPDATA; windowsAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData) }
+        $cliBinary = Find-ReleaseAiCli $settings.backend -LogRoot $Root
+        Assert-ReleaseAiCli $cliBinary $settings.backend -LogRoot $Root
+        Write-ReleaseStartupDiagnostic $Root @{ event = 'cli-check-passed'; backend = $settings.backend; cli = $cliBinary }
+        $env:PATH = (Split-Path -Parent $cliBinary) + [IO.Path]::PathSeparator + $env:PATH
+    } else {
+        Write-ReleaseStartupDiagnostic $Root @{ event = 'startup'; connectionSource = 'external' }
+    }
     if ($CheckOnly) {
         & $python -B -c "import sqlite3,ssl,mcp,win32job; import stardew_ai_runtime.chat_bridge; print('Portable runtime imports OK')"
         if ($LASTEXITCODE -ne 0) { throw 'Packaged Python could not import runtime dependencies.' }
-        Write-Host "Selected $($settings.backend) CLI startup check OK."
+        if ($connectionSource -eq 'builtin') { Write-Host "Selected $($settings.backend) CLI startup check OK." }
         Write-Host "Release $($package.version) verified. No service or game started; account and game connection are checked when used."
         return
     }

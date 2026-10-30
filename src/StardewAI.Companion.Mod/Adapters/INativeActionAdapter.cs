@@ -42,6 +42,7 @@ public sealed class NativeActionStepResult
     public int WaterGained { get; }
     public string? ItemId { get; }
     public int ItemCount { get; }
+    public IReadOnlyList<NativeCollectedItem>? CollectedItems { get; }
     public int TotalCost { get; }
     public bool PlayerActionRequired { get; }
 
@@ -57,7 +58,8 @@ public sealed class NativeActionStepResult
         string? itemId,
         int itemCount,
         bool playerActionRequired,
-        bool inProgress = false, int totalCost = 0)
+        bool inProgress = false, int totalCost = 0,
+        IReadOnlyList<NativeCollectedItem>? collectedItems = null)
     {
         Success = success;
         PreconditionFailed = preconditionFailed;
@@ -72,6 +74,7 @@ public sealed class NativeActionStepResult
         PlayerActionRequired = playerActionRequired;
         InProgress = inProgress;
         TotalCost = totalCost;
+        CollectedItems = collectedItems;
     }
 
     public static NativeActionStepResult Succeeded(
@@ -81,8 +84,9 @@ public sealed class NativeActionStepResult
         int waterGained = 0,
         string? itemId = null,
         int itemCount = 0,
-        bool playerActionRequired = false, int totalCost = 0) =>
-        new(true, false, null, null, state, staminaCost, waterUsed, waterGained, itemId, itemCount, playerActionRequired, totalCost: totalCost);
+        bool playerActionRequired = false, int totalCost = 0,
+        IReadOnlyList<NativeCollectedItem>? collectedItems = null) =>
+        new(true, false, null, null, state, staminaCost, waterUsed, waterGained, itemId, itemCount, playerActionRequired, totalCost: totalCost, collectedItems: collectedItems);
 
     public static NativeActionStepResult Precondition(
         string reason,
@@ -94,8 +98,9 @@ public sealed class NativeActionStepResult
         string reason,
         bool playerActionRequired = false,
         float staminaCost = 0f,
-        int waterUsed = 0, int totalCost = 0) =>
-        new(false, false, reason, null, "failed", staminaCost, waterUsed, 0, null, 0, playerActionRequired, totalCost: totalCost);
+        int waterUsed = 0, int totalCost = 0,
+        IReadOnlyList<NativeCollectedItem>? collectedItems = null) =>
+        new(false, false, reason, null, "failed", staminaCost, waterUsed, 0, null, 0, playerActionRequired, totalCost: totalCost, collectedItems: collectedItems);
 
     public static NativeActionStepResult Continue(
         string state,

@@ -53,10 +53,55 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     private string? _currentExecuteCommandId;
     private WaterZoneResult? _lastResult;
     private SkillResultPayload? _lastSkillResultPayload;
+    private SkillExecutePayload? _restRequest;
+    private EnvelopeDto? _restEnvelope;
+
+    private void FinishRest(string status, string? error = null)
+    {
+        if (_restRequest is not { } request) return;
+        var envelope = _restEnvelope;
+        _restRequest = null;
+        _restEnvelope = null;
+        // A failed explicit daytime-rest command must release its navigator.
+        // Otherwise the next game-clock tick silently resumes the old trip and
+        // pauses/cancels the model's replacement action after a terminal result.
+        if (status != "succeeded" && Rest.IsDaytimeRest) Rest.Wake();
+        var result = new SkillResultPayload(request.CommandId, request.TaskId, status,
+            status == "succeeded" ? 1 : 0, 0, status == "failed" ? 1 : 0, _observer.WorldRevision, new(),
+            SkillId: "rest", Details: new Dictionary<string, object> { ["stamina"] = _actor.Stamina,
+                ["targetStamina"] = request.Parameters.TargetStamina!.Value, ["restState"] = Rest.State },
+            Error: error == null ? null : new SkillResultError("REST_INTERRUPTED", error, null, false));
+        _currentExecuteEnvelope = envelope;
+        CompleteExecution(result);
+    }
 
     private readonly HashSet<string> _cancelledTaskIds = new();
 
     public CompanionRestController Rest { get; }
+    public bool HasRestTask => _restRequest != null;
+
+    public bool PauseRestTask()
+    {
+        if (_restRequest == null || Rest.TaskPaused) return false;
+        Rest.TaskPaused = true;
+        _actor.Halt();
+        return true;
+    }
+
+    public bool ResumeRestTask()
+    {
+        if (_restRequest == null || !Rest.TaskPaused) return false;
+        Rest.TaskPaused = false;
+        return true;
+    }
+
+    public bool CancelRestTask()
+    {
+        if (_restRequest == null) return false;
+        Rest.Wake();
+        FinishRest("cancelled");
+        return true;
+    }
     public StardewAI.Companion.Mod.PlayerMode.PlayerControlAuthority? PlayerAuthority { get; set; }
     private PlayerSleepStateMachine? _sleepMachine;
     private PlayerChestObservationMachine? _chestObservation;
@@ -64,6 +109,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     private bool _sleepCompletionBound;
     private string _sleepSkillId = "sleep";
     public Func<bool>? PresetBusinessAllowed { get; set; }
+    public Func<bool>? ConnectionActionsAllowed { get; set; }
     public IFarmerActor Actor => _actor;
     public CompanionAvatar? Avatar => _avatar;
     public WaterZoneStateMachine StateMachine => _stateMachine;
@@ -86,6 +132,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         get
         {
+            if (extensionMachine?.IsExecuting == true) return extensionMachine;
             if (_fishingMachine?.IsExecuting == true) return _fishingMachine;
             if (_combatMachine?.IsExecuting == true) return _combatMachine;
             if (_eatingMachine?.IsExecuting == true) return _eatingMachine;
@@ -108,6 +155,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     /// Raised after ANY skill execution reaches a terminal state (used for actor-state persistence).
     /// </summary>
     public event Action? OnExecutionCompleted;
+
+    public event Action? OnInventoryChanged;
 
     public event Action<string>? OnNotification;
 
@@ -224,8 +273,15 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     /// </summary>
     public void Update(GameTime? time, long tickCount)
     {
+        extensionMachine?.Update(time, tickCount);
         if (_actor is PlayerActor binding && !binding.BindingValid) { _eatingMachine?.Update(time, tickCount); PlayerAuthority?.Release("actor-binding-lost"); return; }
         if (!ActorGuards.IsPlayerBound(_actor)) Rest.Update(time, tickCount, ActiveMachine);
+        if (_restRequest != null)
+        {
+            if (!Rest.IsResting) FinishRest("succeeded");
+            else if (!Rest.IsDaytimeRest || Rest.State == "waiting-for-bed")
+                FinishRest("failed", Rest.Reason ?? "Nighttime sleep began.");
+        }
         _sleepMachine?.Update(time, tickCount);
         _chestObservation?.Update(time,tickCount);
         _fishingMachine?.Update(time,tickCount);
@@ -242,7 +298,21 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         _navigationMachine.Update(time, tickCount);
         if (_actor is FarmerMechanicsActor nativeActor && !Rest.Paused && !Game1.paused && !Game1.eventUp &&
             !StardewAI.Companion.Mod.Menus.CompanionMenuClock.HasBlockingMenu)
+        {
             nativeActor.UpdateMovementAnimation(time);
+            if (nativeActor.GameFarmer?.currentLocation is { } location
+                && !ReferenceEquals(location, Game1.currentLocation) && !location.farmers.Any())
+            {
+                // Empty locations don't receive native visual terrain ticks.
+                // Finish real falling trees so native drops and stump state settle.
+                foreach (var pair in location.terrainFeatures.Pairs.ToArray())
+                    if (pair.Value is StardewValley.TerrainFeatures.Tree tree && tree.falling.Value
+                        && tree.tickUpdate(time))
+                        location.terrainFeatures.Remove(pair.Key);
+            }
+            if (tickCount % 6 == 0 && CompanionDebrisPickup.CollectNearby(nativeActor.GameFarmer))
+                OnInventoryChanged?.Invoke();
+        }
     }
 
     /// <summary>
@@ -637,6 +707,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             rejectReason = "Actor is busy completing native sleep and save.";
             return false;
         }
+        if (Rest.IsResting && Rest.IsDaytimeRest && _restRequest == null && _actor.Stamina > 0)
+            Rest.Wake();
         if (Rest.IsResting)
         {
             rejectReason = Rest.IsDaytimeRest
@@ -670,6 +742,11 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         lock (_taskLock)
         {
             string skillId = payload.SkillId ?? "";
+            if (ConnectionActionsAllowed?.Invoke() == false && !skillId.StartsWith("inspect-"))
+            {
+                rejectResult = BuildRejection(payload, "CONNECTION_SWITCH_PENDING", "Conversation source handoff is not confirmed; no new action is allowed.", true);
+                return false;
+            }
             if (PresetBusinessAllowed is not null && !skillId.StartsWith("inspect-") && !PresetBusinessAllowed())
             {
                 rejectResult = BuildRejection(payload, "PRESET_DAY_LIMIT", "Independent preset day budget ended; only observation/reporting is allowed. NewRun starts a fresh budget.", false);
@@ -680,6 +757,20 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             }
             if (ActorGuards.IsPlayerBound(_actor) && !skillId.StartsWith("inspect-") && PlayerAuthority?.AgentOwns != true) {
                 rejectResult = BuildRejection(payload, "PLAYER_CONTROL_NOT_HELD", "Agent does not hold player control.", false); return false;
+            }
+            if (skillId == "rest")
+            {
+                if (ActorGuards.IsPlayerBound(_actor) || payload.Parameters.TargetStamina is not float target
+                    || !float.IsFinite(target) || target <= 0 || target > _actor.MaxStamina)
+                { rejectResult = BuildRejection(payload, "INVALID_REST_TARGET", "Companion rest requires targetStamina above zero and no higher than maximum stamina.", false); return false; }
+                if (_restRequest != null || ActiveMachine != null || (Rest.IsResting && !Rest.IsDaytimeRest))
+                { rejectResult = BuildRejection(payload, "ACTOR_BUSY", "Finish or cancel current work before resting.", true); return false; }
+                Rest.BeginDaytimeRest(target);
+                _restRequest = payload;
+                _restEnvelope = envelope;
+                _currentExecuteCommandId = payload.CommandId;
+                rejectResult = null;
+                return true;
             }
             if (skillId is "native-advance" or "native-answer") {
                 if (!TryCheckIdle(out var busy)) { rejectResult=BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
@@ -695,6 +786,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items")) {
                 rejectResult=BuildRejection(payload,uiCode,uiMessage,true,NativeUiDetails()); return false;
             }
+            if (skillId is "discover-extension-api" or "list-extensions" or "load-extension" or "invoke-extension") return TryAcceptExtension(payload,envelope,out rejectResult);
             if (skillId is "talk-npc" or "interact-tile" or "fish" or "attack")
                 return TryAcceptPlayerInteraction(payload,envelope,out rejectResult);
             if (skillId == "eat-food" && _actor is PlayerActor eatingPlayer)
@@ -1472,6 +1564,11 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             }
             var target = !string.IsNullOrEmpty(envelope?.CorrelationId)
                 ? envelope.CorrelationId : payload.CommandId;
+            if (_restRequest is { } rest && (target == rest.CommandId || target == rest.TaskId))
+            {
+                CancelRestTask();
+                return;
+            }
             var active = ActiveMachine;
             if (active != null && (string.Equals(target, _currentExecuteCommandId, StringComparison.Ordinal)
                 || string.Equals(target, active.ActiveTaskId, StringComparison.Ordinal)))
@@ -1485,7 +1582,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         lock (_taskLock)
         {
-            ActiveMachine?.RequestPause();
+            if (HasRestTask) PauseRestTask();
+            else ActiveMachine?.RequestPause();
         }
     }
 
@@ -1493,7 +1591,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         lock (_taskLock)
         {
-            ActiveMachine?.Resume();
+            if (HasRestTask) ResumeRestTask();
+            else ActiveMachine?.Resume();
         }
     }
 
@@ -1592,12 +1691,13 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 WaterCanLevel: _actor.WaterLeft,
                 MaxWaterCanLevel: _actor.MaxWater,
                 HasWateringCan: true,
-                Activity: Rest.IsResting ? Rest.State : activeMachine is not null ? DescribeActivity(activeMachine) : "idle",
+                Activity: Rest.IsResting ? GetActivityStatus() : activeMachine is not null ? DescribeActivity(activeMachine) : "idle",
                 AvailableMoney: companionMoney,
                 MoneyStatus: companionMoneyStatus,
                 RestState: Rest.State,
                 Bedtime: Rest.Bedtime,
-                SleepStartedAt: Rest.SleepStartedAt
+                SleepStartedAt: Rest.SleepStartedAt,
+                ActiveCommandId: activeMachine is not null || _restRequest != null ? _currentExecuteCommandId : null
             );
 
             // Farm work describes the Farm even while the companion is indoors.
@@ -2068,9 +2168,26 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         _ => "working"
     };
 
+    public string GetActivityLabel()
+    {
+        if (Rest.IsResting)
+            return Rest.IsDaytimeRest ? $"休息恢复 {_actor.Stamina:0}/{Rest.RecoveryTarget ?? _actor.MaxStamina:0}" : "回家休息";
+        var machine = ActiveMachine;
+        if (machine == null) return "";
+        string label = DescribeActivity(machine) switch
+        {
+            "watering" => "浇水", "harvesting" => "收获", "navigating" => "赶路",
+            "chopping" => "砍树", "clearing" => "清理", "picking-up" => "拾取",
+            "refilling" => "补水", "depositing" => "存放物品", "withdrawing" => "取物",
+            "planting" => "播种", "hoeing" => "锄地", "eating" => "进食", _ => "工作中"
+        };
+        return machine.TotalTargets > 0
+            ? $"{label} {Math.Clamp(machine.CurrentTargetIndex, 0, machine.TotalTargets)}/{machine.TotalTargets}" : label;
+    }
+
     public string GetActivityStatus()
     {
-        if (Rest.IsResting) return Rest.State;
+        if (Rest.IsResting) return Rest.Paused || Rest.TaskPaused ? "paused" : Rest.State;
         var machine = ActiveMachine;
         if (machine is null) return "idle";
         string activity = DescribeActivity(machine);
@@ -2084,6 +2201,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         lock (_taskLock)
         {
+            if (_restRequest != null) { Rest.Wake(); FinishRest("cancelled"); }
             ActiveMachine?.RequestCancel($"Transport disconnected: {reason}");
         }
     }

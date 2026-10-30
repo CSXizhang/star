@@ -35,6 +35,15 @@ public sealed class LifeMenuUiState
         return true;
     }
 
+    public bool RecordCompanionReply(string requestId, string text, string gameDate)
+    {
+        // De-duplicate against messages actually received by the game, not merely
+        // sent by the bridge. A missed early delivery remains in the final reply.
+        foreach (var entry in _conversation.Where(e => e.Id.StartsWith(requestId + ":message:", StringComparison.Ordinal)))
+            if (text.StartsWith(entry.Text, StringComparison.Ordinal)) text = text[entry.Text.Length..].TrimStart();
+        return RecordConversation(requestId + ":companion", CompanionName, text, gameDate, false, unread: true);
+    }
+
     public void MarkConversationRead(string? entryId = null)
     {
         if (UnreadReplyCount == 0) return;
@@ -52,6 +61,7 @@ public sealed class LifeMenuUiState
         int index = _conversation.FindIndex(e => e.DecisionId == noticeId && e.DecisionStatus == "pending");
         if (index < 0) return;
         _conversation[index] = _conversation[index] with { DecisionStatus = "answered", Unread = false };
+        _unreadCareHints.RemoveAll(h => h.EventKey == "decision:" + noticeId);
         ConversationRevision++;
         ConversationChanged?.Invoke();
     }
@@ -149,8 +159,18 @@ public sealed class LifeMenuUiState
     /// <summary>Whether the player explicitly skipped setup.</summary>
     public bool IsSkipped { get; private set; }
 
-    /// <summary>The companion's chosen name.</summary>
-    public string CompanionName { get; private set; } = "阿星";
+    /// <summary>The built-in profile name, kept separate from an external connection's display alias.</summary>
+    public string ProfileCompanionName { get; private set; } = "阿星";
+    private string? _connectionDisplayName;
+    public string CompanionName => _connectionDisplayName ?? ProfileCompanionName;
+
+    /// <summary>Projects the acknowledged connection; existing conversation speakers remain historical facts.</summary>
+    public void ApplyConnectionName(string source, string? conversationName)
+    {
+        _connectionDisplayName = source == "external"
+            ? string.IsNullOrWhiteSpace(conversationName) ? "已有伙伴" : conversationName.Trim()
+            : null;
+    }
 
     /// <summary>
     /// Play-style: <c>"earn"</c>, <c>"workhorse"</c>, <c>"community"</c>, or <c>"decor"</c>.
@@ -408,7 +428,7 @@ public sealed class LifeMenuUiState
     {
         IsOnboarded = onboarded;
         IsSkipped = skipped;
-        CompanionName = companionName;
+        ProfileCompanionName = companionName;
         PlayStyle = playStyle;
         Personality = personality;
         CareFrequency = careFrequency;
@@ -510,6 +530,7 @@ public sealed class LifeMenuUiState
     /// <summary>Resets transient state (e.g. on return-to-title).</summary>
     public void Reset()
     {
+        _connectionDisplayName = null;
         _conversation.Clear();
         ConversationRevision++;
         _decisionNoticeKeys.Clear();

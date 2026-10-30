@@ -90,6 +90,6 @@ def test_accepted_goal_uses_original_request_across_autonomy_and_delivery(tmp_pa
                                          command_id='native-store', outcome='completed',
                                          effects=[{'state': 'deposited', 'stack': 3}])
     event = bridge._work_store.pending_outbox('S')[0]
-    prompt = bridge._format_delivery_prompt([event], 'S', midflight=[], read_only=True)
+    prompt = bridge._format_delivery_prompt([event], 'S', midflight=[], execution_deferred=True)
     assert instruction in prompt
     assert event['requestId'] == 'player-original'

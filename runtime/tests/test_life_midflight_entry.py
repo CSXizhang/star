@@ -33,7 +33,7 @@ def test_life_submit_persists_midflight_request_before_queued_turn(tmp_path, pau
         bridge._busy_lock.release()
         await bridge._drain_life_queue(ws)
         active = bridge._await_life_provider.call_args.args[0]
-        assert active.read_only is True
+        assert active.execution_deferred is True
         assert store.pending_midflight_requests("farm")[0]["text"] == text
         assert bridge._active_player_requests["farm"] == "A"
         state = store.state("farm")

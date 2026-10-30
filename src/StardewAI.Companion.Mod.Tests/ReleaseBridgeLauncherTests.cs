@@ -44,6 +44,9 @@ public class ReleaseBridgeLauncherTests
             Assert.True(start.RedirectStandardOutput);
             Assert.True(start.RedirectStandardError);
             Assert.Equal(ProcessWindowStyle.Hidden, start.WindowStyle);
+            Assert.Equal("builtin", start.Environment["STARDEW_CONNECTION_SOURCE"]);
+            Assert.Equal("external", ReleaseBridgeLauncher.CreateStartInfo(root, "external")!.Environment["STARDEW_CONNECTION_SOURCE"]);
+            Assert.Throws<ArgumentException>(() => ReleaseBridgeLauncher.CreateStartInfo(root, "unknown"));
         }
         finally { Directory.Delete(root, recursive: true); }
     }

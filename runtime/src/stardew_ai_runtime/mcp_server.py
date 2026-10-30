@@ -33,6 +33,9 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_valida
 
 from stardew_ai_runtime.agent_instructions import read_guidance as load_guidance
 from stardew_ai_runtime.autonomy import AutonomyController
+from stardew_ai_runtime.capability_consent import learning_provenance
+from stardew_ai_runtime.chat_backend_config import load_chat_backend_config
+from stardew_ai_runtime.companion_memory import CompanionMemoryStore, resolve_companion_id
 from stardew_ai_runtime.companion_milestones import (
     CompanionMilestoneStore,
     MilestoneError,
@@ -43,6 +46,7 @@ from stardew_ai_runtime.decision_context import water_can_resources
 from stardew_ai_runtime.decision_policy import project_context
 from stardew_ai_runtime.game_tools import GAME_TOOLS, register_game_tools
 from stardew_ai_runtime.mcode_wire_schema import mcode_tool_schema
+from stardew_ai_runtime.native_capabilities import CapabilityError, NativeCapabilityStore
 from stardew_ai_runtime.plan_executor import (
     PlanExecutor,
 )
@@ -452,20 +456,15 @@ def capability_example(name: str, schema: dict[str, Any], properties: dict[str, 
 
 
 DEFAULT_MCP_INSTRUCTIONS = """
-Use the supplied companion core instructions. discover_capabilities(group) gives
-required parameters, nested shapes and examples; call_capability(tool, params)
-uses that same contract. Read guidance only when the decision needs it.
-submit_plan selects one job with sequential operations, including navigation,
-restocking, preparation, planting and watering across maps. Each operation uses
-real native prerequisites and resources. A partial, failed or uncertain result
-stops the job; inspect its effects before choosing the remaining work.
-Only native results prove completion. Keep ongoing goals active and record future
-work with manage_todo conditions rather than polling. Use water_tiles for an exact
-observed planting batch, water_auto for currently observed missing farm watering.
-For water_auto, max_tiles is only a batch limit, not the requested work scope.
-For an instruction such as "only water the nearest N crops", choose at most N
-freshly observed candidate coordinates and pass target_tiles explicitly, including
-inside submit_plan. Auto selection does not promise nearest-first ordering.
+Use the supplied companion core instructions. query_game observes the game;
+submit_work executes one action immediately and returns its native result.
+Observe remaining work before choosing the next action; do not create a queue.
+A timeout is not proof of failure: check current activity and world state, then
+retry only remaining work once the previous action has stopped.
+Use consult for packaged guidance and wiki knowledge. Keep player agreements
+and long-term goals, not duplicate inventories or execution plans.
+water_auto selects observed dry crops; max_tiles limits one batch, not the goal.
+For a restricted area or nearest N crops, pass an observed target_tiles subset.
 """
 
 
@@ -525,7 +524,7 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
     else:
         outcome, reason = "failed", str(error.get("code") or "FAILED")
 
-    return {
+    response = {
         "skill": skill,
         "outcome": outcome,
         "goalSatisfied": outcome == "completed",
@@ -534,6 +533,8 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
         "taskId": res.get("taskId"),
         "effects": effects,
         "completedCount": completed_count,
+        "completedCountUnit": "action-targets",
+        "completionScope": "This submitted action; material delivery and the player's wider goal are separate.",
         "skippedCount": res.get("skippedCount", 0),
         "failedCount": res.get("failedCount", 0),
         "remaining": details.get("skipped") if outcome == "partial" else None,
@@ -541,13 +542,24 @@ def _native_action_response(skill: str, res: dict[str, Any]) -> dict[str, Any]:
         "reasonMessage": error.get("message"),
         "playerActionRequired": bool(res.get("playerActionRequired")),
         "snapshotRevision": res.get("worldRevision"),
+        "details": {key: value for key, value in details.items() if key not in {"completed", "skipped", "failed"}},
     }
+    for key in ("commandId", "resources", "inventoryDelta", "resourceDelta"):
+        if res.get(key) is not None:
+            response[key] = res[key]
+    if skill in {"clear-debris", "chop-tree", "cut-grass"}:
+        response["quantityMeaning"] = (
+            "completedCount counts processed targets. effects itemId/stack identify the affected objects, "
+            "not materials obtained. details.inventoryDelta, when provided, is the measured command-interval backpack change; "
+            "afterWork shows current inventory and collectible drops. Neither proves who caused every change.")
+    return response
 
 
 # Plan steps may only invoke these existing operations, through their real
 # scheduler implementation. Unknown operations are rejected; unknown parameters
 # reject semantic parameters outside the operation contract before dispatch.
 _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
+    "learned_action": ("learned_action", frozenset({"capability", "version", "arguments"})),
     "observe_player_activities": ("observe_player_activities", frozenset()),
     "talk_npc": ("talk_npc", frozenset({"npc_name", "location_id"})),
     "interact_tile": ("interact_tile", frozenset({"tile", "location_id"})),
@@ -614,6 +626,7 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
     "cut_grass": ("cut_grass", frozenset({"tiles", "location_id"})),
     "pickup_items": ("pickup_items", frozenset({"tiles", "location_id"})),
     "chop_tree": ("chop_tree", frozenset({"tiles", "location_id"})),
+    "rest": ("rest", frozenset({"target_stamina"})),
     "insert_machine": ("insert_machine", frozenset({"tile", "item_id", "item_count", "location_id"})),
     "collect_machine": ("collect_machine", frozenset({"tiles", "location_id"})),
     "pet_animal": ("pet_animal", frozenset({"animal_name", "animal_id", "tile", "location_id"})),
@@ -703,13 +716,6 @@ INTERNAL_TOOLS = LEGACY_GAME_TOOLS | {"reconcile_plan_command", "dispatch_plan_o
 
 # Same declarations on every event; admission controls native access.
 LIFE_TOOLS = LIGHT_TOOLS
-# Only these implementations can run without the native execution connection.
-CACHED_TURN_TOOLS = frozenset({
-    "read_reload_history", "get_work_overview", "get_status", "work_plan_overview",
-    "query_wiki", "read_guidance", "manage_milestones", "manage_companion",
-    "discover_capabilities", "call_capability", "remember_intent", "request_player_decision", "record_decision_note", "answer_player_decision",
-})
-
 # Base tools grouped for on-demand disclosure.
 CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
     "farm": (
@@ -756,7 +762,8 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
     "movement": ("get_status", "query_route", "navigate_to"),
     "native_ui": ("get_status", "observe_player_activities", "talk_npc", "interact_tile", "fish", "attack", "native_menu_select", "native_advance", "native_answer"),
     "knowledge": ("read_guidance", "query_wiki"),
-    "memory": ("manage_goal", "manage_plan", "manage_todo", "record_decision_note", "work_plan_overview"),
+    "learning": ("inspect_capabilities", "develop_capability", "prepare_capability_builder", "manage_capability", "learned_query", "learned_action"),
+    "memory": ("save_memory", "save_method", "recall_memory", "forget_memory", "manage_goal", "manage_plan", "manage_todo", "record_decision_note", "work_plan_overview"),
 }
 
 # The real nested schema for the two model-facing write entry points. The model
@@ -846,21 +853,9 @@ MEMORY_WRITE_SCHEMA: dict[str, Any] = {
 def resolve_surface(full: bool | None = None, surface: str | None = None) -> str:
     """Resolve the exposure surface: "full" (default), "light", "internal" or "life".
 
-    Generic MCP clients keep the complete legacy tool list by default so no
-    existing tool name disappears on upgrade. Only callers that explicitly ask
-    for the game surface (CLI flag or env var) get the trimmed list; the internal
-    plan worker additionally selects the harness-only surface; the life-chat
-    backend selects the strictly read-only observation/query surface.
-
-    Priority: an explicitly set ``STARDEW_MCP_SURFACE`` process env var wins over
-    the CLI ``--surface`` argument. The life-chat bridge injects
-    ``STARDEW_MCP_SURFACE=life`` into the model backend environment while the
-    installed game provider profile always passes ``--surface light``; the forced
-    read-only life surface must hold anyway, so the env var is the dedicated
-    override mechanism. The harness-only ``internal`` surface is the single
-    exception (``--surface internal`` always wins): the plan worker must never be
-    downgraded by an inherited env var, because it depends on the reconcile tool.
-    When the env var is not set, CLI behaviour is unchanged.
+    Generic clients retain the full legacy list. In-game conversations and work
+    use light; life remains a compatibility alias. The environment overrides the
+    CLI profile, except internal workers always retain their reconciliation tools.
     """
     if full is True:
         return "full"
@@ -941,6 +936,8 @@ def create_mcp_server(
     the argument behaves exactly as before.
     """
     resolved_surface = resolve_surface(full, surface)
+    if resolved_surface == "life":  # Legacy CLI/config name; same live game tools.
+        resolved_surface = "light"
     inst = instructions if instructions is not None else DEFAULT_MCP_INSTRUCTIONS
     if instructions is None:
         inst += "持续生产授权后可用set_autonomy(goal_id=...)绑定目标并接续，不改变空闲主动帮忙开关。规模工作分批，由模型选择补水/补给/食物恢复及下一业务。持续生产goal保持active，等待用manage_todo的gameTime/machineReady/resource条件，不轮询倒计时；处理完待办再按需记录下一周期。observe_production提供指定地图地面鸡蛋/水源/食物，鸡蛋用pickup_items；building_services能力组提供原生建造升级购动物目录与服务操作。"
@@ -1070,6 +1067,65 @@ def create_mcp_server(
         actual_run_dir = getattr(sched, "run_dir", None) or run_dir
         return CompanionProfileStore(Path(actual_run_dir or ".") / "data" / "companion-profile.json")
 
+    def memory_for_run() -> CompanionMemoryStore:
+        return CompanionMemoryStore(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "companion-memory.json")
+
+    capability_store = None
+
+    def capabilities_for_run() -> NativeCapabilityStore:
+        nonlocal capability_store
+        if capability_store is None:
+            capability_store = NativeCapabilityStore(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "abilities")
+        return capability_store
+
+    async def learning_permission(quote: str | None, notice_id: str | None = None, previous: dict | None = None) -> dict:
+        assert_life_turn_current(allow_control=True)
+        sid = await current_save_id()
+        path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-turn.json"
+        lease = read_cache(path) if path.exists() else {}
+        notice = next((n for n in work_for_run().state(sid).notices if n.get("id") == notice_id), None) if notice_id else None
+        return learning_provenance(save_id=sid, request_id=os.environ.get("STARDEW_LIFE_TURN_ID"),
+                                   lease=lease or {}, quote=quote, notice=notice, previous=previous)
+
+    async def extension_host_call(fn, *args, **kwargs):
+        previous = getattr(sched, "await_terminal_results", False)
+        sched.await_terminal_results = True
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            sched.await_terminal_results = previous
+
+    def memory_context(save_id: str) -> dict[str, str]:
+        root = Path(getattr(sched, "run_dir", None) or run_dir or ".")
+        lease_path = root / "data" / "life-turn.json"
+        try:
+            lease = read_cache(lease_path) or {}
+        except FileNotFoundError:
+            lease = {}
+        if lease.get("requestId") != os.environ.get("STARDEW_LIFE_TURN_ID") or lease.get("saveId") != save_id:
+            lease = {}
+        try:
+            config = json.loads((root / "config.json").read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            config = {}
+        source = str(lease.get("memoryConnectionSource") or os.environ.get("STARDEW_CONNECTION_SOURCE") or config.get("ConnectionSource") or "builtin")
+        provider = str(lease.get("memoryProvider") or ("mcode" if source == "external" else load_chat_backend_config().get("backend", "")))
+        snapshot = getattr(sched, "latest_snapshot", None) or {}
+        world = (snapshot.get("payload") or {}).get("world") or {}
+        date = ":".join(str(world[k]) for k in ("year", "season", "dayOfMonth")) if all(world.get(k) is not None for k in ("year", "season", "dayOfMonth")) else ""
+        return {"companion_id": resolve_companion_id(root, save_id, provider=provider, connection_source=source), "game_date": date}
+
+    async def ready_memory_context(save_id: str) -> dict[str, str]:
+        # A provider can send its first MCP call just before the bridge consumes
+        # session.started. Let that existing identity arrive; never invent one.
+        deadline = time.monotonic() + 2
+        while True:
+            assert_life_turn_current(allow_control=True)
+            context = memory_context(save_id)
+            if context["companion_id"] or not os.environ.get("STARDEW_LIFE_TURN_ID") or time.monotonic() >= deadline:
+                return context
+            await asyncio.sleep(.05)
+
     async def execute_plan_operation(
         operation: str,
         params: dict[str, Any],
@@ -1160,42 +1216,6 @@ def create_mcp_server(
     def classify_step_outcome(result: Any) -> tuple[str, str | None]:
         return _classify_step_outcome(result)
 
-    async def life_snapshot() -> dict[str, Any]:
-        # Written atomically by the existing chat socket, never open native transport.
-        path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-snapshot.json"
-        # Tool-start progress asks the game thread to observe. A bridge-owned
-        # turn may briefly await that chat publication; standalone readers still
-        # reject stale evidence immediately. Never rewrite the observation time.
-        deadline = time.monotonic() + (5 if os.environ.get("STARDEW_LIFE_TURN_ID") else 0)
-        while True:
-            try:
-                cached = read_cache(path)
-            except (OSError, ValueError) as ex:
-                raise ToolError("游戏近况暂不可用，请稍候。") from ex
-            if cached.get("saveId") and time.time() - cached.get("capturedAt", 0) <= 120:
-                break
-            if time.monotonic() >= deadline:
-                raise ToolError("游戏近况已过期，等下一次游戏更新再安排。")
-            assert_life_turn_current()
-            await asyncio.sleep(0.05)
-        expected_save = os.environ.get("STARDEW_LIFE_SAVE_ID")
-        if expected_save and cached["saveId"] != expected_save:
-            raise ToolError("SAVE_CHANGED: conversation belongs to another save")
-        sched._latest_snapshot_data = cached
-        return cached
-
-    async def life_observation(detail: bool) -> dict[str, Any]:
-        from .decision_context import build_decision_context
-        cached = await life_snapshot()
-        payload = cached["payload"]
-        world = payload.get("world") or {}
-        work = work_for_run().overview(cached["saveId"], snapshot=payload,
-            game_date={"year": world.get("year"), "season": world.get("season"), "day": world.get("dayOfMonth")})
-        facts = build_decision_context(cached, work=work, origin="life-observation")
-        return {"saveId": cached["saveId"], "worldRevision": cached.get("worldRevision"),
-                "capturedAt": cached.get("capturedAt"), "observedFacts": facts,
-                **({"native": payload} if detail and facts.get("observationStatus") != "pending_native_result" else {})}
-
     def assert_life_turn_current(*, allow_control: bool = False, lease_locked: bool = False) -> None:
         request_id = os.environ.get("STARDEW_LIFE_TURN_ID")
         if not request_id:
@@ -1222,12 +1242,13 @@ def create_mcp_server(
             raise ToolError("WORK_STOPPED: this conversation paused or cancelled work; only an explicit resume can allow new work")
 
     async def current_save_id() -> str:
-        if resolved_surface == "life":
-            return str((await life_snapshot())["saveId"])
         if external_codex and external_selected and external_save_id:
             return external_save_id
         current = await sched.get_status()
         sid = current.get("saveId")
+        expected_save = os.environ.get("STARDEW_LIFE_SAVE_ID")
+        if expected_save and sid != expected_save:
+            raise ToolError("SAVE_CHANGED: the active game save differs from this conversation")
         if not sid or sid == "unknown":
             raise SchedulerError("The connected Mod did not publish a current saveId.")
         return str(sid)
@@ -1235,7 +1256,7 @@ def create_mcp_server(
     async def validate_actor_operation(operation: str) -> None:
         if operation != "open_shop":
             return
-        snapshot = await life_snapshot() if resolved_surface == "life" else sched.latest_snapshot
+        snapshot = sched.latest_snapshot
         payload = snapshot.get("payload", {}) if isinstance(snapshot, dict) else {}
         if payload.get("actorMode") == "companion":
             raise ToolError(
@@ -1322,8 +1343,6 @@ def create_mcp_server(
             if external_codex and external_selected and external_save_id:
                 overview = work_for_run().overview(external_save_id)
                 return {**(overview if detail or resolved_surface == "internal" else compact_work_overview(overview)), "gameSnapshotStale": True}
-            if resolved_surface == "life":
-                return await life_observation(detail)
             native = await sched.get_work_overview(detail=detail)
             native = model_water_observation(native)
             if not detail:
@@ -1373,8 +1392,6 @@ def create_mcp_server(
             if external_codex and external_selected and external_save_id:
                 overview = work_for_run().overview(external_save_id)
                 return {**(overview if detail or resolved_surface == "internal" else compact_work_overview(overview)), "gameSnapshotStale": True}
-            if resolved_surface == "life":
-                return await life_observation(detail)
             res = model_water_observation(await sched.get_status())
             if detail:
                 return detailed_status(res)
@@ -1522,7 +1539,7 @@ def create_mcp_server(
         # Mod's sole command socket. Read its persisted result without reopening it.
         sid = external_save_id if external_codex and external_save_id else await current_save_id()
         store = work_for_run()
-        decisions = [] if resolved_surface == "life" else store.recover(sid)
+        decisions = store.recover(sid)
         snapshot = sched.latest_snapshot
         payload = snapshot.get("payload", {}) if isinstance(snapshot, dict) else {}
         world = payload.get("world", {}) if isinstance(payload, dict) else {}
@@ -1571,7 +1588,7 @@ def create_mcp_server(
         project is a partial update that preserves omitted fields. It stores the current plan: phase, nextAction, blocker, prerequisites, window,
         progress, reason and farmRegion (locationId, bounds, reservedPaths, expansionDirection).
         Keep summary concise; revise after actual results. It does not grant execution authority.
-        It never grants authority or proves completion; native execution log does.
+        It never grants authority or proves completion; assess completion from current game observations.
 
         ``kind`` classifies the goal: 'main' is the single long-running main goal
         (only one active main goal is allowed; preset-sourced goals are 'main'),
@@ -1627,7 +1644,13 @@ def create_mcp_server(
                 return {"saveId": sid, "goal": asdict(goal)}
             if action in {"complete", "finish"}:
                 try:
-                    goal = store.complete_goal(sid, goal_id or "")
+                    observation = None
+                    if resolved_surface == "light":
+                        current = await sched.get_status()
+                        if current.get("saveId") != sid or current.get("companion", {}).get("currentTask"):
+                            raise ToolError("Observe the current game's remaining work after its action stops.")
+                        observation = {"worldRevision": current.get("worldRevision"), "world": current.get("world", {})}
+                    goal = store.complete_goal(sid, goal_id or "", completion_observation=observation)
                 except Exception as ex:
                     if "MAIN_GOAL_LOCKED" in str(ex):
                         return {"saveId": sid, "goalId": goal_id, "blocked": True,
@@ -2168,6 +2191,87 @@ def create_mcp_server(
             except WorkStateError as ex:
                 raise ToolError(str(ex)) from None
 
+    async def save_companion_note(text: str, *, kind: str, scope: str | None, title: str = "",
+                                  note_id: str | None = None, supersedes: list[str] | None = None,
+                                  valid_on: str | None = None) -> dict[str, Any]:
+        sid = await current_save_id()
+        context = await ready_memory_context(sid)
+        directory = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data"
+        with cache_lock(directory / "life-turn.json"):
+            assert_life_turn_current(allow_control=True, lease_locked=True)
+            try:
+                status, result = memory_for_run().save_note(
+                    sid, text, **context, source="companion", kind=kind,
+                    scope=scope, title=title, note_id=note_id, supersedes=supersedes, valid_on=valid_on)
+            except ValueError as ex:
+                raise ToolError(str(ex)) from None
+        return {"status": status, "saveId": sid, **result,
+                "recordingMeaning": "confirmed confirms the note was saved, not that its contents were verified in the game."}
+
+    @mcp.tool()
+    async def save_memory(text: str, scope: str | None = None, note_id: str | None = None,
+                          supersedes: list[str] | None = None, valid_on: str | None = None) -> dict[str, Any]:
+        """Remember a preference, agreement, experience or current understanding in natural language.
+
+        Preserve context: '雨天想一起去海边，今天先休息' is a note, not an action trigger.
+        scope describes where/when it applies, e.g. 长期约定 or 昨日整理后的箱子观察.
+        Omitted scope leaves applicability unspecified. Inventory/positions are dated
+        observations or handoff context; keep uncertain explanations as guesses.
+        For a single game day, valid_on is year:season:day (e.g. 1:spring:3).
+        Without valid_on the note remains available for recall; that is not a claim
+        that the recorded world state is still current. Reusable approaches use save_method.
+        To correct a note, pass its note_id and the updated text; supersedes replaces
+        a list of notes while retaining history. A temporary exception can be its own
+        note. Notes support reasoning and do not create work or prove world effects.
+        Updates preserve omitted scope/valid_on; valid_on='' removes a date restriction.
+        """
+        return await save_companion_note(text, kind="memory", scope=scope, note_id=note_id,
+                                         supersedes=supersedes, valid_on=valid_on)
+
+    @mcp.tool()
+    async def save_method(title: str, text: str, scope: str | None = None,
+                          note_id: str | None = None, supersedes: list[str] | None = None) -> dict[str, Any]:
+        """Save a reusable learned method as a flexible skill note, not a scheduled script.
+
+        Describe when it helps, the useful approach and any actual experience.
+        Adapt it to the current world when reused. Player-specific destinations or
+        preferences belong in save_memory. Saving a method does not install code or
+        grant a missing SMAPI capability. Use note_id to improve an existing method.
+        """
+        return await save_companion_note(text, kind="method", scope=scope, title=title,
+                                         note_id=note_id, supersedes=supersedes)
+
+    @mcp.tool()
+    async def recall_memory(query: str = "", kind: Literal["memory", "method"] | None = None,
+                            note_id: str | None = None, offset: int = 0, limit: int = 12) -> dict[str, Any]:
+        """Recall this companion's relevant notes, learned methods and shared save memories.
+
+        Use a topic such as 雨天 海边 or 收获整理; empty query returns recent notes.
+        note_id reads one complete note, including an older dated note when explicitly
+        requested. Notes carry their source/date/scope; current observations and the
+        player's latest words help interpret them. kind='method' finds learned skills.
+        Follow nextOffset for further results; a direct note_id reads the complete text.
+        """
+        sid = await current_save_id()
+        context = await ready_memory_context(sid)
+        return {"saveId": sid, **memory_for_run().recall(
+            sid, query, **context, kind=kind, note_id=note_id, offset=offset, limit=limit)}
+
+    @mcp.tool()
+    async def forget_memory(note_id: str, reason: str = "") -> dict[str, Any]:
+        """Withdraw a remembered note or learned method from future recall; keep its revision history."""
+        sid = await current_save_id()
+        context = await ready_memory_context(sid)
+        directory = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data"
+        with cache_lock(directory / "life-turn.json"):
+            assert_life_turn_current(allow_control=True, lease_locked=True)
+            try:
+                status, result = memory_for_run().forget_note(
+                    sid, note_id, companion_id=context["companion_id"], reason=reason)
+            except ValueError as ex:
+                raise ToolError(str(ex)) from None
+        return {"status": status, "saveId": sid, **result}
+
     @mcp.tool()
     async def remember_intent(
         intent: str,
@@ -2554,7 +2658,7 @@ def create_mcp_server(
             remaining_unwatered = None
             if fresh and fresh_snap:
                 fw = fresh_snap.get("payload", {}).get("farmWork") or {}
-                remaining_unwatered = fw.get("tilledUnwateredCount")
+                remaining_unwatered = fw.get("tilledUnwateredCount" if include_empty_tiles else "cropUnwateredCount")
 
             response = {
                 "status": "executed",
@@ -2564,6 +2668,10 @@ def create_mcp_server(
                 "skippedCount": res.get("skippedCount", 0),
                 "failedCount": res.get("failedCount", 0),
                 "remainingUnwateredCount": remaining_unwatered,
+                "remainingCountScope": "all_tilled_soil" if include_empty_tiles else "crops_only",
+                "remainingCropUnwateredCount": fw.get("cropUnwateredCount") if fresh and fresh_snap else None,
+                "remainingEmptySoilUnwateredCount": (max(0, fw["tilledUnwateredCount"] - fw["cropUnwateredCount"])
+                    if fresh and fresh_snap and type(fw.get("tilledUnwateredCount")) is int and type(fw.get("cropUnwateredCount")) is int else None),
                 "fresh": fresh,
                 "details": res.get("details"),
                 "error": res.get("error"),
@@ -2628,7 +2736,7 @@ def create_mcp_server(
             remaining_unwatered = None
             if fresh and fresh_snap:
                 fw = fresh_snap.get("payload", {}).get("farmWork") or {}
-                remaining_unwatered = fw.get("tilledUnwateredCount")
+                remaining_unwatered = fw.get("tilledUnwateredCount" if include_empty_tiles else "cropUnwateredCount")
 
             details = res.get("details") or {}
             failed_tiles = details.get("failedTiles") or []
@@ -2662,6 +2770,10 @@ def create_mcp_server(
                 "failedCount": res.get("failedCount", 0),
                 "targetCount": res.get("targetCount", 0),
                 "remainingUnwateredCount": remaining_unwatered,
+                "remainingCountScope": "all_tilled_soil" if include_empty_tiles else "crops_only",
+                "remainingCropUnwateredCount": fw.get("cropUnwateredCount") if fresh and fresh_snap else None,
+                "remainingEmptySoilUnwateredCount": (max(0, fw["tilledUnwateredCount"] - fw["cropUnwateredCount"])
+                    if fresh and fresh_snap and type(fw.get("tilledUnwateredCount")) is int and type(fw.get("cropUnwateredCount")) is int else None),
                 "fresh": fresh,
                 "details": res.get("details"),
                 "error": res.get("error"),
@@ -2719,6 +2831,8 @@ def create_mcp_server(
         """Query farm chests: coordinates, capacity, freeSlots, items.
         Supports filtering by item_id, name, is_seed, and pagination (default 20/page).
         Concise summary by default (items truncated per chest); full if detail=True.
+        Positions identify currently observed chests, not persistent chest identities
+        or a history of who moved a chest or removed its contents.
         """
         try:
             res = await sched.query_chests()
@@ -2805,6 +2919,7 @@ def create_mcp_server(
 
             return {
                 "chests": paged_chests,
+                "observationScope": "Current Farm chest positions and contents; movement and item-transfer history are not observed here.",
                 "totalChests": len(all_chests),
                 "matchingChests": len(filtered_chests),
                 "page": safe_page,
@@ -3021,7 +3136,7 @@ def create_mcp_server(
                 chest_y=chest_y,
                 item_ids=item_ids,
                 location_id=location_id,
-                **({"items": items} if items is not None else {}),
+                **({"items": _item_dicts(items)} if items is not None else {}),
             )
 
             if res.get("status") == "executing" or res.get("terminalState") == "running":
@@ -3710,11 +3825,13 @@ def create_mcp_server(
 
     @mcp.tool()
     async def observe_farming_helpers(location_id: str = "Farm") -> dict[str, Any]:
-        """Observe the farming-help group only: native refill-water tiles, ground items, fertilized tiles, choppable trees.
+        """Observe nearby refill tiles, collectible groundItems, standing groundObjects and choppable trees.
 
-        This is the on-demand group surface: it never dumps the backpack or chests.
-        Use it to choose explicit tiles for refill_watering_can / clear_debris /
-        pickup_items / chop_tree.
+        groundItems are existing drops/collectibles for pickup_items. groundObjects
+        are weeds, stones, twigs or placed objects; their stack describes the object,
+        not a material yield. Use their clearTool when choosing clearance work.
+        For map-wide collectible items use observe_production. This nearby scan
+        also provides refill_watering_can/chop_tree targets and carried tools.
         """
         try:
             return await sched.query_farming_helpers(location_id=location_id)
@@ -3813,11 +3930,25 @@ def create_mcp_server(
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
+    async def rest(target_stamina: float) -> dict[str, Any]:
+        """Rest the companion in a real bed until the chosen stamina target, then wake.
+
+        Choose the target from remaining work; full recovery is optional. Player mode uses native sleep instead.
+        """
+        try:
+            return await sched._execute_native_action("rest", {"locationId": "FarmHouse", "targetStamina": target_stamina},
+                                                      tiles=[], timeout_seconds=600)
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
     async def observe_production(location_id: str = "Farm") -> dict[str, Any]:
-        """Inspect a real map's ground items/refill sources and companion edible foods.
+        """Inspect existing drops/collectible produce, refill sources and edible foods.
 
         Coop eggs are ground items: use their observed tiles with pickup_items;
         animal currentProduce is not evidence of an egg's ground position.
+        Weeds, stones, twigs and placed chests are not pickup work; inspect
+        farming helpers or farm space when a clearing task needs those objects.
         Choose subsequent food/refill/material tasks from these facts as needed.
         """
         try:
@@ -4039,6 +4170,8 @@ def create_mcp_server(
         """Pick up dropped debris / spawned items on explicitly selected tiles.
 
         Uses the native debris collect path and the native ground-item check action.
+        completedCount counts handled targets; effects.collectedItems reports accepted
+        items with their own itemId, quality and stack, including partial collection.
         """
         try:
             res = await sched.pickup_items(tiles=_tile_dicts(tiles), location_id=location_id)
@@ -4504,6 +4637,85 @@ def create_mcp_server(
                     **({"handoff": "ack_async", "executionStarts": "after_current_turn"} if not external_codex else {})}
         return guarded
 
+    async def execute_observed_action(name, args):
+        # Keep the native single-action controller and current turn authority,
+        # without creating a persisted plan or waiting for the model to exit.
+        assert_life_turn_current()
+        if external_codex and resolved_surface == "light":
+            from .external_connection import read_binding
+            root = Path(getattr(sched, "run_dir", None) or run_dir or ".")
+            binding = read_binding(root)
+            if binding and binding.get("enabled", True):
+                raise ToolError("ORIGINAL_PARTNER_CONNECTED: disconnect the original partner adapter before manual interaction")
+            source = os.environ.get("STARDEW_CONNECTION_SOURCE")
+            if source is None:
+                try:
+                    source = json.loads((root / "config.json").read_text(encoding="utf-8-sig")).get("ConnectionSource")
+                except (OSError, ValueError):
+                    source = None
+            if source != "external":
+                raise ToolError("MANUAL_CONNECTION_REQUIRED: select the external connection source in game first; tools alone do not wake a conversation")
+            await begin_game_turn()
+        sid = await current_save_id()
+        store = work_for_run()
+        try:
+            state = store.state(sid)
+            if state.paused:
+                raise WorkStateError("WORK_STOPPED: work is paused")
+            if not decision_token() and os.environ.get("STARDEW_LIFE_TURN_ID"):
+                # A conversation may start while native work is busy. Acquire
+                # authority at dispatch only once that work has actually settled.
+                token = uuid.uuid4().hex
+                store.begin_decision(sid, token, require_idle=True,
+                                     request_id=os.environ["STARDEW_LIFE_TURN_ID"])
+                os.environ["STARDEW_DECISION_TOKEN"] = token
+                state = store.state(sid)
+            store._assert_decision_valid(state, decision_token())
+        except WorkStateError as ex:
+            raise ToolError(str(ex)) from None
+        await validate_actor_operation(name)
+        goal = next((g for g in state.goals if g.id == (state.decision.get("goalScope") or state.decision.get("goalId"))), None)
+        args = bind_execution_scope_params(name, args, goal.constraints if goal else {})
+        validated = validate_base_arguments(name, args, for_plan=True)
+        parsed = base_metadata[name].arg_model.model_validate(validated)
+        previous_wait = getattr(sched, "await_terminal_results", False)
+        sched.await_terminal_results = True
+        try:
+            result = await native_tools[name](**{key: getattr(parsed, key) for key in type(parsed).model_fields})
+            if name in {"navigate_to", "ship_items"} and isinstance(result, dict) and result.get("terminalState") in {"failed", "rejected"}:
+                try:
+                    status = await sched.get_status()
+                    pose = status.get("companion") or {}
+                    space = await sched.query_farm_space(location_id=pose.get("locationId") or args.get("location_id") or "Farm")
+                    x, y = pose.get("tileX"), pose.get("tileY")
+                    nearby = [o for o in space.get("occupants", []) if type(x) is int and type(y) is int
+                              and abs(o.get("x", -1000) - x) <= 4 and abs(o.get("y", -1000) - y) <= 4]
+                    result["obstructionObservation"] = {"position": pose, "nearbyOccupants": nearby,
+                        "occupantsTruncated": space.get("occupantsTruncated"),
+                        "nextStep": "Decide whether this obstruction can and should be cleared under player preferences; do not repeat the same blocked route blindly."}
+                except Exception as ex:
+                    result["obstructionObservation"] = {"status": "unavailable", "error": str(ex)}
+            if name in {"harvest_auto", "harvest_tiles", "chop_tree", "clear_debris", "cut_grass", "pickup_items"} and isinstance(result, dict):
+                try:
+                    snapshot = getattr(sched, "latest_snapshot", None) or {}
+                    companion = (snapshot.get("payload") or {}).get("companion") or {}
+                    location = args.get("location_id") or companion.get("locationId") or "Farm"
+                    ground = await sched.query_production(location_id=location)
+                    inventory = await sched.query_inventory()
+                    result["afterWork"] = {
+                        "ground": {"locationId": ground.get("locationId"), "scope": "map",
+                                   "capturedRevision": ground.get("capturedRevision"),
+                                   "groundItems": [item for item in ground.get("groundItems", [])
+                                                   if item.get("canBeGrabbed") or item.get("isDropped")],
+                                   "truncated": ground.get("groundItemsTruncated", True)},
+                        "inventory": inventory,
+                        "interpretation": "Current observations after the action, not an inventory-delta receipt. Automatic pickup, the player and other world changes may affect these items; choose remaining work from the current scene."}
+                except Exception as ex:
+                    result["afterWork"] = {"status": "unavailable", "error": str(ex)}
+            return result
+        finally:
+            sched.await_terminal_results = previous_wait
+
     def protect_external_observation(fn):
         @functools.wraps(fn)
         async def guarded(*args, **kwargs):
@@ -4515,6 +4727,179 @@ def create_mcp_server(
                     raise ToolError("JOB_IN_PROGRESS: use work_plan_overview for persisted progress; native observation is available after the job settles")
             return await fn(*args, **kwargs)
         return guarded
+
+    @mcp.tool()
+    async def inspect_capabilities(capability: str | None = None, version: str | None = None,
+                                   native_type: str | None = None, mod_id: str | None = None,
+                                   member: str | None = None, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+        """Discover learned native abilities, their source/guidance/schema, or actual game and SMAPI API signatures.
+
+        With capability/version, read that persisted package; omit version for its saved active version.
+        With native_type (e.g. Furniture) or mod_id, inspect the loaded native API, authoring interface
+        and C# example. Prefer an exact type name; ambiguous matches return candidate names.
+        Filter members by name with member, or continue with offset/limit when hasMore is true.
+        Without filters, list loaded abilities and available versions.
+        Discover an existing ability before developing a new one. API signatures describe available
+        calls; choose native gameplay methods and use the program-bound actor.
+        """
+        assert_life_turn_current(allow_control=True)
+        store = capabilities_for_run()
+        if capability:
+            result = store.inspect(capability, version)
+            package = store.package_path(capability, result["manifest"]["version"])
+            return {**result, "source": (package / "Adapter.cs").read_text(encoding="utf-8")}
+        if native_type or mod_id:
+            if offset < 0 or not 1 <= limit <= 40:
+                raise ToolError("Use offset >= 0 and limit from 1 to 40 to read API pages.")
+            discovery = await extension_host_call(sched.discover_extension_api, mod_id, native_type,
+                                                  member=member, offset=offset, limit=limit)
+            authoring = dict(discovery.get("authoring") or {})
+            # Build references stay local to the builder; the model needs the API contract.
+            authoring.pop("references", None)
+            authoring.pop("hostAssembly", None)
+            return {**discovery, "authoring": authoring}
+        packages = []
+        for package in store.list_packages():
+            if package.get("error"):
+                packages.append(package)
+                continue
+            manifest = package.get("manifest") or {}
+            packages.append({**{key: manifest.get(key) for key in ("id", "version", "title", "kind")},
+                             "status": (package.get("verification") or {}).get("status"),
+                             "effectVerifiedByHost": False,
+                             "details": "inspect_capabilities(capability=id, version=version)"})
+        return {"host": await extension_host_call(sched.list_extensions), "packages": packages}
+
+    @mcp.tool()
+    async def develop_capability(capability: str, version: str, title: str, kind: Literal["query", "action"],
+                                 source: str, entry_type: str, input_schema: dict[str, Any], guidance: str,
+                                 dependencies: list[dict[str, str]] | None = None,
+                                 permission_quote: str | None = None, notice_id: str | None = None) -> dict[str, Any]:
+        """Compile a missing native ability from C# source after discussing it with the player.
+
+        Use consult.inspect_capabilities to read the actual API and IGameExtension authoring example.
+        Both query and action kinds implement the same IGameExtension interface; there is no separate query interface.
+        input_schema is a JSON object schema. Use native interactions,
+        current actor and observations. guidance explains purpose, conditions, inputs and actual effects.
+        Quote the player's explicit permission in permission_quote; a linked decision answer also works.
+        Existing permission covers revisions of the same ability and scope. Each build has a new version.
+        Compilation is separate from gameplay; on success use manage_capability(action='try'), invoke
+        learned_query/learned_action, then action='keep' to persist a successfully used version.
+        Compiler diagnostics support correction; earlier installed versions stay available.
+        """
+        store = capabilities_for_run()
+        previous = store.recent_learning_provenance(capability, save_id=await current_save_id(),
+                                                    kind=kind, dependencies=dependencies)
+        try:
+            old = store.inspect(capability)
+            if previous is None and old["manifest"]["kind"] == kind and old["manifest"].get("dependencies", []) == (dependencies or []):
+                previous = old.get("provenance")
+        except CapabilityError:
+            pass
+        provenance = await learning_permission(permission_quote, notice_id, previous)
+        discovery = await extension_host_call(sched.discover_extension_api)
+        authoring = discovery.get("authoring")
+        if not isinstance(authoring, dict):
+            raise ToolError("Native authoring information is unavailable; inspect the host result before retrying.")
+        result = await store.build({"id": capability, "version": version, "title": title, "kind": kind,
+            "source": source, "entryType": entry_type, "inputSchema": input_schema,
+            "guidance": guidance, "dependencies": dependencies or []}, authoring, provenance=provenance)
+        assert_life_turn_current(allow_control=True)
+        return result
+
+    @mcp.tool()
+    async def prepare_capability_builder(permission_quote: str, notice_id: str | None = None) -> dict[str, Any]:
+        """Prepare the local C# compiler once when develop_capability reports setup_required.
+
+        Uses an existing compatible SDK when available; otherwise downloads the official SDK into
+        the ability directory and checks its published checksum. Quote the player's agreement to
+        set up the learning environment. Subsequent builds reuse it.
+        """
+        await learning_permission(permission_quote, notice_id)
+        result = await capabilities_for_run().prepare_builder()
+        assert_life_turn_current(allow_control=True)
+        return result
+
+    @mcp.tool()
+    async def manage_capability(action: Literal["try", "keep", "rollback"], capability: str,
+                                version: str | None = None) -> dict[str, Any]:
+        """Load a compiled version for trial, keep its successful native use, or restore a previous version.
+
+        try requires version and hot-loads the agreed package in the current game. Execute it through
+        learned_query or learned_action and inspect the native result. keep saves that successfully
+        used version for subsequent games. rollback restores the previous saved working version.
+        Loading never completes the player's original goal; continue from current observations.
+        Invocation success is the adapter's report. Use game observations to judge its effect and
+        whether to keep it; other players may also change the world during the operation.
+        """
+        assert_life_turn_current()
+        store = capabilities_for_run()
+        saved_before = store.catalog()["capabilities"].get(capability)
+        if action == "rollback":
+            previous = (saved_before or {}).get("previousVersion")
+            if not previous:
+                raise ToolError("No previous saved version is available.")
+            version = previous
+        if not version:
+            raise ToolError("Choose the version returned by develop_capability or inspect_capabilities.")
+        package = store.inspect(capability, version)
+        if not package.get("provenance", {}).get("requestId"):
+            raise ToolError("This package has no recorded player discussion.")
+        store.verify_artifact(capability, version)
+        if action in {"keep", "rollback"} and (package.get("verification") or {}).get("status") != "used_successfully":
+            raise ToolError("Try this version and inspect a successful native invocation before keeping it.")
+        receipt = await extension_host_call(sched.load_extension, f"{capability}/{version}", action != "try")
+        if action == "try":
+            verification = store.record_native_load(capability, version, receipt)
+        else:
+            verification = store.record_native_persist(capability, version, receipt, saved_before=saved_before)
+        return {"capability": capability, "version": version, "native": receipt, "verification": verification}
+
+    async def invoke_learned(capability: str, version: str, arguments: dict[str, Any], kind: str) -> dict[str, Any]:
+        import jsonschema
+
+        # Both operations run native adapter code and honor the player's stop.
+        assert_life_turn_current()
+        store = capabilities_for_run()
+        manifest = store.verify_artifact(capability, version)
+        if manifest["kind"] != kind:
+            raise ToolError(f"This capability is a {manifest['kind']}; use its corresponding learned operation.")
+        try:
+            jsonschema.validate(arguments, manifest["inputSchema"])
+        except (jsonschema.ValidationError, jsonschema.SchemaError) as ex:
+            raise ToolError(f"Invalid capability arguments: {ex.message}") from None
+        result = await extension_host_call(sched.invoke_extension, capability, version, arguments, kind)
+        receipt = result.get("details") or {}
+        if receipt.get("succeeded") is True:
+            result = {**result, "learning": store.record_native_validation(capability, version, receipt)}
+        return result
+
+    @mcp.tool()
+    async def learned_query(capability: str, version: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run a loaded native query adapter, honoring pause/control like other native executions.
+
+        Get its version, input schema and guidance from consult.inspect_capabilities.
+        Query describes its purpose; the adapter runs native code, not a read-only snapshot.
+        """
+        return await invoke_learned(capability, version, arguments, "query")
+
+    @mcp.tool()
+    async def learned_action(capability: str, version: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Execute a loaded native ability as the current actor. Read its schema/guidance first; returns the native terminal result and observations."""
+        return await invoke_learned(capability, version, arguments, "action")
+
+    @mcp.tool()
+    async def say_to_player(text: str) -> dict[str, Any]:
+        """Speak naturally to the player now. Use for conversation or a needed question, not action progress; progress is already on the HUD."""
+        assert_life_turn_current(allow_control=True)
+        request_id = os.environ.get("STARDEW_LIFE_TURN_ID", "")
+        sid = os.environ.get("STARDEW_LIFE_SAVE_ID", "")
+        if not request_id or not sid or not text.strip():
+            raise ToolError("A current game conversation and nonempty text are required")
+        from .snapshot_cache import write_cache
+        path = Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-controls" / f"{request_id}--{time.time_ns()}.json"
+        write_cache(path, {"saveId": sid, "action": "speak", "text": text.strip()})
+        return {"status": "queued"}
 
     def refresh_turn_context(fn):
         @functools.wraps(fn)
@@ -4530,21 +4915,33 @@ def create_mcp_server(
                         os.environ[key] = str(context[key])
                     else:
                         os.environ.pop(key, None)
-            return await fn(*args, **kwargs)
-        return guarded
-
-    def admit_turn(name, fn):
-        @functools.wraps(fn)
-        async def guarded(*args, **kwargs):
-            if resolved_surface == "life" and name not in CACHED_TURN_TOOLS:
-                raise ToolError("WORK_DISPATCH_UNAVAILABLE: current work or player control owns execution. "
-                                "Use cached get_status/work_plan_overview; retain the player's next instruction. "
-                                "Do not retry dispatch or wait for tools to reload in this turn.")
-            return await fn(*args, **kwargs)
+            def player_updates():
+                turn_id = os.environ.get("STARDEW_LIFE_TURN_ID")
+                sid = os.environ.get("STARDEW_LIFE_SAVE_ID")
+                if not turn_id or not sid:
+                    return []
+                assert_life_turn_current(allow_control=True)
+                from .turn_messages import exchange
+                return exchange(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "turn-messages.json",
+                                turn_id, sid, take=True)
+            if fn is execute_observed_action:
+                updates = player_updates()
+                if updates:
+                    return {"status": "player_update", "actionExecuted": False,
+                            "playerMessages": updates,
+                            "nextStep": "Respond to the player's new request and reconsider this action before dispatching."}
+            result = await fn(*args, **kwargs)
+            updates = player_updates() if isinstance(result, dict) else []
+            if updates:
+                result = {**result, "playerMessages": updates,
+                          "nextStep": "Use the new player request to choose the next action."}
+            return result
         return guarded
 
     readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "read_guidance", "read_reload_history", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
     declared_tools = {t.name: t for t in mcp._tool_manager.list_tools()}
+    readonly.update({"recall_memory", "inspect_capabilities", "learned_query"})
+    native_tools = {name: tool.fn for name, tool in declared_tools.items()}
     wire_param_shapes = {}
     def wire_type(shape):
         # Generic operation fields need concrete converter types. Conditional
@@ -4576,10 +4973,12 @@ def create_mcp_server(
         # those open-world. Write/destructive defaults remain conservative.
         passive = tool.name in {"get_status", "query_inventory", "work_plan_overview",
                                 "discover_capabilities", "read_guidance", "read_reload_history", "autonomy_status", "query_wiki"}
+        passive = passive or tool.name == "recall_memory"
         tool.annotations = ToolAnnotations(readOnlyHint=passive, destructiveHint=not passive,
                                            openWorldHint=tool.name in {"query_wiki", "call_capability"})
         tool.description = "Stardew Valley (SMAPI), current saved game. " + tool.description
-        exempt = {"answer_player_decision", "player_control", "request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "record_decision_note", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command", "work_plan_overview"}
+        exempt = {"say_to_player", "answer_player_decision", "player_control", "request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "record_decision_note", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command", "work_plan_overview"}
+        exempt.update({"save_memory", "save_method", "forget_memory", "develop_capability", "manage_capability", "prepare_capability_builder"})
         if tool.name not in exempt and tool.name not in readonly and not tool.name.startswith(("query_", "get_", "list_", "discover_", "observe_")):
             tool.fn = protect_job(tool.name, tool.fn)
         if tool.name.startswith(("query_", "observe_")) and tool.name != "query_wiki":
@@ -4594,23 +4993,28 @@ def create_mcp_server(
         if os.environ.get("STARDEW_MCP_WIRE_STYLE") == "mcode":
             tool.parameters = mcode_tool_schema(tool.name, tool.parameters,
                 wire_param_shapes if tool.name in {"submit_plan", "call_capability", "manage_plan"} else None)
-    for tool in mcp._tool_manager.list_tools():
-        tool.fn = admit_turn(tool.name, tool.fn)
-    base_tools = {name: admit_turn(name, fn) for name, fn in base_tools.items()}
-    if resolved_surface in {"light", "life"}:
+    if resolved_surface == "light":
         register_game_tools(mcp, base_tools, declared_tools, _PLAN_OPERATION_CALLS,
-                            current_save=current_save_id, store_for_run=work_for_run,
-                            read_only=resolved_surface == "life")
+                            execute_action=refresh_turn_context(execute_observed_action))
+        if external_codex:
+            status_tool = mcp._tool_manager.get_tool("get_status")
+            original_status = status_tool.fn
+
+            @functools.wraps(original_status)
+            async def manual_connection_status(*args, **kwargs):
+                result = await original_status(*args, **kwargs)
+                return {**result, "connection": {"mode": "manual", "automaticWake": False,
+                    "instruction": "Tools alone do not receive game chat or wake this conversation. Select the external source before manual actions; disconnect any automatic partner first."}}
+
+            status_tool.fn = manual_connection_status
         if os.environ.get("STARDEW_MCP_WIRE_STYLE") == "mcode":
             for tool in mcp._tool_manager.list_tools():
                 if tool.name in GAME_TOOLS:
                     tool.parameters = mcode_tool_schema(tool.name, tool.parameters)
     if resolved_surface == "light":
-        allowed = LIGHT_TOOLS | ({"begin_game_turn", "work_plan_overview"} if external_codex else set())
+        allowed = LIGHT_TOOLS
     elif resolved_surface == "internal":
         allowed = INTERNAL_TOOLS
-    elif resolved_surface == "life":
-        allowed = LIFE_TOOLS
     else:
         allowed = None
     if allowed is not None:
@@ -4648,7 +5052,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--surface",
         choices=["full", "light", "internal", "life"],
         default=None,
-        help="Tool exposure surface: 'full' (generic default), 'light' (game), 'internal' (plan worker) or 'life' (read-only companion chat)",
+        help="Tool exposure surface: 'full' (generic default), 'light' (game), 'internal' (plan worker) or 'life' (legacy alias for light)",
     )
     parser.add_argument(
         "--light",

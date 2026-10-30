@@ -1247,6 +1247,9 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "activeCommandId": {
+                      "type": "string"
                     }
                   },
                   "required": [

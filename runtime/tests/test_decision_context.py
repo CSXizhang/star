@@ -399,6 +399,8 @@ def test_companion_and_memory_blocks_attach_when_given() -> None:
     # Rendered prompt carries the effective agreements for the work turn (§4).
     rendered = render_decision_context(context)
     assert "每天浇水" in rendered
+    assert "喜欢草莓" in rendered
+    assert context["preferences"] == memory["preferences"]
     assert "lively" in rendered
 
 
@@ -417,3 +419,21 @@ def test_snapshot_companion_section_does_not_clash_with_profile() -> None:
     )
     assert context2["stamina"]["current"] == 100
     assert context2["companion"]["personality"] == "calm"
+
+
+def test_memory_correction_and_removal_are_delivered_incrementally():
+    from stardew_ai_runtime.decision_context import build_incremental_context
+
+    original = build_decision_context({}, memory={"relevantNotes": [{"id": "box", "text": "门口箱"}],
+                                                "agreements": [{"text": "留在门口箱"}],
+                                                "preferences": [{"text": "喜欢草莓"}]})
+    _, delivered = build_incremental_context(None, original)
+    corrected = build_decision_context({}, memory={"relevantNotes": [{"id": "box", "text": "屋里箱"}]})
+    delta, corrected_state = build_incremental_context(delivered, corrected)
+    assert delta["changes"]["relevantNotes"][0]["text"] == "屋里箱"
+    assert delta["changes"]["agreements"] is None
+    assert delta["changes"]["preferences"] is None
+    # An unconfirmed delivery must resend the correction from the old baseline.
+    assert build_incremental_context(delivered, corrected)[0] == delta
+    removed = build_decision_context({}, memory={"relevantNotes": []})
+    assert build_incremental_context(corrected_state, removed)[0]["changes"]["relevantNotes"] == []

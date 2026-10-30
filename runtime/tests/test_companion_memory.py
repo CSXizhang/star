@@ -37,7 +37,7 @@ def test_player_add_increments_revision(tmp_path: Path) -> None:
     assert result2["reason"] == "STALE_REVISION"
 
 
-def test_agreement_limit_rejects_with_memory_full(tmp_path: Path) -> None:
+def test_agreements_are_not_lost_at_legacy_capacity(tmp_path: Path) -> None:
     store = _store(tmp_path)
     revision = 0
     for i in range(15):
@@ -51,8 +51,8 @@ def test_agreement_limit_rejects_with_memory_full(tmp_path: Path) -> None:
         "Save1", kind="agreement", text="超限", source="player",
         game_date="1:spring:1", expected_revision=revision,
     )
-    assert status == "rejected"
-    assert result["reason"] == "MEMORY_FULL"
+    assert status == "confirmed"
+    assert len(store.list("Save1")["entries"]) == 16
 
 
 def test_event_add_dedupes_by_command_id(tmp_path: Path) -> None:
@@ -71,7 +71,7 @@ def test_event_add_dedupes_by_command_id(tmp_path: Path) -> None:
     assert len(store.list("Save1")["entries"]) == 1
 
 
-def test_event_limit_evicts_oldest(tmp_path: Path) -> None:
+def test_events_remain_available_for_recall(tmp_path: Path) -> None:
     store = _store(tmp_path)
     for i in range(21):
         status, result = store.add(
@@ -81,9 +81,9 @@ def test_event_limit_evicts_oldest(tmp_path: Path) -> None:
         assert status == "confirmed"
     entries = store.list("Save1")["entries"]
     events = [e for e in entries if e["kind"] == "event"]
-    assert len(events) == 20
+    assert len(events) == 21
     texts = {e["text"] for e in events}
-    assert "事件0" not in texts  # oldest evicted first
+    assert "事件0" in texts
     assert "事件20" in texts
 
 
@@ -113,7 +113,7 @@ def test_events_cannot_be_corrected(tmp_path: Path) -> None:
     assert result["reason"] == "CANNOT_EDIT_EVENT"
 
 
-def test_render_for_context_limits(tmp_path: Path) -> None:
+def test_render_keeps_recent_continuity_and_history_is_recallable(tmp_path: Path) -> None:
     store = _store(tmp_path)
     revision = 0
     for i in range(10):
@@ -122,12 +122,13 @@ def test_render_for_context_limits(tmp_path: Path) -> None:
                          command_id=f"c-{i}")
         revision = r["memoryRevision"]
     render = store.render_for_context("Save1")
-    assert len(render["recentEvents"]) == 8  # latest ≤8
+    assert len(render["recentEvents"]) == 3
     assert render["recentEvents"][-1]["text"] == "事件9"
-    assert render["recentEvents"][0]["text"] == "事件2"
+    assert render["recentEvents"][0]["text"] == "事件7"
+    assert len(store.recall("Save1", companion_id="")["entries"]) == 10
 
 
-def test_render_budget_truncates_agreements_and_preferences(tmp_path: Path) -> None:
+def test_render_preserves_complete_agreements(tmp_path: Path) -> None:
     store = _store(tmp_path)
     revision = 0
     for _ in range(15):
@@ -136,8 +137,8 @@ def test_render_budget_truncates_agreements_and_preferences(tmp_path: Path) -> N
         revision = r["memoryRevision"]
     render = store.render_for_context("Save1")
     total = sum(len(e["text"]) for e in render["agreements"])
-    assert total <= 1200
-    assert 0 < len(render["agreements"]) < 15
+    assert total == 1350
+    assert len(render["agreements"]) == 15
 
 
 def test_deleted_entry_leaves_context(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
@@ -20,7 +20,6 @@ def test_mcp_reader_and_bridge_publication_share_cache_mutex(tmp_path, monkeypat
     bridge._latest_snapshot_payload = {"observedAt": captured, "world": {}, "companion": {}}
     bridge._latest_snapshot_revision = 1
     bridge._write_life_snapshot("farm")
-    server = create_mcp_server(run_dir=tmp_path, surface="life")
     path = tmp_path / "data/life-snapshot.json"
     entered, release, writer_done = threading.Event(), threading.Event(), threading.Event()
     original_read = Path.read_text
@@ -38,7 +37,7 @@ def test_mcp_reader_and_bridge_publication_share_cache_mutex(tmp_path, monkeypat
 
     def read():
         try:
-            results.append(asyncio.run(server.call_tool("get_status", {}))[1])
+            results.append(read_cache(path))
         except BaseException as error:
             errors.append(error)
 
@@ -78,8 +77,9 @@ def test_new_published_lease_rejects_old_mcp_turn(tmp_path, monkeypatch):
         bridge._life_turn_lease("A", "farm")
         monkeypatch.setenv("STARDEW_LIFE_TURN_ID", "A")
         monkeypatch.setenv("STARDEW_LIFE_SAVE_ID", "farm")
-        server = create_mcp_server(run_dir=tmp_path, surface="life")
-        await server.call_tool("get_status", {})
+        scheduler = MagicMock(run_dir=tmp_path)
+        scheduler.get_status = AsyncMock(return_value={"saveId": "farm"})
+        server = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="life")
         bridge._life_turn_lease("B", "farm")
         with pytest.raises(ToolError, match="STALE_CONVERSATION"):
             await server.call_tool("manage_arrangements", {"change": {"manage_milestones": {"action": "propose", "title": "Old turn"}}})

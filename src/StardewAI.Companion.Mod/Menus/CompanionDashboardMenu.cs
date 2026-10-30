@@ -40,7 +40,7 @@ public sealed class CompanionDashboardMenu : IClickableMenu
         _profileLoaded = state.HasProfileState; _revision = state.ConversationRevision;
         _usage = tab == 2;
         _name = new TextBox(Game1.content.Load<Texture2D>(@"LooseSprites\textBox"), null, Game1.smallFont, Game1.textColor)
-            { limitWidth = false, textLimit = 20, Text = state.CompanionName };
+            { limitWidth = false, textLimit = 20, Text = state.ProfileCompanionName };
         Layout();
     }
 
@@ -237,7 +237,7 @@ public sealed class CompanionDashboardMenu : IClickableMenu
         base.update(time);
         if (!_profileLoaded && _state.HasProfileState)
         {
-            _profileLoaded = true; _name.Text = _state.CompanionName;
+            _profileLoaded = true; _name.Text = _state.ProfileCompanionName;
             _style = _state.PlayStyle; _personality = _state.Personality; _frequency = _state.CareFrequency;
         }
         if (_savingRevision is int revision && _state.PendingProfileSetRequestId == null)

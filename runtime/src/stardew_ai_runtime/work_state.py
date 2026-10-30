@@ -732,6 +732,24 @@ class WorkStore:
             self._load()
             return self._states.setdefault(save_id, SaveWorkState())
 
+    def retire_legacy_execution(self) -> None:
+        """Retain player intent, but never resume pre-upgrade action queues."""
+        self.reload()
+        for save_id in list(self._states):
+            def retire(state: SaveWorkState) -> None:
+                # Historical evidence stays archived; it is not today's progress.
+                state.archive.extend({"task": asdict(task), "reason": "world_observation_execution"}
+                                     for task in state.tasks)
+                state.archive = state.archive[-100:]
+                state.tasks.clear()
+                state.decision.clear()
+                if state.last_job.get("status") in {"unknown", "running", "pending", "waiting", "executing"}:
+                    state.last_job.clear()
+                state.branch_failures.clear()
+                for request in state.requests:
+                    request["taskIds"] = []
+            self._mutate(save_id, retire)
+
     def request_player_decision(self, save_id: str, goal_id: str, message: str, choices: list[str] | None = None) -> dict[str, Any]:
         """Explicit model signal, separate from routine completion text."""
         text = message.strip()
@@ -1110,7 +1128,8 @@ class WorkStore:
             "player to close it. Only a verified preset day boundary may end it."
         )
 
-    def complete_goal(self, save_id: str, goal_id: str, *, verified_native_boundary: dict | None = None) -> Goal:
+    def complete_goal(self, save_id: str, goal_id: str, *, verified_native_boundary: dict | None = None,
+                      completion_observation: dict | None = None) -> Goal:
         """Close the model's project assessment without inventing native effects."""
         preset_finalize = self._check_preset_completion(save_id, goal_id)
         def mutate(state: SaveWorkState) -> Goal:
@@ -1130,11 +1149,13 @@ class WorkStore:
                             and isinstance(verified_native_boundary.get("startDay"), int)
                             and isinstance(verified_native_boundary.get("endDay"), int)
                             and verified_native_boundary["endDay"] > verified_native_boundary["startDay"])
-            if not completed and not restored:
-                raise WorkStateError("PROJECT_NO_EXECUTION: no completed native task evidence; cancel an unneeded goal instead")
+            if not completed and not restored and completion_observation is None:
+                raise WorkStateError("PROJECT_NO_EXECUTION: observe the game before assessing completion")
             goal.status = "completed"
             goal.project = {**goal.project, "phase": "completed", "completionAssessment": "model-reviewed",
                             "completedTaskIds": completed[-64:]}
+            if completion_observation is not None:
+                goal.project["completionObservation"] = completion_observation
             goal.updated_at = _now_iso()
             goal.epoch += 1
             self._retire_child_authorizations(state, goal)
@@ -1957,6 +1978,8 @@ class WorkStore:
     @staticmethod
     def effect_summary(effects: list[dict[str, Any]]) -> str:
         """Describe every confirmed native category, without using the job title."""
+        pickup_effects = [e for e in effects if isinstance(e, dict)
+                          and (e.get("state") == "picked-up" or e.get("collectedItems"))]
         excluded = {"skipped", "unknown", "failed", "rejected"}
         navigation = [e for e in effects if isinstance(e, dict) and (
             e.get("state") in {"navigated", "arrived"} or
@@ -1968,7 +1991,7 @@ class WorkStore:
                          and e["endDay"] == e["startDay"] + 1]
         effects = [e for e in effects if isinstance(e, dict)
                    and e.get("state") is not None and e.get("state") not in excluded]
-        if not effects and not navigation and not native_sleeps:
+        if not effects and not navigation and not native_sleeps and not pickup_effects:
             return "未确认实际变化"
         states = [e.get("state") for e in effects]
         summaries = []
@@ -2007,9 +2030,23 @@ class WorkStore:
         tiles(("fertilized",), "已施肥")
         tiles(("harvested",), "已收获")
         tiles(("placed",), "已放置")
+        handled.add("picked-up")
+        picked_count = 0
+        unmeasured_pickups = 0
+        for effect in pickup_effects:
+            if isinstance(effect.get("collectedItems"), list):
+                picked_count += sum(item["stack"] for item in effect["collectedItems"])
+            elif effect.get("stack") is not None:
+                picked_count += int(effect["stack"])
+            else:
+                unmeasured_pickups += 1
+        if picked_count:
+            summaries.append(f"已拾取 {picked_count} 件")
+        if unmeasured_pickups:
+            summaries.append(f"另有 {unmeasured_pickups} 处拾取完成，物品数量未报告")
         for state, label in (("withdrawn", "已取出"), ("deposited", "已入箱"), ("shipped", "已出货"),
                              ("inserted", "已投入原料"), ("collected", "已收取"),
-                             ("picked-up", "已拾取"), ("crafted", "已制作"),
+                             ("crafted", "已制作"),
                              ("removed-and-recovered", "已回收")):
             items(state, label)
         handled.add("purchased")

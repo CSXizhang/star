@@ -48,7 +48,7 @@ def test_execution_prompts_have_one_resource_source(bridge, surface):
     elif surface == "agent":
         prompt = bridge._format_agent_prompt("care for the garden", "save")
     else:
-        prompt = bridge._format_delivery_prompt([], "save", midflight=[], read_only=False)
+        prompt = bridge._format_delivery_prompt([], "save", midflight=[], execution_deferred=False)
     facts = prompt_context(prompt)
     assert not {"inventory", "stamina", "funds", "fundsStatus"}.intersection(facts)
     resources = facts["resources"]
@@ -72,7 +72,7 @@ def test_delivery_carries_request_and_terminal_fact_once(bridge):
         "commandId": "native-receipt-unique", "requestId": "req-unique",
         "outcome": "completed", "feedback": {"progressSummary": "native-summary-unique"},
     })
-    prompt = bridge._format_delivery_prompt([event], "save", midflight=[], read_only=False)
+    prompt = bridge._format_delivery_prompt([event], "save", midflight=[], execution_deferred=False)
     # The original request text reaches the model exactly once: as the fact's
     # requestText, never duplicated inside the live context.
     assert prompt.count(instruction) == 1
@@ -103,7 +103,7 @@ def test_prompt_projection_preserves_public_context_and_life_compaction(bridge, 
 
 def test_missing_native_resource_values_remain_unknown():
     bridge = ChatBridge()
-    facts = prompt_context(bridge._format_delivery_prompt([], "save", midflight=[], read_only=False))
+    facts = prompt_context(bridge._format_delivery_prompt([], "save", midflight=[], execution_deferred=False))
     assert facts["provenance"] == "unknown"
     assert facts["inventory"]["freeSlots"] == "unknown"
     assert "toolResources" not in facts["inventory"]

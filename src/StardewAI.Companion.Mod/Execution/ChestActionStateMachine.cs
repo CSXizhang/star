@@ -445,7 +445,7 @@ public sealed class ChestActionStateMachine : ISkillExecutionMachine
         if (dist <= WalkPixelsPerTick)
         {
             // Arrived at step tile
-            _actor.PixelPosition = new Vector2(step.Tile.X * 64, step.Tile.Y * 64);
+            if (!ActorGuards.TryFinishWalkingStep(_actor, walkingTarget)) return;
             _actor.Face(step.Facing);
             _currentPathIndex++;
             _replanCount = 0;

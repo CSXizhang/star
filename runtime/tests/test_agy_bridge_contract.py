@@ -59,7 +59,11 @@ def test_life_baselines_reach_transport_and_changed_cid_resets_usage_interval(tm
     delta.assert_called_once_with(returned_cid, baseline)
     assert task.start_max_idx == baseline
     assert task.start_max_step_idx == (11 if returned_cid == OLD_CID else -1)
-    assert result["usage"] is delta_usage and result["success"]
+    assert result["usage"] is delta_usage
+    assert result["success"] is (returned_cid == OLD_CID)
+    assert result["conversation_id"] == OLD_CID
+    if returned_cid != OLD_CID:
+        assert result["error"] == "PROVIDER_SESSION_CHANGED"
 
 
 def test_twenty_measured_multigeneration_turns_do_not_rotate_on_consumption_or_count(tmp_path, monkeypatch):

@@ -25,13 +25,13 @@ public class CompanionRestRecoveryTests
     }
 
     [Theory]
-    [InlineData(0, 270, true)] [InlineData(27, 270, true)] [InlineData(28, 270, false)]
-    [InlineData(20, 100, true)] [InlineData(21, 100, false)] [InlineData(0, 0, false)]
-    public void LowStaminaTriggersBeforeExhaustion(float stamina, int maximum, bool expected) =>
+    [InlineData(0, 270, true)] [InlineData(27, 270, false)] [InlineData(28, 270, false)]
+    [InlineData(20, 100, false)] [InlineData(21, 100, false)] [InlineData(0, 0, false)]
+    public void OnlyExhaustionForcesRest(float stamina, int maximum, bool expected) =>
         Assert.Equal(expected, CompanionBedtime.NeedsDaytimeRest(stamina, maximum));
 
     [Fact]
-    public void DaytimeSleepRestoresAsRestAndOnlyWakesWhenRecovered()
+    public void DaytimeRestWakesAtRequestedTargetInsteadOfMaximum()
     {
         int previous = Game1.timeOfDay;
         try
@@ -40,12 +40,13 @@ public class CompanionRestRecoveryTests
             var actor = new MechanicsActor { Stamina = 2 };
             var rest = CreateRest(actor);
             rest.RestoreSleep(1150, daytime: true);
+            rest.BeginDaytimeRest(80);
             rest.Update(null, 1, null);
             Assert.Equal("resting", rest.State);
             Assert.True(rest.IsDaytimeRest);
             Assert.Equal(1150, rest.SleepStartedAt);
             Assert.Equal(2, actor.Stamina);
-            actor.Stamina = actor.MaxStamina;
+            actor.Stamina = 80;
             rest.Update(null, 2, null);
             Assert.Equal("awake", rest.State);
             Assert.False(rest.IsDaytimeRest);

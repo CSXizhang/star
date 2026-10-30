@@ -89,6 +89,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         Monitor.Log("Stardew AI Companion initializing Stage 0 mechanics and transport.", LogLevel.Info);
 
         _config = Helper.ReadConfig<ModConfig>();
+        _connectionState.Initialize(_config.ConnectionSource);
+        _config.ConnectionSource = _connectionState.Source;
         InitializeUpdates();
         if (!PlayerModeEnabled) CompanionMenuClock.Install();
         _discoveryService = new DiscoveryService(helper.DirectoryPath, Monitor);
@@ -104,7 +106,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
         helper.Events.GameLoop.UpdateTicking += (_, _) => TickNativeChatInput();
         helper.Events.GameLoop.TimeChanged += OnTimeChanged;
-        helper.Events.Display.RenderedWorld += OnRenderedWorld;
+        CompanionWorldDraw.Install(() => PlayerModeEnabled ? null : _avatar);
         helper.Events.Display.RenderedHud += OnRenderedHud;
         helper.Events.Display.MenuChanged += (_, e) => {
             if (PlayerModeEnabled && Context.IsWorldReady && e.NewMenu is StardewValley.Menus.ItemGrabMenu menu && menu.context is StardewValley.Objects.Chest chest)
@@ -252,7 +254,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         _knowledge = new PlayerKnowledgeTracker();
         _knowledge.Load(Helper.Data);
         _observer = new PlayerKnownObserver(new GameWorldObserver(Monitor) {
-            NativeCollisionActor = () => _actor is PlayerActor p && p.BindingValid ? p.GameFarmer : null
+            NativeCollisionActor = () => _actor?.GameFarmer
         }, _knowledge, Monitor.Log);
         _navigator = new SameMapNavigator(_observer);
         _authority = new PlayerControlAuthority(Monitor.Log);
@@ -265,6 +267,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             hoeAdapter: new NormalHoeAdapter(_observer, Monitor), plantAdapter: new NormalPlantAdapter(_observer, Monitor),
             shippingAdapter: new NormalShippingAdapter(_observer, Monitor), purchaseAdapter: new NormalPurchaseAdapter(_observer, Monitor),
             nativeActionAdapter: new NormalNativeActionAdapter(_observer, Monitor));
+        _coordinator.ConfigureExtensions(Path.Combine(Helper.DirectoryPath, "data", "abilities", "packages"), Helper.ModRegistry, Helper.DirectoryPath);
         _coordinator.PlayerAuthority = _authority;
         _coordinator.ProgramHoldProvider = () =>
             _thinking?.CurrentHold is { Active: true } hold
@@ -290,11 +293,13 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             );
 
             _coordinator.SetTransportServer(_transportServer);
+            _coordinator.ConnectionActionsAllowed = () => !_connectionState.IsSwitching;
             var sessionServer = _transportServer;
             void InSession(Action action) => _mainThreadActions.Enqueue(() =>
             {
                 if (ReferenceEquals(_transportServer, sessionServer)) action();
             });
+            _transportServer.OnConnectionStateReceived += payload => InSession(() => HandleConnectionState(payload));
             _transportServer.OnChatReplyReceived += payload => InSession(() => HandleChatReplyReceived(payload));
             _transportServer.OnAutonomyStateReceived += payload => InSession(() => HandleAutonomyStateReceived(payload));
             _transportServer.OnChatChannelProblem += (request, save, problem) =>
@@ -576,6 +581,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 harvestAdapter: _harvestAdapter, chestAdapter: _chestAdapter, hoeAdapter: _hoeAdapter, plantAdapter: _plantAdapter,
                 shippingAdapter: _shippingAdapter, purchaseAdapter: _purchaseAdapter, mapGraph: new WorldMapGraph(null, Monitor.Log),
                 nativeActionAdapter: _nativeActionAdapter);
+            _coordinator.ConfigureExtensions(Path.Combine(Helper.DirectoryPath, "data", "abilities", "packages"), Helper.ModRegistry, Helper.DirectoryPath);
             _coordinator.Rest.Bedtime = CompanionBedtime.Normalize(activeState.PreferredBedtime);
             if (activeState.SleepDay == Game1.Date.TotalDays && activeState.SleepStartedAt is { } sleepTime)
                 _coordinator.Rest.RestoreSleep(sleepTime, activeState.SleepIsDaytime);
@@ -596,12 +602,14 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             );
 
             _coordinator.SetTransportServer(_transportServer);
+            _coordinator.ConnectionActionsAllowed = () => !_connectionState.IsSwitching;
             var sessionServer = _transportServer;
             void InSession(Action action) => _mainThreadActions.Enqueue(() =>
             {
                 if (ReferenceEquals(_transportServer, sessionServer)) action();
             });
             _transportServer.OnChatReplyReceived += payload => InSession(() => HandleChatReplyReceived(payload));
+            _transportServer.OnConnectionStateReceived += payload => InSession(() => HandleConnectionState(payload));
             _transportServer.OnAutonomyStateReceived += payload => InSession(() => HandleAutonomyStateReceived(payload));
             _transportServer.OnChatChannelProblem += (request, save, problem) =>
                 InSession(() => ShowChatChannelProblem(request, save, problem));
@@ -644,6 +652,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             // Persist companion state on every task completion, not only at game-save time:
             // save/exit/reload durability must not depend on save-event timing.
             _coordinator.OnExecutionCompleted += () => PersistActorState("task completion");
+            _coordinator.OnInventoryChanged += () => PersistActorState("nearby pickup");
             _coordinator.OnNotification += OnCompanionNotification;
             _coordinator.OnNativeActionProgress += HandleNativeActionProgress;
 
@@ -726,6 +735,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 if (Game1.activeClickableMenu is CompanionConversationMenu or CompanionCommandMenu or CompanionDashboardMenu or CompanionLifeMenu) Game1.activeClickableMenu.exitThisMenu();
             } else _thinking?.ResumeAfterAction();
         }
+        UpdateConnectionSelection();
         UpdateBridgeStartup();
         // A mid-session bridge death must not orphan the run: poll the launcher
         // while disconnected; ReleaseBridgeStartupState.CanStart throttles retries.
@@ -829,12 +839,6 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             CompanionCommandMenu.CurrentStatusText = GetBridgeConnectionProblem() ?? "桥接未连接，输入会保留";
     }
 
-    private void OnRenderedWorld(object? sender, RenderedWorldEventArgs e)
-    {
-        if (PlayerModeEnabled) return;
-        _avatar?.Draw(e.SpriteBatch);
-    }
-
     private void OnTimeChanged(object? sender, TimeChangedEventArgs e)
     {
         if (!Context.IsWorldReady || (!PlayerModeEnabled && (_dayTransition || _resourceDay != Game1.Date.TotalDays)))
@@ -931,9 +935,11 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             _mainThreadActions.Clear();
             _decisionEdits.Clear();
             _bridgeStartup.Reset();
+            _connectionState.ResetConnection();
 
             _actor = null;
             _avatar = null;
+            _coordinator?.ShutdownExtensions();
             _coordinator = null;
             _preset = null; // re-armed per save load; the persisted marker survives for resume
             _localPauseMachine = null;
@@ -1061,15 +1067,13 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             string? problem = GetBridgeConnectionProblem();
             string state = problem != null ? problem.TrimEnd('。')
                 : _chatUiState.ShouldPauseNative || _lifeMenuUiState.WorkPaused ? "工作已暂停"
-                : _coordinator.Rest.IsResting ? (_coordinator.Rest.IsDaytimeRest ? "休息恢复中" : "已休息，等明天")
-                : activity != "idle" ? (task.Running ? task.Stage : "正在工作")
+                : _coordinator.Rest.IsResting ? _coordinator.GetActivityLabel()
+                : activity != "idle" ? _coordinator.GetActivityLabel()
                 : _lifeMenuUiState.IsChatPending ? _lifeMenuUiState.PendingChatDescription
-                : task.Running ? task.Stage
                 : _lifeMenuUiState.UnreadReplyCount > 0 ? "有新回复"
                 : "等你安排";
             stateLine = _lifeMenuUiState.CompanionName + " · " + state;
-            hintLine = activity != "idle" && !string.IsNullOrWhiteSpace(task.Progress)
-                ? task.Progress + " · F8" : "点击交谈 · F8";
+            hintLine = "点击交谈 · F8";
         }
         if (_lifeMenuUiState.UnreadReplyCount > 0)
             hintLine = (hintLine.Length > 0 ? hintLine + " · " : "") + $"{_lifeMenuUiState.UnreadReplyCount} 条新回复";
@@ -1345,6 +1349,16 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
     private void HandleChatReplyReceived(ChatReplyPayload reply)
     {
         string currentSave = Constants.SaveFolderName ?? Game1.uniqueIDForThisGame.ToString();
+        if (string.Equals(reply.SaveId, currentSave, StringComparison.Ordinal) &&
+            _conversationSaveId == currentSave && !string.IsNullOrWhiteSpace(reply.ReplyText) &&
+            reply.DeliveryOutboxIds is not { Count: > 0 } &&
+            reply.Status is "public-message" or "selected" or "decision-completed" or "completed" or "failed" or "partial" or "unknown")
+        {
+            _lifeMenuUiState.RecordCompanionReply(reply.RequestId,
+                CompanionDialogueInbox.PlainText(reply.ReplyText), GetCurrentGameDate());
+            PersistConversation();
+        }
+        if (reply.Status == "public-message") return;
         // Independent autostart test replies keep the common freshness/outbox
         // processing below (long model planning must read fresh snapshots); only the
         // F8 command-slot UI routing is bypassed further down.
@@ -1729,8 +1743,9 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
     {
         // Isolated acceptance and manually managed developer sessions own their bridge.
         if (Environment.GetEnvironmentVariable("STARDEW_AI_MANUAL_BRIDGE") == "1") return;
+        if (!_config.ConnectionSourceChosen) return;
         if (_transportServer?.IsChatConnected == true || !_bridgeStartup.CanStart(DateTime.UtcNow)) return;
-        var start = ReleaseBridgeLauncher.CreateStartInfo(Helper.DirectoryPath);
+        var start = ReleaseBridgeLauncher.CreateStartInfo(Helper.DirectoryPath, _connectionState.PendingSource ?? _config.ConnectionSource);
         if (start == null) return; // Source builds use the documented developer launcher.
         lock (_bridgeLaunchGate)
         {
@@ -1773,6 +1788,9 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private string? GetBridgeConnectionProblem()
     {
+        if (_connectionState.IsSwitching) return _connectionState.Description;
+        if (_config.ConnectionSource == "external" && (_transportServer?.IsChatConnected != true || _connectionState.Status != "connected"))
+            return "等待已有 AI 伙伴从原会话连接；游戏内消息会保留。";
         if (_transportServer?.IsChatConnected == true) return null;
         if (_bridgeStartup.Problem != null) return "伙伴服务启动失败：" + _bridgeStartup.Problem;
         return _bridgeStartup.IsStarting ? "伙伴服务正在启动，等待连接。"
@@ -1781,6 +1799,7 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private void ProjectBridgeConnection()
     {
+        _lifeMenuUiState.ApplyConnectionName(_connectionState.Source, _connectionState.ConversationName);
         if (GetBridgeConnectionProblem() is { } problem)
             CompanionCommandMenu.TaskState.Disconnected(problem, _bridgeStartup.Problem != null);
         else CompanionCommandMenu.TaskState.Connected();
@@ -1842,6 +1861,12 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private bool RequestPause(out string message)
     {
+        if (Context.IsWorldReady && _coordinator?.HasRestTask == true)
+        {
+            bool changed = _coordinator.PauseRestTask();
+            message = changed ? "Pause requested for active task." : "Task is already paused.";
+            return changed;
+        }
         var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
         if (machine == null)
         {
@@ -1862,6 +1887,12 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private bool RequestResume(out string message)
     {
+        if (Context.IsWorldReady && _coordinator?.HasRestTask == true)
+        {
+            bool changed = _coordinator.ResumeRestTask();
+            message = changed ? "Resumed active task." : "Task is not paused.";
+            return changed;
+        }
         var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
         if (machine == null)
         {
@@ -1894,6 +1925,11 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private bool RequestCancel(string source, out string message)
     {
+        if (Context.IsWorldReady && _coordinator?.CancelRestTask() == true)
+        {
+            message = "Cancellation requested for active task.";
+            return true;
+        }
         var machine = Context.IsWorldReady ? _coordinator?.ActiveMachine : null;
         if (machine == null)
         {
@@ -2046,7 +2082,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 !_chatUiState.HasActiveCommand && !_chatUiState.HasPendingControl &&
                 !_lifeMenuUiState.IsChatPending && (_coordinator == null || _coordinator.GetActivityStatus() == "idle"),
             OpenTaskPanel, GetBridgeConnectionProblem, OpenCompanionConversation,
-            () => OpenCompanionHub(0), () => OpenCompanionHub(2), () => OpenCompanionReplyInput(null));
+            () => OpenCompanionHub(0), () => OpenCompanionHub(2), () => OpenCompanionReplyInput(null),
+            () => _config.ConnectionSource == "external");
         return _companionDialogue;
     }
 
@@ -2143,8 +2180,15 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
     /// </summary>
     private void OpenSetupMenu()
     {
+        if (_config.ConnectionSource == "external")
+        {
+            Game1.activeClickableMenu = new CompanionOptionsMenu("已有 AI 伙伴",
+                "姓名、性格与关系沿用原会话。想调整称呼或交流方式，可以在聊天中告诉原伙伴。",
+                OpenGameSettings, ("打开聊天", OpenCompanionConversation), ("接入设置", OpenConnectionSelection));
+            return;
+        }
         Game1.activeClickableMenu = new CompanionSetupMenu(
-            companionName: _lifeMenuUiState.CompanionName,
+            companionName: _lifeMenuUiState.ProfileCompanionName,
             playStyle: _lifeMenuUiState.PlayStyle,
             personality: _lifeMenuUiState.Personality,
             careFrequency: _lifeMenuUiState.CareFrequency,
@@ -2202,6 +2246,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             TryAutoStartChatBridge();
             return Reject("消息尚未发送：伙伴服务正在连接，原文已保留。");
         }
+        if (_connectionState.IsSwitching)
+            return Reject("消息尚未发送：正在切换伙伴连接，原文已保留。");
         if (_coordinator == null || _observer == null)
             return Reject("消息尚未发送：请等待存档载入，原文已保留。");
         if (string.IsNullOrWhiteSpace(text)) return Reject("请先输入要对伙伴说的话。");
@@ -2467,6 +2513,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                 DispatchLifeProfileRefresh();
                 return;
             }
+            if (reply.AnsweredNoticeId != null)
+                _lifeMenuUiState.ConfirmDecisionReply(reply.AnsweredNoticeId);
             bool accepted = _lifeMenuUiState.ApplyChatReply(
                 reply.RequestId,
                 reply.Status,
@@ -2487,8 +2535,8 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
                         _lifeMenuUiState.ConfirmDecisionReply(reply.AnsweredNoticeId);
                     string text = !string.IsNullOrWhiteSpace(reply.ReplyText) ? reply.ReplyText
                         : !string.IsNullOrWhiteSpace(reply.Error) ? $"这次没能回复：{reply.Error}" : "这次没有收到回复，请再试一次。";
-                    if (_lifeMenuUiState.RecordConversation(reply.RequestId + ":companion", _lifeMenuUiState.CompanionName,
-                        text, GetCurrentGameDate(), isPlayer: false, unread: true))
+                    if (_lifeMenuUiState.RecordCompanionReply(reply.RequestId,
+                        CompanionDialogueInbox.PlainText(text), GetCurrentGameDate()))
                     {
                         if (!visible)
                         {

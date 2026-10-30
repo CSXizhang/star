@@ -114,10 +114,10 @@ def test_cancelled_request_notification_cannot_grant_another_work_turn(tmp_path)
         store.stop_request('Save1', 'cancelled-request', reason='player_cancel')
         store.append_outbox_event('Save1', _event('native-cancelled', 'cancelled', request_id='cancelled-request'))
         bridge._chat_ws = AsyncMock()
-        bridge._delivery_read_only = lambda sid: False
+        bridge._execution_occupied = lambda sid: False
         bridge.handle_chat_submit = AsyncMock()
         await bridge._run_outbox_delivery('Save1')
-        assert bridge.handle_chat_submit.call_args.kwargs['_delivery']['read_only'] is True
+        assert bridge.handle_chat_submit.call_args.kwargs['_delivery']['execution_deferred'] is True
     asyncio.run(check())
 
 

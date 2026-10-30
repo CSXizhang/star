@@ -160,7 +160,7 @@ def test_chat_and_work_expose_the_same_tools() -> None:
     asyncio.run(run())
 
 
-def test_readonly_round_has_no_decision_token(tmp_path, monkeypatch) -> None:
+def test_occupied_round_uses_live_tools_without_inheriting_decision_token(tmp_path, monkeypatch) -> None:
     async def run() -> None:
         bridge = _bridge(tmp_path)
         captured: dict[str, object] = {}
@@ -182,12 +182,12 @@ def test_readonly_round_has_no_decision_token(tmp_path, monkeypatch) -> None:
             result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 bridge._execute_life_turn,
-                ActiveChatTask(request_id="life-1", save_id="Save1", read_only=True),
+                ActiveChatTask(request_id="life-1", save_id="Save1", execution_deferred=True),
                 None,
                 "prompt",
             )
         assert result["success"] is True
-        assert captured["surface"] == "life"
+        assert captured["surface"] == "light"
         assert captured["token"] is None
         assert begin_decision.call_count == 0
         # The surrounding work-token env is restored after the life turn.

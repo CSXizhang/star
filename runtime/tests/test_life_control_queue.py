@@ -2,7 +2,7 @@
 import asyncio
 import json
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
@@ -22,7 +22,9 @@ def setup(tmp_path, monkeypatch):
     (tmp_path / "data" / "life-snapshot.json").write_text(json.dumps({
         "saveId": "farm", "capturedAt": time.time(), "payload": {"world": {"dayOfMonth": 2}},
     }), encoding="utf-8")
-    return bridge, create_mcp_server(run_dir=tmp_path, surface="life")
+    scheduler = MagicMock(run_dir=tmp_path)
+    scheduler.get_status = AsyncMock(return_value={"saveId": "farm", "world": {"dayOfMonth": 2}})
+    return bridge, create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="life")
 
 
 @pytest.mark.parametrize("actions,paused", [(["bedtime", "resume"], False),

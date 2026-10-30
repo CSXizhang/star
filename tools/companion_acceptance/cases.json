@@ -1,0 +1,61 @@
+{
+  "water-refill": {
+    "title": "浇水并补水",
+    "stamina": 270,
+    "water": 1,
+    "instruction": "帮我把田里的作物浇完水，水不够就去补一下，弄完就歇着吧。"
+  },
+  "harvest-store": {
+    "title": "收获、拾取并入箱",
+    "stamina": 270,
+    "water": 40,
+    "instruction": "把成熟的作物收一下，地上掉的材料也捡干净，都放进田边的空箱子，先留着别卖。"
+  },
+  "mature-trees": {
+    "title": "采木保留幼树",
+    "stamina": 270,
+    "water": 40,
+    "instruction": "帮我砍两棵树弄点木头，捡好放到田边的箱子里，先留着。"
+  },
+  "rest-water": {
+    "title": "按目标休息后继续工作",
+    "stamina": 10,
+    "water": 40,
+    "instruction": "你体力不多了，先回床休息到 80 点就起来吧，再把田里的水浇完，之后就歇着。"
+  },
+  "walk-pickup": {
+    "title": "靠近自动拾取",
+    "stamina": 270,
+    "water": 40,
+    "instruction": "走到田边的箱子旁等我就好。"
+  },
+  "walk-pickup-full": {
+    "title": "背包满时保留掉落物",
+    "stamina": 270,
+    "water": 40,
+    "instruction": "走到田边的箱子旁等我就好。"
+  },
+  "care-guidance": {
+    "title": "农活与消息交接",
+    "fixture": "water-refill",
+    "stamina": 270,
+    "water": 1,
+    "instruction": "帮我把田里的作物浇完水，水不够就去补一下。",
+    "duringAction": "浇完之后告诉我还有没有成熟的作物，先别做别的。"
+  },
+  "harvest-logistics": {
+    "title": "收获、拾取、入箱与出货",
+    "fixture": "harvest-store",
+    "stamina": 270,
+    "water": 40,
+    "instruction": "把成熟的作物收一下，地上掉的材料也捡干净，都放进田边的空箱子，先留着别卖。",
+    "then": "把刚收进箱子的防风草取出来，放进出货箱卖掉，木头留着。"
+  },
+  "rest-forestry": {
+    "title": "休息恢复与保留幼树",
+    "fixture": "mature-trees",
+    "stamina": 10,
+    "water": 40,
+    "instruction": "先回床休息到 80 点体力就起来，再帮我砍两棵成熟的树，木头捡好放进田边的箱子，幼树留着。"
+  }
+}

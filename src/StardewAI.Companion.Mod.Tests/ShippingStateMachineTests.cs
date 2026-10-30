@@ -24,6 +24,24 @@ public sealed class ShippingStateMachineTests
     }
 
     [Fact]
+    public void ShippingBlockedAtWaypointReturnsFailureWithoutRemovingInventory()
+    {
+        var (machine, actor, _, _) = CreateTestContext(new TileCoordinate(65, 17));
+        actor.TryAddItemToInventory(new InventoryItem("(O)24", "Parsnip", stack: 4));
+        var origin = actor.PixelPosition;
+        Assert.True(machine.Start(new ShippingRequest("blocked", "blocked-task", "Farm",
+            new[] { new ShippingItemRequest("(O)24", 2) }), out _));
+        for (int tick = 0; tick < 250 && machine.IsExecuting; tick++)
+        {
+            actor.PixelPosition = origin; // physical collision prevents net walking progress
+            machine.Update(null, tick);
+        }
+        Assert.False(machine.IsExecuting);
+        Assert.Equal("MOVEMENT_BLOCKED", machine.FinalResult!.ErrorCode);
+        Assert.Equal(4, actor.GetItemCount("(O)24"));
+    }
+
+    [Fact]
     public void MechanicsActor_TryExtractItem_ExtractsRequestedCountAndReducesStack()
     {
         var actor = new MechanicsActor(initialPose: new AuthoritativePose("Farm", 10, 10, FacingDirection.Down));

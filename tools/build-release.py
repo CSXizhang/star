@@ -6,6 +6,8 @@ Usage: runtime/.venv/Scripts/python.exe tools/build-release.py --version 0.2.0
 from __future__ import annotations
 
 import argparse
+import configparser
+import csv
 import hashlib
 import json
 import os
@@ -39,6 +41,41 @@ def copy_file(source: Path, destination: Path) -> None:
         raise ValueError(f"Missing or linked release input: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
+
+
+def remove_machine_bound_scripts(site_packages: Path, python: Path) -> None:
+    """Remove unused installer launchers, retaining importable libraries and valid RECORDs."""
+    interpreter = str(python.resolve()).encode("utf-8").lower()
+    removed: set[str] = set()
+    for entry_points in site_packages.glob("*.dist-info/entry_points.txt"):
+        config = configparser.ConfigParser(interpolation=None)
+        config.optionxform = str
+        config.read(entry_points, encoding="utf-8")
+        for section in ("console_scripts", "gui_scripts"):
+            for name in config[section] if config.has_section(section) else ():
+                if "/" in name or "\\" in name:
+                    raise ValueError("Invalid dependency entry-point name")
+                for directory in ("Scripts", "bin"):
+                    for suffix in (".exe", "", "-script.py"):
+                        path = site_packages / directory / (name + suffix)
+                        if not path.resolve().is_relative_to(site_packages.resolve()):
+                            raise ValueError("Linked dependency entry point escapes package")
+                        if path.is_file() and interpreter in path.read_bytes().lower():
+                            removed.add(path.relative_to(site_packages).as_posix())
+                            path.unlink()
+    for directory in ("Scripts", "bin"):
+        path = site_packages / directory
+        if not path.resolve().is_relative_to(site_packages.resolve()):
+            raise ValueError("Linked dependency script directory escapes package")
+        if path.is_dir() and not any(path.iterdir()):
+            path.rmdir()
+    for record in site_packages.glob("*.dist-info/RECORD"):
+        with record.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
+        retained = [row for row in rows if not row or row[0].replace("\\", "/") not in removed]
+        if retained != rows:
+            with record.open("w", encoding="utf-8", newline="") as stream:
+                csv.writer(stream, lineterminator="\n").writerows(retained)
 
 
 def build(args) -> Path:
@@ -83,7 +120,8 @@ def build(args) -> Path:
     guide = guide.replace("(companion-guide.md", "(docs/companion-guide.md").replace("(mcp.md", "(docs/mcp.md").replace("(../CONTRIBUTING.md)", "(CONTRIBUTING.md)")
     (package / "使用说明.md").write_text(guide, encoding="utf-8")
     copy_file(ROOT / "CONTRIBUTING.md", package / "CONTRIBUTING.md")
-    for name in ("release-guide.md", "companion-guide.md", "mcp.md", "farm-projects.md"):
+    for name in ("release-guide.md", "companion-guide.md", "mcp.md", "farm-projects.md", "agent-self-integration.md",
+                 "companion-efficiency-and-play-design.md", "dual-connection-validation.md"):
         copy_file(ROOT / "docs" / name, package / "docs" / name)
     release_notes = ROOT / "docs" / f"release-notes-{args.version}.md"
     if release_notes.is_file():
@@ -125,16 +163,9 @@ def build(args) -> Path:
     run([uv, "pip", "install", "--python", str(python), "--target", str(site_packages),
          "--require-hashes", "--only-binary", ":all:", "--no-deps", "--no-cache",
          "-r", str(requirements)])
-    # uv entry-point wrappers may contain absolute build paths and are not used.
-    scripts = site_packages / "Scripts"
-    if scripts.exists():
-        for path in scripts.rglob("*"):
-            if path.is_file():
-                path.unlink()
-        for path in sorted(scripts.rglob("*"), reverse=True):
-            if path.is_dir():
-                path.rmdir()
-        scripts.rmdir()
+    # uv --target uses bin on current Windows versions, while other installers
+    # use Scripts. Our launchers invoke portable Python modules directly.
+    remove_machine_bound_scripts(site_packages, python)
     for path in site_packages.rglob("direct_url.json"):
         path.unlink()
     licenses = package / "LICENSES"

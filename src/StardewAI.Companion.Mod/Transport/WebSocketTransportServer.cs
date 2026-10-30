@@ -64,6 +64,7 @@ public sealed class WebSocketTransportServer : ITransportServer
     private long _chatSocketGeneration;
     private CancellationTokenSource? _chatSocketCts;
     private readonly Queue<ChatReplyPayload> _pendingChatReplies = new();
+    private readonly BoundedMessageQueue _pendingChatCommands = new();
     private readonly Queue<LifeChatReplyPayload> _pendingLifeChatReplies = new();
     private readonly Queue<LifeProfileStatePayload> _pendingLifeProfileStates = new();
     private readonly Queue<LifeMemoryStatePayload> _pendingLifeMemoryStates = new();
@@ -77,7 +78,11 @@ public sealed class WebSocketTransportServer : ITransportServer
     private long _lastSnapshotRevision;
 
     public bool IsChatConnected => _chatSocket is { State: WebSocketState.Open };
+    public long ChatGeneration => Interlocked.Read(ref _chatSocketGeneration);
     public event Action<ChatReplyPayload>? OnChatReplyReceived;
+    public event Action<ConnectionStatePayload>? OnConnectionStateReceived;
+    public Task<bool> SendConnectionSourceAsync(string requestId, string source) => SendChatEnvelopeAsync(
+        CreateEnvelope("connection.source.set", new JsonObject { ["requestId"] = requestId, ["source"] = source }));
     public event Action<AutonomyStatePayload>? OnAutonomyStateReceived;
     public event Action<string?, string?, string>? OnChatChannelProblem;
     public string ActorMode { get; set; } = "companion";
@@ -790,6 +795,15 @@ public sealed class WebSocketTransportServer : ITransportServer
             {
                 _logger?.Invoke($"Error capturing initial snapshot: {ex.Message}", "Error");
             }
+        }
+
+        // Chat cancellation uses the same main-thread handler, with its own socket
+        // generation and the session checked again at dispatch time.
+        while (_pendingChatCommands.TryDequeue(out var chatCommand, out long chatGeneration))
+        {
+            if (chatCommand != null && chatGeneration == ChatGeneration
+                && chatCommand.SaveId == _saveId && chatCommand.GameSessionId == _gameSessionId)
+                ProcessMainThreadEnvelope(chatCommand);
         }
 
         // 3. Drain pending messages from the main-thread bounded queue with per-tick count and time budget
@@ -1574,6 +1588,7 @@ public sealed class WebSocketTransportServer : ITransportServer
             _chatSocketCts?.Dispose();
             _chatSocketCts = new CancellationTokenSource();
             _chatSocket = wsContext.WebSocket;
+            _pendingChatCommands.PurgeOlderThanGeneration(gen);
         }
 
         _logger?.Invoke($"Chat bridge connected (generation {gen}) from {context.Request.RemoteEndPoint}.", "Info");
@@ -1645,9 +1660,27 @@ public sealed class WebSocketTransportServer : ITransportServer
                             ? mtProp.GetString()
                             : null;
 
+                        if (msgType == "skill.cancel")
+                        {
+                            var cancel = JsonSerializer.Deserialize<EnvelopeDto>(jsonString, JsonOptions);
+                            if (cancel != null && cancel.SaveId == _saveId && cancel.GameSessionId == _gameSessionId)
+                                lock (_chatLock)
+                                {
+                                    if (gen == ChatGeneration)
+                                        _pendingChatCommands.TryEnqueue(cancel, gen, out _);
+                                }
+                            continue;
+                        }
+
                         bool hasPayload = root.TryGetProperty("payload", out var payloadElem);
 
-                        if (string.Equals(msgType, "autonomy.state", StringComparison.OrdinalIgnoreCase) && hasPayload)
+                        if (msgType == "connection.state" && hasPayload)
+                        {
+                            if (gen != Interlocked.Read(ref _chatSocketGeneration)) continue;
+                            var state = payloadElem.Deserialize<ConnectionStatePayload>(JsonOptions);
+                            if (state != null) OnConnectionStateReceived?.Invoke(state);
+                        }
+                        else if (string.Equals(msgType, "autonomy.state", StringComparison.OrdinalIgnoreCase) && hasPayload)
                         {
                             var state = payloadElem.Deserialize<AutonomyStatePayload>(JsonOptions);
                             if (state != null) OnAutonomyStateReceived?.Invoke(state);

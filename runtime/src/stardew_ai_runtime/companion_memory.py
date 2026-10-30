@@ -7,11 +7,7 @@ Persistence mirrors autonomy.py:
 - mutate holds lock and re-reads
 - camelCase wire format
 
-Limits per §2 of contract:
-  agreement  ≤ 15
-  preference ≤ 15
-  event      ≤ 20  (oldest evicted first when needed for new add)
-  Total render budget: agreements+preferences full (≤1200 chars), events latest ≤8
+Free-text notes and methods retain source, scope and revision history.
 
 Events are written ONLY by the system (source=system) and only in a real success
 terminal state. op=add does NOT accept kind=event.
@@ -20,8 +16,10 @@ terminal state. op=add does NOT accept kind=event.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,19 +27,56 @@ from typing import Any
 
 KIND_VALUES = frozenset({"preference", "agreement", "event"})
 SOURCE_VALUES = frozenset({"player", "companion", "system"})
-CATEGORY_VALUES = frozenset({"fact", "speculation", "constraint"})
+CATEGORY_VALUES = frozenset({"fact", "speculation", "constraint", "preference"})
 
-# Default layering by entry kind: player agreements/preferences are user
-# constraints; system-recorded shared events are facts.
-_KIND_DEFAULT_CATEGORY = {"event": "fact", "agreement": "constraint", "preference": "constraint"}
+# Agreements express constraints; preferences remain preferences.
+# System-recorded shared events are historical facts.
+_KIND_DEFAULT_CATEGORY = {"event": "fact", "agreement": "constraint", "preference": "preference"}
 
-_AGREEMENT_LIMIT = 15
-_PREFERENCE_LIMIT = 15
-_EVENT_LIMIT = 20
-_RENDER_EVENT_COUNT = 8
-_RENDER_CHAR_BUDGET = 1200
+_CATEGORY_LABELS = {"fact": "事实", "speculation": "推测", "constraint": "用户约束", "preference": "偏好（非硬性约束）"}
 
-_CATEGORY_LABELS = {"fact": "事实", "speculation": "推测", "constraint": "用户约束"}
+
+def resolve_companion_id(run_dir: Path | str, save_id: str, *, provider: str = "",
+                         connection_source: str = "builtin", session_id: str | None = None) -> str:
+    """Bind notes to the actual provider session, never to a display name.
+
+    Callers supply the selected source/provider; an unavailable selected session
+    returns no identity instead of falling back to another partner.
+    """
+    def read(path: Path) -> dict:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    root = Path(run_dir)
+    if connection_source == "external":
+        binding = read(root / "data" / "companion-connection.json")
+        if not binding.get("enabled", True):
+            return ""
+        provider = provider or str(binding.get("provider") or binding.get("adapter") or "external")
+        session_id = session_id or binding.get("providerSessionId")
+    elif not session_id:
+        if not provider:
+            return ""
+        sessions = read(root / "chat_sessions.json")
+        session_id = sessions.get(f"{provider}:{save_id}") or sessions.get(f"life:{provider}:{save_id}")
+        if not session_id and provider == "agy":
+            session_id = sessions.get(save_id)
+    if not provider or not isinstance(session_id, str) or not session_id.strip():
+        return ""
+    return "partner-" + hashlib.sha256(
+        json.dumps([connection_source, provider, session_id]).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _recall_terms(text: str) -> set[str]:
+    """Small local lexical recall, including Chinese without a tokenizer service."""
+    terms = set(re.findall(r"[a-z0-9_]+", text.casefold()))
+    for segment in re.findall(r"[\u3400-\u9fff]+", text):
+        terms.update(segment[i:i + 2] for i in range(max(1, len(segment) - 1)))
+    return terms
 
 
 class CompanionMemoryStore:
@@ -67,9 +102,11 @@ class CompanionMemoryStore:
                 for k, v in raw.items():
                     if isinstance(v, dict):
                         self._data[str(k)] = {
+                            **v,
                             "memoryRevision": int(v.get("memoryRevision", 0)),
                             "instructionRevision": int(v.get("instructionRevision", v.get("memoryRevision", 0))),
                             "entries": [self._migrate_entry(dict(e)) for e in v.get("entries", []) if isinstance(e, dict)] if isinstance(v.get("entries"), list) else [],
+                            "notes": [dict(n) for n in v.get("notes", []) if isinstance(n, dict)] if isinstance(v.get("notes"), list) else [],
                         }
         except (FileNotFoundError, OSError, ValueError, TypeError):
             self._data = {}
@@ -132,6 +169,10 @@ class CompanionMemoryStore:
         """Fill layering fields on legacy entries (load-time only)."""
         if not isinstance(entry.get("category"), str) or entry["category"] not in CATEGORY_VALUES:
             entry["category"] = _KIND_DEFAULT_CATEGORY.get(str(entry.get("kind")), "fact")
+        # Earlier versions assigned every preference to the constraint layer.
+        # The saved kind is the player's explicit distinction from an agreement.
+        if entry.get("kind") == "preference" and entry.get("category") == "constraint":
+            entry["category"] = "preference"
         return entry
 
     @staticmethod
@@ -161,7 +202,8 @@ class CompanionMemoryStore:
         self._load()
         record = self._data.get(save_id, {"memoryRevision": 0, "entries": []})
         internal = {"commandId", "category", "validFrom", "validTo",
-                    "revoked", "superseded_by", "revisionReason"}
+                    "revoked", "superseded_by", "revisionReason", "title", "scope",
+                    "validOn", "derivedFrom", "companionId"}
         entries: list[Any] = []
         for e in record.get("entries", []):
             if isinstance(e, dict) and internal.intersection(e):
@@ -193,7 +235,7 @@ class CompanionMemoryStore:
         expectedRevision check (events are written by the system internally).
         For kind=preference/agreement, expectedRevision must match.
         ``category`` defaults from the entry kind (event→fact,
-        agreement/preference→constraint); a scope-limited observation may be
+        agreement→constraint, preference→preference); a scope-limited observation may be
         recorded as ``speculation`` so a later wider observation can supersede
         it. Returns (status, result_dict).
         """
@@ -219,29 +261,6 @@ class CompanionMemoryStore:
                         result["entry"] = dict(e)
                         return
 
-            if kind == "event":
-                # Evict oldest events if at limit
-                event_count = self._count_kind(entries, "event")
-                while event_count >= _EVENT_LIMIT:
-                    # find and remove oldest event
-                    for i, e in enumerate(entries):
-                        if isinstance(e, dict) and e.get("kind") == "event":
-                            entries.pop(i)
-                            break
-                    event_count = self._count_kind(entries, "event")
-            elif kind == "agreement":
-                if self._count_kind(entries, "agreement") >= _AGREEMENT_LIMIT:
-                    status_holder[0] = "rejected"
-                    result["reason"] = "MEMORY_FULL"
-                    result["memoryRevision"] = current_rev
-                    return
-            elif kind == "preference":
-                if self._count_kind(entries, "preference") >= _PREFERENCE_LIMIT:
-                    status_holder[0] = "rejected"
-                    result["reason"] = "MEMORY_FULL"
-                    result["memoryRevision"] = current_rev
-                    return
-
             eid = entry_id or self._entry_id()
             resolved_category = category or _KIND_DEFAULT_CATEGORY.get(kind, "fact")
             if resolved_category not in CATEGORY_VALUES:
@@ -252,7 +271,7 @@ class CompanionMemoryStore:
             new_entry: dict[str, Any] = {
                 "id": eid,
                 "kind": kind,
-                "text": str(text)[:200],
+                "text": str(text),
                 "source": source,
                 "gameDate": game_date,
                 "category": resolved_category,
@@ -300,7 +319,7 @@ class CompanionMemoryStore:
                         result["reason"] = "CANNOT_EDIT_EVENT"
                         result["memoryRevision"] = current_rev
                         return
-                    e["text"] = str(text)[:200]
+                    e["text"] = str(text)
                     record["memoryRevision"] = current_rev + 1
                     record["instructionRevision"] = int(record.get("instructionRevision", current_rev)) + 1
                     result["memoryRevision"] = record["memoryRevision"]
@@ -368,7 +387,7 @@ class CompanionMemoryStore:
             for e in entries:
                 if isinstance(e, dict) and e.get("id") == entry_id:
                     e["revoked"] = True
-                    e["revisionReason"] = str(reason or "")[:200]
+                    e["revisionReason"] = str(reason or "")
                     record["memoryRevision"] = current_rev + 1
                     if e.get("kind") != "event":
                         record["instructionRevision"] = int(record.get("instructionRevision", current_rev)) + 1
@@ -424,7 +443,7 @@ class CompanionMemoryStore:
             new_entry: dict[str, Any] = {
                 "id": new_id,
                 "kind": old.get("kind") if old.get("kind") != "event" else "event",
-                "text": str(text or "")[:200],
+                "text": str(text or ""),
                 "source": source,
                 "gameDate": game_date or old.get("gameDate") or "unknown",
                 "category": category or old.get("category") or "fact",
@@ -435,7 +454,7 @@ class CompanionMemoryStore:
             if valid_to:
                 new_entry["validTo"] = str(valid_to)
             old["superseded_by"] = new_id
-            old["revisionReason"] = str(reason or "")[:200]
+            old["revisionReason"] = str(reason or "")
             entries.append(new_entry)
             record["memoryRevision"] = current_rev + 1
             if old.get("kind") != "event":
@@ -446,11 +465,167 @@ class CompanionMemoryStore:
         self._mutate(save_id, apply)
         return status_holder[0], result
 
-    def render_for_context(self, save_id: str) -> dict[str, Any]:
+    def save_note(self, save_id: str, text: str, *, companion_id: str,
+                  game_date: str = "unknown", source: str = "companion", scope: str | None = None,
+                  kind: str = "memory", title: str = "", note_id: str | None = None,
+                  supersedes: list[str] | str | None = None, valid_on: str | None = None,
+                  ) -> tuple[str, dict[str, Any]]:
+        """Save a model-authored note or reusable method as unexecuted prose.
+
+        Updating or consolidating explicitly named notes is atomic. Historical
+        versions remain on disk; arbitrary scope prose is presented to the model,
+        not interpreted as an action plan. valid_on optionally pins a game day.
+        """
+        if not companion_id:
+            return "rejected", {"reason": "COMPANION_IDENTITY_UNAVAILABLE"}
+        if kind not in {"memory", "method"} or source not in SOURCE_VALUES:
+            return "rejected", {"reason": "INVALID_NOTE_KIND_OR_SOURCE"}
+        if not isinstance(text, str) or not text.strip() or (scope is not None and (not isinstance(scope, str) or not scope.strip())):
+            return "rejected", {"reason": "EMPTY_NOTE_OR_SCOPE"}
+        targets = [supersedes] if isinstance(supersedes, str) else list(supersedes or [])
+        if note_id:
+            targets.append(note_id)
+        result: dict[str, Any] = {}
+        status = "confirmed"
+
+        def apply(record: dict[str, Any]) -> None:
+            nonlocal status
+            notes = record.setdefault("notes", [])
+            entries = record.setdefault("entries", [])
+            previous = []
+            for target in dict.fromkeys(targets):
+                old = next((n for n in notes if n.get("id") == target
+                            and n.get("companionId") == companion_id and self._is_current(n)), None)
+                if old is None:
+                    old = next((e for e in entries if e.get("id") == target and self._is_current(e)), None)
+                if old is None:
+                    status = "rejected"
+                    result["reason"] = "NOTE_NOT_FOUND"
+                    return
+                if old.get("kind") == "event":
+                    status = "rejected"
+                    result["reason"] = "CANNOT_EDIT_EVENT"
+                    return
+                previous.append(old)
+            if any(e in entries for e in previous) and any(n in notes for n in previous):
+                status = "rejected"
+                result["reason"] = "MIXED_SHARED_AND_PRIVATE_NOTES"
+                return
+            original = next((n for n in previous if n.get("id") == note_id), None)
+            resolved_scope = scope if scope is not None else (original or {}).get("scope", "未指定；按记录语境判断")
+            resolved_day = valid_on if valid_on is not None else (original or {}).get("validOn")
+            note = {"id": self._entry_id(), "kind": kind, "title": title,
+                    "text": text.strip(), "source": source, "scope": resolved_scope.strip(),
+                    "gameDate": game_date, "companionId": companion_id,
+                    "createdAt": datetime.now(UTC).isoformat().replace("+00:00", "Z")}
+            if resolved_day:
+                note["validOn"] = resolved_day
+            if previous:
+                note["derivedFrom"] = [n["id"] for n in previous]
+            for old in previous:
+                old["superseded_by"] = note["id"]
+            shared_origin = next((e for e in previous if e in entries), None)
+            if shared_origin is not None:
+                # A legacy shared agreement stays shared after a correction.
+                # Do not convert player-wide information into one partner's note.
+                note["kind"] = shared_origin.get("kind", "agreement")
+                note["category"] = shared_origin.get("category", "fact")
+                note.pop("companionId", None)
+                entries.append(note)
+                if note["kind"] != "event":
+                    record["instructionRevision"] = int(record.get("instructionRevision", 0)) + 1
+            else:
+                notes.append(note)
+            record["memoryRevision"] = int(record.get("memoryRevision", 0)) + 1
+            result.update(note=dict(note), memoryRevision=record["memoryRevision"])
+
+        self._mutate(save_id, apply)
+        return status, result
+
+    def forget_note(self, save_id: str, note_id: str, *, companion_id: str,
+                    reason: str = "") -> tuple[str, dict[str, Any]]:
+        """Withdraw an owned note while retaining provenance on disk."""
+        result: dict[str, Any] = {}
+        status = "rejected"
+
+        def apply(record: dict[str, Any]) -> None:
+            nonlocal status
+            for note in record.get("notes", []):
+                if companion_id and note.get("id") == note_id and note.get("companionId") == companion_id:
+                    note.update(revoked=True, revisionReason=reason)
+                    record["memoryRevision"] = int(record.get("memoryRevision", 0)) + 1
+                    result.update(memoryRevision=record["memoryRevision"])
+                    status = "confirmed"
+                    return
+            if companion_id:
+                for entry in record.get("entries", []):
+                    if entry.get("id") == note_id:
+                        entry.update(revoked=True, revisionReason=reason)
+                        record["memoryRevision"] = int(record.get("memoryRevision", 0)) + 1
+                        if entry.get("kind") != "event":
+                            record["instructionRevision"] = int(record.get("instructionRevision", 0)) + 1
+                        result.update(memoryRevision=record["memoryRevision"])
+                        status = "confirmed"
+                        return
+            result["reason"] = "NOTE_NOT_FOUND"
+
+        self._mutate(save_id, apply)
+        return status, result
+
+    def recall(self, save_id: str, query: str = "", *, companion_id: str,
+               game_date: str = "", kind: str | None = None,
+               note_id: str | None = None, offset: int = 0,
+               limit: int | None = None) -> dict[str, Any]:
+        """Recall relevant prose with its source and scope; never execute methods.
+
+        Empty queries list current owned notes. Explicit IDs can inspect a dated
+        note after its applicable day, labelled historical. Lexical ranking is a
+        local retrieval aid, not semantic understanding or a truth judgement.
+        """
+        self._load()
+        record = self._data.get(save_id, {})
+        terms = _recall_terms(query)
+
+        def rank(rows: list[dict]) -> list[dict]:
+            scored = []
+            for row in reversed(rows):
+                score = len(terms & _recall_terms(" ".join(str(row.get(k) or "") for k in ("text", "title", "scope"))))
+                if not terms or score or note_id:
+                    scored.append((score, row))
+            return [dict(row) for _, row in sorted(scored, key=lambda pair: pair[0], reverse=True)]
+
+        notes = []
+        for note in record.get("notes", []):
+            if not companion_id or note.get("companionId") != companion_id:
+                continue
+            if not note_id and not self._is_current(note):
+                continue
+            if kind and note.get("kind") != kind or note_id and note.get("id") != note_id:
+                continue
+            dated = note.get("validOn")
+            if dated and dated != game_date and not note_id:
+                continue
+            notes.append({**note, "status": "revoked" if note.get("revoked") else "superseded" if note.get("superseded_by") else "current",
+                          "applicability": "historical" if dated and dated != game_date else "check_scope",
+                          "worldEvidence": "历史记录；涉及当前世界的结论须重新观察。"})
+        entries = [e for e in record.get("entries", [])
+                   if (e.get("id") == note_id if note_id else self._is_current(e)
+                       and (not e.get("validOn") or e["validOn"] == game_date))] if kind != "method" else []
+        ranked_notes, ranked_entries = rank(notes), rank(entries)
+        # Explicit pagination is for browsing, never a storage eviction policy.
+        combined = [("notes", row) for row in ranked_notes] + [("entries", row) for row in ranked_entries]
+        start = max(0, offset)
+        page = combined[start:] if limit is None else combined[start:start + max(1, limit)]
+        return {"memoryRevision": int(record.get("memoryRevision", 0)),
+                "notes": [row for bucket, row in page if bucket == "notes"],
+                "entries": [row for bucket, row in page if bucket == "entries"],
+                "total": len(combined), "nextOffset": start + len(page) if start + len(page) < len(combined) else None}
+
+    def render_for_context(self, save_id: str, *, companion_id: str = "", query: str = "",
+                           game_date: str = "", context_budget: int = 6000) -> dict[str, Any]:
         """Render memory in a compact form suitable for LLM context injection.
 
-        agreements + preferences: full, combined ≤ 1200 chars total (oldest events truncated).
-        events: latest ≤ 8.
+        Prose is preserved whole; relevant recall is available for focused queries.
         Layered projection (``facts``/``speculations``/``constraints``): grouped
         with validity labels; revoked/superseded entries never render.
         """
@@ -466,36 +641,55 @@ class CompanionMemoryStore:
                     ("每日购买额度", "每日采购额度", "purchaseBudget", "dailyPurchaseBudget")))]
         entries = [self._migrate_entry(dict(entry)) for entry in entries]
         # Retracted or replaced knowledge never reaches the model context.
-        current = [e for e in entries if self._is_current(e)]
+        current = [e for e in entries if self._is_current(e)
+                   and (not e.get("validOn") or e["validOn"] == game_date)]
+        recent = self.recall(save_id, companion_id=companion_id, game_date=game_date)
+        related = self.recall(save_id, query, companion_id=companion_id, game_date=game_date) if query else {"entries": [], "notes": []}
+        recent_events = list(reversed([e for e in current if e.get("kind") == "event"]))[:3]
+        recent_ids = {e.get("id") for e in recent_events}
+        related_ids = {e.get("id") for e in related["entries"]}
+        extra_events = [e for e in reversed(current) if e.get("kind") == "event"
+                        and e.get("id") in related_ids and e.get("id") not in recent_ids]
+        notes = recent["notes"][:3]
+        recent_note_ids = {n.get("id") for n in notes}
+        notes += [n for n in related["notes"] if n.get("id") not in recent_note_ids]
+        remaining = max(0, context_budget)
+
+        def compact(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            nonlocal remaining
+            selected = []
+            for row in rows:
+                cost = len(json.dumps(row, ensure_ascii=False))
+                if cost <= remaining:
+                    selected.append(row)
+                    remaining -= cost
+                elif remaining >= 200:
+                    # Keep an addressable pointer, never a chopped sentence.
+                    pointer = {"id": row.get("id"), "kind": row.get("kind"),
+                               "title": row.get("title", ""), "source": row.get("source"),
+                               "gameDate": row.get("gameDate"), "category": row.get("category"),
+                               "scope": row.get("scope"), "validOn": row.get("validOn"),
+                               "recallRequired": True,
+                               "text": "完整笔记请使用 consult recall_memory 按 note_id 读取。"}
+                    pointer_cost = len(json.dumps(pointer, ensure_ascii=False))
+                    if pointer_cost <= remaining:
+                        selected.append(pointer)
+                        remaining -= pointer_cost
+            return selected
+
+        # Shared agreements and immediate continuity must not be crowded out by
+        # an arbitrarily large learned-method library. Everything stays within
+        # the same prompt budget; full prose remains explicitly retrievable.
+        current = compact([e for e in current if e.get("kind") != "event"] + recent_events)
+        relevant_notes = compact(notes)
+        current += compact(extra_events)
 
         agreements = [e for e in current if isinstance(e, dict) and e.get("kind") == "agreement"]
         preferences = [e for e in current if isinstance(e, dict) and e.get("kind") == "preference"]
         events = [e for e in current if isinstance(e, dict) and e.get("kind") == "event"]
 
-        def _entry_text(e: dict[str, Any]) -> str:
-            return f"[{e.get('gameDate', '?')}] {e.get('text', '')}"
-
-        def _truncate_to_budget(
-            items: list[dict[str, Any]], budget: int
-        ) -> list[dict[str, Any]]:
-            result = []
-            used = 0
-            for item in items:
-                t = _entry_text(item)
-                if used + len(t) > budget and result:
-                    break
-                result.append(item)
-                used += len(t)
-            return result
-
-        # Build agreements + preferences text; drop oldest if over budget
         ap_combined = agreements + preferences
-        ap_text_total = sum(len(_entry_text(e)) for e in ap_combined)
-        if ap_text_total > _RENDER_CHAR_BUDGET:
-            ap_combined = _truncate_to_budget(ap_combined, _RENDER_CHAR_BUDGET)
-
-        # Events: latest ≤8
-        recent_events = events[-_RENDER_EVENT_COUNT:]
+        recent_events = list(reversed(events))
 
         def _layered(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             rendered: list[dict[str, Any]] = []
@@ -506,6 +700,7 @@ class CompanionMemoryStore:
                     "label": label,
                     "text": e.get("text"),
                     "gameDate": e.get("gameDate"),
+                    "source": e.get("source"),
                 }
                 if e.get("validFrom") or e.get("validTo"):
                     row["validity"] = {"from": e.get("validFrom"), "to": e.get("validTo")}
@@ -513,6 +708,7 @@ class CompanionMemoryStore:
             return rendered
 
         return {
+            "relevantNotes": relevant_notes,
             "agreements": [
                 {"id": e.get("id"), "text": e.get("text"), "gameDate": e.get("gameDate")}
                 for e in ap_combined

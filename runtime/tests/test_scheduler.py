@@ -2527,6 +2527,7 @@ def test_scheduler_navigate_to_dynamic_shop_and_unsupported_landmark(mock_transp
         )
 
         # 2. Omitting tile for location without dynamic data raises clear unsupported error
+        scheduler.query_farm_space = AsyncMock(return_value={"occupants": []})
         with pytest.raises(SchedulerError, match="no native dynamic interaction data"):
             await scheduler.execute_navigate_to(location_id="Farm", landmark="shipping_bin")
 
@@ -3215,4 +3216,56 @@ def test_scoped_auto_rejects_other_map_and_invalid_coordinates_without_dispatch(
         with pytest.raises(PolicyViolationError):
             await getattr(scheduler, operation)(target_tiles=[{"x": True, "y": 1}], location_id="Farm")
         native.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_lost_receipt_releases_only_after_fresh_idle_and_reconnect_can_cancel(mock_transport_client):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from stardew_ai_runtime.scheduler import ActiveTask
+    async def run():
+        client = mock_transport_client
+        client.get_cached_result.return_value = None
+        client.wait_for_result = AsyncMock(side_effect=TimeoutError)
+        client.cancel_skill = AsyncMock()
+        now = datetime.now(UTC)
+        scheduler = CompanionScheduler(client=client)
+        scheduler._active_task = ActiveTask("old", "old-command", "water", "running", "Farm", [],
+                                            now - timedelta(seconds=60), now - timedelta(seconds=30), "old")
+        await scheduler.get_status()  # A cached pre-dispatch idle snapshot proves nothing.
+        assert scheduler.has_active_task
+        fresh = replace(client.latest_snapshot, sent_at=now)
+        client.latest_snapshot = fresh
+        client.wait_for_snapshot.return_value = fresh
+        status = await scheduler.get_status()
+        assert status['companion']['currentTask'] is None
+        assert not scheduler.has_active_task
+        # A new process can inspect and cancel the actual game-owned command.
+        fresh.payload['companion'].update(activity='watering', activeCommandId='native-command')
+        reconnected = CompanionScheduler(client=client)
+        result = await reconnected.cancel_task()
+        assert result['status'] == 'cancelling'
+        assert client.cancel_skill.await_args.kwargs['correlation_id'] == 'native-command'
+    asyncio.run(run())
+
+
+def test_terminal_action_recovers_receipt_without_redispatch(mock_transport_client, native_compatible_run_dir):
+    async def run():
+        scheduler = CompanionScheduler(client=mock_transport_client, run_dir=native_compatible_run_dir)
+        scheduler.await_terminal_results = True
+        receipt = Envelope(message_type="skill.result", sender_instance_id="mod", payload={
+            "commandId": "cmd-water", "terminalState": "succeeded", "completedCount": 1,
+            "skippedCount": 0, "failedCount": 0, "effects": []},
+            protocol_version="0.1", message_id="result", sequence_number=1, world_revision=6,
+            sent_at=datetime.now(UTC), save_id=mock_transport_client.save_id,
+            game_session_id=mock_transport_client.game_session_id)
+        mock_transport_client.execute_water_zone = AsyncMock(return_value="cmd-water")
+        mock_transport_client.request_command_result = AsyncMock()
+        mock_transport_client.wait_for_result = AsyncMock(side_effect=[TimeoutError(), receipt])
+        result = await scheduler.execute_water_zone(center_x=64, center_y=15, radius=0)
+        assert result["terminalState"] == "succeeded" and result["completedCount"] == 1
+        mock_transport_client.execute_water_zone.assert_awaited_once()
+        mock_transport_client.request_command_result.assert_awaited_once_with("cmd-water")
+        assert not scheduler.has_active_task
     asyncio.run(run())

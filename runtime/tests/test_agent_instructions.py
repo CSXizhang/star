@@ -52,3 +52,29 @@ def test_core_is_shared_and_only_repeated_for_a_new_session(tmp_path, mode):
     sent, _ = delivery.prepare("fake:farm", "cid", prompt, core)
     assert core not in sent and "上下文增量：" in sent
     assert delivery.prepare("fake:farm", "new", prompt, core)[0].count(core) == 1
+
+
+def test_documented_memory_operations_match_published_game_tool_schema():
+    import re
+    from pathlib import Path
+
+    from stardew_ai_runtime.game_tools import GAME_TOOLS
+
+    game = create_mcp_server(scheduler=MagicMock(), surface="light")
+    tools = {tool.name: tool for tool in game._tool_manager.list_tools()}
+    root = Path(__file__).resolve().parents[2]
+    for path in (root / "docs/agent-core-instructions-draft.md",
+                 root / "agent-skills/stardew-companion/SKILL.md"):
+        guidance = path.read_text(encoding="utf-8").split("## 共同经历与方法", 1)[1]
+        references = re.findall(r"`([a-z_]+)\.([a-z_]+)(?:\.([a-z_]+))?`", guidance)
+        assert references
+        for tool_name, wrapper_or_operation, nested_operation in references:
+            assert tool_name in GAME_TOOLS and tool_name in tools
+            schema = tools[tool_name].parameters
+            if nested_operation:
+                wrapper = schema["properties"][wrapper_or_operation]
+                definition = schema["$defs"][wrapper["$ref"].rsplit("/", 1)[-1]]
+                assert nested_operation in definition["properties"], (path, tool_name, nested_operation)
+            else:
+                assert any(wrapper_or_operation in definition.get("properties", {})
+                           for definition in schema.get("$defs", {}).values()), (path, tool_name, wrapper_or_operation)

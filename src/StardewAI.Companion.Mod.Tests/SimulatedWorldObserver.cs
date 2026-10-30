@@ -63,6 +63,9 @@ public sealed class SimulatedWorldObserver : IWorldObserver
     }
 
     public int TilePassabilityChecks { get; private set; }
+    public HashSet<(TileCoordinate From, TileCoordinate To)> BlockedWalkingSegments { get; } = new();
+    public bool CanWalkBetween(string locationName, TileCoordinate from, TileCoordinate to) =>
+        !BlockedWalkingSegments.Contains((from, to));
     public Exception? FarmWorkScanFailure { get; set; }
 
     public bool IsWarpOrDoorTile(string locationName, TileCoordinate tile)

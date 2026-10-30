@@ -76,7 +76,7 @@ def bridge_with_inflight_job(tmp_path, monkeypatch):
     return bridge, client
 
 
-def test_midflight_player_chat_is_recorded_and_answered_read_only(tmp_path, monkeypatch):
+def test_midflight_player_chat_is_recorded_and_answered_execution_deferred(tmp_path, monkeypatch):
     bridge, client = bridge_with_inflight_job(tmp_path, monkeypatch)
     ws = FakeWs()
     bridge._chat_ws = ws
@@ -104,12 +104,12 @@ def test_midflight_player_chat_is_recorded_and_answered_read_only(tmp_path, monk
     async def run():
         await bridge.handle_chat_submit(ws, "req-mid-1", "顺便看看鸡", "Save1")
 
-        # The turn ran on the cached life surface with no decision token.
+        # The turn uses live tools without taking the existing work decision.
         assert len(life_turns) == 1
-        assert seen == [{"surface": "life", "token": None, "mode": None}]
+        assert seen == [{"surface": "light", "token": None, "mode": None}]
         active, prompt = life_turns[0]
-        assert active.read_only is True
-        assert '"workDispatchAvailable": false' in prompt
+        assert active.execution_deferred is True
+        assert '"executionOccupied": true' in prompt
         assert '"taskId": "t1"' in prompt
 
         # The original text is persisted as a midflight request.

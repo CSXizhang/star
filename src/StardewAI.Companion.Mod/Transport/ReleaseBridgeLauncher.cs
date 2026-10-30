@@ -5,8 +5,10 @@ namespace StardewAI.Companion.Mod.Transport;
 /// <summary>Launch only the runtime shipped beside this installed Mod.</summary>
 public static class ReleaseBridgeLauncher
 {
-    public static ProcessStartInfo? CreateStartInfo(string modDirectory)
+    public static ProcessStartInfo? CreateStartInfo(string modDirectory, string connectionSource = "builtin")
     {
+        if (connectionSource is not ("builtin" or "external"))
+            throw new ArgumentException("Unknown conversation source.", nameof(connectionSource));
         string root = Path.GetFullPath(modDirectory);
         string script = Path.Combine(root, "tools", "start-companion.ps1");
         if (!File.Exists(Path.Combine(root, "release-manifest.json")) || !File.Exists(script)) return null;
@@ -26,6 +28,8 @@ public static class ReleaseBridgeLauncher
         foreach (string argument in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
             "-OwnerProcessId", Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture) })
             start.ArgumentList.Add(argument);
+        start.Environment["STARDEW_BRIDGE_STOP_FILE"] = Path.Combine(Path.GetTempPath(), "stardew-bridge-stop-" + Guid.NewGuid().ToString("N"));
+        start.Environment["STARDEW_CONNECTION_SOURCE"] = connectionSource;
         return start;
     }
 
@@ -189,6 +193,22 @@ public sealed class ReleaseBridgeLaunch : IDisposable
         try
         {
             if (process.HasExited) return;
+            if (process.StartInfo.Environment.TryGetValue("STARDEW_BRIDGE_STOP_FILE", out var marker) && marker != null)
+            {
+                try
+                {
+                    File.WriteAllText(marker, "stop");
+                    if (process.WaitForExit(10000)) return;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                finally
+                {
+                    try { File.Delete(marker); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+            }
             process.Kill(entireProcessTree: true);
             // ProcessExit cannot await the background task. Bound the synchronous
             // wait, while allowing the launcher/mutex to finish before a new save.

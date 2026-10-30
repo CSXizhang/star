@@ -59,6 +59,7 @@ public interface IWorldObserver
     /// Evaluates if a given tile is passable without collision.
     /// </summary>
     bool IsTilePassable(string locationName, TileCoordinate tile);
+    bool CanWalkBetween(string locationName, TileCoordinate from, TileCoordinate to) => true;
 
     /// <summary>
     /// Checks whether a tile on the given location is a door, warp, or transition trigger tile.

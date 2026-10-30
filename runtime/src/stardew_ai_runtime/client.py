@@ -14,6 +14,10 @@ class TransportClientError(WebSocketError):
     """Raised for high-level transport client failures."""
 
 
+class NativeResultUnavailable(TimeoutError):
+    """The native session explicitly has no record of this command."""
+
+
 class TransportClient:
     """Production WebSocket client connecting to the Companion Mod transport server."""
 
@@ -978,7 +982,7 @@ class TransportClient:
             elif (envelope.message_type == "skill.result.status"
                   and envelope.payload.get("commandId") == command_id
                   and envelope.payload.get("status") == "unknown"):
-                raise TimeoutError(f"Native session has no cached result for command {command_id}")
+                raise NativeResultUnavailable(f"Native session has no cached result for command {command_id}")
             elif envelope.message_type == "protocol.error":
                 code = envelope.payload.get("code", "UNKNOWN")
                 msg = envelope.payload.get("message", "Error")

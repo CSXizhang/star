@@ -26,6 +26,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
 {
     private readonly IWorldObserver _observer;
     private readonly IMonitor _monitor;
+    private (string CommandId, IFarmerActor Actor, GameLocation Location, TileCoordinate Tile, Tree? Tree, ResourceClump? Clump)? _companionChopProgress;
 
     public NormalNativeActionAdapter(IWorldObserver observer, IMonitor monitor)
     {
@@ -354,6 +355,8 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
     // ------------------------------------------------------------------
     private NativeActionStepResult ChopTree(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
+        var previous = _companionChopProgress;
+        _companionChopProgress = null;
         var loc = ResolveLocation(request.LocationId);
         if (loc is null)
             return NativeActionStepResult.Failed($"Game location '{request.LocationId}' not found.");
@@ -362,6 +365,17 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             return NativeActionStepResult.Precondition($"Actor at {actor.Tile} is not adjacent to target tile {target.Tile}.", "not-adjacent");
 
         var v = new Vector2(target.Tile.X, target.Tile.Y);
+
+        // A native terrain tick can remove a tree between our visible swings.
+        // Credit only a fall this command actually started, never a missing
+        // target supplied by a later command or a different actor/location.
+        bool continuing = previous is { } progress && progress.CommandId == request.CommandId
+            && ReferenceEquals(progress.Actor, actor) && ReferenceEquals(progress.Location, loc) && progress.Tile == target.Tile;
+        if (continuing && previous is { } pending
+            && (pending.Tree is not null
+                ? !loc.terrainFeatures.TryGetValue(v, out var currentTree) || !ReferenceEquals(currentTree, pending.Tree)
+                : !loc.resourceClumps.Contains(pending.Clump!)))
+            return NativeActionStepResult.Succeeded(pending.Tree is not null ? "tree-felled" : "clump-cleared");
 
         // Fruit trees are long-term player investments and are never chopped.
         if (loc.terrainFeatures.TryGetValue(v, out var tf) && tf is FruitTree)
@@ -441,11 +455,14 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     bool falling;
                     try { falling = tree.falling?.Value == true; } catch { falling = false; }
                     if (falling)
+                    {
+                        if (continuing) _companionChopProgress = previous;
                         // No swing happens while the native fall animation owns the
                         // tree, so this round's delta is 0 — never inflated.
                         return NativeActionStepResult.Continue(
                             "tree-falling",
                             staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
+                    }
                 }
                 else
                 {
@@ -469,6 +486,11 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                 bool phaseChanged = tree != null && (!stumpBefore && tree.stump?.Value == true || tree.falling?.Value == true);
                 bool removed = tree != null ? !loc.terrainFeatures.TryGetValue(v, out var remaining) || !ReferenceEquals(remaining, tree)
                     : !loc.resourceClumps.Contains(clump!);
+                if (removed)
+                    return NativeActionStepResult.Succeeded(tree is not null ? "tree-felled" : "clump-cleared",
+                        staminaCost: Math.Max(0f, staminaBefore - actor.Stamina));
+                if (phaseChanged || continuing)
+                    _companionChopProgress = (request.CommandId, actor, loc, target.Tile, tree, clump);
                 if (healthAfter < healthBefore || phaseChanged || removed)
                     dealtDamage = true;
                 else if (!dealtDamage)
@@ -506,7 +528,7 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
             // Bind the detached receiver to this exact ordinary debris/chunk; never
             // route archaeological discoveries through the global player path.
             int collected = 0;
-            string? firstItemId = null;
+            var collectedItems = new List<NativeCollectedItem>();
             foreach (var debris in loc.debris.ToList())
             {
                 if (debris is null || !NativeAnimalHarvestInventoryScope.IsOrdinaryDebris(debris)) continue;
@@ -517,43 +539,40 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                     if ((int)(pos.X / 64) != target.Tile.X || (int)(pos.Y / 64) != target.Tile.Y) continue;
                     string id = debris.item?.QualifiedItemId ?? debris.itemId.Value;
                     int expected = debris.item?.Stack ?? 1;
-                    var before = SnapshotInventoryTotals(actor.GameFarmer);
+                    int quality = debris.item?.Quality ?? debris.itemQuality;
                     bool accepted;
                     if (ReferenceEquals(actor.GameFarmer, Game1.player))
                         accepted = debris.collect(actor.GameFarmer, chunk);
                     else
                         using (new NativeAnimalHarvestInventoryScope(actor.GameFarmer, loc, debris, chunk))
                             accepted = debris.collect(actor.GameFarmer, chunk);
-                    int gained = MeasureGainedStack(before, SnapshotInventoryTotals(actor.GameFarmer), id);
                     if (!accepted)
-                        return gained == 0 && collected == 0
+                        return collected == 0
                             ? NativeActionStepResult.Precondition("Native inventory refused the dropped item.", "inventory-full")
-                            : NativeActionStepResult.Failed($"Native pickup refused after a partial transfer: gained={gained}, earlier={collected}.");
+                            : NativeActionStepResult.Failed($"Native pickup refused after accepting {collected} item(s) earlier in this call. Inspect current ground and inventory before continuing.", collectedItems: collectedItems);
                     // This is the native caller's cleanup, not a replacement effect.
                     debris.Chunks.RemoveAt(i);
                     if (debris.Chunks.Count == 0) loc.debris.Remove(debris);
-                    if (gained != expected)
-                        return NativeActionStepResult.Failed($"Native debris pickup '{id}': inventoryGained={gained}, expected={expected}.");
-                    firstItemId ??= id;
-                    collected += gained;
+                    collectedItems.Add(new NativeCollectedItem(id, quality, expected));
+                    collected += expected;
                 }
             }
             if (collected > 0)
-                return NativeActionStepResult.Succeeded("picked-up", itemId: firstItemId, itemCount: collected);
+            {
+                bool oneItemKind = collectedItems.All(item => item.ItemId == collectedItems[0].ItemId
+                    && item.Quality == collectedItems[0].Quality);
+                return NativeActionStepResult.Succeeded("picked-up",
+                    itemId: oneItemKind ? collectedItems[0].ItemId : null,
+                    itemCount: oneItemKind ? collected : 0, collectedItems: collectedItems);
+            }
 
             // 2. Spawned object on the ground (forage / animal produce dropped by the game).
-            if (loc.getObjectAtTile(target.Tile.X, target.Tile.Y) is StardewValley.Object spawned && spawned.CanBeGrabbed)
+            if (loc.getObjectAtTile(target.Tile.X, target.Tile.Y) is StardewValley.Object spawned && IsPickupGroundObject(spawned))
             {
-                if (spawned.IsWeeds() || spawned.IsBreakableStone() || spawned.IsTwig())
-                    return NativeActionStepResult.Precondition("This is an observed native obstacle, not a loose pickup. Use its native clearing tool.", "requires-clearing-tool");
-                if (spawned is StardewValley.Objects.Chest { giftbox.Value: true })
-                    return NativeActionStepResult.Precondition("This is a native giftbox; use open_chest and inspect its native result.", "requires-open-chest");
                 string spawnedId = spawned.QualifiedItemId ?? spawned.ItemId ?? "";
-                if (spawnedId is "(O)590" or "(O)SeedSpot")
-                    return NativeActionStepResult.Precondition("Native dig spots require Hoe tool interaction; they are not ordinary pickup objects.", "requires-native-hoe");
                 int stack = spawned.Stack;
+                int quality = spawned.Quality;
                 var tileLoc = new xTile.Dimensions.Location(target.Tile.X, target.Tile.Y);
-                var inventoryBefore = SnapshotInventoryTotals(actor.GameFarmer);
                 bool groundEgg = loc is AnimalHouse && NativeAnimalHarvestInventoryScope.IsGroundEgg(spawned);
                 if (groundEgg && !ReferenceEquals(actor.GameFarmer.currentLocation, loc))
                     return NativeActionStepResult.Failed("Companion is not inside the egg's animal house.");
@@ -590,17 +609,22 @@ public sealed partial class NormalNativeActionAdapter : INativeActionAdapter
                 {
                     _monitor.Log($"Ground pickup animation cleanup failed: {ex.Message}", LogLevel.Warn);
                 }
-                int gained = MeasureGainedStack(inventoryBefore, SnapshotInventoryTotals(actor.GameFarmer), spawnedId);
-                bool gone = loc.getObjectAtTile(target.Tile.X, target.Tile.Y) is null;
-                if (!gone || gained != stack)
+                bool gone = !ReferenceEquals(loc.getObjectAtTile(target.Tile.X, target.Tile.Y), spawned);
+                if (!gone)
                     return NativeActionStepResult.Failed(
-                        $"Native ground pickup '{spawnedId}' at {target.Tile}: removed={gone}, inventoryGained={gained}, expected={stack}.");
-                return NativeActionStepResult.Succeeded("picked-up", itemId: spawnedId, itemCount: gained);
+                        $"Native ground pickup '{spawnedId}' at {target.Tile}: target remains. Inspect current ground and inventory before continuing.");
+                return NativeActionStepResult.Succeeded("picked-up", itemId: spawnedId, itemCount: stack,
+                    collectedItems: new[] { new NativeCollectedItem(spawnedId, quality, stack) });
             }
 
-            return NativeActionStepResult.Precondition($"Tile {target.Tile} has no dropped or spawned item.", "no-item");
+            return NativeActionStepResult.Precondition($"Tile {target.Tile} currently has no loose drop or directly collectible ground item. An earlier drop may have moved or been collected while travelling; this does not identify who collected it. Any obstacle or placed object here was left untouched. Reobserve ground and inventory before choosing further work.", "no-item");
         });
     }
+
+    internal static bool IsPickupGroundObject(StardewValley.Object item) =>
+        item.CanBeGrabbed && item is not StardewValley.Objects.Chest
+        && !item.bigCraftable.Value && !item.IsWeeds() && !item.IsBreakableStone() && !item.IsTwig()
+        && item.QualifiedItemId is not ("(O)590" or "(O)SeedSpot");
 
     // ------------------------------------------------------------------
     // Machines

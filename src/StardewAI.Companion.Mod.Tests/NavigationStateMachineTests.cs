@@ -264,7 +264,11 @@ public class NavigationStateMachineTests
         public bool IsWateringCanEmpty => false;
         public string? ActiveTaskId { get; private set; }
         public void SetActiveTask(string? taskId) => ActiveTaskId = taskId;
-        public void MovePixels(float dx, float dy) => PixelPosition += new Microsoft.Xna.Framework.Vector2(dx, dy);
+        public bool BlockMovement { get; set; }
+        public void MovePixels(float dx, float dy)
+        {
+            if (!BlockMovement) PixelPosition += new Microsoft.Xna.Framework.Vector2(dx, dy);
+        }
         public void Face(FacingDirection dir) => Facing = dir;
         public void Halt() { }
         public void SetLocation(string locationName, TileCoordinate tile)
@@ -320,6 +324,22 @@ public class NavigationStateMachineTests
         Assert.Equal(ExecutionState.Rejected, earlyResult.FinalState);
         Assert.Equal("INVALID_PARAMETERS", earlyResult.ErrorCode);
         Assert.Null(actor.ActiveTaskId);
+    }
+
+    [Fact]
+    public void FinalWaypointStepCannotSnapThroughRejectedMovement()
+    {
+        var start = new Microsoft.Xna.Framework.Vector2(10 * 64, 11 * 64 - 2);
+        var actor = new StubFarmerActor { PixelPosition = start, BlockMovement = true };
+        var observer = new SimulatedWorldObserver();
+        var machine = new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph());
+        Assert.True(machine.Start(new NavigationRequest("blocked-snap", "task-snap", "Farm", new TileCoordinate(10, 11), 120), out _));
+        for (int tick = 1; tick <= 20; tick++) machine.Update(null, tick);
+        Assert.Equal(start, actor.PixelPosition);
+        Assert.NotEqual(ExecutionState.Succeeded, machine.CurrentState);
+        actor.BlockMovement = false;
+        for (int tick = 21; tick <= 120 && machine.CurrentState != ExecutionState.Succeeded; tick++) machine.Update(null, tick);
+        Assert.Equal(ExecutionState.Succeeded, machine.CurrentState);
     }
 
     [Fact]

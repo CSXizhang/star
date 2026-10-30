@@ -64,6 +64,130 @@ public class CompanionMechanicsCoordinatorTests
     }
 
     [Fact]
+    public void ExtensionDiscoveryCannotStealRunningActionReceiptOrCancellation()
+    {
+        var (coordinator, actor, observer) = CreateHarness();
+        string root=Path.Combine(Path.GetTempPath(),"star-busy-extension-"+Guid.NewGuid().ToString("N"));
+        try {
+            coordinator.ConfigureExtensions(root,null!);
+            observer.SetDirt(new TileCoordinate(10,12),TileDirtState.DryDirt());
+            var original=new SkillExecutePayload("water-command","water-task","water-zone","0.1",1,
+                new WaterZoneParameters("Farm",new() { new(10,12) }),new ExecutionBudgets(60,50,20),"safe-point","test");
+            var envelope=CreateEnvelope("skill.execute","water-message");
+            Assert.True(coordinator.TryAcceptSkillExecute(original,envelope,out _));
+            coordinator.ActiveMachine!.RequestPause();
+            foreach (string skill in new[] { "discover-extension-api", "list-extensions" }) {
+                var query=original with { CommandId="query-command",TaskId="query-task",SkillId=skill };
+                Assert.False(coordinator.TryAcceptSkillExecute(query,CreateEnvelope("skill.execute","query-message"),out var reject));
+                Assert.Equal("ACTOR_BUSY",reject!.Error!.Code);
+                Assert.Null(coordinator.LastSkillResultPayload);
+            }
+            coordinator.OnCancelSkill(new SkillCancelPayload(original.CommandId,"player cancelled",true,"safe-point"),envelope);
+            coordinator.StateMachine.StepTicks(2);
+            Assert.False(coordinator.StateMachine.IsExecuting);
+            Assert.Null(actor.ActiveTaskId);
+            Assert.Equal(original.CommandId,coordinator.LastSkillResultPayload!.CommandId);
+        } finally { coordinator.ShutdownExtensions(); Directory.Delete(root,true); }
+    }
+
+    [Fact]
+    public void SourceHandoffRejectsLateActionsUntilConfirmed()
+    {
+        var (coordinator, actor, _) = CreateHarness();
+        actor.Stamina = 25;
+        bool switching = true;
+        coordinator.ConnectionActionsAllowed = () => !switching;
+        var request = new SkillExecutePayload("switch-rest", "rest-task", "rest", "0.1", 1,
+            new WaterZoneParameters("FarmHouse", new()) { TargetStamina = 80 },
+            new ExecutionBudgets(0, 0, 0), "safe-point", "test");
+        var envelope = CreateEnvelope("skill.execute", "switch-message");
+        Assert.False(coordinator.TryAcceptSkillExecute(request, envelope, out var rejected));
+        Assert.NotNull(rejected);
+        Assert.False(coordinator.Rest.IsResting);
+        switching = false;
+        Assert.True(coordinator.TryAcceptSkillExecute(request, envelope, out _));
+        Assert.True(coordinator.Rest.IsResting);
+    }
+
+    [Fact]
+    public void RestUsesSkillPauseResumeAndLocalCancellationWithoutReviving()
+    {
+        var (coordinator, actor, _) = CreateHarness();
+        actor.Stamina = 25;
+        var request = new SkillExecutePayload("rest-controls", "rest-task", "rest", "0.1", 1,
+            new WaterZoneParameters("FarmHouse", new()) { TargetStamina = 80 },
+            new ExecutionBudgets(0, 0, 0), "safe-point", "test");
+        var envelope = CreateEnvelope("skill.execute", "rest-controls-message");
+        Assert.True(coordinator.TryAcceptSkillExecute(request, envelope, out _));
+        coordinator.Rest.RestoreSleep(900, daytime: true);
+        coordinator.OnPauseSkill(new SkillPausePayload(request.CommandId, "player"), envelope);
+        Assert.Equal("paused", coordinator.GetActivityStatus());
+        actor.Stamina = 80;
+        for (int tick = 1; tick <= 20; tick++) coordinator.Update(null, tick);
+        Assert.Null(coordinator.LastSkillResultPayload);
+        coordinator.OnResumeSkill(new SkillResumePayload(request.CommandId), envelope);
+        coordinator.Update(null, 2);
+        Assert.Equal("succeeded", coordinator.LastSkillResultPayload!.TerminalState);
+
+        actor.Stamina = 25;
+        Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-cancel" }, envelope, out _));
+        var restNavigation = (NavigationStateMachine)typeof(CompanionRestController)
+            .GetField("_navigation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(coordinator.Rest)!;
+        Assert.True(restNavigation.Start(new NavigationRequest("rest-route", "rest-task", "Farm", new(15, 10), 120), out _));
+        restNavigation.Update(null, 30);
+        Assert.True(coordinator.PauseRestTask());
+        var pausedTile = actor.Tile;
+        var pausedState = restNavigation.CurrentState;
+        for (int tick = 31; tick <= 60; tick++) coordinator.Update(null, tick);
+        Assert.Equal(pausedTile, actor.Tile);
+        Assert.Equal(pausedState, restNavigation.CurrentState);
+        Assert.True(coordinator.CancelRestTask());
+        Assert.False(restNavigation.IsExecuting);
+        Assert.False(coordinator.ResumeRestTask());
+        for (int tick = 61; tick <= 90; tick++) coordinator.Update(null, tick);
+        Assert.Equal(pausedTile, actor.Tile);
+        Assert.Equal("cancelled", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("awake", coordinator.Rest.State);
+        Assert.False(coordinator.HasRestTask);
+    }
+
+    [Fact]
+    public void RestCommandReturnsItsTargetResultAndCanBeCancelled()
+    {
+        var (coordinator, actor, _) = CreateHarness();
+        actor.Stamina = 25;
+        var request = new SkillExecutePayload("rest-command", "rest-task", "rest", "0.1", 1,
+            new WaterZoneParameters("FarmHouse", new()) { TargetStamina = 80 },
+            new ExecutionBudgets(0, 0, 0), "safe-point", "test");
+        var envelope = CreateEnvelope("skill.execute", "rest-message");
+        Assert.True(coordinator.TryAcceptSkillExecute(request, envelope, out var rejection));
+        Assert.Null(rejection);
+        Assert.Equal(80, coordinator.Rest.RecoveryTarget);
+        Assert.Null(coordinator.LastSkillResultPayload);
+        coordinator.OnCancelSkill(new SkillCancelPayload("cancel", "test", true, "safe-point"),
+            envelope with { CorrelationId = request.CommandId });
+        Assert.Equal("cancelled", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("awake", coordinator.Rest.State);
+
+        actor.Stamina = 80;
+        Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-done" }, envelope, out rejection));
+        coordinator.Update(null, 1);
+        Assert.Equal("succeeded", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("rest-done", coordinator.LastSkillResultPayload.CommandId);
+
+        actor.Stamina = 25;
+        Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-blocked" }, envelope, out rejection));
+        typeof(CompanionRestController).GetProperty("State")!.SetValue(coordinator.Rest, "waiting-for-bed");
+        coordinator.Update(null, 2);
+        Assert.Equal("failed", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("awake", coordinator.Rest.State);
+        Assert.False(coordinator.Rest.IsDaytimeRest);
+        Assert.Null(coordinator.Rest.RecoveryTarget);
+        coordinator.Update(null, 3);
+        Assert.Equal("awake", coordinator.Rest.State);
+    }
+
+    [Fact]
     public void TryAcceptSkillExecute_ValidWaterZone_AcceptedAndExecuted()
     {
         var (coordinator, actor, observer) = CreateHarness();

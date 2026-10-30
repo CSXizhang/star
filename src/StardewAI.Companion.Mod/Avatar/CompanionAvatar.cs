@@ -32,7 +32,7 @@ public sealed class CompanionAvatar
     }
 
     /// <summary>
-    /// Renders the companion visually during SMAPI Display.RenderedWorld.
+    /// Renders the companion in the native location's farmer draw pass.
     /// Uses the actual Farmer draw routine including clothing, hair, tool animations, and shadow.
     /// </summary>
     public void Draw(SpriteBatch spriteBatch)

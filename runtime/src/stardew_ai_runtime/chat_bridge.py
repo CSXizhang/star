@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -49,7 +50,7 @@ from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
 from stardew_ai_runtime.codex_game_profile import CODEX_GAME_TOOL_PROFILE_VERSION
 from stardew_ai_runtime.companion_care import CompanionCareService
-from stardew_ai_runtime.companion_memory import CompanionMemoryStore
+from stardew_ai_runtime.companion_memory import CompanionMemoryStore, resolve_companion_id
 from stardew_ai_runtime.companion_milestones import (
     CompanionMilestoneStore,
     wire_node,
@@ -1077,15 +1078,15 @@ class ActiveChatTask:
     abort_reason: str | None = None
     start_time: float = field(default_factory=time.monotonic)
     recorded: bool = False
+    interrupted_result: dict[str, Any] | None = None
     decision_token: str | None = None
     decision_day: str | None = None
     provider_conversation_id: str | None = None
     instructions_text: str | None = None
     # Full original context is retained only for a provider's fresh-session recovery.
     provider_bootstrap_prompt: str | None = None
-    read_only: bool = False
-    # In-game read-only turns retain conversation history while the life tool
-    # surface independently removes execution authority.
+    execution_deferred: bool = False
+    # Conversations retain their session while existing native work settles.
     preserve_session: bool = False
     goal_scope: str | None = None
     goal_default: str | None = None
@@ -1114,8 +1115,17 @@ class ChatBridge:
         self.run_dir = Path(run_dir) if run_dir else None
         configured = load_chat_backend_config()
         self.backend_name = backend or configured["backend"]
+        self.connection_source = os.environ.get("STARDEW_CONNECTION_SOURCE", "builtin")
+        if self.connection_source not in {"builtin", "external"}:
+            raise ValueError("Connection source must be builtin or external")
+        self._builtin_backend_name = self.backend_name
+        self._external_binding_id = None
+        self._connection_state_sent = None
         self.model = backend_model or model or (configured["model"] if self.backend_name == configured["backend"] else ("kimi-code/k3" if self.backend_name == "kimi" else "" if self.backend_name in {"codex", "mcode"} else "deepseek-flash" if self.backend_name == "dsh" else "gemini-3.8-flash"))
         self.effort = effort or configured.get("effort") or ("low" if self.backend_name in {"codex", "dsh"} else "default")
+        self._builtin_model, self._builtin_effort = self.model, self.effort
+        if self.connection_source == "external":
+            self.backend_name, self.model, self.effort = "mcode", "", "default"
         self.instance_id = instance_id or f"chat-bridge-{uuid.uuid4().hex[:8]}"
         self.agy_cmd = agy_cmd or "agy.exe"
         self.kimi_cmd = kimi_cmd or "kimi.exe"
@@ -1236,9 +1246,106 @@ class ChatBridge:
     def provider(self) -> str:
         return self.backend_name
 
+    def _connection_ready(self) -> bool:
+        if getattr(self, "_connection_switching", False):
+            return False
+        if getattr(self, "connection_source", "builtin") != "external":
+            return True
+        from .external_connection import read_binding
+        binding = read_binding(self.run_dir)
+        return bool(binding and binding.get("enabled", True)
+                    and getattr(self, "_external_status", None) == "connected")
+
+    async def _send_connection_state(self, ws, *, request_id=None, error=None):
+        from .external_connection import read_binding
+        source = getattr(self, "connection_source", "builtin")
+        binding = read_binding(self.run_dir) if source == "external" else None
+        status = ("error" if error else "connected" if source == "builtin" else
+                  getattr(self, "_external_status", "waiting"))
+        payload = {"source": source, "status": status,
+            "clientName": binding.get("clientName") if binding else self.backend_name if source == "builtin" else None,
+            "conversationName": binding.get("conversationName") if binding else None,
+            "interactionMode": "automatic" if source == "builtin" or binding else "waiting",
+            "exclusiveClientRequired": source == "external"}
+        if request_id:
+            payload["requestId"] = request_id
+        if error:
+            payload["error"] = error
+        if payload == getattr(self, "_connection_state_sent", None):
+            return
+        envelope = Envelope("0.1", "connection.state", "msg-" + uuid.uuid4().hex,
+                            self.instance_id, 0, 0, datetime.datetime.now(datetime.UTC), payload)
+        if await self._send_reply(ws, envelope):
+            self._connection_state_sent = payload
+
+    async def _refresh_external_connection(self, ws):
+        if getattr(self, "connection_source", "builtin") != "external":
+            return
+        from .external_connection import read_binding
+        binding = read_binding(self.run_dir)
+        identity = (binding.get("bindingId"), binding.get("enabled", True)) if binding else None
+        previous = getattr(self, "_external_binding_id", None)
+        if previous is not None and previous != identity:
+            self.abort_active_task("Original partner attachment changed")
+            self._autonomy_generation += 1
+            if self._active_task and self._active_task.save_id and self._work_store:
+                self._work_store.revoke_decision(self._active_task.save_id)
+        self._external_binding_id = identity
+        if time.monotonic() >= getattr(self, "_external_health_at", 0) or previous != identity:
+            from .external_connection import AcpError, call_adapter
+            self._external_health_at = time.monotonic() + 2
+            if not binding or not binding.get("enabled", True):
+                self._external_status = "waiting"
+            else:
+                try:
+                    health = await asyncio.to_thread(call_adapter, binding, "health")
+                    self._external_status = health.get("status", "disconnected")
+                except (OSError, ValueError, AcpError):
+                    self._external_status = "disconnected"
+                    self.abort_active_task("Original client adapter disconnected")
+        await self._send_connection_state(ws)
+
+    async def _set_connection_source(self, ws, payload, save_id):
+        source, request_id = payload.get("source"), payload.get("requestId")
+        if source not in {"builtin", "external"}:
+            await self._send_connection_state(ws, request_id=request_id, error="Unknown connection source")
+            return
+        self._connection_switching = True
+        try:
+            active = self._active_task
+            self.abort_active_task("Player changed partner source")
+            self._autonomy_generation += 1
+            if save_id and self._work_store:
+                self._work_store.revoke_decision(save_id)
+            if active and active.async_task and active.async_task is not asyncio.current_task():
+                await asyncio.gather(active.async_task, return_exceptions=True)
+            if self._plan_worker:
+                await self._plan_worker.stop()
+            self._life_queue.clear()
+            self._pending_life_preparation.clear()
+            self.connection_source = source
+            self.backend_name = "mcode" if source == "external" else self._builtin_backend_name
+            self.model = "" if source == "external" else self._builtin_model
+            self.effort = "default" if source == "external" else self._builtin_effort
+            self._backend = None
+            self._bind_companion_stores()
+            self._external_binding_id = None
+            self._external_status = "waiting"
+            self._external_health_at = 0
+            self._connection_state_sent = None
+            await self._send_connection_state(ws, request_id=request_id)
+        finally:
+            self._connection_switching = False
+
     def _get_backend(self):
         if self._backend is None:
-            if self.backend_name == "agy":
+            if getattr(self, "connection_source", "builtin") == "external":
+                from .external_connection import ExternalSessionBackend
+                if self.run_dir is None:
+                    raise ValueError("External connection requires a game run directory")
+                self._backend = ExternalSessionBackend(self.run_dir,
+                    progress=getattr(self, "_backend_progress_callback", None))
+            elif self.backend_name == "agy":
                 self._backend = AgyBackend(self._execute_agy_turn)
             elif self.backend_name == "kimi":
                 self._backend = KimiBackend(
@@ -1303,13 +1410,22 @@ class ChatBridge:
         loop = asyncio.get_running_loop()
 
         def callback(event: Any) -> None:
-            if event.kind != "tool_started" or not event.tool_name:
+            if event.kind == "session_ready":
+                active = self._active_task
+                if (active is not None and active.request_id == request_id and not active.cancelled
+                        and event.provider == self.backend_name and event.message):
+                    existing = self.get_conversation_id(save_id)
+                    if existing is None or existing == event.message:
+                        self.record_conversation_id(save_id, event.message)
+                return
+            public = event.kind == "public_message"
+            if not public and (event.kind != "tool_started" or not event.tool_name):
                 return
             reply = Envelope.create_chat_reply(
                 sender_instance_id=self.instance_id,
-                request_id=request_id,
+                request_id=(request_id + ":message:" + hashlib.sha256(event.message.encode()).hexdigest()[:16] if public else request_id),
                 status="processing",
-                reply_text=f"{event.message}：{event.tool_name}",
+                reply_text=event.message if public else f"{event.message}：{event.tool_name}",
                 save_id=save_id,
                 provider=self.backend_name,
                 command_id=(self._active_task.command_id if self._active_task and self._active_task.request_id == request_id else request_id),
@@ -1340,11 +1456,13 @@ class ChatBridge:
         self._milestone_store = CompanionMilestoneStore(data_dir / "companion-milestones.json")
         self._life_fingerprints = self._load_life_fingerprints()
         self._life_chat = LifeChatService(
-            backend_name=self.backend_name,
+            backend_name=("external:mcode" if getattr(self, "connection_source", "builtin") == "external" else self.backend_name),
             sessions=self._sessions,
             sessions_file=self._sessions_file,
             fingerprints=self._life_fingerprints,
             fingerprints_file=self._life_fingerprint_path(),
+            session_resolver=self.get_conversation_id,
+            session_recorder=self.record_conversation_id,
         )
 
     def _life_fingerprint_path(self) -> Path:
@@ -1624,6 +1742,10 @@ class ChatBridge:
         logger.info("Recorded command [%s] (status=%s, usage=%s)", request_id, status, "yes" if usage else "none")
 
     def get_conversation_id(self, save_id: str | None) -> str | None:
+        if getattr(self, "connection_source", "builtin") == "external":
+            from .external_connection import read_binding
+            binding = read_binding(self.run_dir)
+            return binding["providerSessionId"] if binding and binding.get("enabled", True) else None
         if not save_id:
             return None
         # Provider-qualified keys prevent sessions from crossing CLI backends.
@@ -1638,6 +1760,10 @@ class ChatBridge:
                 or self._sessions.get(f"life:agy:{save_id}"))
 
     def record_conversation_id(self, save_id: str | None, conversation_id: str) -> None:
+        if getattr(self, "connection_source", "builtin") == "external":
+            # The client-verified binding owns identity across farm partitions.
+            # Never overwrite a built-in partner mapping with the external ID.
+            return
         if not save_id or not conversation_id:
             return
         key = f"{self.backend_name}:{save_id}"
@@ -1663,7 +1789,7 @@ class ChatBridge:
                         terminate(proc)
                     else:
                         proc.kill()
-                    logger.info("Killed %s CLI subprocess (pid=%s)", self.backend_name, proc.pid)
+                    logger.info("Cancelled %s game turn (owned process pid=%s)", self.backend_name, getattr(proc, "pid", None))
                 except Exception as ex:
                     logger.debug("Error killing process: %s", ex)
             if self._active_task.async_task and not self._active_task.async_task.done():
@@ -1691,6 +1817,7 @@ class ChatBridge:
         )
 
         last_wait_log = 0.0
+        retired_execution_paths: set[str] = set()
 
         while stop_event is None or not stop_event.is_set():
             try:
@@ -1721,6 +1848,12 @@ class ChatBridge:
                             logger.info("已将日志文件切换至运行目录: %s", new_log)
                         except Exception as ex:
                             logger.debug("Failed to switch log path to %s: %s", self.run_dir, ex)
+
+                if not self._enable_plan_worker and self._work_store is not None:
+                    state_path = str(self._work_store.state_path)
+                    if state_path not in retired_execution_paths:
+                        self._work_store.retire_legacy_execution()
+                        retired_execution_paths.add(state_path)
 
                 # Guard against save switch while task was running
                 if self._active_task and self._active_task.save_id != save_id:
@@ -1777,14 +1910,16 @@ class ChatBridge:
         from .game_reload import (
             mark_game_load_applied,
             pending_game_load,
+            preserve_provider_sessions,
+            recover_recorded_choices,
             restore_game_load,
-            rotate_provider_sessions,
         )
 
         if self.run_dir is None or not save_id:
             return
         request = pending_game_load(self.run_dir, save_id, session_id)
         if request is None:
+            recover_recorded_choices(self.run_dir, save_id)
             return
         self.abort_active_task("Game save reloaded")
         self._autonomy_generation += 1
@@ -1803,8 +1938,14 @@ class ChatBridge:
         if active is not None and active is not asyncio.current_task():
             await asyncio.gather(active, return_exceptions=True)
         restore_game_load(self.run_dir, request)
-        rotate_provider_sessions(self.run_dir, request, self._sessions, self._sessions_file)
+        preserve_provider_sessions(self.run_dir, request, self._sessions, self._sessions_file)
+        from .prompt_delivery import PromptDelivery
+        delivery = PromptDelivery(self.run_dir / "prompt-delivery.json")
+        for key, baseline in list(delivery.state.items()):
+            if f":{save_id}:" in key:
+                delivery.invalidate_session(key, baseline.get("session"))
         self._latest_snapshot_payload = None
+
         self._latest_snapshot_observed_at = None
         self._latest_snapshot_revision = None
         self._current_game_day_key = None
@@ -1819,6 +1960,7 @@ class ChatBridge:
         self._bind_autonomy_store()
         self._bind_work_store()
         self._bind_companion_stores()
+        recover_recorded_choices(self.run_dir, save_id)
         if self._life_chat is not None:
             self._life_chat.record_fingerprint(save_id, self._profile_revision(save_id), self._memory_instruction_revision(save_id))
         mark_game_load_applied(self.run_dir, request)
@@ -1834,6 +1976,9 @@ class ChatBridge:
         latest_snapshot: Envelope | None = None
         last_work_push_at = float("-inf")
         self._chat_ws = ws
+        self._connection_state_sent = None
+        await self._refresh_external_connection(ws)
+        await self._send_connection_state(ws)
         self._player_claim_attempted = False
         # Reconnect must first learn the current native actor and authority.
         # Delivery is scheduled after a snapshot/claim acknowledgement, never
@@ -1855,6 +2000,7 @@ class ChatBridge:
                 try:
                     raw_text = await ws.receive_text(timeout=2.0)
                 except TimeoutError:
+                    await self._refresh_external_connection(ws)
                     self._maybe_deliver_outbox(active_save_id)
                     self._schedule_life_drain(ws)
                     await self._stop_autonomy_if_disabled(ws, active_save_id)
@@ -1869,6 +2015,10 @@ class ChatBridge:
                     continue
 
                 msg_type = data.get("messageType")
+                await self._refresh_external_connection(ws)
+                if msg_type == "connection.source.set":
+                    await self._set_connection_source(ws, data.get("payload") or {}, active_save_id)
+                    continue
                 if msg_type == "chat.delivery.ack":
                     payload = data.get("payload") or {}
                     if self._work_store and payload.get("saveId") == active_save_id:
@@ -2046,6 +2196,8 @@ class ChatBridge:
         *, force: bool = False
     ) -> None:
         """Evaluate the latest native snapshot through the chat channel only."""
+        if not self._connection_ready():
+            return
         if not save_id or self._autonomy is None or envelope.message_type != "world.snapshot":
             return
         restored = self._restore_accepted_preset_scope(save_id)
@@ -2439,7 +2591,23 @@ class ChatBridge:
             "continuity": overview.get("continuity", {}),
         }
 
-    def _decision_context(self, save_id: str | None, *, origin: str = "chat") -> dict[str, Any]:
+    def _recalled_memory(self, save_id: str | None, *, query: str = "") -> dict[str, Any] | None:
+        """Recall farm experience for this partner without replacing its session."""
+        if not save_id or self._memory_store is None:
+            return None
+        snapshot = self._latest_snapshot_payload or {}
+        scene = {key: snapshot.get(key) for key in ("world", "player", "companion") if snapshot.get(key)}
+        return self._memory_store.render_for_context(
+            save_id,
+            companion_id=resolve_companion_id(
+                self.run_dir, save_id, provider=self.backend_name,
+                connection_source=getattr(self, "connection_source", "builtin"),
+                session_id=self.get_conversation_id(save_id)),
+            query=query + " " + json.dumps(scene, ensure_ascii=False),
+            game_date=self._current_game_day_key or "",
+        )
+
+    def _decision_context(self, save_id: str | None, *, origin: str = "chat", query: str = "") -> dict[str, Any]:
         """Compact live context for one decision, rebuilt from the latest snapshot.
 
         Nothing is accumulated across turns, so an old snapshot never grows the
@@ -2456,7 +2624,7 @@ class ChatBridge:
         companion: dict[str, Any] | None = None
         memory: dict[str, Any] | None = None
         if save_id:
-            if self._profile_store is not None:
+            if self._profile_store is not None and getattr(self, "connection_source", "builtin") != "external":
                 profile = (self._profile_store.get(save_id) or {}).get("profile")
                 if profile:
                     companion = {
@@ -2466,7 +2634,7 @@ class ChatBridge:
                         "careFrequency": profile.get("careFrequency"),
                     }
             if self._memory_store is not None:
-                memory = self._memory_store.render_for_context(save_id)
+                memory = self._recalled_memory(save_id, query=query)
         context = build_decision_context(
             snapshot, work=work, origin=origin, companion=companion, memory=memory,
             actor_mode=getattr(self, "actor_mode", None),
@@ -3119,7 +3287,9 @@ class ChatBridge:
         if self.run_dir is None:
             return
         path = self.run_dir / "data" / "life-turn.json"
-        write_cache(path, {"requestId": request_id, "saveId": save_id, "playerText": player_text, "noticeId": notice_id})
+        write_cache(path, {"requestId": request_id, "saveId": save_id, "playerText": player_text, "noticeId": notice_id,
+                           "memoryProvider": "mcode" if getattr(self, "connection_source", "builtin") == "external" else self.backend_name,
+                           "memoryConnectionSource": getattr(self, "connection_source", "builtin")})
 
     async def _apply_life_intent(self, ws: WebSocketClient | None, request_id: str, save_id: str) -> None:
         if self.run_dir is None or not re.fullmatch(r"[A-Za-z0-9_-]+", request_id):
@@ -3149,7 +3319,11 @@ class ChatBridge:
                     or lease.get("saveId") != save_id):
                 continue  # A newer player control invalidated this delayed response.
             action = intent.get("action")
-            if action == "bedtime" and self._profile_store is not None:
+            if action == "speak":
+                await self._send_reply(ws, Envelope.create_chat_reply(
+                    self.instance_id, f"{request_id}:speech:{path.stem}", "public-message",
+                    str(intent.get("text") or ""), save_id=save_id, command_complete=False))
+            elif action == "bedtime" and self._profile_store is not None:
                 self._profile_store.set(save_id, {"bedtime": intent.get("bedtime")}, self._profile_revision(save_id))
                 profile = self._profile_store.get(save_id)
                 await self._send_reply(ws, Envelope.create_life_profile_state(
@@ -3248,7 +3422,17 @@ class ChatBridge:
         if self._work_store is not None and payload.text.strip():
             self._work_store.record_request(save_id, payload.request_id, payload.text,
                                             origin="player-midflight" if midflight else "player")
+        answered_notice = None
+        if payload.reply_to_notice_id and payload.resolve_notice and self._work_store:
+            answered_notice = next(dict(n) for n in self._work_store.unresolved_player_notices(save_id)
+                                   if n.get("id") == payload.reply_to_notice_id)
+            self._work_store.answer_player_notice(save_id, payload.reply_to_notice_id, payload.text, payload.request_id)
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                self.instance_id, payload.request_id, save_id, status="processing",
+                answered_notice_id=payload.reply_to_notice_id,
+                profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
         item = {
+            "answered_notice": answered_notice,
             "ws": ws,
             "request_id": payload.request_id,
             "save_id": save_id,
@@ -3260,11 +3444,16 @@ class ChatBridge:
             "resolve_notice": payload.resolve_notice,
             "control_generation": self._life_control_generation.get(save_id, 0),
         }
-        if self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
+        if not self._connection_ready() or self._busy_lock.locked() or (self._active_task and not self._active_task.cancelled):
             # A work turn/decision owns the single model slot: acknowledge with a
             # player-visible queued status; the drain after that turn finishes
             # delivers the terminal state FIFO (never silently dropped).
-            self._life_queue.append(item)
+            if not any(queued["request_id"] == payload.request_id for queued in self._life_queue):
+                self._life_queue.append(item)
+            if self.run_dir and self._active_task and self._active_task.save_id == save_id and not payload.accepted_node_id:
+                from .turn_messages import exchange
+                exchange(self.run_dir / "data" / "turn-messages.json", self._active_task.request_id, save_id,
+                         publish=[{"requestId": payload.request_id, "text": payload.text}])
             await self._send_reply(ws, Envelope.create_life_chat_reply(
                 sender_instance_id=self.instance_id,
                 request_id=payload.request_id,
@@ -3273,7 +3462,7 @@ class ChatBridge:
                 queue_position=len(self._life_queue),
                 profile_revision=self._profile_revision(save_id),
                 memory_revision=self._memory_revision(save_id),
-                activity={"phase": "waiting", "summary": "伙伴正忙，这次对话已排队。", "nextStep": "当前工作告一段落后继续。"},
+                activity={"phase": "waiting", "summary": "等待原伙伴连接，这次对话已保留。" if not self._connection_ready() else "伙伴正忙，这次对话已排队。", "nextStep": "连接后继续。" if not self._connection_ready() else "当前工作告一段落后继续。"},
             ))
             return
         await self._run_life_chat_turn(ws, item)
@@ -3281,6 +3470,8 @@ class ChatBridge:
 
     def _schedule_life_drain(self, ws: WebSocketClient | None) -> None:
         """Wake deferred dialogue/work without tying up the snapshot reader."""
+        if not self._connection_ready():
+            return
         if (not (self._life_queue or self._pending_life_preparation)
                 or self._life_draining or self._busy_lock.locked() or self._active_task
                 or any(not task.done() for task in self._life_drain_tasks)):
@@ -3291,11 +3482,13 @@ class ChatBridge:
 
     async def _drain_life_queue(self, ws: WebSocketClient | None) -> None:
         """Process queued life submits FIFO once the model slot is free."""
-        if self._life_draining:
+        if self._life_draining or not self._connection_ready():
             return
         self._life_draining = True
         try:
             while self._life_queue or self._pending_life_preparation:
+                if not self._connection_ready():
+                    return
                 if self._busy_lock.locked() or (
                     self._active_task and not self._active_task.cancelled
                 ):
@@ -3303,7 +3496,10 @@ class ChatBridge:
                     return
                 if self._life_queue:
                     item = self._life_queue.pop(0)
-                    await self._run_life_chat_turn(ws or item.get("ws"), item)
+                    if item.get("legacy_connection_message"):
+                        await self.handle_chat_submit(ws or item.get("ws"), item["request_id"], item["text"], item["save_id"])
+                    else:
+                        await self._run_life_chat_turn(ws or item.get("ws"), item)
                 else:
                     save_id = next(iter(self._pending_life_preparation))
                     before = self._pending_life_preparation.pop(save_id)
@@ -3329,13 +3525,18 @@ class ChatBridge:
             self._prompt_delivery = PromptDelivery(delivery_root / "prompt-delivery.json")
         key = f"{self.backend_name}:{active_task.save_id}:{getattr(self, 'actor_mode', '')}:{(self._latest_snapshot_payload or {}).get('actorMultiplayerId', 'unknown')}"
         key += f":{getattr(self, '_player_session_id', None) or 'unknown-session'}"
+        if getattr(self, "connection_source", "builtin") == "external":
+            key = "external:" + key
+            # ACP cannot notify us about compaction performed in the original
+            # client between attachments. Every external turn is self-contained.
+            self._prompt_delivery.invalidate_session(key, conversation_id)
         # All event sources share one state schema. The player suffix is opaque.
         marker = re.search(r"(?m)^(?:玩家说：|玩家指令：)", prompt)
         boundary = marker.start() if marker else len(prompt)
         prefix, player = prompt[:boundary], prompt[boundary:]
-        context = model_decision_context(self._decision_context(active_task.save_id, origin="game"))
-        context["workDispatchAvailable"] = not active_task.read_only
-        if self._profile_store and active_task.save_id:
+        context = model_decision_context(self._decision_context(active_task.save_id, origin="game", query=active_task.prompt))
+        context["executionOccupied"] = active_task.execution_deferred
+        if self._profile_store and active_task.save_id and getattr(self, "connection_source", "builtin") != "external":
             context["profile"] = (self._profile_store.get(active_task.save_id) or {}).get("profile")
         context["milestones"] = self._life_milestone_summary(active_task.save_id, "chat")
         # Event metadata is not world state: retain it when canonicalizing snapshots.
@@ -3347,7 +3548,7 @@ class ChatBridge:
                 if event_key in original:
                     event[event_key] = original[event_key]
         decision = context.get("decision") or {}
-        event.update(requestId=active_task.request_id, workDispatchAvailable=not active_task.read_only)
+        event.update(requestId=active_task.request_id, executionOccupied=active_task.execution_deferred)
         event["goalId"] = decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope
         # These are already represented in the current state; don't inject duplicates from reload.
         if isinstance(context.get("reloadSummary"), dict):
@@ -3356,6 +3557,8 @@ class ChatBridge:
         replacement = "实时上下文：" + render_decision_context(context)
         prefix = re.sub(r"(?m)^实时上下文：[^\n]*", lambda _: replacement, prefix)
         prompt = prefix + "\n本轮任务：" + json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n" + player
+        if getattr(self, "connection_source", "builtin") == "external":
+            prompt = "沿用原对话的身份、角色指令、称呼和记忆；以下只增加当前游戏场景与操作规则。\n" + prompt
         sent, pending = self._prompt_delivery.prepare(
             key, conversation_id, prompt,
             load_instruction_bundle(getattr(self, "actor_mode", None)).text)
@@ -3386,8 +3589,9 @@ class ChatBridge:
             result = self._execute_turn(active_task, conversation_id, prompt)
             cid = result.get("conversation_id") or conversation_id
             if self.backend_name == "agy":
-                result["usage"] = (get_command_usage_delta(cid, start if cid == conversation_id else -1)
-                                   if cid else None) or result.get("usage")
+                usage_cid = result.get("actual_provider_session_id") or cid
+                result["usage"] = (get_command_usage_delta(usage_cid, start if usage_cid == conversation_id else -1)
+                                   if usage_cid else None) or result.get("usage")
             elif self.backend_name == "kimi":
                 result["usage"] = read_usage_since(cid, offset, cwd=project_root())
             return result
@@ -3416,7 +3620,7 @@ class ChatBridge:
                 logger.warning("Could not stop interrupted provider", exc_info=True)
         while True:
             try:
-                await asyncio.shield(future)
+                active_task.interrupted_result = await asyncio.shield(future)
                 break
             except asyncio.CancelledError:
                 # Repeated cancel/disconnect requests still cannot abandon an
@@ -3427,6 +3631,26 @@ class ChatBridge:
                 logger.debug("Interrupted provider exited with an error", exc_info=True)
                 break
 
+    async def _settle_turn_messages(self, active_task, result):
+        if not self.run_dir:
+            return result
+        from .turn_messages import exchange
+        delivered = exchange(self.run_dir / "data" / "turn-messages.json",
+                             active_task.request_id, active_task.save_id)
+        ids = {message["requestId"] for message in delivered}
+        # Tool-boundary delivery is confirmed independently of the turn's outcome.
+        if self._work_store is not None:
+            self._work_store.mark_midflight_consumed(active_task.save_id, list(ids))
+        for item in list(self._life_queue):
+            if item["request_id"] not in ids or item["save_id"] != active_task.save_id:
+                continue
+            self._life_queue.remove(item)
+            await self._send_reply(item.get("ws") or self._chat_ws, Envelope.create_life_chat_reply(
+                self.instance_id, item["request_id"], item["save_id"], status="completed",
+                profile_revision=self._profile_revision(item["save_id"]),
+                memory_revision=self._memory_revision(item["save_id"])))
+        return result
+
     async def _await_work_provider(
         self, active_task: ActiveChatTask, conversation_id: str | None, prompt: str,
     ) -> dict[str, Any]:
@@ -3434,10 +3658,15 @@ class ChatBridge:
             None, self._execute_turn, active_task, conversation_id, prompt)
         try:
             async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
+                while not future.done():
+                    await asyncio.wait({future}, timeout=0.1)
+                    await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
                 return await asyncio.shield(future)
         except asyncio.CancelledError:
             await self._join_interrupted_provider(active_task, future)
             raise
+        finally:
+            await self._settle_turn_messages(active_task, {})
 
     async def _await_life_provider(
         self, active_task: ActiveChatTask, conversation_id: str | None,
@@ -3460,6 +3689,8 @@ class ChatBridge:
             await self._join_interrupted_provider(active_task, future)
             logger.info("Life provider [%s] interrupted by channel shutdown", active_task.request_id)
             raise
+        finally:
+            await self._settle_turn_messages(active_task, {})
 
     async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
         """Run one life-chat turn under the shared single-model-turn lock."""
@@ -3467,6 +3698,7 @@ class ChatBridge:
         save_id = str(item.get("save_id") or "")
         mode = str(item.get("mode") or "chat")
         text = str(item.get("text") or "")
+        active_task = None
         try:
             generation = item.get("control_generation", self._life_control_generation.get(save_id, 0))
             if generation != self._life_control_generation.get(save_id, 0):
@@ -3483,13 +3715,13 @@ class ChatBridge:
                         self.instance_id, request_id, save_id, status="completed", reply_text="这条旧请求已被新的工作控制撤销。",
                         profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id)))
                     return
-                if await self._replay_answered_decision(ws, save_id, item.get("reply_to_notice_id"), request_id, bool(item.get("resolve_notice"))):
+                if not item.get("answered_notice") and await self._replay_answered_decision(ws, save_id, item.get("reply_to_notice_id"), request_id, bool(item.get("resolve_notice"))):
                     return
                 profile = None
-                if self._profile_store is not None and save_id:
+                if self._profile_store is not None and save_id and getattr(self, "connection_source", "builtin") != "external":
                     profile = (self._profile_store.get(save_id) or {}).get("profile")
                 memory_render = (
-                    self._memory_store.render_for_context(save_id)
+                    self._recalled_memory(save_id, query=text)
                     if self._memory_store is not None and save_id
                     else None
                 )
@@ -3520,7 +3752,7 @@ class ChatBridge:
                 prompt_options = {
                     "mode": mode,
                     "milestones": self._life_milestone_summary(save_id, mode),
-                    "live_context": self._decision_context(save_id, origin="life-plan" if mode == "plan" else "life-chat"),
+                    "live_context": self._decision_context(save_id, origin="life-plan" if mode == "plan" else "life-chat", query=text),
                 }
                 system_prompt = (prompt_builder(save_id, existing_cid, *prompt_args, **prompt_options)
                                  if prompt_builder else LifeChatService.build_system_prompt(*prompt_args, **prompt_options))
@@ -3528,7 +3760,7 @@ class ChatBridge:
                 notice_id = item.get("reply_to_notice_id")
                 if notice_id:
                     notices = self._work_store.unresolved_player_notices(save_id) if self._work_store else []
-                    notice = next((n for n in notices if n.get("id") == notice_id), None)
+                    notice = item.get("answered_notice") or next((n for n in notices if n.get("id") == notice_id), None)
                     if notice is None:
                         await self._send_life_error(ws, "life.chat.submit", {"requestId": request_id}, save_id, "DECISION_NO_LONGER_PENDING")
                         return
@@ -3547,7 +3779,7 @@ class ChatBridge:
                     command_id=request_id,
                     prompt=text,
                     async_task=asyncio.current_task(),
-                    read_only=self._delivery_read_only(save_id) or self._job_in_flight(save_id),
+                    execution_deferred=self._execution_occupied(save_id) or self._job_in_flight(save_id),
                 )
                 self._configure_backend_progress(ws, request_id, save_id)
                 await self._send_reply(ws, Envelope.create_life_chat_reply(
@@ -3566,12 +3798,12 @@ class ChatBridge:
                 previous_active = self._active_task
                 self._active_task = active_task
                 try:
-                    if not active_task.read_only:
+                    if not active_task.execution_deferred:
                         execution_claimed = await self._claim_execution(save_id)
                         if self._work_store and text.strip():
                             self._work_store.record_request(save_id, request_id, text, origin="player")
                     result = await self._await_life_provider(active_task, existing_cid, prompt, mode)
-                    if result.get("success") and not active_task.read_only and self._work_store:
+                    if result.get("success") and not active_task.execution_deferred and self._work_store:
                         selected = self._work_store.state(save_id).decision
                         if selected.get("selected") and not selected.get("finished"):
                             self._active_player_requests[save_id] = request_id
@@ -3605,6 +3837,7 @@ class ChatBridge:
                     usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
                     error=result.get("error"), duration=time.monotonic() - active_task.start_time,
                 )
+                active_task.recorded = True
                 if success and self._milestone_store:
                     changed_arrangements = [node for node in self._milestone_store.list_nodes(save_id)
                                             if node.get("status") in {"suggested", "adopted"}
@@ -3680,6 +3913,31 @@ class ChatBridge:
                 reply.payload["activity"] = self._player_activity(save_id)
                 await self._send_reply(ws, reply)
                 self._pending_life_preparation.setdefault(save_id, preparation_before)
+        except asyncio.CancelledError:
+            # The provider await has joined its executor and the inner finally
+            # has released native ownership. Settle this life request too:
+            # the cancel handler's legacy chat.reply does not close life UI.
+            player_cancelled = bool(active_task and (active_task.abort_reason or "").startswith("Cancel requested:"))
+            if active_task is not None and not active_task.recorded:
+                interrupted = active_task.interrupted_result or {}
+                usage = self._codex_turn_usage(interrupted) if self.backend_name == "codex" else interrupted.get("usage")
+                self._record_command(
+                    request_id=request_id, save_id=save_id,
+                    conversation_id=active_task.provider_conversation_id or interrupted.get("conversation_id") or existing_cid,
+                    prompt=text, status="cancelled" if player_cancelled else "interrupted",
+                    start_idx=active_task.start_max_idx, end_idx=-1, usage=usage,
+                    missing_reason=None if usage else "interrupted",
+                    error="PLAYER_CANCELLED" if player_cancelled else active_task.abort_reason or "INTERRUPTED",
+                    duration=time.monotonic() - active_task.start_time,
+                )
+                active_task.recorded = True
+            await self._send_reply(ws, Envelope.create_life_chat_reply(
+                self.instance_id, request_id, save_id,
+                status="completed" if player_cancelled else "failed",
+                reply_text="这次请求已由玩家取消。" if player_cancelled else "这次对话已中断。",
+                profile_revision=self._profile_revision(save_id), memory_revision=self._memory_revision(save_id),
+                error=None if player_cancelled else "INTERRUPTED"))
+            raise
         except Exception as ex:
             logger.error("Life chat turn [%s] failed: %s", request_id, ex, exc_info=True)
             await self._send_reply(ws, Envelope.create_life_chat_reply(
@@ -3820,6 +4078,8 @@ class ChatBridge:
         the service de-duplicates by persisted eventKey, so restarts or repeated
         snapshots never re-fire.
         """
+        if not self._connection_ready():
+            return
         if day_key is not None and day_key != previous_day_key:
             await self._maybe_fire_care(save_id, "morning", day_key, world)
         tod = world.get("timeOfDay")
@@ -3953,7 +4213,7 @@ class ChatBridge:
                 profile = current_profile or profile
                 if profile.get("careFrequency") == "quiet":
                     return None
-                memory_render = self._memory_store.render_for_context(save_id) if self._memory_store else None
+                memory_render = self._recalled_memory(save_id, query=str(ref_event or kind))
                 existing_cid = None
                 session_profile_revision = self._profile_revision(save_id)
                 session_instruction_revision = self._memory_instruction_revision(save_id)
@@ -3972,8 +4232,25 @@ class ChatBridge:
                 active_task = ActiveChatTask(
                     request_id=f"care-{uuid.uuid4().hex[:8]}", save_id=save_id,
                     command_id="", prompt=prompt, async_task=asyncio.current_task())
-                active_task.read_only = True
-                result = await self._await_life_provider(active_task, existing_cid, prompt)
+                active_task.execution_deferred = self._execution_occupied(save_id)
+                self._life_turn_lease(active_task.request_id, save_id)
+                previous_active = self._active_task
+                self._active_task = active_task
+                self._configure_backend_progress(self._chat_ws, active_task.request_id, save_id)
+                execution_claimed = False
+                result = {}
+                try:
+                    if not active_task.execution_deferred:
+                        execution_claimed = await self._claim_execution(save_id)
+                    result = await self._await_life_provider(active_task, existing_cid, prompt)
+                finally:
+                    if (not result.get("success") or active_task.cancelled) and active_task.decision_token and self._work_store:
+                        if self._work_store.state(save_id).decision.get("token") == active_task.decision_token:
+                            self._work_store.revoke_decision(save_id)
+                    if self._active_task is active_task:
+                        self._active_task = previous_active
+                    if execution_claimed:
+                        await self._release_execution(save_id)
                 cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
                 if cid and self._life_chat:
                     self._life_chat.record_session_id(save_id, str(cid))
@@ -4637,7 +4914,7 @@ class ChatBridge:
                 self._active_task = None
             # The cancelled provider turn no longer owns the command socket; hand
             # it back so the worker can settle its own epoch-checked bookkeeping.
-            if old_async_task is None and not task.read_only:
+            if old_async_task is None and not task.execution_deferred:
                 await self._release_execution(active_save or save_id)
         else:
             logger.info("chat.cancel received but no task was actively running.")
@@ -4742,6 +5019,14 @@ class ChatBridge:
         native_command_id = next((step.command_id for step in selected_task.steps
                                   if step.command_id and step.status == "running"), None) if selected_task else None
         self._work_store.revoke_decision(save_id)
+        if self._plan_worker is None:
+            native = (self._latest_snapshot_payload or {}).get("companion", {}).get("activeCommandId")
+            if not native:
+                return True
+            cancel = Envelope.create_cancel(self.instance_id, 0, save_id,
+                getattr(self, "_player_session_id", None), 0, "interrupt-" + uuid.uuid4().hex,
+                native, "Player changed or stopped current work")
+            return await self._send_reply(self._chat_ws, cancel)
         if d.get("selected") and not d.get("finished") and was_dispatched and self._plan_worker:
             try:
                 await self._plan_worker.client.call_tool("dispatch_plan_operation", {
@@ -4793,6 +5078,19 @@ class ChatBridge:
     ) -> None:
         """Processes a user chat submit message."""
         logger.info("Processing chat submit [%s]: %s (saveId=%s)", request_id, text, save_id)
+        if not self._connection_ready() and self._control_utterance(text) not in {"pause", "cancel", "resume"}:
+            if _delivery is not None:
+                self._settle_delivery(request_id, False)
+                return
+            if self._is_player_request(request_id):
+                if self._work_store and save_id:
+                    self._work_store.record_request(save_id, request_id, text, origin="player")
+                if not any(item["request_id"] == request_id for item in self._life_queue):
+                    self._life_queue.append({"request_id": request_id, "text": text, "save_id": save_id,
+                                             "ws": ws, "legacy_connection_message": True})
+                await self._send_reply(ws, Envelope.create_chat_reply(self.instance_id, request_id, "queued",
+                    "等待原伙伴连接，这条消息已保留。", save_id=save_id, command_complete=False))
+            return
         if self._active_task and self._active_task.request_id == request_id:
             # Transport replay must not cancel and restart the same decision.
             return
@@ -4960,7 +5258,7 @@ class ChatBridge:
                 prompt = self._format_delivery_prompt(
                     _delivery["events"], save_id or "",
                     midflight=_delivery.get("midflight") or [],
-                    read_only=bool(_delivery.get("read_only")),
+                    execution_deferred=bool(_delivery.get("execution_deferred")),
                     instructions=instructions.text,
                 )
                 task_prompt = "[outbox-delivery]"
@@ -4972,7 +5270,7 @@ class ChatBridge:
                 task_prompt = text
             if midflight or paused_chat:
                 prompt += "\n执行环境：" + json.dumps({
-                    "workDispatchAvailable": False, "paused": bool(paused_chat),
+                    "executionOccupied": True, "paused": bool(paused_chat),
                     "inFlight": self._in_flight_summary(save_id) if midflight else None,
                 }, ensure_ascii=False)
             # PromptDelivery shares acknowledged guidance across all turn types.
@@ -4999,7 +5297,7 @@ class ChatBridge:
                 wire_start_offset=wire_start_offset,
                 async_task=asyncio.current_task(),
                 instructions_text=instructions.text,
-                read_only=paused_chat or midflight or bool((_delivery or {}).get("read_only")),
+                execution_deferred=paused_chat or midflight or bool((_delivery or {}).get("execution_deferred")),
                 preserve_session=paused_chat or midflight or _delivery is not None,
                 goal_scope=_goal_scope,
                 goal_default=_goal_default,
@@ -5010,11 +5308,10 @@ class ChatBridge:
                                        if self._work_store is not None and save_id else None)
             # Park the internal plan worker and release its MCP session: the Mod
             # serves one command socket and the provider turn now owns it.
-            # Read-only turns (paused/midflight/read-only delivery) only use the
-            # cached life surface and never touch the execution connection.
+            # Existing work keeps ownership; tools recheck current state when called.
             execution_claimed = False
             try:
-                if not active_task.read_only:
+                if not active_task.execution_deferred:
                     execution_claimed = await self._claim_execution(save_id, recover=not paused_chat)
                 # 2. Immediate progress notification.
                 prog_reply = Envelope.create_chat_reply(
@@ -5114,16 +5411,18 @@ class ChatBridge:
                         reply_text = "Kimi 登录或认证已失效，请完成登录后再试。"
                     elif err == "RATE_LIMIT_EXCEEDED":
                         reply_text = "Kimi 请求过于频繁，请稍后重试。"
-                    elif err == "MCODE_SESSION_UNAVAILABLE":
-                        reply_text = "会话已失效，已安全新建会话；请再发一次。"
+                    elif err in {"MCODE_SESSION_UNAVAILABLE", "CODEX_SESSION_UNAVAILABLE", "CODEX_CONTEXT_EXHAUSTED"}:
+                        reply_text = "原会话暂时无法恢复，已保留绑定并停止本轮；请修复原会话连接或明确选择更换伙伴。"
 
-                if cid and save_id and (not active_task.read_only or active_task.preserve_session):
+                if cid and save_id and (not active_task.execution_deferred or active_task.preserve_session):
                     self.record_conversation_id(save_id, cid)
                     if result.get("success") and reload_summary:
                         self._work_reload_context(save_id, cid, delivered=True,
                                                   expected_game_session_id=reload_summary.get("gameSessionId"))
 
-                end_max_idx = get_max_gen_idx(cid) if (cid and self.backend_name == "agy") else -1
+                usage_cid = result.get("actual_provider_session_id") or cid
+                usage_start_idx = -1 if usage_cid != cid else start_max_idx
+                end_max_idx = get_max_gen_idx(usage_cid) if (usage_cid and self.backend_name == "agy") else -1
 
                 missing_reason = None
                 tokens_used = None
@@ -5140,7 +5439,7 @@ class ChatBridge:
                     # Provider-specific metering: sum the wire's usage.record lines
                     # produced after this turn started. Unknown stays unknown; never 0.
                     usage = read_usage_since(
-                        cid, active_task.wire_start_offset, cwd=project_root()
+                        usage_cid, active_task.wire_start_offset if usage_cid == cid else 0, cwd=project_root()
                     )
                     if usage is None:
                         usage_source = "unknown"
@@ -5170,7 +5469,7 @@ class ChatBridge:
                         missing_reason = "mcode_exec_usage_unavailable"
                 else:
                     # Authoritative agy delta from the conversation DB (agy only).
-                    usage_delta = get_command_usage_delta(cid, start_max_idx) if cid else None
+                    usage_delta = get_command_usage_delta(usage_cid, usage_start_idx) if usage_cid else None
                     if usage_delta:
                         usage = usage_delta
                         usage_source = "db_gen_metadata_delta"
@@ -5225,10 +5524,10 @@ class ChatBridge:
                 self._record_command(
                     request_id=request_id,
                     save_id=save_id,
-                    conversation_id=cid,
+                    conversation_id=usage_cid,
                     prompt=active_task.prompt,
                     status=status,
-                    start_idx=start_max_idx,
+                    start_idx=usage_start_idx,
                     end_idx=end_max_idx,
                     usage=usage,
                     missing_reason=missing_reason,
@@ -5241,7 +5540,7 @@ class ChatBridge:
                 # Keep diagnostic operation names/reason codes out of chat.
                 reply_status = status
                 job_selected = False
-                if not active_task.read_only and self._work_store and save_id:
+                if not active_task.execution_deferred and self._work_store and save_id:
                     selected = self._work_store.state(save_id).decision
                     if selected.get("selected") and not selected.get("finished"):
                         # job-selected means dispatched, not finished: the model's
@@ -5281,8 +5580,8 @@ class ChatBridge:
                     sender_instance_id=self.instance_id,
                     request_id=request_id,
                     status=reply_status,
-                reply_text=reply_text or ("本次对话未能完成。" if active_task.read_only and status == "failed"
-                    else "已保留暂停。" if active_task.read_only else "任务未能成功执行。" if status == "failed" else "任务执行完毕。"),
+                reply_text=reply_text or ("本次对话未能完成。" if active_task.execution_deferred and status == "failed"
+                    else "已保留暂停。" if active_task.execution_deferred else "任务未能成功执行。" if status == "failed" else "任务执行完毕。"),
                     save_id=save_id,
                     tokens_used=tokens_used,
                     prompt_tokens=prompt_tokens,
@@ -5319,7 +5618,7 @@ class ChatBridge:
                     # Model completion consumes its turn. Player delivery needs
                     # the native receipt; a failed socket replays the saved reply.
                     self._settle_delivery(request_id, bool(sent_ok or notification_saved) and bool(result.get("success")))
-                if self._autonomy is not None and save_id and not active_task.read_only:
+                if self._autonomy is not None and save_id and not active_task.execution_deferred:
                     self._autonomy.record_event(save_id, f"chat-terminal:{request_id}:{status}", f"chat.{status}")
                     autonomy_fingerprint = self._autonomy_requests.pop(request_id, None)
                     if autonomy_fingerprint:
@@ -5505,7 +5804,7 @@ class ChatBridge:
         return summary
 
     def _format_agent_prompt(self, user_text: str, save_id: str | None = None, *, instructions: str | None = None) -> str:
-        live = self._decision_context(save_id, origin="chat")
+        live = self._decision_context(save_id, origin="chat", query=user_text)
         live.pop("reloadSummary", None)
         context = render_decision_context(model_decision_context(live))
         return (
@@ -5696,6 +5995,8 @@ class ChatBridge:
 
     def _maybe_deliver_outbox(self, save_id: str | None) -> None:
         """Start the boundary delivery turn for persisted terminal facts."""
+        if not self._connection_ready():
+            return
         if not save_id or self._work_store is None:
             return
         if self._latest_snapshot_payload is None:
@@ -5725,7 +6026,7 @@ class ChatBridge:
 
         task.add_done_callback(_clear)
 
-    def _delivery_read_only(self, save_id: str) -> bool:
+    def _execution_occupied(self, save_id: str) -> bool:
         """Current native ownership, not the event source, gates execution."""
         if self.actor_mode == "player" and self.control_owner != "agent":
             return True
@@ -5772,13 +6073,13 @@ class ChatBridge:
             if ws is None:
                 return
             self._work_store.recover(save_id)
-            read_only = self._delivery_read_only(save_id)
-            midflight = [] if read_only else self._work_store.pending_midflight_requests(save_id)
+            execution_deferred = self._execution_occupied(save_id)
+            midflight = [] if execution_deferred else self._work_store.pending_midflight_requests(save_id)
             requests_by_id = {str(r.get("id")): r for r in self._work_store.state(save_id).requests}
             event_requests = {str(event["requestId"]) for event in events if event.get("requestId")}
             if (not midflight and event_requests
                     and all(requests_by_id.get(root, {}).get("workStopped") for root in event_requests)):
-                read_only = True
+                execution_deferred = True
             visible = any(
                 event.get("requestId") and not str(event.get("requestId")).startswith("autonomy-")
                 for event in events
@@ -5817,7 +6118,7 @@ class ChatBridge:
                         "events": events,
                         "midflight": midflight,
                         "midflight_ids": [m["id"] for m in midflight],
-                        "read_only": read_only,
+                        "execution_deferred": execution_deferred,
                         "command_id": root,
                     },
                 )
@@ -5849,10 +6150,10 @@ class ChatBridge:
         save_id: str,
         *,
         midflight: list[dict[str, Any]],
-        read_only: bool,
+        execution_deferred: bool,
         instructions: str | None = None,
     ) -> str:
-        live = self._decision_context(save_id, origin="delivery")
+        live = self._decision_context(save_id, origin="delivery", query=json.dumps(events, ensure_ascii=False))
         live.pop("reloadSummary", None)
         context = render_decision_context(model_decision_context(live))
         requests_by_id: dict[str, dict[str, Any]] = {}
@@ -5906,7 +6207,7 @@ class ChatBridge:
                 if request_id in request_totals
             },
         }
-        payload["workDispatchAvailable"] = not read_only
+        payload["executionOccupied"] = execution_deferred
         return (
             f"{instructions or decision_policy()}\n"
             f"实时上下文：{context}\n"
@@ -5921,6 +6222,9 @@ class ChatBridge:
         prompt: str,
     ) -> dict[str, Any]:
         """Dispatch one turn to the configured provider adapter."""
+        if not self._connection_ready():
+            return {"success": False, "response": "等待原伙伴连接；未启动替代会话。",
+                    "conversation_id": conversation_id, "error": "EXTERNAL_CONNECTION_WAITING"}
         # Preserve the legacy test/integration seam when callers explicitly
         # replace _execute_agy_turn; normal production dispatch remains solely
         # controlled by backend_name.
@@ -5930,7 +6234,7 @@ class ChatBridge:
         assert_native_compatible(self.run_dir)
         token = uuid.uuid4().hex
         save_id = active_task.save_id
-        if save_id and self._work_store is not None and not active_task.read_only:
+        if save_id and self._work_store is not None and not active_task.execution_deferred:
             scope = active_task.goal_scope or (self._autonomy.state(save_id).goal_scope
                      if self._autonomy and active_task.request_id.startswith("autonomy-") else None)
             state = self._work_store.state(save_id)
@@ -5946,7 +6250,7 @@ class ChatBridge:
                 request_ids=list(dict.fromkeys([
                     *active_task.work_request_ids,
                     *(str(request["id"]) for request in self._work_store.pending_midflight_requests(save_id)
-                      if not active_task.read_only),
+                      if not active_task.execution_deferred),
                 ])),
             )
             active_task.decision_token = token
@@ -5954,34 +6258,28 @@ class ChatBridge:
         previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
         previous_surface = os.environ.get("STARDEW_MCP_SURFACE")
         # Capability discovery stays fixed; only cached reads/execution admission differ.
-        os.environ["STARDEW_MCP_SURFACE"] = "life" if active_task.read_only else "light"
-        if active_task.read_only:
+        os.environ["STARDEW_MCP_SURFACE"] = "light"
+        if active_task.execution_deferred:
             os.environ.pop("STARDEW_DECISION_TOKEN", None)
         else:
             os.environ["STARDEW_DECISION_TOKEN"] = token
         try:
             backend = self._get_backend()
-            if isinstance(backend, (KimiBackend, CodexBackend, DshBackend, McodeBackend)):
+            if hasattr(backend, "progress"):
                 backend.progress = getattr(self, "_backend_progress_callback", None)
             turn_native_session = getattr(self, "_player_session_id", None)
-            for attempt in range(2):
-                delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
-                    active_task, conversation_id, prompt, backend)
-                result = backend.run(active_task, conversation_id, sent_prompt)
-                if attempt:
-                    result["session_retried"] = True
-                if (attempt == 0 and conversation_id and save_id and not active_task.cancelled
-                        and (self.backend_name, result.get("error")) in {
-                            ("mcode", "MCODE_SESSION_UNAVAILABLE"),
-                            ("codex", "CODEX_SESSION_UNAVAILABLE"),
-                            ("codex", "CODEX_CONTEXT_EXHAUSTED"),
-                        }):
-                    self._rotate_provider_session(save_id, reason=str(result["error"]))
-                    conversation_id = None
-                    continue
-                break
+            delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
+                active_task, conversation_id, prompt, backend)
+            result = backend.run(active_task, conversation_id, sent_prompt)
+            if conversation_id and result.get("conversation_id") not in {None, conversation_id}:
+                # A provider may return an unexpected session; never bless it as
+                # continuity or advance the old conversation's delivery baseline.
+                active_task.provider_input_delivered = False
+                result.update(actual_provider_session_id=result.get("conversation_id"),
+                              success=False, error="PROVIDER_SESSION_CHANGED",
+                              response="后端返回了不同会话；原绑定保留，请检查客户端。", conversation_id=conversation_id)
             delivered_session = result.get("conversation_id")
-            if delivered_session and not active_task.cancelled and not result.get("error"):
+            if delivered_session and (getattr(active_task, "provider_input_delivered", False) or (not active_task.cancelled and not result.get("error"))):
                 self._acknowledge_prompt_delivery(delivery_key, pending_prompt, save_id, str(delivered_session))
                 if self.actor_mode == "player":
                     self._work_reload_context(active_task.save_id, str(delivered_session), delivered=True,
@@ -6549,7 +6847,7 @@ class ChatBridge:
                 logger.warning("agent.thinking end [%s] send failed", lease_id, exc_info=True)
 
     async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> bool:
-        if reply.message_type == "chat.reply" and self._active_task is not None and self._active_task.read_only and (
+        if reply.message_type == "chat.reply" and self._active_task is not None and self._active_task.execution_deferred and (
             reply.payload.get("requestId") == self._active_task.request_id
         ):
             reply.payload["readOnly"] = True
@@ -6560,10 +6858,6 @@ class ChatBridge:
         if reply.message_type in {"chat.reply", "life.chat.reply", "autonomy.state"} and ws is not None and reply.payload.get("saveId"):
             save_id = str(reply.payload["saveId"])
             await self._push_work_state(ws, save_id)
-        if reply.message_type == "chat.reply" and str(reply.payload.get("requestId", "")).startswith("autonomy-"):
-            if reply.payload.get("status") not in {"failed", "job-failed", "rejected", "unknown", "partial"}:
-                logger.info("Quiet autonomous reply: %s", json.dumps(dict(reply.payload), ensure_ascii=False))
-                return True
         if ws is None:
             return False
         try:
@@ -6649,6 +6943,7 @@ def _main_bridge(args: argparse.Namespace, owner_guard: OwnerProcessGuard | None
         backend=args.backend,
         kimi_cmd=args.kimi_cmd,
         mcode_cmd=args.mcode_cmd,
+        enable_plan_worker=False,
     )
 
     _, log_file_path = configure_chat_bridge_file_logging(bridge.run_dir)

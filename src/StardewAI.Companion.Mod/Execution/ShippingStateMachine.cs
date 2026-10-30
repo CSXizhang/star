@@ -50,6 +50,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
 
     private long _elapsedTicks;
     private readonly ExecutionProgressWatchdog _progressWatchdog = new();
+    private readonly WalkingProgress _walkingProgress = new();
     private int _startClock;
 
     private volatile bool _cancelRequested;
@@ -111,6 +112,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
             _shippingBinTotalCount = 0;
             _elapsedTicks = 0;
             _progressWatchdog.Reset();
+            _walkingProgress.Reset();
             _replanCount = 0;
             _startClock = _observer.TimeOfDay;
             _cancelRequested = false;
@@ -372,6 +374,12 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
         }
 
         var step = _currentPath[_currentPathIndex];
+        if (!ActorGuards.IsPlayerBound(_actor) && _walkingProgress.IsBlocked(_actor, step.Tile))
+        {
+            FinishExecution(ExecutionState.Failed,
+                $"Walking blocked on '{_actor.LocationName}' at {_actor.Tile} toward {step.Tile}; pixel={_actor.PixelPosition}. Inspect the obstruction before choosing clearance or another route.", "MOVEMENT_BLOCKED");
+            return;
+        }
         if (ActorGuards.HasReachedWalkingTile(_actor, step.Tile)) {
             _actor.Halt(); _currentPathIndex++; return;
         }
@@ -412,7 +420,7 @@ public sealed class ShippingStateMachine : ISkillExecutionMachine
         }
         if (dist <= WalkPixelsPerTick)
         {
-            _actor.PixelPosition = new Vector2(step.Tile.X * 64, step.Tile.Y * 64);
+            if (!ActorGuards.TryFinishWalkingStep(_actor, walkingTarget)) return;
             _actor.Face(step.Facing);
             _currentPathIndex++;
             _replanCount = 0;

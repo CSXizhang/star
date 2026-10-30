@@ -693,7 +693,7 @@ def build_decision_context(
             "boundaryIsNotStrategy": True,
             "remainingResources": "Use time/stamina/funds/inventory above; necessary farm work is not the entire day.",
             "nativeOptions": {
-                "travelAndForage": "movement + farming_helpers: observe one purposeful reachable area, pickup observed items",
+                "travelAndForage": "movement + farming_helpers: observe one purposeful reachable area, pickup existing drops/collectibles (isDropped/canBeGrabbed)",
                 "tradeAndCraft": "shopping/crafting: observed prices and unlocked recipes only",
                 "landAndResources": "farm/forestry: preserve doors/routes, compare regions including home/water distances",
                 "story": "native_ui: actual event/dialogue, legal advance/skip and observed choices",
@@ -748,6 +748,12 @@ def _attach_companion_memory(
             layers[label] = [dict(r) for r in rows if isinstance(r, dict)]
     if layers:
         context["sharedMemory"] = layers
+    notes = memory.get("relevantNotes")
+    if isinstance(notes, list):
+        context["relevantNotes"] = [dict(note) for note in notes if isinstance(note, dict)]
+    preferences = memory.get("preferences")
+    if isinstance(preferences, list) and preferences:
+        context["preferences"] = [dict(note) for note in preferences if isinstance(note, dict)]
     agreements = memory.get("agreements")
     if isinstance(agreements, list) and agreements:
         context["agreements"] = [
@@ -773,6 +779,33 @@ def model_decision_context(context: dict[str, Any]) -> dict[str, Any]:
                                  ("funds", "spendableMoney"), ("fundsStatus", "moneyStatus")):
             if canonical in companion:
                 result.pop(alias, None)
+    # Historical ledgers remain queryable; unrelated past requests are not part
+    # of the current decision. Keep the uncertainty flag and the current request.
+    decision = result.get("decision") or {}
+    request_ids = {decision.get("requestId"), *decision.get("requestIds", [])}
+    totals = result.get("confirmedRequestTotals")
+    if isinstance(totals, dict):
+        result["confirmedRequestTotals"] = {key: value for key, value in totals.items() if key in request_ids}
+    goals = result.get("goals") or []
+    goal_ids = {g.get("id") for g in goals if isinstance(g, dict)}
+    prep = result.get("duePreparation")
+    if isinstance(prep, list):
+        date = result.get("date") or {}
+        def past(item):
+            trigger = item.get("trigger") or {}
+            try:
+                return (str(trigger.get("year")) == str(date.get("year"))
+                        and trigger.get("season") == date.get("season")
+                        and int(trigger.get("day", 99)) < int(date.get("day", 0)))
+            except (TypeError, ValueError):
+                return False
+        # A dated observation is not a fresh command. Preserve linked goals and
+        # constraints, but don't repeat their long scope text in preparations.
+        result["duePreparation"] = [
+            {k: row[k] for k in ("id", "goalId", "trigger") if k in row}
+            if row.get("goalId") in goal_ids else row
+            for row in prep if isinstance(row, dict) and (row.get("goalId") or not past(row))]
+        result["historicalPreparationCount"] = sum(1 for row in prep if isinstance(row, dict) and not row.get("goalId") and past(row))
     return result
 
 
@@ -791,7 +824,7 @@ def render_decision_context(context: dict[str, Any]) -> str:
 _INCREMENTAL_SLICES = (
     "lastResult", "decision", "currentTask", "waitingConditions",
     "duePreparation", "anomalies", "blockedBranches", "plantingEvidence", "dayChoice",
-    "lastSettledDay",
+    "lastSettledDay", "sharedMemory", "agreements", "preferences", "recentSharedEvents", "relevantNotes",
 )
 
 
@@ -881,7 +914,8 @@ def build_incremental_context(
         value = context.get(key)
         digest = _slice_digest(value)
         slices[key] = digest
-        if value is not None and prev_slices.get(key) != digest:
+        memory_slice = key in {"sharedMemory", "agreements", "preferences", "recentSharedEvents", "relevantNotes"}
+        if prev_slices.get(key) != digest and (value is not None or (memory_slice and key in prev_slices)):
             changes[key] = value
     incremental = {"summary": build_compact_summary(context)}
     if changes:

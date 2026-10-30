@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from stardew_ai_runtime.autonomy import AutonomyController
-from stardew_ai_runtime.client import TransportClient
+from stardew_ai_runtime.client import NativeResultUnavailable, TransportClient
 from stardew_ai_runtime.protocol import NATIVE_ACTION_TASK_PREFIXES, Envelope
 
 logger = logging.getLogger("stardew_ai_runtime.scheduler")
@@ -58,7 +58,6 @@ class NoActiveTaskError(SchedulerError):
 
 
 COMMON_GAME_PATHS: list[str] = [
-    r"E:\Game\steam\steamapps\common\Stardew Valley",
     r"C:\Program Files (x86)\Steam\steamapps\common\Stardew Valley",
     r"C:\Program Files\Steam\steamapps\common\Stardew Valley",
     r"D:\SteamLibrary\steamapps\common\Stardew Valley",
@@ -1006,6 +1005,7 @@ class CompanionScheduler:
                 "saveId": envelope.save_id,
                 "gameSessionId": envelope.game_session_id,
                 "worldRevision": envelope.world_revision,
+                "observedAt": envelope.sent_at.isoformat(),
             }
 
     async def _refresh_snapshot(self, client: TransportClient) -> None:
@@ -1246,14 +1246,24 @@ class CompanionScheduler:
                     self._active_task.is_terminal = True
                     self._active_task = None
                 except Exception:
-                    pass
+                    # A fresh native idle observation releases execution even if
+                    # its terminal receipt was lost. It does NOT prove success.
+                    observed_at = snap.get("observedAt")
+                    try:
+                        fresh_idle = (datetime.fromisoformat(observed_at) > self._active_task.expires_at
+                                      and snap.get("gameSessionId") == client.game_session_id)
+                    except (TypeError, ValueError):
+                        fresh_idle = False
+                    if fresh_idle:
+                        self._active_task = None
 
         snap = self._latest_snapshot_data or {}
         payload = snap.get("payload", {})
         companion = payload.get("companion", {})
         world = payload.get("world", {})
 
-        current_task = None
+        current_task = ({"commandId": companion["activeCommandId"], "status": companion.get("activity")}
+                        if companion.get("activeCommandId") else None)
         if self.has_active_task and self._active_task:
             current_task = {
                 "taskId": self._active_task.task_id,
@@ -1480,9 +1490,30 @@ class CompanionScheduler:
             if not cmd_id:
                 raise SchedulerError("Active task missing command ID for wait")
 
-            result_env = await client.wait_for_result(
-                command_id=cmd_id, timeout=timeout_seconds
-            )
+            if getattr(self, "await_terminal_results", False):
+                deadline = time.monotonic() + max(timeout_seconds, 600.0)
+                while True:
+                    try:
+                        result_env = await client.wait_for_result(
+                            command_id=cmd_id, timeout=min(30.0, max(0.1, deadline - time.monotonic())))
+                        break
+                    except NativeResultUnavailable as ex:
+                        raise SchedulerError("EXECUTION_UNCONFIRMED: native command record is unavailable") from ex
+                    except TimeoutError:
+                        if time.monotonic() >= deadline:
+                            await client.cancel_skill(
+                                command_id=f"cmd-cancel-{uuid.uuid4().hex[:8]}", correlation_id=cmd_id,
+                                reason="Execution result deadline exceeded", requested_by_player=False)
+                            try:
+                                result_env = await client.wait_for_result(command_id=cmd_id, timeout=10.0)
+                                break
+                            except TimeoutError as ex:
+                                raise SchedulerError("EXECUTION_UNCONFIRMED: cancellation sent but native result missing") from ex
+                        await client.request_command_result(cmd_id)
+            else:
+                result_env = await client.wait_for_result(
+                    command_id=cmd_id, timeout=timeout_seconds
+                )
             payload = result_env.payload
             terminal_state = payload.get("terminalState", "unknown")
             self._active_task.status = terminal_state
@@ -2709,6 +2740,17 @@ class CompanionScheduler:
                             "y": int(interaction_tile["y"]),
                         }
 
+            if landmark and resolved_coord is None:
+                space = await self.query_farm_space(location_id=clean_loc)
+                def normalize(value):
+                    return "".join(c for c in str(value).casefold() if c.isalnum())
+                matches = [row for row in space.get("occupants", []) if isinstance(row, dict)
+                           and normalize(landmark) in {normalize(row.get("id")), normalize(row.get("name"))}]
+                candidates = [row.get("standingTile") for row in matches if isinstance(row.get("standingTile"), dict)]
+                if len(candidates) == 1:
+                    resolved_coord = candidates[0]
+                elif matches:
+                    raise SchedulerError(f"Landmark {landmark!r} has no unique checked standing tile; inspect its observed footprint and obstruction.")
             if resolved_coord is not None:
                 tile = resolved_coord
             else:
@@ -3077,6 +3119,42 @@ class CompanionScheduler:
             pre_dispatch=pre_dispatch,
         )
 
+    async def discover_extension_api(self, mod_id: str | None = None, native_type: str | None = None,
+                                     *, member: str | None = None, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+        parameters = {"extensionOffset": offset, "extensionLimit": limit}
+        if mod_id:
+            parameters["extensionModId"] = mod_id
+        if native_type:
+            parameters["extensionType"] = native_type
+        if member:
+            parameters["extensionMember"] = member
+        result = await self._extension_command("discover-extension-api", parameters)
+        return (result.get("details") or {}).get("extension") or result
+
+    async def list_extensions(self) -> dict[str, Any]:
+        result = await self._extension_command("list-extensions", {})
+        return (result.get("details") or {}).get("extension") or result
+
+    async def load_extension(self, package: str, persist: bool = False) -> dict[str, Any]:
+        result = await self._extension_command("load-extension", {"extensionPackage": package, "extensionPersist": persist})
+        return (result.get("details") or {}).get("extension") or result
+
+    async def learned_action(self, capability: str, version: str, arguments: dict[str, Any], command_id: str | None = None) -> dict[str, Any]:
+        return await self.invoke_extension(capability, version, arguments, "action", command_id)
+
+    async def invoke_extension(self, capability: str, version: str, arguments: dict[str, Any], kind: str,
+                               command_id: str | None = None) -> dict[str, Any]:
+        return await self._extension_command("invoke-extension", {
+            "extensionId": capability, "extensionVersion": version, "extensionArguments": arguments,
+            "extensionKind": kind}, command_id=command_id)
+
+    async def _extension_command(self, skill: str, parameters: dict[str, Any], command_id: str | None = None) -> dict[str, Any]:
+        status = await self.get_status()
+        location = (status.get("companion") or {}).get("locationId")
+        if not isinstance(location, str) or not location:
+            raise SchedulerError("Current actor location is unavailable")
+        return await self._execute_native_action(skill, {"locationId": location, **parameters}, tiles=[], command_id=command_id)
+
     async def observe_player_activities(self, command_id: str | None = None) -> dict[str, Any]:
         """Current public NPCs, map actions and shore geometry, never future loot."""
         await self.ensure_connected()
@@ -3156,7 +3234,7 @@ class CompanionScheduler:
         return tiles[: max(1, max_tiles)]
 
     async def query_farming_helpers(self, location_id: str = "Farm") -> dict[str, Any]:
-        """Projects the farming observation group: refill tiles, ground items, fertilized tiles."""
+        """Project collectible items separately from objects requiring interaction/tools."""
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
         client = await self.ensure_connected()
@@ -3169,6 +3247,10 @@ class CompanionScheduler:
                 "World snapshot does not include a 'farming' section. The running game "
                 "build is too old; upgrade StardewAI.Companion.Mod."
             )
+        ground = farming.get("groundItems") or []
+        def collectible(item):
+            return bool(item.get("isDropped") or item.get("canBeGrabbed"))
+
         return {
             "location": farming.get("location", location_id),
             "refillWaterTiles": farming.get("refillWaterTiles", []),
@@ -3177,8 +3259,13 @@ class CompanionScheduler:
             "refillWaterCenter": farming.get("refillWaterCenter"),
             "refillWaterTilesTruncated": farming.get("refillWaterTilesTruncated", False),
             "refillWaterMapComplete": farming.get("refillWaterMapComplete", False),
-            "groundItems": farming.get("groundItems", []),
+            "groundItems": [item for item in ground if collectible(item)],
+            "groundObjects": [item for item in ground if not collectible(item)],
+            "groundItemsScope": "existing-drops-and-collectibles",
+            "groundObjectsScope": "standing-objects; itemId/stack describe the object, not its possible drops",
+            "groundObservationScope": "near-companion",
             "groundItemsTruncated": bool(farming.get("groundItemsTruncated", False)),
+            "groundObjectsTruncated": bool(farming.get("groundItemsTruncated", False)),
             "fertilizedTiles": farming.get("fertilizedTiles", []),
             # Choppable wild trees / giant stumps / hollow logs near the companion.
             "choppableTrees": farming.get("choppableTrees", []),
@@ -4041,7 +4128,16 @@ class CompanionScheduler:
     async def cancel_task(self, reason: str = "User cancelled via MCP") -> dict[str, Any]:
         """Cancels the currently active task."""
         if not self.has_active_task or not self._active_task:
-            raise NoActiveTaskError("No active task to cancel. Companion is currently idle.")
+            # After reconnect the game, not a local task ledger, owns the action.
+            status = await self.get_status()
+            current = status.get("companion", {}).get("currentTask") or {}
+            if not current.get("commandId"):
+                raise NoActiveTaskError("No active task to cancel. Companion is currently idle.")
+            client = await self.ensure_connected()
+            await client.cancel_skill(command_id=f"cmd-cancel-{uuid.uuid4().hex[:8]}",
+                                      correlation_id=current["commandId"], reason=reason)
+            return {"status": "cancelling", "commandId": current["commandId"],
+                    "message": "Cancellation requested; observe the game before the next action."}
 
         client = await self.ensure_connected()
         cancel_cmd_id = f"cmd-cancel-{uuid.uuid4().hex[:8]}"

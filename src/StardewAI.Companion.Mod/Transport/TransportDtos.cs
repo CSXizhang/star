@@ -4,6 +4,14 @@ using System.Text.Json.Serialization;
 
 namespace StardewAI.Companion.Mod.Transport;
 
+public sealed record ConnectionStatePayload(
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("requestId")] string? RequestId = null,
+    [property: JsonPropertyName("clientName")] string? ClientName = null,
+    [property: JsonPropertyName("conversationName")] string? ConversationName = null
+);
+
 public sealed record TileCoord(
     [property: JsonPropertyName("x")] int X,
     [property: JsonPropertyName("y")] int Y
@@ -62,7 +70,8 @@ public sealed record CompanionSnapshot(
     [property: JsonPropertyName("moneyStatus"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? MoneyStatus = null,
     [property: JsonPropertyName("restState"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? RestState = null,
     [property: JsonPropertyName("bedtime"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Bedtime = null,
-    [property: JsonPropertyName("sleepStartedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? SleepStartedAt = null
+    [property: JsonPropertyName("sleepStartedAt"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? SleepStartedAt = null,
+    [property: JsonPropertyName("activeCommandId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ActiveCommandId = null
 );
 
 public sealed record MatureCropTile(
@@ -530,6 +539,19 @@ public sealed record WaterZoneParameters(
     public string? NpcName { get; init; }
     [JsonPropertyName("facing")]
     public int? Facing { get; init; }
+    [JsonPropertyName("targetStamina")]
+    public float? TargetStamina { get; init; }
+    [JsonPropertyName("extensionId")] public string? ExtensionId { get; init; }
+    [JsonPropertyName("extensionVersion")] public string? ExtensionVersion { get; init; }
+    [JsonPropertyName("extensionKind")] public string? ExtensionKind { get; init; }
+    [JsonPropertyName("extensionPersist")] public bool ExtensionPersist { get; init; }
+    [JsonPropertyName("extensionPackage")] public string? ExtensionPackage { get; init; }
+    [JsonPropertyName("extensionMember")] public string? ExtensionMember { get; init; }
+    [JsonPropertyName("extensionOffset")] public int ExtensionOffset { get; init; }
+    [JsonPropertyName("extensionLimit")] public int ExtensionLimit { get; init; } = 20;
+    [JsonPropertyName("extensionType")] public string? ExtensionType { get; init; }
+    [JsonPropertyName("extensionModId")] public string? ExtensionModId { get; init; }
+    [JsonPropertyName("extensionArguments")] public JsonObject? ExtensionArguments { get; init; }
 }
 
 public sealed record ExecutionBudgets(

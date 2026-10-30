@@ -7,6 +7,21 @@ namespace StardewAI.Companion.Mod.Tests;
 public class SameMapNavigatorTests
 {
     [Fact]
+    public void ReachableEndpointsDoNotPermitCrossingBlockedWalkingSegment()
+    {
+        var observer = new SimulatedWorldObserver();
+        for (int x = 0; x <= 2; x++)
+        for (int y = 0; y <= 1; y++) observer.SetPassable("Farm", new(x, y), true);
+        observer.BlockedWalkingSegments.Add((new(0, 0), new(1, 0)));
+        var navigator = new SameMapNavigator(observer);
+        var path = navigator.FindPath("Farm", new(0, 0), new(2, 0));
+        Assert.True(path.Success);
+        Assert.Equal(new TileCoordinate(0, 1), path.Steps[0].Tile);
+        observer.BlockedWalkingSegments.Add((new(0, 0), new(0, 1)));
+        Assert.False(navigator.FindPath("Farm", new(0, 0), new(2, 0)).Success);
+    }
+
+    [Fact]
     public void CrossMapMovement_IsStrictlyForbidden()
     {
         var observer = new SimulatedWorldObserver { CurrentLocationName = "Farm" };

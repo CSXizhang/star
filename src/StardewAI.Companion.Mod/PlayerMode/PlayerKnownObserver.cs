@@ -464,6 +464,9 @@ public sealed class PlayerKnownObserver : IWorldObserver
 
     public bool IsWarpOrDoorTile(string locationName, TileCoordinate tile) => _inner.IsWarpOrDoorTile(locationName, tile);
 
+    public bool CanWalkBetween(string locationName, TileCoordinate from, TileCoordinate to) =>
+        _inner.CanWalkBetween(locationName, from, to);
+
     public PlayerResourceSnapshot GetPlayerSnapshot() => _inner.GetPlayerSnapshot();
 
     public bool IsPlayerOnSameMap(string locationName) => _inner.IsPlayerOnSameMap(locationName);

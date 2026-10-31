@@ -1,15 +1,16 @@
 """Operate only an already running isolated TestDriver; never fabricate game outcomes."""
 from __future__ import annotations
+
 import argparse
 import asyncio
 import hashlib
 import json
-from pathlib import Path
 import re
 import shutil
 import sys
 import time
 import uuid
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "companion_acceptance"))
@@ -130,7 +131,17 @@ class Probe:
                 await self.r.request("leave-player-bed")
                 return {"before": before, "after": await self.r.native(), "nativeSleep": True}
             if "ShippingMenu" in str(ui.get("menuType")):
-                await self.r.request("key", key="Escape")
+                try:
+                    await self.r.request("key", key="Escape")
+                except RuntimeError as error:
+                    # The native overnight can dismiss its shipping menu between
+                    # the sampled frame and input. Only tolerate that exact race;
+                    # the next loop must still observe a settled new game day.
+                    if str(error) != "Invalid menu key.":
+                        raise
+                    current = await self.r.request("snapshot")
+                    if current.get("menuType") is not None:
+                        raise
         raise TimeoutError("Native overnight did not advance the date")
 
     async def observer(self):

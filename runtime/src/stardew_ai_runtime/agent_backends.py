@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .agent_instructions import runtime_instructions
-from .codex_game_profile import game_tool_config, unrelated_mcp_config, write_game_instructions
+from .codex_game_profile import game_tool_config, write_game_instructions
 from .codex_usage import CodexUsageMeter
+from .provider_activity import inactivity_deadline
 from .provider_diagnostics import record_completed, record_prepared, safe_error
 
 logger = logging.getLogger("stardew_ai_runtime.agent_backends")
@@ -78,7 +79,14 @@ class AgyBackend:
         self._execute = execute
 
     def run(self, active_task: ActiveTaskLike, session_id: str | None, prompt: str) -> dict[str, Any]:
-        return self._execute(active_task, session_id, prompt)
+        from .agy_usage import has_new_compaction
+
+        result = self._execute(active_task, session_id, prompt)
+        cid = result.get("conversation_id") or session_id
+        if (session_id is None or cid == session_id) and has_new_compaction(
+                cid, getattr(active_task, "start_max_step_idx", -1)):
+            result["context_compacted"] = True
+        return result
 
 
 class CodexBackend:
@@ -136,14 +144,12 @@ class CodexBackend:
                                  error={"code": "BACKEND_START_FAILED", "message": "bundled Python missing"},
                                  provider=self.name).as_dict()
         try:
-            inherited_mcp = unrelated_mcp_config(self.command, self.run_dir)
             instructions = getattr(active_task, "instructions_text", None)
             if not isinstance(instructions, str) or not instructions:
                 instructions = runtime_instructions()
             instructions_file = write_game_instructions(self.run_dir, instructions)
             prompt = prompt.replace(instructions, "").strip()
         except Exception:
-            # Do not start a model with an unverified inherited tool surface.
             # CLI configuration can include secrets, so keep errors generic.
             logger.warning("Could not prepare the Codex game tool profile")
             return BackendResult(False, "GPT 游戏工具配置失败，请检查本机 Codex 配置。", session_id,
@@ -175,7 +181,7 @@ class CodexBackend:
         # Keep this bridge-owned process in the same sandbox on every turn.
         cmd.extend(["--json", "--skip-git-repo-check", "-c", "approval_policy=never",
                     "-c", 'sandbox_mode="danger-full-access"',
-                    *game_tool_config(), *inherited_mcp,
+                    *game_tool_config(),
                     "-c", f"model_instructions_file={json.dumps(str(instructions_file))}", *mcp])
         if self.model:
             cmd.extend(["-m", self.model])
@@ -220,8 +226,8 @@ class CodexBackend:
             errors: list[str] = []
             terminal_failure: dict[str, Any] | None = None
             deadline = start + self.timeout_seconds
-            while len(done) < 2 and time.monotonic() < deadline:
-                if active_task.cancelled:
+            while len(done) < 2 and time.monotonic() < inactivity_deadline(active_task, deadline, self.timeout_seconds):
+                if active_task.cancelled or getattr(active_task, "provider_interrupted", False) is True:
                     KimiBackend.terminate(proc)
                     return BackendResult(False, "任务已取消。", session_id, provider=self.name,
                                          duration=time.monotonic() - start).as_dict()
@@ -245,6 +251,8 @@ class CodexBackend:
                 except json.JSONDecodeError:
                     continue
                 kind = event.get("type")
+                if kind in {"thread.started", "turn.started", "item.started", "item.updated", "item.completed", "turn.completed"}:
+                    deadline = time.monotonic() + self.timeout_seconds
                 if kind == "thread.started":
                     session_id = event.get("thread_id") or session_id
                     if session_id and self.progress:
@@ -292,7 +300,7 @@ class CodexBackend:
             if len(done) < 2:
                 KimiBackend.terminate(proc)
                 return BackendResult(False, "GPT 执行超时，操作已中止。", session_id,
-                                     error={"code": "TIMEOUT", "message": "Codex process deadline exceeded"},
+                                     error={"code": "TIMEOUT", "message": "Codex inactivity timeout exceeded"},
                                      provider=self.name, duration=time.monotonic() - start).as_dict()
             proc.wait(timeout=2)
             if proc.returncode != 0 or not reply:
@@ -458,7 +466,7 @@ class KimiBackend:
         start = time.monotonic()
         proc: Any = None
         readers: list[threading.Thread] = []
-        if active_task.cancelled:
+        if active_task.cancelled or getattr(active_task, "provider_interrupted", False) is True:
             return BackendResult(False, "任务已取消。", session_id, provider=self.name, duration=0).as_dict()
         try:
             proc = subprocess.Popen(
@@ -492,13 +500,14 @@ class KimiBackend:
             fatal_error: tuple[str, str] | None = None
             deadline = start + self.timeout_seconds
             while not (stdout_eof and stderr_eof):
-                if active_task.cancelled:
+                if active_task.cancelled or getattr(active_task, "provider_interrupted", False) is True:
                     self.terminate(proc)
                     return BackendResult(False, "任务已取消。", found_session[0], provider=self.name, duration=time.monotonic() - start).as_dict()
+                deadline = inactivity_deadline(active_task, deadline, self.timeout_seconds)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self.terminate(proc)
-                    return BackendResult(False, "执行超时，操作已中止。", found_session[0], error={"code": "TIMEOUT", "message": "Kimi process deadline exceeded"}, provider=self.name, duration=time.monotonic() - start).as_dict()
+                    return BackendResult(False, "执行超时，操作已中止。", found_session[0], error={"code": "TIMEOUT", "message": "Kimi inactivity timeout exceeded"}, provider=self.name, duration=time.monotonic() - start).as_dict()
                 try:
                     channel, line = events.get(timeout=min(0.1, remaining))
                 except queue.Empty:
@@ -521,6 +530,10 @@ class KimiBackend:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict):
+                    if event.get("role") == "assistant" or event.get("type") in {
+                        "session.resume_hint", "tool_call", "tool_start", "tool_started", "tool_use",
+                        "tool_result", "tool_completed", "assistant", "message", "text"}:
+                        deadline = time.monotonic() + self.timeout_seconds
                     parsed = self._event(event, chunks, found_session)
                     if parsed and "__error__" in parsed:
                         code, message = self.classify_error(parsed["__error__"])
@@ -537,9 +550,9 @@ class KimiBackend:
                 proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 self.terminate(proc)
-                return BackendResult(False, "执行超时，操作已中止。", found_session[0], error={"code": "TIMEOUT", "message": "Kimi process deadline exceeded"}, provider=self.name, duration=time.monotonic() - start).as_dict()
+                return BackendResult(False, "执行超时，操作已中止。", found_session[0], error={"code": "TIMEOUT", "message": "Kimi inactivity timeout exceeded"}, provider=self.name, duration=time.monotonic() - start).as_dict()
             duration = time.monotonic() - start
-            if active_task.cancelled:
+            if active_task.cancelled or getattr(active_task, "provider_interrupted", False) is True:
                 return BackendResult(False, "任务已取消。", found_session[0], provider=self.name, duration=duration).as_dict()
             err_text = "".join(stderr_errors).strip()
             if proc.returncode != 0:
@@ -678,9 +691,9 @@ class DshBackend:
         patch_path.write_text(json.dumps(patch, ensure_ascii=False, indent=2), encoding="utf-8")
         return patch_path, env
 
-    def _next(self, active_task: ActiveTaskLike, deadline: float) -> dict[str, Any]:
-        while time.monotonic() < deadline:
-            if active_task.cancelled:
+    def _next(self, active_task: ActiveTaskLike, deadline: float, *, native_progress: bool = False) -> dict[str, Any]:
+        while time.monotonic() < (inactivity_deadline(active_task, deadline, self.timeout_seconds) if native_progress else deadline):
+            if active_task.cancelled or getattr(active_task, "provider_interrupted", False) is True:
                 raise InterruptedError("cancelled")
             try:
                 event = self._events.get(timeout=0.1)
@@ -782,7 +795,7 @@ class DshBackend:
             while True:
                 if receipt and idle_seen and finish is not None:
                     break
-                frame = self._next(active_task, deadline)
+                frame = self._next(active_task, deadline, native_progress=True)
                 if frame.get("id") == request_id:
                     if frame.get("error"):
                         error = str((frame.get("error") or {}).get("message", "")).lower()
@@ -813,6 +826,8 @@ class DshBackend:
                         continue
                     if active_turn is not None and data.get("turn") not in (None, active_turn):
                         continue
+                    if event.get("type") in {"turn/start", "assistant/message", "tool/call", "tool/result", "turn/end"}:
+                        deadline = time.monotonic() + self.timeout_seconds
                     if event.get("type") == "assistant/message":
                         message = data.get("message") or {}
                         content = message.get("content") or []
@@ -1142,8 +1157,8 @@ class McodeBackend:
             status = ""
             errors: list[str] = []
             deadline = start + self.timeout_seconds
-            while len(done) < 2 and time.monotonic() < deadline:
-                if active_task.cancelled:
+            while len(done) < 2 and time.monotonic() < inactivity_deadline(active_task, deadline, self.timeout_seconds):
+                if active_task.cancelled or getattr(active_task, "provider_interrupted", False) is True:
                     self.terminate(proc)
                     if usage:
                         usage["partial"] = True
@@ -1171,7 +1186,7 @@ class McodeBackend:
                     active_task.provider_input_delivered = True
                 # A productive sequence has no aggregate wall-clock limit. Bound
                 # each silent interval instead; native actions retain their own watchdog.
-                if kind in {"item.started", "item.completed"} and item_type == "tool_call":
+                if kind in {"item.started", "item.updated", "item.completed"} and item_type in {"tool_call", "agent_message", "reasoning"}:
                     deadline = time.monotonic() + self.timeout_seconds
                 # Public provider events only: never persist reasoning items or credentials.
                 public_item = event.get("item") or {}
@@ -1242,7 +1257,7 @@ class McodeBackend:
                 if usage:
                     usage["partial"] = True
                 return BackendResult(False, "MiniMax Code 执行超时，操作已中止。", session_id, usage,
-                                     error={"code": "TIMEOUT", "message": "mcode process deadline exceeded"},
+                                     error={"code": "TIMEOUT", "message": "mcode inactivity timeout exceeded"},
                                      provider=self.name, duration=time.monotonic() - start).as_dict()
             proc.wait(timeout=2)
             if usage is not None:

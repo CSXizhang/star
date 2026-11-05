@@ -1,23 +1,23 @@
-# 使用文档
+# 文档入口
 
-- [项目介绍与功能状态](../README.md)
-- [Windows 发行包安装](release-guide.md)
-- [0.3.16 更新说明](release-notes-0.3.16.md)
-- [玩家指南](companion-guide.md)
-- [自主生活与农场改造](farm-projects.md)
-- [MCP 与聊天接入](mcp.md)
-- [其他 Agent 自行接入指南](agent-self-integration.md)
-- [参与开发](../CONTRIBUTING.md)
-- [后端验证状态与成本基线](tested-backends.md)
-- [通信协议](../protocol/README.md)
-- [0.3.6 更新说明](release-notes-0.3.6.md)
-- [AI 自己玩与游戏内设置](companion-guide.md#两种模式)
-- [伙伴效率与可玩性设计：双路径接入、自进化与持续会话（含实施进度）](companion-efficiency-and-play-design.md)
-- [双路径接入第一阶段验证记录](dual-connection-validation.md)
+## 安装与使用
 
-## 决策设计审核草案
+- [项目与快速开始](../README.md) · [Windows 安装与升级](release-guide.md) · [玩家指南](companion-guide.md)
+- [农场项目](farm-projects.md) · [原伙伴与其他 Agent 接入](agent-self-integration.md) · [客户端配置参考](mcp.md)
+- [0.3.22 更新说明](release-notes-0.3.22.md) · [历史版本](release-history.md) · [后端验证状态](tested-backends.md)
 
-- [伙伴核心指令草案](agent-core-instructions-draft.md)
-- [伙伴领域指导索引（六个主题）](agent-domain-guidance-draft.md)
-- [提示词接入与修订说明](agent-prompt-integration-notes.md)
-- [提示词修改简报](agent-prompt-revision-brief.md)
+## 开发与验证
+
+- [参与开发](../CONTRIBUTING.md) · [通信协议](../protocol/README.md)
+- [清理与兼容边界](maintenance-cleanup.md)
+- [当前提示词来源](agent-prompt-integration-notes.md) · [核心指令](agent-core-instructions-draft.md) · [领域指导](agent-domain-guidance-draft.md)
+- [伙伴实机回归](repeatable-companion-acceptance.md) · [双路径、记忆与能力验证](dual-connection-validation.md)
+- [成长设计与实施进度](companion-efficiency-and-play-design.md)
+
+## 历史资料
+
+历史方案中的队列、会话和工具配置描述不代表当前行为。
+
+- [旧提示接入与验收](archive/agent-prompt-integration-20261001.md) · [提示修改简报](archive/agent-prompt-revision-brief-20261001.md) · [旧评测结果](archive/agent-review-results-20261001.md)
+- [自玩模式最初方案](archive/autonomous-single-player-plan.md) · [旧后端与费用基线](archive/tested-backends-20261003.md)
+- [0.3.14 连续农活验收](companion-farm-loop-acceptance-20261022.md) · [0.3.14 玩家合作验收](companion-player-loop-acceptance-20261021.md)

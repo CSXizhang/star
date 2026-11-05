@@ -165,7 +165,7 @@ def test_stage_goal_accepts_unverified_note_without_authorizing_more_work(tmp_pa
 
 
 @pytest.mark.parametrize("legacy_only", [False, True])
-def test_chat_work_and_restart_share_session_and_recover_unavailable_only(tmp_path, legacy_only):
+def test_chat_work_and_restart_keep_original_session(tmp_path, legacy_only):
     rows = {"life:mcode:farm": "old-chat"}
     if not legacy_only:
         rows["mcode:farm"] = "current-work"
@@ -178,9 +178,9 @@ def test_chat_work_and_restart_share_session_and_recover_unavailable_only(tmp_pa
     assert restarted.get_conversation_id("farm") == "continued"
     restarted._ensure_session_matches_profile("farm", "continued")
     assert restarted.get_conversation_id("farm") == "continued"
-    restarted._rotate_provider_session("farm", reason="MCODE_SESSION_UNAVAILABLE")
-    assert restarted.get_conversation_id("farm") is None
-    assert restarted._life_chat.get_session_id("farm") is None
+    restarted._note_session_context("farm", {"latestRequestInputContext": 190000})
+    assert restarted.get_conversation_id("farm") == "continued"
+    assert restarted._life_chat.rotate_if_needed("farm", 99, 99) == "continued"
 
 
 def test_raw_player_text_is_not_deduplicated_or_parsed_as_context(tmp_path):

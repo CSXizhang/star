@@ -6,6 +6,8 @@ from mcp.server.fastmcp import Image
 from mcp.types import CallToolResult
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
+from .turn_context import compact_action_result
+
 GAME_TOOLS = frozenset({"get_status", "query_game", "submit_work", "manage_arrangements",
                         "remember", "request_player_decision", "consult", "read_reload_history"})
 
@@ -49,28 +51,33 @@ class OneOperation(BaseModel):
         return name, value.model_dump(exclude_unset=True)
 
 
+def operation_description(declaration, *, full=False):
+    """The same concise operation help is used by discovery and the eight tools."""
+    text = OPERATION_HELP.get(declaration.name) or declaration.description
+    if full:
+        return text.removeprefix("Stardew Valley (SMAPI), current saved game. ")
+    if declaration.name not in {"save_memory", "save_method", "recall_memory", "forget_memory", "inspect_capabilities", "develop_capability", "manage_capability", "prepare_capability_builder"}:
+        text = text.split("\n\n", 1)[0]
+    return " ".join(text.split()).removeprefix("Stardew Valley (SMAPI), current saved game. ")
+
+
 def register_game_tools(mcp, implementations, declarations, operations, *, execute_action):
-    def model(label, names, *, plan=False):
+    def model(label, names):
         fields = {}
         for name in sorted(names):
             if name not in declarations:
                 continue
             source = declarations[name].fn_metadata.arg_model
-            allowed = operations[name][1] if plan else source.model_fields
             arguments = create_model(label + name, __config__=ConfigDict(extra="forbid"), **{
-                key: (field.annotation, deepcopy(field)) for key, field in source.model_fields.items()
-                if key in allowed})
-            description = OPERATION_HELP.get(name) or " ".join(declarations[name].description.split("\n\n", 1)[0].split())
-            if name in {"save_memory", "save_method", "recall_memory", "forget_memory", "inspect_capabilities", "develop_capability", "manage_capability", "prepare_capability_builder"}:
-                description = " ".join(declarations[name].description.split())
-            description = description.removeprefix("Stardew Valley (SMAPI), current saved game. ")
+                key: (field.annotation, deepcopy(field)) for key, field in source.model_fields.items()})
+            description = operation_description(declarations[name])
             fields[name] = (arguments | None, Field(default=None, description=description))
         return create_model(label, __base__=OneOperation, **fields)
 
     queries = {name for name in declarations if name.startswith(("query_", "observe_"))
                and name != "query_wiki"} | {"work_plan_overview", "get_work_overview", "autonomy_status", "learned_query"}
     Query = model("GameQuery", queries)
-    Action = model("GameAction", operations, plan=True)
+    Action = model("GameAction", operations)
     Arrangement = model("Arrangement", {"manage_milestones", "manage_companion", "remember_intent", "manage_goal", "manage_todo", "set_autonomy", "develop_capability", "manage_capability", "prepare_capability_builder"})
     Memory = model("Memory", {"save_memory", "save_method", "forget_memory", "record_decision_note", "answer_player_decision", "say_to_player"})
     Reference = model("Reference", {"recall_memory", "query_wiki", "read_guidance", "inspect_capabilities"})
@@ -102,7 +109,7 @@ def register_game_tools(mcp, implementations, declarations, operations, *, execu
         infer personal output or remaining work solely from inventory differences.
         """
         name, args = action.selected()
-        return await execute_action(name, args)
+        return compact_action_result(await execute_action(name, args), detail=bool(args.get("detail")))
     submit_work.__annotations__ = {"action": Action, "return": dict[str, Any]}
 
     async def manage_arrangements(change):

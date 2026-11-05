@@ -1,9 +1,10 @@
 """Supplement native acceptance with the same round's exported public ACP receipts."""
 import argparse
-from datetime import datetime
 import json
-from pathlib import Path
 import sys
+from datetime import datetime
+from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/companion_acceptance"))
 from runner import summarize_trace, write
 

@@ -14,9 +14,7 @@ public sealed class CompanionRestController
     private readonly IFarmerActor _actor;
     private readonly NavigationStateMachine _navigation;
     private int _lastAttemptTime = -1;
-    private int _lastPreviewTime = -1;
     private bool _cancelRequested;
-    private readonly CompanionBedtimeRouteEstimate _routeEstimate = new();
     private string? _recoveryFailure;
     public bool Paused { get; set; }
     public bool TaskPaused { get; set; }
@@ -75,8 +73,6 @@ public sealed class CompanionRestController
         IsDaytimeRest = false;
         _cancelRequested = false;
         _lastAttemptTime = -1;
-        _lastPreviewTime = -1;
-        _routeEstimate.Clear();
         _recoveryFailure = null;
         if (_actor.GameFarmer is { } farmer)
         {
@@ -128,14 +124,6 @@ public sealed class CompanionRestController
         int now = Game1.timeOfDay;
         if (State is "sleeping" or "resting")
         {
-            if (IsDaytimeRest && CompanionBedtime.ShouldWindDown(now, Bedtime, 0))
-            {
-                IsDaytimeRest = false;
-                SleepStartedAt = now;
-                State = "sleeping";
-                if (_actor.GameFarmer is { } sleepingFarmer) sleepingFarmer.timeWentToBed.Value = now;
-                return;
-            }
             if (IsDaytimeRest && _actor.Stamina >= (RecoveryTarget ?? _actor.MaxStamina))
             {
                 Wake();
@@ -165,21 +153,14 @@ public sealed class CompanionRestController
         // Rest requires a physical native farmer and bed. Offline mechanics tests
         // have neither and must not resolve the global game world when stamina falls.
         if (_actor.GameFarmer is null) return;
-        if (!IsResting)
-        {
-            if (CompanionBedtime.NeedsDaytimeRest(_actor.Stamina, _actor.MaxStamina))
-            {
-                IsDaytimeRest = !CompanionBedtime.ShouldWindDown(now, Bedtime, 0);
-                State = "winding-down";
-                Reason = IsDaytimeRest ? "体力耗尽，回床恢复。" : null;
-            }
-            else if (!CompanionBedtime.ShouldPreviewRoute(now, Bedtime)) return;
-        }
+        // Only an explicit rest action owns this navigator. Stamina and time
+        // are observations for the model, never an automatic work takeover.
+        if (!IsResting) return;
         var house = Game1.getLocationFromName("FarmHouse") as FarmHouse;
         var bed = house?.GetPlayerBed();
         if (house == null || bed == null)
         {
-            if (IsResting || CompanionBedtime.ShouldWindDown(now, Bedtime, 30))
+            if (IsResting)
             {
                 State = "waiting-for-bed"; Reason = "家里没有可用的床。";
                 FinishWorkAtSafePoint(work);
@@ -188,20 +169,6 @@ public sealed class CompanionRestController
         }
         var spot = bed.GetBedSpot();
         var target = new TileCoordinate(spot.X, spot.Y);
-        if (!IsResting)
-        {
-            int day = Game1.Date.TotalDays;
-            if (!_routeEstimate.TryGet(day, Bedtime, _actor.LocationName, _actor.Tile, house.NameOrUniqueName, target, now, out int travel))
-            {
-                if (_lastPreviewTime == now) return;
-                _lastPreviewTime = now;
-                var route = _navigation.PreviewRoute(house.NameOrUniqueName, target);
-                travel = route.TryGetValue("estimatedGameMinutes", out var estimate) && estimate is int minutes ? minutes : 60;
-                _routeEstimate.Store(day, Bedtime, _actor.LocationName, _actor.Tile, house.NameOrUniqueName, target, now, travel);
-            }
-            if (!CompanionBedtime.ShouldWindDown(now, Bedtime, travel)) return;
-            State = "winding-down";
-        }
         if (work?.IsExecuting == true)
         {
             FinishWorkAtSafePoint(work);

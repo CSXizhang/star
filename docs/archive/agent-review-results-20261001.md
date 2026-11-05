@@ -1,5 +1,7 @@
 # Review 修改与评测结果（2026-10-01—02）
 
+> 历史记录：保留当时的设计、验证与失败，不代表当前行为。当前使用方式见[文档入口](../README.md)。
+
 本轮按已认可的 review 修改；依玩家最后裁决，不增加每日 token、费用硬上限。原有未提交工作保留，未提交、安装到日常游戏或发布。
 
 ## 修改结果
@@ -64,11 +66,11 @@ r22发现讨论污染实际结果，r23确认修复、显示顶部用量、明�
 
 可继续经营的匹配点为`.test-runs/production-decision-20261001-r24/checkpoint-before-cancel/`，其中世界、伙伴data与计费日志均从暂停后的原始文件逐字节复制，11份文件有校验清单。之后的取消验收使用独立分支，不能把已取消的伙伴状态与这个继续经营存档混用。
 
-账本从472条增至491条：18条completed、1条unknown。读审计见[r24原生验收](../.test-runs/production-decision-20261001-r24/evidence/review-acceptance.json)。实机新增5轮模型决策、30次模型请求，输入1,291,472、输出11,719，共1,303,191 token；输入中的缓存1,198,336（约92.8%），输出中的思考2,551均不重复加总。与九场景评测的63,467 token分开统计；这些数字不包含开发对话或此前隔离轮次。
+账本从472条增至491条：18条completed、1条unknown。读审计见[r24原生验收](../../.test-runs/production-decision-20261001-r24/evidence/review-acceptance.json)。实机新增5轮模型决策、30次模型请求，输入1,291,472、输出11,719，共1,303,191 token；输入中的缓存1,198,336（约92.8%），输出中的思考2,551均不重复加总。与九场景评测的63,467 token分开统计；这些数字不包含开发对话或此前隔离轮次。
 
 ### r25 最终取消与面板检查
 
-使用最终DLL重新加载同一个夏27匹配点，只执行取消控制。确认后仍为free/enabled/paused，目标和待办取消、goalScope清空；面板同步显示“当前安排已取消；伙伴仍处于暂停”，并提示“点击继续只解除暂停”，历史真实结果保留。顶部实际显示现实日期用量与“费用暂不可用”，不设置每日上限。该轮0新增模型决策、0新增原生执行、世界字节未变。[取消验收](../.test-runs/production-decision-20261001-r25/evidence/review-cancel-acceptance.json)、[实机面板](../.test-runs/production-decision-20261001-r25/evidence/f8-ui-review-r25-cancel-ack.png)。
+使用最终DLL重新加载同一个夏27匹配点，只执行取消控制。确认后仍为free/enabled/paused，目标和待办取消、goalScope清空；面板同步显示“当前安排已取消；伙伴仍处于暂停”，并提示“点击继续只解除暂停”，历史真实结果保留。顶部实际显示现实日期用量与“费用暂不可用”，不设置每日上限。该轮0新增模型决策、0新增原生执行、世界字节未变。[取消验收](../../.test-runs/production-decision-20261001-r25/evidence/review-cancel-acceptance.json)、[实机面板](../../.test-runs/production-decision-20261001-r25/evidence/f8-ui-review-r25-cancel-ack.png)。
 
 最终指令版本`33ec2ed78056738d`，实机核验DLL `16a9f7ca9c050e7841dfac85a096f4c6d5681e0296cd8491d4abc89db5b8f026`。r24、r25均已停止，启动器前后校验确认日常Mods、日常存档、各自来源保存未变。
 

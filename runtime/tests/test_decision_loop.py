@@ -283,7 +283,7 @@ def test_fake_provider_two_decisions_receive_real_worker_feedback(tmp_path, monk
             dispatches.append(args["operation"])
             return {"status":"completed","effects":[{"kind":"offline-native-fixture"}],"inventoryDelta":{"water":-3}}
     worker=PlanWorker(store,NativeClient())
-    bridge._execute_turn(ActiveChatTask(request_id="d1",save_id="save"),None,bridge._format_agent_prompt("care","save"))
+    asyncio.run(bridge._await_work_provider(ActiveChatTask(request_id="d1",save_id="save"),None,bridge._format_agent_prompt("care","save")))
     assert dispatches==[]
     asyncio.run(worker.evaluate())
     assert len(dispatches)==4 and len(prompts)==1
@@ -291,7 +291,7 @@ def test_fake_provider_two_decisions_receive_real_worker_feedback(tmp_path, monk
     assert len(dispatches)==4 and len(prompts)==1
     prompt=bridge._format_agent_prompt("continue","save")
     assert 'offline-native-fixture' in prompt, json.dumps(store.state('save').last_job)
-    bridge._execute_turn(ActiveChatTask(request_id="d2",save_id="save"),None,prompt)
+    asyncio.run(bridge._await_work_provider(ActiveChatTask(request_id="d2",save_id="save"),None,prompt))
     assert len(prompts)==2 and tokens[0]!=tokens[1]
     store.revoke_decision("save")
     asyncio.run(worker.evaluate())

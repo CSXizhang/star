@@ -15,7 +15,7 @@ using StardewValley.TerrainFeatures;
 
 namespace StardewAI.Companion.TestDriver;
 
-public sealed class TestDriverMod : Mod
+public sealed partial class TestDriverMod : Mod
 {
     private string? _isolatedSavesPath;
     private string _testMode = "none";
@@ -50,6 +50,9 @@ public sealed class TestDriverMod : Mod
     private readonly List<Vector2> _acceptanceMatureTrees = new();
     private Vector2? _acceptanceSapling;
     private string? _harnessCaptureLabel;
+    private int _mixedWoodLastTotal = -1, _mixedWoodCreated, _mixedWoodLost;
+    private bool _mixedClockStarted;
+    private readonly List<object> _mixedWoodLedger = new();
 
     // Scenarios driven by the external loop-demo-done.json completion channel: time runs
     // unfrozen, periodic frames are captured while waiting, and the gate reads the done-file.
@@ -404,6 +407,9 @@ public sealed class TestDriverMod : Mod
                 _previousCompanionAnimationPosition = animationFarmer.Position;
             }
         }
+
+        if (_harnessFixtureMode == "mixed-long" && Context.IsWorldReady) TrackMixedWood();
+        if (_multiDayActive && Context.IsWorldReady) TrackMultiDay();
 
         if (_freezeTime && Context.IsWorldReady && Game1.gameTimeInterval > 0)
         {
@@ -768,6 +774,15 @@ public sealed class TestDriverMod : Mod
                 // Isolated runs must survive foreground theft (browser popups, notifications):
                 // vanilla pauses a single-player world when the window loses focus.
                 Game1.options.pauseWhenOutOfFocus = false;
+                if (Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1")
+                {
+                    // A saved continuation keeps its actual location, clock and RNG.
+                    // Only the read-only observer metadata is restored below.
+                    _freezeTime = false;
+                    _scenarioState = ScenarioState.ArrangeScenario;
+                    _tickCounter = 0;
+                    break;
+                }
                 if (!UsesLoopDemoCompletionChannel)
                 {
                     _freezeTime = true;
@@ -793,7 +808,7 @@ public sealed class TestDriverMod : Mod
 
             case ScenarioState.ArrangeScenario:
                 _tickCounter++;
-                if (Game1.currentLocation?.Name == "Farm" &&
+                if ((Game1.currentLocation?.Name == "Farm" || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1") &&
                     !Game1.fadeToBlack &&
                     !Game1.fadeIn &&
                     Game1.fadeToBlackAlpha <= 0.001f &&
@@ -1601,6 +1616,7 @@ public sealed class TestDriverMod : Mod
             var chest = root.GetProperty("chest");
             _acceptanceChest = chest.ValueKind == JsonValueKind.Null ? null
                 : new Vector2(chest.GetProperty("x").GetInt32(), chest.GetProperty("y").GetInt32());
+            if (_harnessFixtureMode == "multi-day") ResumeMultiDayObservation();
             Monitor.Log("[TestDriver] Continuity: restored observation metadata only; loaded world preserved.", LogLevel.Info);
             return;
         }
@@ -2782,6 +2798,7 @@ public sealed class TestDriverMod : Mod
             ["x"] = (int)tile.X,
             ["y"] = (int)tile.Y,
             ["dirtPresent"] = dirt != null,
+            ["waterState"] = dirt?.state.Value,
             ["hasCrop"] = crop != null,
             ["cropSeedId"] = crop?.netSeedIndex?.Value,
             ["harvestItemId"] = crop?.indexOfHarvest?.Value,
@@ -3520,7 +3537,8 @@ public sealed class TestDriverMod : Mod
             ?? throw new InvalidOperationException("Production ModEntry unavailable for harness fixture.");
         AssertHarnessFixtureBoundary(modEntry);
         string mode = request.GetProperty("mode").GetString() ?? "";
-        if (mode is not ("watering" or "partial-planting" or "harvest-store" or "rest-water" or "water-refill" or "mature-trees" or "walk-pickup" or "walk-pickup-full"))
+        if (mode == "multi-day") { ArrangeMultiDayFixture(modEntry, outDir, label); return; }
+        if (mode is not ("watering" or "partial-planting" or "harvest-store" or "rest-water" or "water-refill" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long"))
             throw new ArgumentException("Unknown harness fixture mode.");
         if (Game1.currentSeason != "spring")
             throw new InvalidOperationException("Parsnip harness fixture requires a spring clone; it never changes the game calendar.");
@@ -3551,7 +3569,7 @@ public sealed class TestDriverMod : Mod
         _acceptanceSolidOverlaps.Clear();
         var selected = new List<Vector2>();
         var reachable = new List<object>();
-        int count = mode == "watering" ? 80 : mode == "partial-planting" ? 19 : mode == "water-refill" ? 12 : 6;
+        int count = mode == "mixed-long" ? 20 : mode == "watering" ? 80 : mode == "partial-planting" ? 19 : mode == "water-refill" ? 12 : 6;
         Vector2 center = farmer.Tile + new Vector2(0, 10);
         var candidates = Enumerable.Range(-16, 33).SelectMany(dx => Enumerable.Range(-6, 25)
                 .Select(dy => center + new Vector2(dx, dy)))
@@ -3601,7 +3619,7 @@ public sealed class TestDriverMod : Mod
         _harnessFixtureTiles.AddRange(selected);
         _harnessFixtureInitiallyEmpty.Clear();
         _harnessFixtureMode = mode;
-        if (mode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full")
+        if (mode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long")
         {
             // Natural player requests refer to the whole field. Remove unrelated
             // baseline crops only during isolated fixture setup, never during execution.
@@ -3613,8 +3631,8 @@ public sealed class TestDriverMod : Mod
             var tile = selected[index];
             var dirt = EnsureHoeDirt(farm, tile);
             bool empty = mode == "partial-planting" && index >= 17;
-            dirt.crop = empty ? null : CreateParsnipCrop((int)tile.X, (int)tile.Y, farm, mature: mode == "harvest-store");
-            dirt.state.Value = mode is "watering" or "rest-water" or "water-refill" || empty ? 0 : 1;
+            dirt.crop = empty ? null : CreateParsnipCrop((int)tile.X, (int)tile.Y, farm, mature: mode == "harvest-store" || mode == "mixed-long" && index >= 8 && index < 16);
+            dirt.state.Value = mode is "watering" or "rest-water" or "water-refill" || mode == "mixed-long" && index < 8 || empty ? 0 : 1;
             if (empty) _harnessFixtureInitiallyEmpty.Add(tile);
         }
         ReadNativeMember(modEntry, "_actor")?.GetType().GetProperty("Stamina")?.SetValue(actor, stamina);
@@ -3677,6 +3695,41 @@ public sealed class TestDriverMod : Mod
                 farmer.addItemToInventory(new StardewValley.Tools.Axe());
             ParkHarnessObserver();
         }
+        if (mode == "mixed-long")
+        {
+            foreach (var pair in farm.terrainFeatures.Pairs.ToArray())
+                if (pair.Value is Tree || selected.Skip(16).Contains(pair.Key)) farm.terrainFeatures.Remove(pair.Key);
+            _harnessFixtureTiles.RemoveAll(tile => selected.IndexOf(tile) >= 16);
+            _acceptanceChest = selected[16];
+            farm.objects[selected[16]] = new StardewValley.Objects.Chest(true, selected[16], "130");
+            foreach (var tile in new[] { selected[17], selected[18] })
+            {
+                farm.terrainFeatures[tile] = new Tree("1", 5);
+                _acceptanceMatureTrees.Add(tile);
+            }
+            _acceptanceSapling = selected[19];
+            farm.terrainFeatures[selected[19]] = new Tree("1", 2);
+            for (int index = 0; index < farmer.Items.Count; index++)
+                if (farmer.Items[index] is not Tool) farmer.Items[index] = null;
+            if (!farmer.Items.OfType<StardewValley.Tools.Axe>().Any()) farmer.addItemToInventory(new StardewValley.Tools.Axe());
+            // Remove unrelated loose drops at initial arrangement only, never during execution.
+            farm.debris.Clear();
+            var origin = selected[2] * 64 + new Vector2(32, 32);
+            _acceptanceDrop = new Debris(ItemRegistry.Create("(O)388", 3), origin, origin);
+            farm.debris.Add(_acceptanceDrop);
+            ParkHarnessObserver();
+            // Recalculate after every solid object has been installed and the host parked.
+            reachable.Clear();
+            foreach (var tile in _harnessFixtureTiles.Concat(_acceptanceMatureTrees).Append(selected[16]))
+            {
+                var path = pathMethod.Invoke(navigator, new object?[] { actor, "Farm", NativeTile(tile), null });
+                bool success = ReadNativeMember(path, "Success") is true;
+                reachable.Add(new { target = new { x = (int)tile.X, y = (int)tile.Y }, nativePathSuccess = success });
+                if (!success) throw new InvalidOperationException($"Mixed fixture final layout cannot reach {tile}; refuse model dispatch.");
+            }
+            _mixedWoodLastTotal = -1; _mixedWoodCreated = 0; _mixedWoodLost = 0; _mixedWoodLedger.Clear();
+            TrackMixedWood();
+        }
         if (mode == "walk-pickup-full")
         {
             for (int index = 0; index < farmer.MaxItems; index++)
@@ -3708,6 +3761,33 @@ public sealed class TestDriverMod : Mod
         if (snapshot != null) transport?.GetType().GetMethod("SendSnapshotAsync")?.Invoke(transport, new object?[] { snapshot, revision });
         WriteFreeModeNativeSnapshot(outDir, label);
         Monitor.Log($"[TestDriver] Harness fixture {mode}: {count} reachable actual Farm targets recorded; no action result fabricated.", LogLevel.Info);
+    }
+
+    private object[] MixedGroundItems() => Game1.getFarm().debris
+        .Where(d => d.debrisType.Value is Debris.DebrisType.OBJECT or Debris.DebrisType.RESOURCE)
+        .Select(d => (object)new { id = d.item?.QualifiedItemId ?? d.itemId.Value,
+            stack = d.item?.Stack ?? d.Chunks.Count, chunks = d.Chunks.Count,
+            positions = d.Chunks.Select(c => new { x = c.position.Value.X / 64, y = c.position.Value.Y / 64 }).ToArray() }).ToArray();
+
+    private void TrackMixedWood()
+    {
+        ResolveCompanionActor(out _, out var farmer, out _, out _);
+        if (farmer == null) return;
+        var farm = Game1.getFarm();
+        int Wood(System.Collections.IEnumerable items) => items.Cast<object>().OfType<Item>().Where(i => i.QualifiedItemId == "(O)388").Sum(i => i.Stack);
+        int ground = farm.debris.Where(d => (d.item?.QualifiedItemId ?? d.itemId.Value) is "(O)388" or "388")
+            .Sum(d => d.item?.Stack ?? d.Chunks.Count);
+        int chest = _acceptanceChest is Vector2 ct && farm.objects.TryGetValue(ct, out var obj)
+            && obj is StardewValley.Objects.Chest box ? Wood(box.Items) : 0;
+        int total = Wood(farmer.Items) + Wood(Game1.player.Items) + Wood(farm.getShippingBin(farmer)) + chest + ground;
+        if (_mixedWoodLastTotal >= 0 && total != _mixedWoodLastTotal)
+        {
+            int delta = total - _mixedWoodLastTotal;
+            if (delta > 0) _mixedWoodCreated += delta; else _mixedWoodLost -= delta;
+            _mixedWoodLedger.Add(new { timestampUtc = DateTime.UtcNow.ToString("o"), total, delta, ground, chest,
+                companion = Wood(farmer.Items), observer = Wood(Game1.player.Items) });
+        }
+        _mixedWoodLastTotal = total;
     }
 
     private const string GrowthFixtureKey = "CSXizhang.StardewAICompanion.TestDriver/NativeGrowthFixture";
@@ -3892,6 +3972,40 @@ public sealed class TestDriverMod : Mod
             fixtureCoordinator?.GetType().GetMethod("OnTimeChanged")?.Invoke(fixtureCoordinator, new object[] { Game1.timeOfDay });
             WriteFreeModeNativeSnapshot(outDir, label);
         }
+        else if (action == "harness-observe-contracts")
+        {
+            AssertHarnessFixtureBoundary(modEntry);
+            ResolveCompanionActor(out _, out var observedFarmer, out _, out _);
+            if (observedFarmer?.currentLocation is not Farm farm)
+                throw new InvalidOperationException("Observation contract probe requires the actor on Farm.");
+            var coordinator = ReadNativeMember(modEntry, "_coordinator")!;
+            var observer = ReadNativeMember(modEntry, "_observer")!;
+            var activities = coordinator.GetType().GetMethod("InspectPlayerActivities", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(coordinator, null);
+            var tileType = modType.Assembly.GetType("StardewAI.Companion.Mod.Domain.TileCoordinate")!;
+            var mailbox = farm.GetMainMailboxPosition();
+            object Tile(int x, int y) => Activator.CreateInstance(tileType, x, y)!;
+            var probe = new {
+                activities,
+                actorTile = new { x = observedFarmer.TilePoint.X, y = observedFarmer.TilePoint.Y },
+                playerTile = new { x = Game1.player.TilePoint.X, y = Game1.player.TilePoint.Y },
+                mailbox = new { x = mailbox.X, y = mailbox.Y },
+                mailboxPassable = observer.GetType().GetMethod("IsTilePassable")!
+                    .Invoke(observer, new[] { (object)farm.NameOrUniqueName, Tile(mailbox.X, mailbox.Y) }),
+                mailboxEdgePassable = observer.GetType().GetMethod("CanWalkBetween")!
+                    .Invoke(observer, new[] { (object)farm.NameOrUniqueName, Tile(mailbox.X, mailbox.Y + 1), Tile(mailbox.X, mailbox.Y) })
+            };
+            File.WriteAllText(Path.Combine(outDir, $"observation-contract-{label}.json"), JsonSerializer.Serialize(probe));
+        }
+        else if (action == "harness-start-clock")
+        {
+            if (_harnessFixtureMode != "mixed-long" || _mixedClockStarted)
+                throw new InvalidOperationException("Clock start requires mixed-long fixture and may occur only once.");
+            AssertHarnessFixtureBoundary(modEntry);
+            _freezeTime = false;
+            _mixedClockStarted = true;
+            WriteFreeModeNativeSnapshot(outDir, label);
+        }
         else if (action == "harness-fixture")
         {
             ArrangeHarnessFixture(outDir, label, request);
@@ -4024,6 +4138,9 @@ public sealed class TestDriverMod : Mod
         else if (action == "key")
         {
             string key = request.GetProperty("key").GetString() ?? "";
+            if (request.TryGetProperty("expectedMenuType", out var expectedMenu) &&
+                menu?.GetType().FullName != expectedMenu.GetString())
+                throw new InvalidOperationException("Menu identity changed; guarded key was not sent.");
             if (menu == null || !Enum.TryParse<Microsoft.Xna.Framework.Input.Keys>(key, out var parsed))
                 throw new ArgumentException("Invalid menu key.");
             var keyController = modType.GetMethod("GetCompanionDialogue", BindingFlags.NonPublic | BindingFlags.Instance)?.Invoke(modEntry, null);
@@ -8009,7 +8126,7 @@ public sealed class TestDriverMod : Mod
                     }
                 }
                 else if (!screenshotValid && !(_scenario == "free-mode-control" &&
-                    _harnessFixtureMode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full"))
+                    _harnessFixtureMode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long" or "multi-day"))
                 {
                     _evidence["functionalSkillPassed"] = false;
                     _evidence["gateSuccess"] = false;
@@ -8463,6 +8580,7 @@ public sealed class TestDriverMod : Mod
                 ["timeOfDay"] = Game1.timeOfDay,
                 ["isRaining"] = Game1.isRaining,
                 ["playerMoney"] = Game1.player.Money,
+                ["multiDay"] = _multiDayActive ? ObserveMultiDay() : null,
                 ["playerStamina"] = Game1.player.stamina,
                 ["playerLocation"] = Game1.player.currentLocation?.NameOrUniqueName,
                 ["playerTile"] = new { x = (int)Game1.player.Tile.X, y = (int)Game1.player.Tile.Y },
@@ -8551,6 +8669,17 @@ public sealed class TestDriverMod : Mod
                 var fixtureDirt = _harnessFixtureTiles.Select(tile =>
                     farm.terrainFeatures.TryGetValue(tile, out var nativeFeature) ? nativeFeature as HoeDirt : null).ToList();
                 payload["harnessFixtureMode"] = _harnessFixtureMode;
+                payload["harnessTimeFrozen"] = _freezeTime;
+                if (_harnessFixtureMode == "mixed-long")
+                {
+                    TrackMixedWood();
+                    payload["mixedGroundItems"] = MixedGroundItems();
+                    payload["mixedObserverItems"] = Game1.player == null ? null : DescribeItems(Game1.player.Items);
+                    payload["mixedWoodTotal"] = _mixedWoodLastTotal;
+                    payload["mixedWoodCreated"] = _mixedWoodCreated;
+                    payload["mixedWoodLost"] = _mixedWoodLost;
+                    payload["mixedWoodLedger"] = _mixedWoodLedger;
+                }
                 payload["harnessFixtureTargetCount"] = _harnessFixtureTiles.Count;
                 payload["acceptanceShippedItems"] = companionFarmer == null ? null : DescribeItems(farm.getShippingBin(companionFarmer));
                 payload["acceptanceGroundDropRemaining"] = _acceptanceDrop != null && farm.debris.Contains(_acceptanceDrop);

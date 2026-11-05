@@ -36,7 +36,7 @@ from stardew_ai_runtime.work_state import WorkStateError, WorkStore
 def test_native_action_parameter_contract() -> None:
     assert set(NATIVE_ACTION_SKILLS) == {
         "discover-extension-api", "list-extensions", "load-extension", "invoke-extension",
-        "inspect-machines", "inspect-production", "eat-food", "cut-grass", "rest",
+        "inspect-machines", "inspect-production", "eat-food", "cut-grass", "rest", "wait",
         "inspect-planting", "inspect-route", "inspect-livestock", "inspect-shop",
         "inspect-building-services", "build-building", "upgrade-building", "purchase-animal",
         "inspect-location",
@@ -85,8 +85,9 @@ def test_native_inspection_parameter_allowlist(skill, parameters):
         validate_native_action_parameters(skill, {**parameters, "dispatch": True})
 
 
-def test_create_execute_native_action_envelope_shape() -> None:
-    env = Envelope.create_execute_native_action(
+@pytest.mark.parametrize("factory", [Envelope.create_execute_native_action, Envelope.create_execute_skill])
+def test_create_execute_native_action_envelope_shape(factory) -> None:
+    env = factory(
         sender_instance_id="rt-1",
         sequence_number=3,
         save_id="save-1",

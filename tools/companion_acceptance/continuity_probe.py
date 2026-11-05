@@ -1,15 +1,16 @@
 """Operate only an already running isolated TestDriver; never fabricate game outcomes."""
 from __future__ import annotations
+
 import argparse
 import asyncio
 import hashlib
 import json
-from pathlib import Path
 import re
 import shutil
 import sys
 import time
 import uuid
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "companion_acceptance"))
@@ -100,6 +101,17 @@ class Probe:
         await self.r.request("close")
         before = await self.r.native()
         assert native_finished(before), "Refuse to sleep during an active action"
+        # A mid-day reload may restore the player inside the bed. Leave it
+        # first so native re-entry can open a fresh sleep question.
+        if before.get("playerIsInBed"):
+            await self.r.request("leave-player-bed")
+            for _ in range(30):
+                ui = await self.r.request("snapshot")
+                if not ui.get("playerIsInBed") and not ui.get("nativeFade"):
+                    break
+                await asyncio.sleep(.5)
+            else:
+                raise TimeoutError("Player did not leave the restored bed")
         await self.r.request("host-go-bed")
         await asyncio.sleep(2)
         await self.r.request("host-walk-bed")
@@ -119,7 +131,17 @@ class Probe:
                 await self.r.request("leave-player-bed")
                 return {"before": before, "after": await self.r.native(), "nativeSleep": True}
             if "ShippingMenu" in str(ui.get("menuType")):
-                await self.r.request("key", key="Escape")
+                try:
+                    await self.r.request("key", key="Escape")
+                except RuntimeError as error:
+                    # The native overnight can dismiss its shipping menu between
+                    # the sampled frame and input. Only tolerate that exact race;
+                    # the next loop must still observe a settled new game day.
+                    if str(error) != "Invalid menu key.":
+                        raise
+                    current = await self.r.request("snapshot")
+                    if current.get("menuType") is not None:
+                        raise
         raise TimeoutError("Native overnight did not advance the date")
 
     async def observer(self):

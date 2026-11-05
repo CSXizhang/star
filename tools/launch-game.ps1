@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('baseline-gate', 'arrange-smoke', 'scenario', 'init-golden-v1', 'interactive', 'test')]
     [string]$Mode = 'arrange-smoke',
@@ -13,6 +13,10 @@ param(
     [string]$ExpectedProdDllSha256 = '',
     [string]$CustomSavePath = '',
     [switch]$PresetAcceptance,
+    [ValidateSet('mcode','agy')][string]$AcceptanceBackend = 'mcode',
+    [string]$AcceptanceModel = '',
+    [ValidateSet('default','low','medium','high')][string]$AcceptanceEffort = 'default',
+    [ValidateSet('companion','player')][string]$ActorMode = 'companion',
     [switch]$NoOrchestrator,
     # Optional child-process environment overrides (name => value). Used by sandboxed
     # runs to redirect SMAPI's %APPDATA% error-log path into the workspace, because
@@ -257,6 +261,29 @@ Write-Host " Scenario: $Scenario"
 Write-Host " Port:     $Port"
 Write-Host "============================================================"
 
+function Get-AgyAcceptanceServerName {
+    param([Parameter(Mandatory=$true)][string]$RunId)
+    if ([string]::IsNullOrWhiteSpace($RunId)) { throw 'Acceptance run ID is required.' }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($RunId)) }
+    finally { $sha.Dispose() }
+    $hex = [BitConverter]::ToString($bytes).Replace('-','').ToLowerInvariant()
+    return 'star-' + $hex.Substring(0,12)
+}
+
+function Get-AgyConfigDigest {
+    param([string]$ConfigPath)
+    $digestPython = Join-Path $repoRoot 'runtime/.venv/Scripts/python.exe'
+    $code = 'import json,hashlib,sys,pathlib; p=pathlib.Path(sys.argv[1]); d=json.loads(p.read_text(encoding="utf-8-sig")) if p.exists() else {}; d.setdefault("mcpServers",{}); print(hashlib.sha256(json.dumps(d,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest())'
+    $digest = & $digestPython -c $code $ConfigPath
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect agy MCP configuration safely.' }
+    return [string]$digest
+}
+$acceptanceAgyServer = $null
+$acceptanceAgyRegistered = $false
+$acceptanceAgyConfig = Join-Path $env:USERPROFILE '.gemini/config/mcp_config.json'
+$acceptanceAgyBefore = $null
+
 # State variables for try/finally lifecycle
 $violations = [System.Collections.Generic.List[string]]::new()
 $proc = $null
@@ -456,7 +483,7 @@ try {
         }
         $presetConfig = Join-Path $prodDest 'config'
         New-Item -ItemType Directory -Path $presetConfig -Force | Out-Null
-        Write-Utf8File (Join-Path $presetConfig 'chat-backend.json') '{"backend":"mcode","effort":"default","model":""}'
+        Write-Utf8File (Join-Path $presetConfig 'chat-backend.json') (@{backend=$AcceptanceBackend;effort=$AcceptanceEffort;model=$AcceptanceModel} | ConvertTo-Json -Compress)
         # This suite explicitly exercises the built-in entry. Keep the choice
         # inside its isolated Mod copy; never change the player's installation.
         $presetModConfigPath = Join-Path $prodDest 'config.json'
@@ -465,6 +492,7 @@ try {
         } else { [pscustomobject]@{} }
         $presetModConfig | Add-Member -NotePropertyName ConnectionSource -NotePropertyValue 'builtin' -Force
         $presetModConfig | Add-Member -NotePropertyName ConnectionSourceChosen -NotePropertyValue $true -Force
+        $presetModConfig | Add-Member -NotePropertyName Mode -NotePropertyValue $ActorMode -Force
         Write-Utf8File $presetModConfigPath ($presetModConfig | ConvertTo-Json -Depth 20)
     }
 
@@ -479,6 +507,24 @@ try {
         Copy-Item -LiteralPath $harmonySrc -Destination (Join-Path $driverDest "0Harmony.dll") -Force
     }
     Write-Host "Deployed TestDriver Mod to: $driverDest"
+
+    if ($PresetAcceptance -and $AcceptanceBackend -eq 'agy') {
+        $acceptanceAgyServer = Get-AgyAcceptanceServerName $RunId
+        $acceptanceAgyBefore = Get-AgyConfigDigest $acceptanceAgyConfig
+        if (Test-Path -LiteralPath $acceptanceAgyConfig) {
+            $existingAgy = Get-Content -LiteralPath $acceptanceAgyConfig -Raw | ConvertFrom-Json
+            if ($existingAgy.mcpServers.PSObject.Properties.Name -contains $acceptanceAgyServer) { throw 'Unique acceptance MCP service already exists.' }
+        }
+        $acceptanceContext = Join-Path $prodDest 'data/agy-turn-context.json'
+        New-Item -ItemType Directory -Path (Split-Path $acceptanceContext -Parent) -Force | Out-Null
+        Write-Utf8File $acceptanceContext '{}'
+        $acceptancePython = Join-Path $prodDest 'runtime/python/python.exe'
+        $acceptanceModulePath = Join-Path $prodDest 'runtime/src'
+        & agy mcp add --env "PYTHONPATH=$acceptanceModulePath" --env "STARDEW_TURN_CONTEXT=$acceptanceContext" $acceptanceAgyServer -- $acceptancePython -B -m stardew_ai_runtime.mcp_server --run-dir $prodDest --surface light
+        if ($LASTEXITCODE -ne 0) { throw 'Acceptance agy game service registration failed.' }
+        $acceptanceAgyRegistered = $true
+        Write-Utf8File (Join-Path $runEvidenceDir 'agy-game-binding.json') (@{ serverName=$acceptanceAgyServer;legacyServerName=('stardew-accept-'+$RunId);command=$acceptancePython;args=@('-B','-m','stardew_ai_runtime.mcp_server','--run-dir',$prodDest,'--surface','light');env=@{PYTHONPATH=$acceptanceModulePath;STARDEW_TURN_CONTEXT=$acceptanceContext};otherConfigDigestBefore=$acceptanceAgyBefore } | ConvertTo-Json)
+    }
 
     # 7. WRITE PER-RUN SESSION CONFIG & COORDINATION
     Write-Host "`n>>> STEP 7: Writing Per-Run Session Config <<<"
@@ -542,6 +588,7 @@ try {
             }
         }
     }
+    if ($acceptanceAgyRegistered) { $psi.EnvironmentVariables['STARDEW_AGY_GAME_SERVER'] = $acceptanceAgyServer }
     $psi.UseShellExecute = $false
 
     Write-Host "Launching process: $($psi.FileName) $($psi.Arguments)"
@@ -601,6 +648,17 @@ finally {
         }
     } catch {
         Write-Warning "Note during game process termination: $_"
+    }
+
+    if ($acceptanceAgyRegistered) {
+        try {
+            & agy mcp remove $acceptanceAgyServer | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Acceptance agy service removal failed.' }
+            $agyAfter = Get-AgyConfigDigest $acceptanceAgyConfig
+            $agyUnchanged = $agyAfter -eq $acceptanceAgyBefore
+            Write-Utf8File (Join-Path $runEvidenceDir 'agy-service-cleanup.json') (@{server=$acceptanceAgyServer;removed=$true;otherConfigurationUnchanged=$agyUnchanged;afterDigest=$agyAfter} | ConvertTo-Json)
+            if (-not $agyUnchanged) { $violations.Add('Agy configuration outside the temporary registration changed.') }
+        } catch { $violations.Add("Acceptance agy cleanup incomplete: $_") }
     }
 
     # 2. Cleanup orchestrator process if still running & capture exit code

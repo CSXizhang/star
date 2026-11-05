@@ -17,6 +17,34 @@ OLD_CID = "8a529711-ba69-4525-9e02-1677048039d6"
 NEW_CID = "512337d0-c926-4732-af39-eaa39da2de13"
 
 
+def test_first_agy_init_makes_original_identity_available_before_tools(tmp_path, monkeypatch):
+    from stardew_ai_runtime.companion_memory import resolve_companion_id
+
+    async def run():
+        bridge = ChatBridge(run_dir=tmp_path, backend="agy", effort="low", enable_plan_worker=False)
+        task = ActiveChatTask(request_id="first-turn", save_id="Save1")
+        bridge._active_task = task
+        bridge._configure_backend_progress(None, task.request_id, "Save1")
+
+        def transport(active, command, prompt, session_id, **options):
+            cid = OLD_CID if session_id is None else NEW_CID
+            options["on_conversation"](cid)
+            # The real memory-tool identity resolver can identify the partner
+            # before the first provider turn has finished. A different resume
+            # ID must never replace the established original binding.
+            assert bridge.get_conversation_id("Save1") == OLD_CID
+            assert resolve_companion_id(tmp_path, "Save1", provider="agy") == resolve_companion_id(
+                tmp_path, "Save1", provider="agy", session_id=OLD_CID)
+            return AgyProcessOutcome(json.dumps({"conversation_id": cid, "status": "SUCCESS", "response": "ok"}),
+                                     "", cid, 0)
+
+        monkeypatch.setattr(bridge_module, "run_agy_process", transport)
+        monkeypatch.setattr(bridge_module, "check_new_quota_error", lambda *args: (False, ""))
+        bridge._execute_agy_turn(task, None, "first")
+        bridge._execute_agy_turn(task, OLD_CID, "resume")
+    asyncio.run(run())
+
+
 def _bridge(tmp_path: Path, monkeypatch, *, run_dir: Path | None = None) -> ChatBridge:
     monkeypatch.setenv("STARDEW_CENTRAL_COMMANDS_FILE", "none")
     bridge = ChatBridge(run_dir=run_dir, backend="agy", model="gemini-test", effort="low",
@@ -193,6 +221,7 @@ def test_abort_and_join_delegate_agy_owned_process_tree_cleanup(tmp_path, monkey
     bridge._backend = SimpleNamespace(terminate=wrong_backend_terminate)
     terminate = Mock()
     monkeypatch.setattr(bridge_module, "terminate_agy_process", terminate)
+    monkeypatch.setattr("stardew_ai_runtime.turn_execution.terminate_agy_process", terminate)
     if path == "abort":
         bridge.abort_active_task("contract teardown")
     else:

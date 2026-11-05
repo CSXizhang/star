@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agy_usage import completed_response_after_historical_error
+from .provider_activity import inactivity_deadline
 from .usage_meter import AgyTurnReceipts
 
 logger = logging.getLogger(__name__)
@@ -66,7 +68,7 @@ def run_agy_process(
     print/input/output/log options. stdout in the outcome is the unwrapped final
     result JSON, compatible with the existing bridge's terminal parser.
     """
-    if getattr(active_task, "cancelled", False):
+    if getattr(active_task, "cancelled", False) or getattr(active_task, "provider_interrupted", False) is True:
         return AgyProcessOutcome("", "", session_id, None, cancelled=True)
     if any(arg in {"--print", "-p", "--prompt", "--input-format", "--output-format", "--log-file"}
            for arg in command):
@@ -101,13 +103,15 @@ def run_agy_process(
             events.put((channel, None))
 
     def handle_stdout(line: str, *, progress: bool = True) -> None:
-        nonlocal cid, terminal
+        nonlocal cid, terminal, deadline
         try:
             event = json.loads(line)
         except ValueError:
             return
         if not isinstance(event, dict):
             return
+        if event.get("event") in {"init", "step_update", "result"}:
+            deadline = time.monotonic() + timeout_seconds
         if event.get("event") == "init" and isinstance(event.get("conversation_id"), str):
             cid = event["conversation_id"]
             active_task.provider_conversation_id = cid
@@ -157,11 +161,11 @@ def run_agy_process(
         writer.start()
         done: set[str] = set()
         while len(done) < 2:
-            if getattr(active_task, "cancelled", False):
+            if getattr(active_task, "cancelled", False) or getattr(active_task, "provider_interrupted", False) is True:
                 cancelled = True
                 terminate_agy_process(proc)
                 break
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= inactivity_deadline(active_task, deadline, timeout_seconds):
                 timed_out = True
                 terminate_agy_process(proc)
                 break
@@ -198,6 +202,14 @@ def run_agy_process(
         if terminal is None:
             terminal = {"conversation_id": cid, "status": "ERROR", "response": "",
                         "error": "CANCELLED" if cancelled else "TIMEOUT" if timed_out else "AGY_STREAM_RESULT_MISSING"}
+        elif (not cancelled and not timed_out and proc.returncode == 0
+              and session_id and cid == session_id and terminal.get("status") == "ERROR"):
+            response = completed_response_after_historical_error(
+                cid, getattr(active_task, "start_max_step_idx", -1))
+            if response is not None:
+                terminal = {**terminal, "status": "SUCCESS", "response": response,
+                            "provider_status": "ERROR", "reconciled_from": "current_turn_steps"}
+                logger.info("agy cumulative ERROR reconciled with a completed current-turn response")
         return AgyProcessOutcome(json.dumps(terminal, ensure_ascii=False), stderr,
                                  cid, proc.returncode, cancelled, timed_out)
     finally:

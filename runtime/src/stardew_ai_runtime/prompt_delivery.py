@@ -44,11 +44,12 @@ class PromptDelivery:
             self.state = {}
 
     def prepare(self, key: str, session: str | None, prompt: str, rules: str,
-                *, context: dict[str, str] | None = None) -> tuple[str, dict[str, Any]]:
+                *, context: dict[str, str] | None = None,
+                self_contained: bool = False) -> tuple[str, dict[str, Any]]:
         # Native context maintenance may invalidate this persisted baseline.
         self._reload()
         old = self.state.get(key, {})
-        continuing = bool(session) and old.get("session") == session
+        continuing = bool(session) and old.get("session") == session and not self_contained
         static = dict(old.get("static", {})) if continuing else {}
         # Player text is opaque: labels, newlines and whitespace are preserved.
         marker = re.search(r"(?m)^(?:玩家说：|玩家指令：)", prompt)
@@ -101,6 +102,7 @@ class PromptDelivery:
         if player:
             sent += "\n\n" + player
         pending = {"session": session, "static": static, "snapshots": copy.deepcopy(snapshots),
+                   "contextMode": "self-contained" if self_contained else "delta" if prior else "full",
                    "deltaProtocol": 1 if snapshots else 0,
                    "version": old.get("version", 0) + 1,
                    "originalPromptBytes": len(prompt.encode()), "newPromptBytes": len(sent.encode())}

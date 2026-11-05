@@ -512,8 +512,8 @@ public sealed class WebSocketTransportServer : ITransportServer
                 SmapiVersion: "4.2.1",
                 LifecycleState: "syncing",
                 Skills: ActorMode == "player"
-                    ? new[] { "navigate-to", "water-zone", "harvest-zone", "open-chest", "open-shop", "deposit-chest", "organize-chest", "withdraw-chest", "hoe-tiles", "plant-seeds", "ship-items", "purchase-items", "sleep", "refill-watering-can", "clear-debris", "cut-grass", "apply-fertilizer", "pickup-items" }
-                    : new[] { "water-zone", "harvest-zone", "deposit-chest", "organize-chest", "hoe-tiles", "plant-seeds", "ship-items", "withdraw-chest" },
+                    ? new[] { "navigate-to", "water-zone", "harvest-zone", "open-chest", "open-shop", "deposit-chest", "organize-chest", "withdraw-chest", "hoe-tiles", "plant-seeds", "ship-items", "purchase-items", "sleep", "wait", "refill-watering-can", "clear-debris", "cut-grass", "apply-fertilizer", "pickup-items" }
+                    : new[] { "water-zone", "harvest-zone", "deposit-chest", "organize-chest", "hoe-tiles", "plant-seeds", "ship-items", "withdraw-chest", "wait" },
                 ActorMode: ActorMode, ActorMultiplayerId: ActorMultiplayerId,
                 CommandResultQuery: true
             );

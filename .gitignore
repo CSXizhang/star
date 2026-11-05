@@ -89,6 +89,7 @@ MagicMock/
 !/src/StardewAI.Companion.TestDriver/SaveIsolationPatcher.cs
 !/src/StardewAI.Companion.TestDriver/StardewAI.Companion.TestDriver.csproj
 !/src/StardewAI.Companion.TestDriver/TestDriverMod.cs
+!/src/StardewAI.Companion.TestDriver/TestDriverMod.MultiDay.cs
 /config/test-runner*.json
 /tests/test_save_isolation.py
 /tests/test_harness_behavioral.py
@@ -116,6 +117,9 @@ MagicMock/
 !/tools/test.ps1
 !/tools/view-usage.py
 !/tools/run-companion-presets.ps1
+!/tools/run-companion-long.ps1
+!/tools/run-companion-multi-day.ps1
+!/tools/resume-companion-multi-day.ps1
 !/tools/companion_acceptance/
 !/tools/launch-game.ps1
 !/tools/build-testdriver.ps1

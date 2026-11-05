@@ -44,14 +44,14 @@ public sealed record AnimalBuildingScanInfo(
     TileCoordinate DoorTile,
     bool AnimalDoorOpen,
     bool DoorStateKnown,
-    int AnimalCount,
-    int AnimalLimit,
-    int HayCount,
-    int HayCapacity,
-    int SiloHayCount,
+    int? AnimalCount,
+    int? AnimalLimit,
+    int? HayCount,
+    int? HayCapacity,
+    int? SiloHayCount,
     IReadOnlyList<AnimalScanInfo> Animals,
     string? BuildingId = null,
-    int ResidentCount = 0,
+    int? ResidentCount = 0,
     IReadOnlyList<string>? ResidentAnimalIds = null
 );
 

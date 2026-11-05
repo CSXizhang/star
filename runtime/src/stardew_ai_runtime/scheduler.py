@@ -29,6 +29,8 @@ from typing import Any
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.client import NativeResultUnavailable, TransportClient
 from stardew_ai_runtime.protocol import NATIVE_ACTION_TASK_PREFIXES, Envelope
+from stardew_ai_runtime.websocket_client import WebSocketError
+from stardew_ai_runtime.work_state import PLANT_WORKFLOW_PLAN_ERROR
 
 logger = logging.getLogger("stardew_ai_runtime.scheduler")
 
@@ -980,10 +982,11 @@ class CompanionScheduler:
                 if not self._client.is_connected:
                     await self._client.connect(timeout=5.0)
                     await self._client.handshake(timeout=5.0)
+                    self._latest_snapshot_data = None
                     try:
                         snapshot_env = await self._client.wait_for_snapshot(timeout=3.0)
                         self._cache_snapshot(snapshot_env)
-                    except Exception:
+                    except TimeoutError:
                         pass
             except Exception as ex:
                 last_error = ex
@@ -1014,7 +1017,7 @@ class CompanionScheduler:
         try:
             snapshot_env = await client.wait_for_snapshot(timeout=0.5)
             self._cache_snapshot(snapshot_env)
-        except Exception:
+        except TimeoutError:
             snapshot_env = client.latest_snapshot
             if snapshot_env is not None:
                 self._cache_snapshot(snapshot_env)
@@ -1023,8 +1026,11 @@ class CompanionScheduler:
             try:
                 snapshot_env = await client.wait_for_snapshot(timeout=3.0)
                 self._cache_snapshot(snapshot_env)
-            except Exception:
-                pass
+            except TimeoutError:
+                raise SchedulerError("Native status unavailable: no world snapshot received") from None
+
+        if not client.is_connected:
+            raise SchedulerError("Native connection lost; cached world state is not current status")
 
     @property
     def latest_world_revision(self) -> int:
@@ -1310,6 +1316,7 @@ class CompanionScheduler:
             "saveId": client.save_id or snap.get("saveId", "unknown"),
             "gameSessionId": client.game_session_id or snap.get("gameSessionId", "unknown"),
             "worldRevision": client.world_revision or snap.get("worldRevision", 0),
+            "observedAt": snap.get("observedAt"),
         }
 
     async def query_farm_work(self) -> dict[str, Any]:
@@ -1586,6 +1593,17 @@ class CompanionScheduler:
                 "message": f"Task '{cur_tid}' is still active on companion after {timeout_seconds}s (status: {cur_status}).",
                 "error": None,
             }
+        except (OSError, WebSocketError) as ex:
+            # Losing the channel says nothing about whether the native action
+            # ran. Release this call's ownership and report the receipt as unknown.
+            command = self._active_task.command_id or requested_command_id if self._active_task else requested_command_id
+            if self._active_task:
+                self._active_task.status = "unknown"
+                self._active_task.is_terminal = True
+            raise SchedulerError(
+                f"EXECUTION_UNCONFIRMED: native connection lost; commandId={command}; "
+                f"query the current action and world before choosing remaining work: {ex}"
+            ) from None
         except Exception as ex:
             if self._active_task:
                 self._active_task.status = "failed"
@@ -3077,6 +3095,17 @@ class CompanionScheduler:
     # same allow-listed skill contract; nothing is simulated client-side.
     # ------------------------------------------------------------------
 
+    async def execute_wait(self, game_minutes: int, command_id: str | None = None) -> dict[str, Any]:
+        """Stand neutrally while the native clock runs, within this same action/session."""
+        if type(game_minutes) is not int or not 1 <= game_minutes <= 1440:
+            raise SchedulerError("game_minutes must be an integer from 1 to 1440")
+        status = await self.get_status()
+        location = (status.get("companion") or {}).get("locationId")
+        if not isinstance(location, str) or not location:
+            raise SchedulerError("Current actor location is unavailable")
+        return await self._execute_native_action("wait", {"locationId": location, "waitMinutes": game_minutes},
+            tiles=[], timeout_seconds=max(30.0, game_minutes * 0.7 + 30.0), command_id=command_id)
+
     async def _execute_native_action(
         self,
         skill_id: str,
@@ -4167,477 +4196,8 @@ class CompanionScheduler:
         water: bool | None = None,
         command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Thin composite planting workflow tool.
-
-        Executes: locate seed (backpack or chest) -> identify tiles (tilled or tillable)
-        -> hoe if needed -> plant seeds -> water planted tiles (if auto_water=True).
-        Returns unified outcome and explicit pending decision if blocked.
-
-        ``command_id`` is the stable plan command id. Each sub-skill gets a
-        deterministic derived id (``<command_id>:withdraw``/``:hoe``/``:plant``/
-        ``:water``) so a retried composite step maps to the same native commands.
-        """
-
-        def sub_command(suffix: str) -> str | None:
-            return f"{command_id}:{suffix}" if command_id else None
-        if water is not None:
-            auto_water = water
-        if not crop_name_or_id or not isinstance(crop_name_or_id, str):
-            raise PolicyViolationError("crop_name_or_id must be a non-empty string.")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-            raise PolicyViolationError(f"count must be a positive integer, got {count}.")
-
-        clean_target = crop_name_or_id.strip().lower()
-        snapshot_revision: int | None = None
-
-        def outcome_envelope(
-            outcome: str, satisfied: bool, reason: str, remaining: Any = None
-        ) -> dict[str, Any]:
-            return build_unified_outcome(
-                outcome=outcome,
-                goal_satisfied=satisfied,
-                effects=[],
-                remaining=remaining if remaining is not None else {"requested": count},
-                reason_code=reason,
-                snapshot_revision=snapshot_revision,
-            )
-
-        def matches_seed(item: dict[str, Any]) -> bool:
-            iid = str(item.get("itemId", "")).lower()
-            name = str(item.get("name", "")).lower()
-            disp = str(item.get("displayName", "")).lower()
-            t = clean_target.replace("(o)", "").replace("seeds", "").replace("种子", "").strip()
-            return (
-                clean_target in iid
-                or clean_target in name
-                or clean_target in disp
-                or (bool(t) and (t in name or t in disp or t in iid))
-            )
-
-        # Step 1: Check inventory
-        inv_res = await self.query_inventory()
-        inv_slots = inv_res.get("inventory", {}).get("slots", [])
-
-        backpack_seed = None
-        backpack_count = 0
-        for slot in inv_slots:
-            if matches_seed(slot):
-                backpack_seed = slot
-                backpack_count += int(slot.get("stack", 1))
-
-        needed_from_chest = max(0, count - backpack_count)
-        seed_id = str(backpack_seed.get("itemId", "")) if backpack_seed else ""
-        withdrawn_info = None
-
-        # Withdraw from chest if needed and allowed
-        if withdraw_from_chest and needed_from_chest > 0:
-            chests_res = await self.query_chests()
-            all_chests = chests_res.get("chests", [])
-            target_chest = None
-            chest_matching_item = None
-
-            if chest_tile:
-                ctx, cty = chest_tile.get("x"), chest_tile.get("y")
-                for c in all_chests:
-                    t = c.get("tile", {})
-                    if t.get("x") == ctx and t.get("y") == cty:
-                        target_chest = c
-                        break
-
-            if not target_chest:
-                for c in all_chests:
-                    for it in c.get("contents", []):
-                        if matches_seed(it):
-                            target_chest = c
-                            chest_matching_item = it
-                            break
-                    if target_chest:
-                        break
-            else:
-                for it in target_chest.get("contents", []):
-                    if matches_seed(it):
-                        chest_matching_item = it
-                        break
-
-            if target_chest and chest_matching_item:
-                cx = target_chest.get("tile", {}).get("x", 0)
-                cy = target_chest.get("tile", {}).get("y", 0)
-                seed_id = str(chest_matching_item.get("itemId", ""))
-                avail_in_chest = int(chest_matching_item.get("stack", 1))
-                withdraw_qty = min(needed_from_chest, avail_in_chest)
-
-                with_res = await self.withdraw_from_chest(
-                    chest_x=cx,
-                    chest_y=cy,
-                    item_id=seed_id,
-                    count=withdraw_qty,
-                    location_id=location_id,
-                    command_id=sub_command("withdraw"),
-                )
-
-                # If withdraw is executing/running, return executing immediately; do not fake success or continue
-                if with_res.get("status") == "executing" or with_res.get("terminalState") == "running":
-                    return {
-                        **outcome_envelope("unknown", False, "WITHDRAW_IN_PROGRESS"),
-                        "status": "executing",
-                        "terminalState": "running",
-                        "taskId": with_res.get("taskId"),
-                        "inProgress": True,
-                        "crop": crop_name_or_id,
-                        "seedId": seed_id,
-                        "seedsPlanted": 0,
-                        "tilesHoed": 0,
-                        "tilesWatered": 0,
-                        "targetTiles": [],
-                        "details": with_res.get("details"),
-                        "message": f"Withdrawing seeds from chest is in progress (taskId={with_res.get('taskId')}).",
-                    }
-
-                # Credit actual completed stack quantity from effects or completedCount
-                actual_withdrawn = 0
-                for eff in with_res.get("effects", []):
-                    if isinstance(eff, dict) and eff.get("state") == "withdrawn":
-                        eff_id = str(eff.get("itemId", ""))
-                        if not seed_id or eff_id.lower() == seed_id.lower() or matches_seed(eff):
-                            actual_withdrawn += int(eff.get("stack", 1))
-
-                # Fallback if effects empty/missing but terminalState is succeeded
-                if actual_withdrawn == 0 and with_res.get("terminalState") in ("succeeded", "partially-succeeded"):
-                    comp = with_res.get("completedCount", 0)
-                    if comp > 0:
-                        actual_withdrawn = withdraw_qty
-
-                withdrawn_info = {
-                    "chestTile": {"x": cx, "y": cy},
-                    "itemId": seed_id,
-                    "count": actual_withdrawn,
-                    "status": with_res.get("status"),
-                    "terminalState": with_res.get("terminalState"),
-                    "error": with_res.get("error"),
-                }
-                backpack_count += actual_withdrawn
-
-        if backpack_count <= 0 or not seed_id:
-            reason = (
-                f"No seeds matching '{crop_name_or_id}' found in backpack or chests. "
-                "Please store seeds in a farm chest or purchase seeds from Pierre's General Store."
-            )
-            if withdrawn_info and withdrawn_info.get("terminalState") in ("failed", "rejected"):
-                reason = f"Failed to withdraw seeds from chest: {withdrawn_info.get('error') or 'chest action failed'}."
-            return {
-                **outcome_envelope("partial", False, "SEEDS_MISSING"),
-                "status": "blocked",
-                "crop": crop_name_or_id,
-                "seedId": seed_id or "unknown",
-                "seedsPlanted": 0,
-                "tilesHoed": 0,
-                "tilesWatered": 0,
-                "targetTiles": [],
-                "withdrawnFromChest": withdrawn_info,
-                "pendingDecision": reason,
-            }
-
-        actual_plan_count = min(count, backpack_count)
-
-        # Step 2: Determine target tiles and necessary hoeing based on native soil status
-        tilled_set: set[tuple[int, int]] = set()
-        tilled_empty: list[dict[str, int]] = []
-        tillable: list[dict[str, int]] = []
-
-        options = await self.query_planting_options(detail=True)
-        snapshot_revision = options.get("worldRevision")
-        candidate_tiles = options.get("candidateTiles", {})
-        if isinstance(candidate_tiles, dict):
-            tilled_empty = candidate_tiles.get("tilledEmptyTiles", [])
-            tillable = candidate_tiles.get("tillableTiles", [])
-            if not isinstance(tilled_empty, list):
-                tilled_empty = []
-            if not isinstance(tillable, list):
-                tillable = []
-            tilled_set = {
-                (int(t["x"]), int(t["y"]))
-                for t in tilled_empty
-                if isinstance(t, dict) and "x" in t and "y" in t
-            }
-
-        # Prefer contiguous legal patches. Explicit model coordinates are never
-        # reordered; only auto-selected candidates go through this grouping.
-        search_bounds = options.get("searchBounds")
-        anchor = search_bounds.get("center") if isinstance(search_bounds, dict) else None
-        if not target_tiles:
-            tilled_empty = order_candidates_for_contiguous_work(
-                tilled_empty, anchor=anchor, preferred_group_size=actual_plan_count
-            )
-            tillable = order_candidates_for_contiguous_work(
-                tillable, anchor=anchor, preferred_group_size=actual_plan_count
-            )
-
-        tiles_to_hoe: list[dict[str, int]] = []
-        final_target_tiles: list[dict[str, int]] = []
-
-        if target_tiles:
-            for t in target_tiles[:actual_plan_count]:
-                coord = {"x": int(t["x"]), "y": int(t["y"])}
-                coord_tuple = (coord["x"], coord["y"])
-                if coord_tuple in tilled_set:
-                    final_target_tiles.append(coord)
-                elif auto_till:
-                    tiles_to_hoe.append(coord)
-                    final_target_tiles.append(coord)
-                else:
-                    pass
-        else:
-            if len(tilled_empty) >= actual_plan_count:
-                final_target_tiles = [{"x": int(t["x"]), "y": int(t["y"])} for t in tilled_empty[:actual_plan_count]]
-            elif auto_till:
-                final_target_tiles = [{"x": int(t["x"]), "y": int(t["y"])} for t in tilled_empty]
-                needed_hoe = actual_plan_count - len(final_target_tiles)
-                tiles_to_hoe = [{"x": int(t["x"]), "y": int(t["y"])} for t in tillable[:needed_hoe]]
-                final_target_tiles.extend(tiles_to_hoe)
-            else:
-                final_target_tiles = [{"x": int(t["x"]), "y": int(t["y"])} for t in tilled_empty]
-
-        if not final_target_tiles:
-            return {
-                **outcome_envelope("partial", False, "NO_TILES"),
-                "status": "blocked",
-                "crop": crop_name_or_id,
-                "seedId": seed_id,
-                "seedsPlanted": 0,
-                "tilesHoed": 0,
-                "tilesWatered": 0,
-                "targetTiles": [],
-                "pendingDecision": (
-                    "No tilled or tillable tiles available near companion for planting. "
-                    "Specify target_tiles or clear farm obstacles."
-                ),
-            }
-
-        # Step 3: Hoe tiles if needed
-        hoed_count = 0
-        if tiles_to_hoe:
-            hoe_res = await self.execute_hoe_tiles(
-                tiles=tiles_to_hoe, location_id=location_id, command_id=sub_command("hoe")
-            )
-            if hoe_res.get("status") == "executing" or hoe_res.get("terminalState") == "running":
-                return {
-                    **outcome_envelope("unknown", False, "HOE_IN_PROGRESS"),
-                    "status": "executing",
-                    "terminalState": "running",
-                    "taskId": hoe_res.get("taskId"),
-                    "inProgress": True,
-                    "crop": crop_name_or_id,
-                    "seedId": seed_id,
-                    "seedsPlanted": 0,
-                    "tilesHoed": 0,
-                    "tilesWatered": 0,
-                    "targetTiles": final_target_tiles,
-                    "details": hoe_res.get("details"),
-                    "message": f"Hoeing tiles is in progress (taskId={hoe_res.get('taskId')}).",
-                }
-
-            hoed_count = hoe_res.get("completedCount", 0)
-            if hoe_res.get("terminalState") != "succeeded" and hoed_count == 0:
-                return {
-                    **outcome_envelope("partial", False, "HOE_FAILED"),
-                    "status": "partial" if (backpack_count > 0 and len(final_target_tiles) > len(tiles_to_hoe)) else "failed",
-                    "crop": crop_name_or_id,
-                    "seedId": seed_id,
-                    "seedsPlanted": 0,
-                    "tilesHoed": 0,
-                    "tilesWatered": 0,
-                    "targetTiles": [],
-                    "pendingDecision": f"Failed hoeing tiles: {hoe_res.get('error')}. Companion may be missing a Hoe.",
-                }
-
-            # Filter final_target_tiles to exclude tiles that failed hoeing
-            hoed_tiles = [
-                e["tile"] for e in hoe_res.get("effects", [])
-                if isinstance(e.get("tile"), dict) and (e.get("state") == "hoed" or e.get("tilled"))
-            ]
-            if hoed_tiles:
-                actual_hoed_set = {(int(t["x"]), int(t["y"])) for t in hoed_tiles}
-                final_target_tiles = [
-                    t for t in final_target_tiles
-                    if (t["x"], t["y"]) in tilled_set or (t["x"], t["y"]) in actual_hoed_set
-                ]
-            elif hoed_count < len(tiles_to_hoe):
-                final_target_tiles = [
-                    t for t in final_target_tiles if (t["x"], t["y"]) in tilled_set
-                ] + tiles_to_hoe[:hoed_count]
-
-        # Step 4: Plant seeds
-        if not final_target_tiles:
-            return {
-                **outcome_envelope("partial", False, "NO_TILLED"),
-                "status": "failed",
-                "crop": crop_name_or_id,
-                "seedId": seed_id,
-                "seedsPlanted": 0,
-                "tilesHoed": hoed_count,
-                "tilesWatered": 0,
-                "targetTiles": [],
-                "pendingDecision": "No workable tilled tiles available for planting.",
-            }
-
-        plant_res = await self.execute_plant_seeds(
-            seed_item_id=seed_id,
-            tiles=final_target_tiles,
-            location_id=location_id,
-            command_id=sub_command("plant"),
-        )
-        if plant_res.get("status") == "executing" or plant_res.get("terminalState") == "running":
-            return {
-                **outcome_envelope("unknown", False, "PLANT_IN_PROGRESS"),
-                "status": "executing",
-                "terminalState": "running",
-                "taskId": plant_res.get("taskId"),
-                "inProgress": True,
-                "crop": crop_name_or_id,
-                "seedId": seed_id,
-                "seedsPlanted": 0,
-                "tilesHoed": hoed_count,
-                "tilesWatered": 0,
-                "targetTiles": final_target_tiles,
-                "details": plant_res.get("details"),
-                "message": f"Planting seeds is in progress (taskId={plant_res.get('taskId')}).",
-            }
-
-        real_planted_tiles: list[dict[str, int]] = []
-        details_planted = plant_res.get("details", {}).get("plantedTiles") if isinstance(plant_res.get("details"), dict) else None
-        if isinstance(details_planted, list) and len(details_planted) > 0:
-            real_planted_tiles = [{"x": int(t["x"]), "y": int(t["y"])} for t in details_planted if isinstance(t, dict)]
-        else:
-            for eff in plant_res.get("effects", []):
-                if eff.get("state") == "planted" and isinstance(eff.get("tile"), dict):
-                    real_planted_tiles.append({"x": int(eff["tile"]["x"]), "y": int(eff["tile"]["y"])})
-
-        planted_count = plant_res.get("completedCount", len(real_planted_tiles))
-        if len(real_planted_tiles) < planted_count:
-            seen = {(t["x"], t["y"]) for t in real_planted_tiles}
-            for t in final_target_tiles:
-                if (t["x"], t["y"]) not in seen:
-                    real_planted_tiles.append(t)
-                    seen.add((t["x"], t["y"]))
-                if len(real_planted_tiles) >= planted_count:
-                    break
-
-        if planted_count == 0:
-            err_msg = plant_res.get("error")
-            skipped = plant_res.get("details", {}).get("skippedTiles", []) if isinstance(plant_res.get("details"), dict) else []
-            if not err_msg and skipped:
-                reasons_list = [f"({s.get('x')},{s.get('y')}:{s.get('reason')})" for s in skipped if isinstance(s, dict)]
-                err_msg = f"Tiles skipped ({', '.join(reasons_list)})"
-            if not err_msg:
-                err_msg = "Unknown planting failure"
-            return {
-                **outcome_envelope("partial", False, "PLANT_FAILED"),
-                "status": "failed",
-                "crop": crop_name_or_id,
-                "seedId": seed_id,
-                "seedsPlanted": 0,
-                "tilesHoed": hoed_count,
-                "tilesWatered": 0,
-                "targetTiles": [],
-                "details": plant_res.get("details"),
-                "pendingDecision": f"Failed planting seeds: {err_msg}.",
-            }
-
-        # Step 5: Water planted tiles
-        watered_count = 0
-        water_res = {}
-        watering_succeeded = True
-        if auto_water and real_planted_tiles:
-            water_targets = real_planted_tiles
-            water_res = await self.execute_tiles(
-                tiles=water_targets, location_id=location_id, command_id=sub_command("water")
-            )
-            if water_res.get("status") == "executing" or water_res.get("terminalState") == "running":
-                return {
-                    **outcome_envelope("unknown", False, "WATER_IN_PROGRESS"),
-                    "status": "executing",
-                    "terminalState": "running",
-                    "taskId": water_res.get("taskId"),
-                    "inProgress": True,
-                    "crop": crop_name_or_id,
-                    "seedId": seed_id,
-                    "seedsPlanted": planted_count,
-                    "tilesHoed": hoed_count,
-                    "tilesWatered": 0,
-                    "targetTiles": real_planted_tiles,
-                    "details": water_res.get("details"),
-                    "message": f"Watering planted crops is in progress (taskId={water_res.get('taskId')}).",
-                }
-
-            watered_count = water_res.get("completedCount", 0)
-            watering_term = water_res.get("terminalState")
-            # The Mod reports "succeeded" only when every requested tile ended the
-            # task watered. Tiles skipped as AlreadyWatered count as goal satisfied
-            # and consume no water, so completedCount can legitimately be 0 while the
-            # goal is met. Trust that verdict rather than comparing
-            # completedCount against the target count.
-            watering_succeeded = watering_term == "succeeded" or (
-                isinstance(watered_count, int) and watered_count >= len(water_targets)
-            )
-
-        all_effects = list(plant_res.get("effects", []))
-        if auto_water and water_res:
-            all_effects.extend(water_res.get("effects", []))
-
-        is_fully_successful = (
-            planted_count >= count
-            and (not auto_water or watering_succeeded)
-        )
-        final_status = "succeeded" if is_fully_successful else "partial"
-        pending_decision = None
-        reason_code = "OK"
-        if not is_fully_successful:
-            reasons = []
-            if planted_count < count:
-                reason_code = "PLANT_INCOMPLETE"
-                skip_info = ""
-                skipped = plant_res.get("details", {}).get("skippedTiles", []) if isinstance(plant_res.get("details"), dict) else []
-                if skipped:
-                    reasons_list = [f"({s.get('x')},{s.get('y')}:{s.get('reason')})" for s in skipped if isinstance(s, dict)]
-                    skip_info = f" (skipped: {', '.join(reasons_list)})"
-                reasons.append(f"Planted {planted_count}/{count} seeds{skip_info}")
-            if auto_water and not watering_succeeded:
-                reason_code = "WATER_INCOMPLETE"
-                reasons.append(f"Watered {watered_count}/{len(real_planted_tiles)} tiles ({water_res.get('terminalState', 'failed')})")
-            pending_decision = "; ".join(reasons)
-
-        envelope = build_unified_outcome(
-            outcome="completed" if is_fully_successful else "partial",
-            goal_satisfied=is_fully_successful,
-            effects=all_effects,
-            remaining={
-                "requested": count,
-                "seedsPlanted": planted_count,
-                "unwateredPlantedTiles": max(0, len(real_planted_tiles) - watered_count) if auto_water else 0,
-                "remainingSeedsInBackpack": max(0, backpack_count - planted_count),
-            },
-            reason_code=reason_code,
-            snapshot_revision=snapshot_revision,
-        )
-
-        return {
-            **envelope,
-            "status": final_status,
-            "crop": crop_name_or_id,
-            "seedId": seed_id,
-            "seedsPlanted": planted_count,
-            "tilesHoed": hoed_count,
-            "tilesWatered": watered_count,
-            "targetTiles": real_planted_tiles,
-            "withdrawnFromChest": withdrawn_info,
-            "remainingSeedsInBackpack": max(0, backpack_count - planted_count),
-            "pendingDecision": pending_decision,
-            "details": {
-                "plantDetails": plant_res.get("details"),
-                "waterDetails": water_res.get("details") if auto_water else None,
-            },
-            "effects": all_effects,
-        }
+        """Retired composite entry: preserve the signature and explicit migration error."""
+        raise PolicyViolationError(PLANT_WORKFLOW_PLAN_ERROR)
 
     async def close(self) -> None:
         """Closes the underlying transport client if connected."""

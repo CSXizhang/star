@@ -11,11 +11,11 @@ Persistence follows the same pattern as autonomy.py:
 
 from __future__ import annotations
 
-import contextlib
 import json
-import os
 from pathlib import Path
 from typing import Any
+
+from stardew_ai_runtime.file_lock import lock_file, unlock_file
 
 PLAY_STYLES = frozenset({"earn", "workhorse", "community", "decor"})
 PERSONALITIES = frozenset({"gentle", "lively", "calm", "tsundere"})
@@ -70,26 +70,9 @@ class CompanionProfileStore:
         except (FileNotFoundError, OSError, ValueError, TypeError):
             self._data = {}
 
-    @staticmethod
-    def _lock(lock: Any) -> None:
-        if os.name == "nt":
-            import msvcrt
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    _lock = staticmethod(lock_file)
 
-    @staticmethod
-    def _unlock(lock: Any) -> None:
-        with contextlib.suppress(Exception):
-            if os.name == "nt":
-                import msvcrt
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    _unlock = staticmethod(unlock_file)
 
     def _write_unlocked(self) -> None:
         temp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")

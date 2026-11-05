@@ -12,6 +12,23 @@ from stardew_ai_runtime.mcp_server import create_mcp_server
 mock_scheduler = _scheduler_fixture
 
 
+def test_wait_uses_existing_action_entry_and_validates_duration(tmp_path, mock_scheduler):
+    _grant_decision(tmp_path, mock_scheduler)
+    mock_scheduler.execute_wait = AsyncMock(return_value={"status": "completed", "terminalState": "succeeded",
+        "details": {"elapsedGameMinutes": 40, "startTime": 820, "endTime": 900}})
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+        assert len(await server.list_tools()) == 8
+        _, result = await server.call_tool("submit_work", {"action": {"wait": {"game_minutes": 40}}})
+        assert result["terminalState"] == "succeeded"
+        assert result["details"]["elapsedGameMinutes"] == 40
+        mock_scheduler.execute_wait.assert_awaited_once_with(40)
+        with pytest.raises(ToolError):
+            await server.call_tool("submit_work", {"action": {"wait": {"game_minutes": True}}})
+        assert mock_scheduler.execute_wait.await_count == 1
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('operation, method_name', [('clear_debris', 'clear_debris'), ('water_tiles', 'execute_tiles')])
 def test_typed_action_executes_now_and_rechecks_authority(tmp_path, monkeypatch, mock_scheduler, operation, method_name):
     store = _grant_decision(tmp_path, mock_scheduler)
@@ -39,9 +56,12 @@ def test_typed_action_executes_now_and_rechecks_authority(tmp_path, monkeypatch,
         assert completion['goal']['status'] == 'completed'
         assert completion['goal']['project']['completionObservation']['worldRevision'] == 1
         store.revoke_decision('mock-save-123')
-        with pytest.raises(ToolError, match='STALE_DECISION'):
+        await server.call_tool('submit_work', args)
+        assert method.await_count == 3
+        store.set_paused('mock-save-123', True)
+        with pytest.raises(ToolError, match='WORK_STOPPED'):
             await server.call_tool('submit_work', args)
-        assert method.await_count == 2
+        assert method.await_count == 3
     asyncio.run(run())
 
 
@@ -136,6 +156,26 @@ def test_natural_answer_requires_matching_live_notice_and_original_player_text(t
     asyncio.run(run())
 
 
+def test_player_question_without_goal_is_durable_and_does_not_change_control(tmp_path, mock_scheduler):
+    store = _grant_decision(tmp_path, mock_scheduler)
+    store.set_paused('mock-save-123', True)
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='light')
+        _, notice = await server.call_tool('request_player_decision', {
+            'message': '这块地方留作什么？', 'choices': ['留空', '种花']})
+        _, repeated = await server.call_tool('request_player_decision', {
+            'message': '这块地方留作什么？', 'choices': ['留空', '种花']})
+        assert repeated['id'] == notice['id']
+        assert store.pending_player_notice('mock-save-123')['id'] == notice['id']
+        assert not store.state('mock-save-123').goals
+        assert store.state('mock-save-123').paused
+        store.answer_player_notice('mock-save-123', notice['id'], '留空', 'player-answer')
+        assert store.unresolved_player_notices('mock-save-123') == []
+        with pytest.raises(ToolError, match='goal'):
+            await server.call_tool('request_player_decision', {'message': '另一件事', 'goal_id': 'missing'})
+    asyncio.run(run())
+
+
 def test_upgrade_discards_old_queue_without_cancelling_player_goal(tmp_path, mock_scheduler):
     store = _grant_decision(tmp_path, mock_scheduler)
     goal = store.add_goal('mock-save-123', '照顾农场', source='user')
@@ -158,22 +198,24 @@ def test_occupied_conversation_can_execute_after_owner_settles(tmp_path, monkeyp
     mock_scheduler.execute_tiles = AsyncMock(return_value={
         'status': 'completed', 'terminalState': 'succeeded', 'completedCount': 1})
 
+    mock_scheduler.execute_tiles.side_effect = ToolError('GAME_BUSY: native actor already executing')
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='life')
         args = {'action': {'water_tiles': {'tiles': [{'x': 4, 'y': 5}]}}}
         with pytest.raises(ToolError, match='GAME_BUSY'):
             await server.call_tool('submit_work', args)
         assert store.state('mock-save-123').decision['token'] == 'decision-1'
-        mock_scheduler.execute_tiles.assert_not_awaited()
+        mock_scheduler.execute_tiles.assert_awaited_once()
         store.revoke_decision('mock-save-123')
         store.set_paused('mock-save-123', True)
         with pytest.raises(ToolError, match='WORK_STOPPED'):
             await server.call_tool('submit_work', args)
-        mock_scheduler.execute_tiles.assert_not_awaited()
+        mock_scheduler.execute_tiles.assert_awaited_once()
         store.set_paused('mock-save-123', False)
+        mock_scheduler.execute_tiles.side_effect = None
         _, result = await server.call_tool('submit_work', args)
         assert result['terminalState'] == 'succeeded'
-        mock_scheduler.execute_tiles.assert_awaited_once()
+        assert mock_scheduler.execute_tiles.await_count == 2
     asyncio.run(run())
 
 

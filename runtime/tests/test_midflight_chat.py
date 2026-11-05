@@ -2,8 +2,8 @@
 
 While a selected job is still in flight, the execution connection stays with
 the native executor: a player message is recorded verbatim
-(origin ``player-midflight``) and answered by a read-only life-surface turn
-that never claims the execution connection and cannot dispatch work.  Whole
+(origin ``player-midflight``) and answered in the same live tool surface; native busy/pause checks apply when
+the model actually attempts work.  Whole
 work-control utterances (the same vocabulary as the life surface) reach the
 in-flight command through the autonomy-control bypass immediately.  Only
 ``preparation-`` turns (bridge-scheduled accepted preparations) keep the
@@ -128,7 +128,7 @@ def test_midflight_player_chat_is_recorded_and_answered_execution_deferred(tmp_p
 
         final = ws.replies()[-1]
         assert final["status"] == "completed"
-        assert final["readOnly"] is True
+        assert "readOnly" not in final
         assert final["commandId"] == "req-mid-1"
 
     asyncio.run(run())

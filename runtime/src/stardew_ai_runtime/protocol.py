@@ -21,6 +21,7 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "load-extension": frozenset({"locationId", "extensionPackage", "extensionPersist"}),
     "invoke-extension": frozenset({"locationId", "extensionId", "extensionVersion", "extensionKind", "extensionArguments"}),
     "rest": frozenset({"locationId", "targetStamina"}),
+    "wait": frozenset({"locationId", "waitMinutes"}),
     "inspect-player-activities": frozenset({"locationId"}),
     "talk-npc": frozenset({"locationId", "npcName"}),
     "interact-tile": frozenset({"locationId", "tile"}),
@@ -236,35 +237,24 @@ class Envelope:
         cancel_policy: str = "safe-point",
         policy_decision_id: str = "policy-allow",
     ) -> Envelope:
-        """Builds skill.execute for one explicitly allow-listed native action."""
-        validate_native_action_parameters(skill_id, parameters)
-        return cls(
-            protocol_version="0.1",
-            message_type="skill.execute",
-            message_id=f"msg-exec-{uuid.uuid4().hex[:8]}",
+        """Compatibility entry for the shared validated skill envelope."""
+        return cls.create_execute_skill(
             sender_instance_id=sender_instance_id,
             sequence_number=sequence_number,
-            world_revision=world_revision,
-            sent_at=datetime.now(UTC),
             save_id=save_id,
             game_session_id=game_session_id,
+            world_revision=world_revision,
+            command_id=command_id,
+            task_id=task_id,
+            skill_id=skill_id,
+            parameters=parameters,
             idempotency_key=idempotency_key,
             expires_at=expires_at,
-            payload={
-                "commandId": command_id,
-                "taskId": task_id,
-                "skillId": skill_id,
-                "skillVersion": "0.1",
-                "expectedWorldRevision": world_revision,
-                "parameters": dict(parameters),
-                "budgets": {
-                    "maxGameMinutes": max_game_minutes,
-                    "maxStamina": max_stamina,
-                    "maxWater": max_water,
-                },
-                "cancelPolicy": cancel_policy,
-                "policyDecisionId": policy_decision_id,
-            },
+            max_game_minutes=max_game_minutes,
+            max_stamina=max_stamina,
+            max_water=max_water,
+            cancel_policy=cancel_policy,
+            policy_decision_id=policy_decision_id,
         )
 
     @classmethod

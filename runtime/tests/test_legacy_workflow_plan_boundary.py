@@ -6,6 +6,7 @@ import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from stardew_ai_runtime.mcp_server import _PLAN_OPERATION_CALLS, create_mcp_server
+from stardew_ai_runtime.scheduler import CompanionScheduler, PolicyViolationError
 from stardew_ai_runtime.work_state import ALLOWED_OPERATIONS, WorkStateError, WorkStore
 
 
@@ -77,3 +78,14 @@ def test_native_combinations_remain_unrestricted_after_wrapper_correction(bounda
     assert saved[5].params["tiles"] == tiles
     assert "plant_crop_workflow" not in _PLAN_OPERATION_CALLS
     assert "plant_crop_workflow" not in ALLOWED_OPERATIONS
+
+
+def test_direct_scheduler_composite_rejects_before_connecting(tmp_path):
+    scheduler = CompanionScheduler(run_dir=tmp_path)
+    scheduler.ensure_connected = AsyncMock(side_effect=AssertionError("Must not connect"))
+    with pytest.raises(PolicyViolationError, match="COMPOSITE_STEP_UNSUPPORTED") as error:
+        asyncio.run(scheduler.plant_crop_workflow("Potato", count=100, command_id="legacy"))
+    assert '"saved": false' in str(error.value)
+    assert '"execution": "not_started"' in str(error.value)
+    scheduler.ensure_connected.assert_not_awaited()
+    assert not scheduler.has_active_task

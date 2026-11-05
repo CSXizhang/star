@@ -1,0 +1,10 @@
+{
+  "name": "two-harvest-reinvestment",
+  "instruction": "从今天春1日开始经营这块农场，到春11日早上收尾。完成两轮防风草经营，每轮都要购买至少25颗种子、实际种下并照料成熟、收获和出货；第二轮种子必须等第一轮防风草出货过夜结算后再购买。结束时手上至少有800金币，田边箱子里留至少4根防风草和80木材。农场南边的两棵幼树留着，即使后来长大了也不要砍；每天优先照料还在生长的作物。购买、种植位置、日程、采木和正常上床睡觉由你安排，沿用这个目标连续做，不用每天问我。不要卖工具或这次要保留的物资；到春11日上午9点就停止并如实汇报结果，不要为了补目标延长到下一天。",
+  "initial": {"year": 1, "season": "spring", "day": 1, "money": 500, "seeds": 0, "food": 0},
+  "expectedNativeEconomics": {"seedItemId": "(O)472", "harvestItemId": "(O)24", "seedPrice": 20, "normalHarvestPrice": 35, "growthDays": 4},
+  "criteria": {"minimumMoney": 800, "minimumStoredParsnips": 4, "minimumStoredWood": 80, "minimumPlantsPerCycle": 25, "minimumPurchasedSeedsPerCycle": 25, "cycles": 2, "secondPurchaseAfterFirstSettlement": true, "earliestCompletionDay": 11, "deadlineDay": 11, "deadlineTime": 900, "protectedTreeCount": 2, "oneProviderSession": true},
+  "wallBudgetSeconds": 7200,
+  "interventionPolicy": "One initial handoff and goal. No reminders, action dispatch, sleep assistance, resets or supplies after submission. Only native observations and public receipts are collected.",
+  "feasibilityNotSentToModel": "If native prices and growth match: 25 seeds cost 500; first ordinary harvest sells 25 for 875; second 25 seeds cost 500, leaving 375; retain 4 of the second harvest and sell 21 for 735, leaving 1110 after settlement. Plant on spring 1 and 6 to settle harvests on spring 6 and 11. This is an evaluator feasibility witness, not a prescribed model route."
+}

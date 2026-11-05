@@ -389,14 +389,14 @@ public sealed record AnimalBuildingSnapshot(
     [property: JsonPropertyName("doorTile")] TileCoord DoorTile,
     [property: JsonPropertyName("animalDoorOpen")] bool AnimalDoorOpen,
     [property: JsonPropertyName("doorStateKnown")] bool DoorStateKnown,
-    [property: JsonPropertyName("animalCount")] int AnimalCount,
-    [property: JsonPropertyName("animalLimit")] int AnimalLimit,
-    [property: JsonPropertyName("hayCount")] int HayCount,
-    [property: JsonPropertyName("hayCapacity")] int HayCapacity,
-    [property: JsonPropertyName("siloHayCount")] int SiloHayCount,
+    [property: JsonPropertyName("animalCount")] int? AnimalCount,
+    [property: JsonPropertyName("animalLimit")] int? AnimalLimit,
+    [property: JsonPropertyName("hayCount")] int? HayCount,
+    [property: JsonPropertyName("hayCapacity")] int? HayCapacity,
+    [property: JsonPropertyName("siloHayCount")] int? SiloHayCount,
     [property: JsonPropertyName("animals")] List<AnimalSnapshot> Animals,
     [property: JsonPropertyName("buildingId")] string? BuildingId = null,
-    [property: JsonPropertyName("residentCount")] int ResidentCount = 0,
+    [property: JsonPropertyName("residentCount")] int? ResidentCount = 0,
     [property: JsonPropertyName("residentAnimalIds")] IReadOnlyList<string>? ResidentAnimalIds = null
 );
 
@@ -541,6 +541,8 @@ public sealed record WaterZoneParameters(
     public int? Facing { get; init; }
     [JsonPropertyName("targetStamina")]
     public float? TargetStamina { get; init; }
+    [JsonPropertyName("waitMinutes")]
+    public int? WaitMinutes { get; init; }
     [JsonPropertyName("extensionId")] public string? ExtensionId { get; init; }
     [JsonPropertyName("extensionVersion")] public string? ExtensionVersion { get; init; }
     [JsonPropertyName("extensionKind")] public string? ExtensionKind { get; init; }

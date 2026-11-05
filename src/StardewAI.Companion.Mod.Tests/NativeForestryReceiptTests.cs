@@ -28,8 +28,6 @@ public sealed class NativeForestryReceiptTests
         return false;
     }
 
-    private static bool NotHostPaused(ref bool __result) { __result = false; return false; }
-
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -39,8 +37,10 @@ public sealed class NativeForestryReceiptTests
         var harmony = new Harmony("StardewAI.Tests.MixedPickupReceipt");
         var collect = AccessTools.Method(typeof(Debris), nameof(Debris.collect), new[] { typeof(Farmer), typeof(Chunk) });
         harmony.Patch(collect, prefix: new HarmonyMethod(typeof(NativeForestryReceiptTests), nameof(AcceptCollection)));
-        var hostPaused = AccessTools.PropertyGetter(typeof(Game1), nameof(Game1.HostPaused));
-        harmony.Patch(hostPaused, prefix: new HarmonyMethod(typeof(NativeForestryReceiptTests), nameof(NotHostPaused)));
+        // Netcode may inline HostPaused before this test installs a Harmony
+        // prefix. Supply its real world state so Release test order is irrelevant.
+        var oldWorldState = Game1.netWorldState;
+        Game1.netWorldState = new NetRoot<StardewValley.Network.NetWorldState>(new());
         var oldPlayer = Game1.player;
         var playerField = AccessTools.GetDeclaredFields(typeof(Game1)).Single(field => field.FieldType == typeof(Farmer));
         var game = AccessTools.Field(typeof(Game1), "game1").GetValue(null);
@@ -99,7 +99,7 @@ public sealed class NativeForestryReceiptTests
         {
             playerField.SetValue(game, oldPlayer);
             harmony.Unpatch(collect, HarmonyPatchType.Prefix, harmony.Id);
-            harmony.Unpatch(hostPaused, HarmonyPatchType.Prefix, harmony.Id);
+            Game1.netWorldState = oldWorldState;
         }
     }
 

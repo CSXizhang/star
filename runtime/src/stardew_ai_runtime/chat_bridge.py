@@ -27,18 +27,17 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 from stardew_ai_runtime.agent_backends import (
     AgyBackend,
+    BackendProgress,
     CodexBackend,
     DshBackend,
     KimiBackend,
@@ -46,8 +45,71 @@ from stardew_ai_runtime.agent_backends import (
 )
 from stardew_ai_runtime.agent_instructions import instructions_revision, load_instruction_bundle
 from stardew_ai_runtime.agy_process import run_agy_process, terminate_agy_process
+from stardew_ai_runtime.agy_usage import (
+    _decode_varint as _decode_varint,
+)
+from stardew_ai_runtime.agy_usage import (
+    _parse_protobuf as _parse_protobuf,
+)
+from stardew_ai_runtime.agy_usage import (
+    _parse_usage_from_gen_metadata as _parse_usage_from_gen_metadata,
+)
+from stardew_ai_runtime.agy_usage import (
+    check_new_quota_error as check_new_quota_error,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_command_usage_delta as get_command_usage_delta,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_conversation_db_path as get_conversation_db_path,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_max_gen_idx as get_max_gen_idx,
+)
+from stardew_ai_runtime.agy_usage import (
+    get_max_step_idx as get_max_step_idx,
+)
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config, project_root
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_BACKUP_COUNT as CHAT_BRIDGE_LOG_BACKUP_COUNT,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_DATEFMT as CHAT_BRIDGE_LOG_DATEFMT,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_ENCODING as CHAT_BRIDGE_LOG_ENCODING,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_FILENAME as CHAT_BRIDGE_LOG_FILENAME,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_FORMAT as CHAT_BRIDGE_LOG_FORMAT,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    CHAT_BRIDGE_LOG_MAX_BYTES as CHAT_BRIDGE_LOG_MAX_BYTES,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    configure_chat_bridge_file_logging as configure_chat_bridge_file_logging,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    get_chat_bridge_fallback_log_dir as get_chat_bridge_fallback_log_dir,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    get_chat_bridge_log_path as get_chat_bridge_log_path,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    has_chat_bridge_file_logging as has_chat_bridge_file_logging,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    remove_chat_bridge_file_logging as remove_chat_bridge_file_logging,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    resolve_chat_bridge_run_dir as resolve_chat_bridge_run_dir,
+)
+from stardew_ai_runtime.chat_bridge_logging import (
+    switch_chat_bridge_file_logging as switch_chat_bridge_file_logging,
+)
 from stardew_ai_runtime.codex_game_profile import CODEX_GAME_TOOL_PROFILE_VERSION
 from stardew_ai_runtime.companion_care import CompanionCareService
 from stardew_ai_runtime.companion_memory import CompanionMemoryStore, resolve_companion_id
@@ -93,10 +155,11 @@ from stardew_ai_runtime.protocol import (
 )
 from stardew_ai_runtime.scheduler import (
     DiscoveryError,
-    get_candidate_discovery_paths,
     resolve_discovery,
 )
 from stardew_ai_runtime.snapshot_cache import cache_lock, write_cache
+from stardew_ai_runtime.turn_context import compose_turn_prompt
+from stardew_ai_runtime.turn_execution import TurnExecutionMixin, execute_provider
 from stardew_ai_runtime.usage_display import UsageDisplay
 from stardew_ai_runtime.usage_meter import normalize_usage
 from stardew_ai_runtime.websocket_client import (
@@ -112,357 +175,6 @@ from stardew_ai_runtime.work_state import (
 )
 
 logger = logging.getLogger("stardew_ai_runtime.chat_bridge")
-
-CHAT_BRIDGE_LOG_FILENAME = "chat-bridge.log"
-CHAT_BRIDGE_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-CHAT_BRIDGE_LOG_BACKUP_COUNT = 3
-CHAT_BRIDGE_LOG_ENCODING = "utf-8"
-CHAT_BRIDGE_LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
-CHAT_BRIDGE_LOG_DATEFMT = "%H:%M:%S"
-
-
-def resolve_chat_bridge_run_dir(run_dir: str | Path | None = None) -> Path | None:
-    """Resolves the active run directory, consulting explicit path, environment, and auto-discovery."""
-    if run_dir:
-        return Path(run_dir).resolve()
-    env_dir = os.getenv("STARDEW_RUN_DIR")
-    if env_dir and env_dir.strip():
-        return Path(env_dir.strip()).resolve()
-    try:
-        candidate_meta = project_root() / "config" / "installed-candidate.json"
-        if candidate_meta.is_file():
-            meta = json.loads(candidate_meta.read_text(encoding="utf-8"))
-            mod_dir = meta.get("modDirectory")
-            if mod_dir and Path(mod_dir).is_dir():
-                return Path(mod_dir).resolve()
-    except Exception:
-        pass
-    try:
-        for cand in get_candidate_discovery_paths(None):
-            if cand.is_file():
-                parent = cand.parent
-                mod_dir = parent.parent if parent.name.lower() == "data" else parent
-                return mod_dir.resolve()
-            parent = cand.parent
-            cand_mod = parent.parent if parent.name.lower() == "data" else parent
-            if cand_mod.is_dir():
-                return cand_mod.resolve()
-    except Exception:
-        pass
-    return None
-
-
-def get_chat_bridge_fallback_log_dir() -> Path:
-    """Returns the fallback directory for logs when run-dir cannot be resolved."""
-    env_override = os.getenv("STARDEW_FALLBACK_LOG_DIR")
-    if env_override and env_override.strip():
-        return Path(env_override.strip())
-    return Path.home() / ".gemini" / "antigravity-cli" / "logs"
-
-
-def get_chat_bridge_log_path(run_dir: str | Path | None = None) -> Path:
-    """Determines the destination path for chat-bridge.log."""
-    resolved = resolve_chat_bridge_run_dir(run_dir)
-    if resolved is not None:
-        return resolved / "logs" / CHAT_BRIDGE_LOG_FILENAME
-    return get_chat_bridge_fallback_log_dir() / CHAT_BRIDGE_LOG_FILENAME
-
-
-def has_chat_bridge_file_logging() -> bool:
-    """Checks whether a ChatBridge RotatingFileHandler is currently attached to the root logger."""
-    root_logger = logging.getLogger()
-    for h in root_logger.handlers:
-        if getattr(h, "_is_chat_bridge_handler", False):
-            return True
-    return False
-
-
-def configure_chat_bridge_file_logging(
-    run_dir: str | Path | None = None,
-) -> tuple[RotatingFileHandler, Path]:
-    """Attaches a 5MB x 3 UTF-8 RotatingFileHandler to the root logger."""
-    log_path = get_chat_bridge_log_path(run_dir)
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-    except Exception as ex:
-        fallback_path = get_chat_bridge_fallback_log_dir() / CHAT_BRIDGE_LOG_FILENAME
-        try:
-            fallback_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path = fallback_path
-        except Exception:
-            logger.warning("Failed to create log directories (%s); falling back to current working directory", ex)
-            log_path = Path.cwd() / "logs" / CHAT_BRIDGE_LOG_FILENAME
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    root_logger = logging.getLogger()
-    for h in root_logger.handlers:
-        if getattr(h, "_is_chat_bridge_handler", False) and isinstance(h, RotatingFileHandler):
-            try:
-                if Path(h.baseFilename).resolve() == log_path.resolve():
-                    return h, log_path
-            except Exception:
-                pass
-
-    handler = RotatingFileHandler(
-        str(log_path),
-        maxBytes=CHAT_BRIDGE_LOG_MAX_BYTES,
-        backupCount=CHAT_BRIDGE_LOG_BACKUP_COUNT,
-        encoding=CHAT_BRIDGE_LOG_ENCODING,
-    )
-    handler.setLevel(logging.INFO)
-    handler._is_chat_bridge_handler = True  # type: ignore[attr-defined]
-    formatter = logging.Formatter(
-        CHAT_BRIDGE_LOG_FORMAT,
-        datefmt=CHAT_BRIDGE_LOG_DATEFMT,
-    )
-    handler.setFormatter(formatter)
-    root_logger.addHandler(handler)
-    if root_logger.level > logging.INFO or root_logger.level == logging.NOTSET:
-        root_logger.setLevel(logging.INFO)
-    return handler, log_path
-
-
-def switch_chat_bridge_file_logging(
-    new_run_dir: str | Path | None,
-) -> tuple[RotatingFileHandler, Path]:
-    """Switches the active chat_bridge file handler to a newly discovered run directory."""
-    log_path = get_chat_bridge_log_path(new_run_dir)
-    root_logger = logging.getLogger()
-    for h in list(root_logger.handlers):
-        if getattr(h, "_is_chat_bridge_handler", False) and isinstance(h, RotatingFileHandler):
-            try:
-                if Path(h.baseFilename).resolve() == log_path.resolve():
-                    return h, log_path
-                h.close()
-                root_logger.removeHandler(h)
-            except Exception:
-                pass
-    return configure_chat_bridge_file_logging(new_run_dir)
-
-
-def remove_chat_bridge_file_logging() -> None:
-    """Closes and removes all chat_bridge file handlers from the root logger."""
-    root_logger = logging.getLogger()
-    for h in list(root_logger.handlers):
-        if getattr(h, "_is_chat_bridge_handler", False):
-            try:
-                h.close()
-            except Exception:
-                pass
-            root_logger.removeHandler(h)
-
-
-def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
-    res = 0
-    shift = 0
-    while offset < len(data):
-        b = data[offset]
-        offset += 1
-        res |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return res, offset
-        shift += 7
-    return res, offset
-
-
-def _parse_protobuf(data: bytes) -> dict[int, list[tuple[int, Any]]]:
-    offset = 0
-    fields: dict[int, list[tuple[int, Any]]] = {}
-    while offset < len(data):
-        try:
-            tag_val, offset = _decode_varint(data, offset)
-        except Exception:
-            break
-        tag = tag_val >> 3
-        wire = tag_val & 7
-        if wire == 0:
-            val, offset = _decode_varint(data, offset)
-        elif wire == 2:
-            length, offset = _decode_varint(data, offset)
-            val = data[offset : offset + length]
-            offset += length
-        elif wire == 1:
-            val = data[offset : offset + 8]
-            offset += 8
-        elif wire == 5:
-            val = data[offset : offset + 4]
-            offset += 4
-        else:
-            break
-        fields.setdefault(tag, []).append((wire, val))
-    return fields
-
-
-def _parse_usage_from_gen_metadata(data: bytes) -> dict[str, int]:
-    usage = {
-        "prompt_tokens": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "thinking_tokens": 0,
-        "total_tokens": 0,
-    }
-    if not data:
-        return usage
-    f = _parse_protobuf(data)
-    if 1 not in f:
-        return usage
-    wire, val = f[1][0]
-    if wire != 2 or not isinstance(val, bytes):
-        return usage
-    gen_meta = _parse_protobuf(val)
-    if 4 not in gen_meta:
-        return usage
-    wire4, val4 = gen_meta[4][0]
-    if wire4 != 2 or not isinstance(val4, bytes):
-        return usage
-    u = _parse_protobuf(val4)
-    usage["prompt_tokens"] = u.get(1, [(0, 0)])[0][1]
-    usage["input_tokens"] = u.get(2, [(0, 0)])[0][1]
-    usage["output_tokens"] = u.get(3, [(0, 0)])[0][1]
-    usage["cache_read_tokens"] = u.get(5, [(0, 0)])[0][1]
-    usage["thinking_tokens"] = u.get(9, [(0, 0)])[0][1]
-    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
-    usage["input_context_measured"] = any(key in u for key in (2, 5))
-    return usage
-
-
-def get_conversation_db_path(conversation_id: str) -> Path:
-    return (
-        Path.home()
-        / ".gemini"
-        / "antigravity-cli"
-        / "conversations"
-        / f"{conversation_id}.db"
-    )
-
-
-def get_max_gen_idx(conversation_id: str | None) -> int:
-    """Returns the maximum gen_metadata.idx recorded for conversation_id, or -1 if none."""
-    if not conversation_id:
-        return -1
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return -1
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute("SELECT MAX(idx) FROM gen_metadata")
-        row = cur.fetchone()
-        con.close()
-        return row[0] if (row and row[0] is not None) else -1
-    except Exception as ex:
-        logger.debug("Failed getting max gen idx for %s: %s", conversation_id, ex)
-        return -1
-
-
-def get_command_usage_delta(conversation_id: str | None, start_idx: int) -> dict[str, Any] | None:
-    """Calculates exact usage delta for generations strictly after start_idx."""
-    if not conversation_id:
-        return None
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return None
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute(
-            "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx",
-            (start_idx,),
-        )
-        rows = cur.fetchall()
-        con.close()
-        if not rows:
-            return None
-
-        inp = 0
-        out = 0
-        cache = 0
-        thinking = 0
-        for _, data in rows:
-            u = _parse_usage_from_gen_metadata(data)
-            inp += u.get("input_tokens", 0)
-            out += u.get("output_tokens", 0)
-            cache += u.get("cache_read_tokens", 0)
-            thinking += u.get("thinking_tokens", 0)
-
-        latest = _parse_usage_from_gen_metadata(rows[-1][1])
-        measured = latest.get("input_context_measured", False)
-        return {
-            "input_tokens": inp,
-            "output_tokens": out,
-            "cache_read_tokens": cache,
-            "thinking_tokens": thinking,
-            "total_tokens": inp + out,
-            "generations_count": len(rows),
-            "start_idx": start_idx + 1,
-            "end_idx": rows[-1][0],
-            "source": "db_gen_metadata_delta",
-            "input_includes_cache": False,
-            "input_context_measured": measured,
-            "latestRequestInputContext": latest["input_tokens"] + latest["cache_read_tokens"] if measured else None,
-        }
-    except Exception as ex:
-        logger.warning(
-            "Failed calculating usage delta for %s (start_idx=%d): %s",
-            conversation_id,
-            start_idx,
-            ex,
-        )
-        return None
-
-
-def get_max_step_idx(conversation_id: str | None) -> int:
-    """Returns the maximum steps.idx recorded for conversation_id, or -1 if none."""
-    if not conversation_id:
-        return -1
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return -1
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute("SELECT coalesce(max(idx), -1) FROM steps")
-        row = cur.fetchone()
-        con.close()
-        return row[0] if (row and row[0] is not None) else -1
-    except Exception as ex:
-        logger.debug("Failed getting max step idx for %s: %s", conversation_id, ex)
-        return -1
-
-
-def check_new_quota_error(conversation_id: str | None, start_step_idx: int) -> tuple[bool, str]:
-    """Checks if any new step with idx > start_step_idx and step_type == 17 has RESOURCE_EXHAUSTED."""
-    if not conversation_id:
-        return False, ""
-    db_path = get_conversation_db_path(conversation_id)
-    if not db_path.is_file():
-        return False, ""
-    try:
-        con = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
-        cur = con.cursor()
-        cur.execute(
-            "SELECT idx, step_payload FROM steps WHERE idx > ? AND step_type = 17 ORDER BY idx",
-            (start_step_idx,),
-        )
-        rows = cur.fetchall()
-        con.close()
-        for _idx, payload in rows:
-            text = (
-                payload.decode("utf-8", errors="replace")
-                if isinstance(payload, bytes)
-                else str(payload)
-            )
-            if (
-                "RESOURCE_EXHAUSTED" in text
-                or "Individual quota reached" in text
-                or "quota exceeded" in text
-            ):
-                return True, text
-        return False, ""
-    except Exception as ex:
-        logger.debug("Failed checking new steps for quota error: %s", ex)
-        return False, ""
 
 
 class InternalMcpPlanClient:
@@ -1082,6 +794,7 @@ class ActiveChatTask:
     decision_token: str | None = None
     decision_day: str | None = None
     provider_conversation_id: str | None = None
+    original_request: dict[str, Any] | None = None
     instructions_text: str | None = None
     # Full original context is retained only for a provider's fresh-session recovery.
     provider_bootstrap_prompt: str | None = None
@@ -1091,9 +804,12 @@ class ActiveChatTask:
     goal_scope: str | None = None
     goal_default: str | None = None
     work_request_ids: list[str] = field(default_factory=list)
+    world_change_at: float | None = None
+    world_change_version: int = 0
+    native_progress_at: float = 0.0
 
 
-class ChatBridge:
+class ChatBridge(TurnExecutionMixin):
     """Bridges WebSocket /chat messages to agy CLI executions with lifecycle and cancel management."""
 
     def __init__(
@@ -1171,6 +887,7 @@ class ChatBridge:
         self._last_day_settlement: dict[str, Any] | None = None
         self._last_native_ui_recovery_signal: tuple[Any, ...] | None = None
         self._autonomy_generation = 0
+        self._live_player_wakeups: dict[str, str] = {}
         self._autonomy_last_snapshot_at: dict[str, float] = {}
         self._autonomy_pending_snapshot: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
         self._autonomy_debounce_tasks: dict[str, asyncio.Task] = {}
@@ -1932,6 +1649,7 @@ class ChatBridge:
             wakeup.cancel()
             await asyncio.gather(wakeup, return_exceptions=True)
         self._autonomy_wakeup_snapshots.pop(save_id, None)
+        self._live_player_wakeups.pop(save_id, None)
         if self._plan_worker is not None:
             await self._plan_worker.stop()
         active = self._active_task.async_task if self._active_task else None
@@ -2040,6 +1758,17 @@ class ChatBridge:
                         envelope.payload if isinstance(envelope.payload, dict) else None
                     )
                     self._latest_snapshot_revision = envelope.world_revision
+                    active = self._active_task
+                    companion = (self._latest_snapshot_payload or {}).get("companion") or {}
+                    if active and companion.get("activeCommandId"):
+                        active.last_native_command_id = companion["activeCommandId"]
+                        # Only changed action facts extend silence, not the clock
+                        # or an otherwise identical periodic snapshot.
+                        progress = tuple(companion.get(k) for k in (
+                            "activeCommandId", "activity", "locationId", "tileX", "tileY", "stamina", "waterCanLevel"))
+                        if progress != getattr(active, "native_progress", None):
+                            active.native_progress = progress
+                            active.native_progress_at = time.monotonic()
                     self._latest_snapshot_observed_at = (
                         self._latest_snapshot_payload.get("observedAt", envelope.sent_at.timestamp())
                         if self._latest_snapshot_payload is not None else None
@@ -2200,7 +1929,8 @@ class ChatBridge:
             return
         if not save_id or self._autonomy is None or envelope.message_type != "world.snapshot":
             return
-        restored = self._restore_accepted_preset_scope(save_id)
+        live_player = self._uses_live_player_loop()
+        restored = None if live_player else self._restore_accepted_preset_scope(save_id)
         if restored:
             rid, goal_id = restored
             reply = Envelope.create_chat_reply(self.instance_id, rid, "selected", "继续已授权的预设目标。",
@@ -2214,7 +1944,7 @@ class ChatBridge:
                     self.instance_id, notice["id"], "player-decision", notice["message"], save_id=save_id))
                 if delivered:
                     self._work_store.acknowledge_player_notice(save_id, notice["id"])
-        if self._preset_business_blocked(save_id):
+        if not live_player and self._preset_business_blocked(save_id):
             await self._maybe_notify_preset_terminal(ws, save_id)
             return
         rest_state = ((envelope.payload or {}).get("companion") or {}).get("restState")
@@ -2231,10 +1961,11 @@ class ChatBridge:
             self._autonomy_wakeup_snapshots[save_id] = (envelope, tracked_tasks, ws)
             return
         state = self._autonomy.state(save_id)
-        if ((not state.enabled and not state.goal_scope) or state.paused
+        if state.paused or (not live_player and (
+                (not state.enabled and not state.goal_scope)
                 or self._autonomy.is_cooling_down(save_id)
                 or rest_state == "resting"
-                or self._bedtime_winding_down(save_id, envelope.payload)):
+                or self._bedtime_winding_down(save_id, envelope.payload))):
             return
         now = time.monotonic()
         previous = self._autonomy_last_snapshot_at.get(save_id)
@@ -2270,7 +2001,9 @@ class ChatBridge:
                     if prepared is None:
                         return
                     fingerprint, prompt = prepared
-                    if not self._autonomy.record_world_event(save_id, fingerprint, current.world_revision):
+                    if live_player:
+                        self._live_player_wakeups[save_id] = fingerprint
+                    elif not self._autonomy.record_world_event(save_id, fingerprint, current.world_revision):
                         return
                     request_id = f"autonomy-{uuid.uuid4().hex}"
                     self._autonomy_requests[request_id] = fingerprint
@@ -2349,6 +2082,8 @@ class ChatBridge:
 
     def _maybe_arm_hold_recovery(self, save_id: str | None, payload: dict[str, Any] | None) -> None:
         """Bound protective recovery by native progress, independently of hold IDs."""
+        if self._uses_live_player_loop():
+            return  # Immediate turns observe the hold directly; no legacy retry budget.
         if not save_id or self._autonomy is None or not isinstance(payload, dict):
             return
         if getattr(self, "actor_mode", None) != "player":
@@ -2423,8 +2158,30 @@ class ChatBridge:
             self._work_store.set_outbox_retry_block(save_id, reason)
         logger.error("Native recovery paused for %s: %s; no further automatic model retries.", save_id, reason)
 
+    def _uses_live_player_loop(self) -> bool:
+        return not self._enable_plan_worker and self.actor_mode == "player"
+
+    def _prepare_live_player_decision(self, envelope: Envelope, save_id: str) -> tuple[str, str] | None:
+        """Wake the existing session from native facts, independent of goal bookkeeping."""
+        if (self.control_owner != "agent" or self._manual_takeover.get(save_id)
+                or self._active_task is not None or self._autonomy.state(save_id).paused
+                or (self._work_store is not None and self._work_store.state(save_id).paused)):
+            return None
+        snapshot = envelope.payload or {}
+        world = snapshot.get("world") or {}
+        native = snapshot.get("native") or world.get("native") or {}
+        hold = native.get("programHold") or {}
+        fingerprint = f"{envelope.game_session_id}:{hold.get('holdId')}:{self._native_recovery_fingerprint(snapshot)}"
+        if self._live_player_wakeups.get(save_id) == fingerprint:
+            return None
+        # handle_chat_submit supplies the normal confirmed-state delta. Do not
+        # duplicate a full snapshot in the synthetic message or open a new session.
+        return fingerprint, "继续当前游戏：结合原要求、最新观察和已完成结果决定下一步，并及时更新目标与进度记录。"
+
     def _prepare_autonomy_decision(self, envelope: Envelope, save_id: str) -> tuple[str, str] | None:
         """Re-evaluate the latest wakeup while owning the single model slot."""
+        if self._uses_live_player_loop():
+            return self._prepare_live_player_decision(envelope, save_id)
         state = self._autonomy.state(save_id)
         if (
             (not state.enabled and not state.goal_scope)
@@ -3252,21 +3009,8 @@ class ChatBridge:
         companion = snapshot.get("companion") or {}
         if companion.get("restState") in {"winding-down", "returning-home", "waiting-for-bed", "sleeping"}:
             return True
-        profile = self._profile_store.get(save_id).get("profile") if self._profile_store else None
-        bedtime = (profile or {}).get("bedtime", 2400)
-        now = (snapshot.get("world") or {}).get("timeOfDay", 600)
-        # Reserve an hour for the current safe action and the actual route home.
-        return isinstance(now, int) and now // 100 * 60 + now % 100 >= bedtime // 100 * 60 + bedtime % 100 - 60
+        return False  # Bedtime is context, not an automatic work prohibition.
 
-    def _near_midnight_hint(self, snapshot: dict[str, Any] | None = None) -> str | None:
-        """Player-mode 'approaching midnight' context note (≥ 23:30)."""
-        if getattr(self, "actor_mode", None) != "player":
-            return None
-        snapshot = snapshot or self._latest_snapshot_payload or {}
-        clock = (snapshot.get("world") or {}).get("timeOfDay")
-        if isinstance(clock, int) and not isinstance(clock, bool) and clock >= self.PLAYER_NEAR_MIDNIGHT:
-            return "临近午夜：优先安排回屋用 sleep 工具原生睡觉结束当天，避免在外昏倒。"
-        return None
 
     def _write_life_snapshot(self, save_id: str | None) -> None:
         if self.run_dir is None or not save_id or self._latest_snapshot_payload is None:
@@ -3529,41 +3273,21 @@ class ChatBridge:
             key = "external:" + key
             # ACP cannot notify us about compaction performed in the original
             # client between attachments. Every external turn is self-contained.
-            self._prompt_delivery.invalidate_session(key, conversation_id)
-        # All event sources share one state schema. The player suffix is opaque.
-        marker = re.search(r"(?m)^(?:玩家说：|玩家指令：)", prompt)
-        boundary = marker.start() if marker else len(prompt)
-        prefix, player = prompt[:boundary], prompt[boundary:]
-        context = model_decision_context(self._decision_context(active_task.save_id, origin="game", query=active_task.prompt))
+        context = self._decision_context(active_task.save_id, origin="game", query=active_task.prompt)
         context["executionOccupied"] = active_task.execution_deferred
         if self._profile_store and active_task.save_id and getattr(self, "connection_source", "builtin") != "external":
             context["profile"] = (self._profile_store.get(active_task.save_id) or {}).get("profile")
         context["milestones"] = self._life_milestone_summary(active_task.save_id, "chat")
-        # Event metadata is not world state: retain it when canonicalizing snapshots.
-        event = {}
-        for match in re.finditer(r"(?m)^实时上下文：([^\n]*)", prefix):
-            original = json.loads(match.group(1))
-            for event_key in ("projectScope", "objective", "wakeReason", "acceptedArrangement",
-                          "boxRange", "idlePreference", "idleHelpEnabled", "autonomyMode"):
-                if event_key in original:
-                    event[event_key] = original[event_key]
         decision = context.get("decision") or {}
-        event.update(requestId=active_task.request_id, executionOccupied=active_task.execution_deferred)
-        event["goalId"] = decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope
-        # These are already represented in the current state; don't inject duplicates from reload.
-        if isinstance(context.get("reloadSummary"), dict):
-            context["reloadSummary"] = {k: v for k, v in context["reloadSummary"].items()
-                                        if k not in {"goals", "agreementsAndPreferences", "decisions"}}
-        replacement = "实时上下文：" + render_decision_context(context)
-        prefix = re.sub(r"(?m)^实时上下文：[^\n]*", lambda _: replacement, prefix)
-        prompt = prefix + "\n本轮任务：" + json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n" + player
-        if getattr(self, "connection_source", "builtin") == "external":
-            prompt = "沿用原对话的身份、角色指令、称呼和记忆；以下只增加当前游戏场景与操作规则。\n" + prompt
+        prompt = compose_turn_prompt(prompt, context, event={
+            "requestId": active_task.request_id,
+            "goalId": decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope,
+        }, external=getattr(self, "connection_source", "builtin") == "external",
+            original_request=getattr(active_task, "original_request", None))
         sent, pending = self._prompt_delivery.prepare(
             key, conversation_id, prompt,
-            load_instruction_bundle(getattr(self, "actor_mode", None)).text)
-        logger.info("Turn payload stateBytes=%s eventBytes=%s sentBytes=%s",
-                    len(replacement.encode()), len(json.dumps(event, ensure_ascii=False).encode()), len(sent.encode()))
+            load_instruction_bundle(getattr(self, "actor_mode", None)).text,
+            self_contained=getattr(self, "connection_source", "builtin") == "external")
         return key, sent, pending
 
     def _acknowledge_prompt_delivery(self, key: str, pending: dict[str, Any],
@@ -3602,95 +3326,10 @@ class ChatBridge:
                 else:
                     os.environ[key] = value
 
-    async def _join_interrupted_provider(self, active_task: ActiveChatTask, future: asyncio.Future) -> None:
-        """Keep the model slot until its executor has restored turn-local state."""
-        active_task.cancelled = True
-        active_task.abort_reason = active_task.abort_reason or "Chat channel closed"
-        proc = active_task.process
-        if proc is not None and proc.poll() is None:
-            try:
-                terminate = getattr(self._backend, "terminate", None)
-                if self.backend_name == "agy":
-                    terminate_agy_process(proc)
-                elif callable(terminate):
-                    terminate(proc)
-                else:
-                    proc.kill()
-            except Exception:
-                logger.warning("Could not stop interrupted provider", exc_info=True)
-        while True:
-            try:
-                active_task.interrupted_result = await asyncio.shield(future)
-                break
-            except asyncio.CancelledError:
-                # Repeated cancel/disconnect requests still cannot abandon an
-                # executor which owns process-global turn environment variables.
-                if future.cancelled():
-                    break
-            except Exception:
-                logger.debug("Interrupted provider exited with an error", exc_info=True)
-                break
 
-    async def _settle_turn_messages(self, active_task, result):
-        if not self.run_dir:
-            return result
-        from .turn_messages import exchange
-        delivered = exchange(self.run_dir / "data" / "turn-messages.json",
-                             active_task.request_id, active_task.save_id)
-        ids = {message["requestId"] for message in delivered}
-        # Tool-boundary delivery is confirmed independently of the turn's outcome.
-        if self._work_store is not None:
-            self._work_store.mark_midflight_consumed(active_task.save_id, list(ids))
-        for item in list(self._life_queue):
-            if item["request_id"] not in ids or item["save_id"] != active_task.save_id:
-                continue
-            self._life_queue.remove(item)
-            await self._send_reply(item.get("ws") or self._chat_ws, Envelope.create_life_chat_reply(
-                self.instance_id, item["request_id"], item["save_id"], status="completed",
-                profile_revision=self._profile_revision(item["save_id"]),
-                memory_revision=self._memory_revision(item["save_id"])))
-        return result
 
-    async def _await_work_provider(
-        self, active_task: ActiveChatTask, conversation_id: str | None, prompt: str,
-    ) -> dict[str, Any]:
-        future = asyncio.get_running_loop().run_in_executor(
-            None, self._execute_turn, active_task, conversation_id, prompt)
-        try:
-            async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
-                while not future.done():
-                    await asyncio.wait({future}, timeout=0.1)
-                    await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
-                return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await self._join_interrupted_provider(active_task, future)
-            raise
-        finally:
-            await self._settle_turn_messages(active_task, {})
 
-    async def _await_life_provider(
-        self, active_task: ActiveChatTask, conversation_id: str | None,
-        prompt: str, mode: str | None = None,
-    ) -> dict[str, Any]:
-        """Keep provider ownership until its thread has restored turn-local state."""
-        args = (active_task, conversation_id, prompt)
-        if mode is not None:
-            args += (mode,)
-        future = asyncio.get_running_loop().run_in_executor(None, self._execute_life_turn, *args)
-        try:
-            async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
-                while not future.done():
-                    await asyncio.wait({future}, timeout=0.1)
-                    await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
-                return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            # Cancelling an executor await does not stop the executor thread.
-            # Wait for this owned turn before releasing the model/native slot.
-            await self._join_interrupted_provider(active_task, future)
-            logger.info("Life provider [%s] interrupted by channel shutdown", active_task.request_id)
-            raise
-        finally:
-            await self._settle_turn_messages(active_task, {})
+
 
     async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
         """Run one life-chat turn under the shared single-model-turn lock."""
@@ -3831,7 +3470,7 @@ class ChatBridge:
                     for n in self._work_store.state(save_id).notices) else None
                 self._record_command(
                     request_id=request_id, save_id=save_id,
-                    conversation_id=result.get("conversation_id") or (None if result.get("session_retried") else existing_cid),
+                    conversation_id=result.get("conversation_id") or existing_cid,
                     prompt=text, status="completed" if success else "failed",
                     start_idx=-1, end_idx=-1,
                     usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
@@ -3854,7 +3493,7 @@ class ChatBridge:
                     if changed:
                         proposed = max(changed, key=lambda node: node.get("updatedAt", 0))
                         self._life_proposals[save_id] = (proposed["id"], self._profile_revision(save_id), proposed["updatedAt"])
-                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
+                cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat is not None and save_id:
                     self._life_chat.record_session_id(save_id, str(cid))
                     self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
@@ -4251,7 +3890,7 @@ class ChatBridge:
                         self._active_task = previous_active
                     if execution_claimed:
                         await self._release_execution(save_id)
-                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
+                cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat:
                     self._life_chat.record_session_id(save_id, str(cid))
                     self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
@@ -4347,7 +3986,7 @@ class ChatBridge:
         """Refresh configuration metadata without replacing the conversation.
 
         Current instructions and preferences travel with the next turn. Only an
-        explicit provider resume failure requires a replacement session.
+        explicit player connection can change the bound session.
         """
         if save_id:
             fingerprints = self._load_profile_fingerprints()
@@ -4388,39 +4027,6 @@ class ChatBridge:
         except Exception:
             logger.debug("Failed to save session history", exc_info=True)
 
-    def _rotate_provider_session(self, save_id: str | None, *, reason: str) -> str | None:
-        """End the current provider session, keeping the old id in history.
-
-        The next turn starts a fresh session and carries the saved goals, the
-        unfinished/waiting tasks and the live context, so rotation never loses
-        in-progress work. Old session ids stay in ``chat_session_history.json`` so
-        their billing records remain attributable.
-        """
-        if not save_id:
-            return None
-        cid = self.get_conversation_id(save_id)
-        if not cid:
-            return None
-        self._load_session_history()
-        key = f"{self.backend_name}:{save_id}"
-        history = self._session_history.setdefault(key, [])
-        if cid not in history:
-            history.append(cid)
-        self._session_history[key] = history[-20:]
-        self._sessions.pop(key, None)
-        self._sessions.pop(f"life:{key}", None)
-        if self.backend_name == "agy":
-            self._sessions.pop(save_id, None)
-        self._save_sessions()
-        self._save_session_history()
-        self._session_requests[save_id] = 0
-        self._session_context_state[save_id] = {
-            "latestInputContext": None,
-            "maxInputContext": None,
-            "measured": False,
-        }
-        logger.info("Rotated provider session for %s (%s); previous=%s", save_id, reason, cid)
-        return cid
 
     @staticmethod
     def _request_input_context(usage: dict[str, Any] | None) -> int | None:
@@ -4479,9 +4085,6 @@ class ChatBridge:
             state["maxInputContext"] = max(state.get("maxInputContext") or 0, context_tokens)
         return None
 
-    def _note_session_tokens(self, save_id: str | None, usage: dict[str, Any] | None) -> bool:
-        """Compatibility diagnostic; the harness owns context maintenance."""
-        return self._note_session_context(save_id, usage) is not None
 
     async def _settle_day_advance(self, save_id: str | None, world: dict[str, Any]) -> None:
         """Settle current game progress at the native day boundary."""
@@ -4506,6 +4109,13 @@ class ChatBridge:
             except Exception:
                 logger.warning("Day settlement failed for %s", save_id, exc_info=True)
         if settlement and settlement.get("settled"):
+            active = self._active_task
+            if active and not active.cancelled and active.save_id == save_id and self.run_dir:
+                from .turn_messages import day_event, exchange
+                exchange(self.run_dir / "data" / "turn-messages.json", active.request_id, save_id,
+                         publish=[day_event(settlement["day"], self._latest_snapshot_payload or {"world": world})])
+                active.world_change_at = time.monotonic()
+                active.world_change_version += 1
             logger.info(
                 "Settled game day for %s: %s -> %s (archived=%s, carried=%s)",
                 save_id,
@@ -4594,24 +4204,6 @@ class ChatBridge:
             status=phase, reply_text=f"{labels[phase]}：{title}。{detail[:400]}", save_id=save_id,
             command_id=command_id, command_complete=command_complete))
 
-    def _plan_status_line(self) -> str | None:
-        """Short F8-visible line: last plan action and the current wait reason."""
-        worker = self._plan_worker
-        if worker is None:
-            return None
-        parts: list[str] = []
-        last = worker.last_result
-        if last is not None and last.status == "executed":
-            parts.append(
-                f"动作 {last.operation}（{last.outcome or 'unknown'}）"
-            )
-        if worker.pending_reasons:
-            parts.append(f"等待原因 {worker.pending_reasons[-1]}")
-        if not parts and self._last_day_settlement:
-            parts.append(f"日结 {self._last_day_settlement.get('reasonCode')}")
-        if not parts:
-            return None
-        return "计划状态：" + "；".join(parts)
 
     def _autonomy_state_payload(self, save_id: str, state: Any, *, overview: dict[str, Any] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -4759,7 +4351,7 @@ class ChatBridge:
         self, ws: WebSocketClient | None, save_id: str | None
     ) -> None:
         """Apply a shared disable immediately on every chat event, not only timeout."""
-        if self._autonomy is None or not save_id:
+        if self._uses_live_player_loop() or self._autonomy is None or not save_id:
             return
         if (
             not self._autonomy.state(save_id).enabled
@@ -5336,7 +4928,6 @@ class ChatBridge:
 
                 # Chat and work share the same bounded session recovery.
                 result = await self._await_work_provider(active_task, existing_cid, prompt)
-                session_retried = bool(result.get("session_retried"))
 
                 # If task was cancelled during execution, handle_chat_cancel already handled reply & record
                 if active_task.cancelled:
@@ -5375,9 +4966,7 @@ class ChatBridge:
                 new_session_established = previous_cid is None
                 self._notify_terminal(status)
                 reply_text = result.get("response", "")
-                if session_retried and result.get("success"):
-                    reply_text = "（会话已失效，已安全新建会话后继续。）\n" + reply_text
-                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
+                cid = result.get("conversation_id") or existing_cid
                 if cid and existing_cid and cid != existing_cid:
                     start_max_idx = -1
                 if new_session_established and cid:
@@ -5619,9 +5208,16 @@ class ChatBridge:
                     # the native receipt; a failed socket replays the saved reply.
                     self._settle_delivery(request_id, bool(sent_ok or notification_saved) and bool(result.get("success")))
                 if self._autonomy is not None and save_id and not active_task.execution_deferred:
+                    if self._uses_live_player_loop():
+                        snapshot = self._latest_snapshot_payload or {}
+                        native = snapshot.get("native") or (snapshot.get("world") or {}).get("native") or {}
+                        if (native.get("programHold") or {}).get("active"):
+                            # A native menu/hold cannot produce clock ticks. Let
+                            # the same session inspect it again after this turn.
+                            self._live_player_wakeups.pop(save_id, None)
                     self._autonomy.record_event(save_id, f"chat-terminal:{request_id}:{status}", f"chat.{status}")
                     autonomy_fingerprint = self._autonomy_requests.pop(request_id, None)
-                    if autonomy_fingerprint:
+                    if autonomy_fingerprint and not self._uses_live_player_loop():
                         if status != "completed":
                             self._autonomy.record_action_result(
                                 save_id, autonomy_fingerprint, False, reason=err or f"turn_{status}"
@@ -6225,11 +5821,6 @@ class ChatBridge:
         if not self._connection_ready():
             return {"success": False, "response": "等待原伙伴连接；未启动替代会话。",
                     "conversation_id": conversation_id, "error": "EXTERNAL_CONNECTION_WAITING"}
-        # Preserve the legacy test/integration seam when callers explicitly
-        # replace _execute_agy_turn; normal production dispatch remains solely
-        # controlled by backend_name.
-        if self.backend_name == "kimi" and type(self._execute_agy_turn).__module__.startswith("unittest.mock"):
-            return self._execute_agy_turn(active_task, conversation_id, prompt)
         from stardew_ai_runtime.compatibility import assert_native_compatible
         assert_native_compatible(self.run_dir)
         token = uuid.uuid4().hex
@@ -6242,8 +5833,7 @@ class ChatBridge:
             source_id = goal.constraints.get("playerRequestId") if goal else None
             source = next((r for r in state.requests if r.get("id") == source_id), None)
             if source:
-                prompt += "\n玩家原始指令（保留动作限制、汇报要求与统计范围；当前已采纳范围以目标为准）：" + json.dumps(
-                    {"text": source["text"]}, ensure_ascii=False)
+                active_task.original_request = {"requestId": source["id"], "text": source["text"]}
             self._work_store.begin_decision(
                 save_id, token, goal_scope=scope, goal_default=active_task.goal_default,
                 request_id=source_id if source else active_task.command_id or active_task.request_id,
@@ -6255,48 +5845,17 @@ class ChatBridge:
             )
             active_task.decision_token = token
             active_task.decision_day = self._work_store.state(save_id).last_settled_day
-        previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
-        previous_surface = os.environ.get("STARDEW_MCP_SURFACE")
-        # Capability discovery stays fixed; only cached reads/execution admission differ.
-        os.environ["STARDEW_MCP_SURFACE"] = "light"
-        if active_task.execution_deferred:
-            os.environ.pop("STARDEW_DECISION_TOKEN", None)
-        else:
-            os.environ["STARDEW_DECISION_TOKEN"] = token
-        try:
-            backend = self._get_backend()
-            if hasattr(backend, "progress"):
-                backend.progress = getattr(self, "_backend_progress_callback", None)
-            turn_native_session = getattr(self, "_player_session_id", None)
-            delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
-                active_task, conversation_id, prompt, backend)
-            result = backend.run(active_task, conversation_id, sent_prompt)
-            if conversation_id and result.get("conversation_id") not in {None, conversation_id}:
-                # A provider may return an unexpected session; never bless it as
-                # continuity or advance the old conversation's delivery baseline.
-                active_task.provider_input_delivered = False
-                result.update(actual_provider_session_id=result.get("conversation_id"),
-                              success=False, error="PROVIDER_SESSION_CHANGED",
-                              response="后端返回了不同会话；原绑定保留，请检查客户端。", conversation_id=conversation_id)
-            delivered_session = result.get("conversation_id")
-            if delivered_session and (getattr(active_task, "provider_input_delivered", False) or (not active_task.cancelled and not result.get("error"))):
-                self._acknowledge_prompt_delivery(delivery_key, pending_prompt, save_id, str(delivered_session))
-                if self.actor_mode == "player":
-                    self._work_reload_context(active_task.save_id, str(delivered_session), delivered=True,
-                                              expected_game_session_id=turn_native_session)
-            logger.info("Prompt delivery save=%s session=%s version=%s originalBytes=%s newBytes=%s",
-                        active_task.save_id, delivered_session, pending_prompt["version"],
-                        pending_prompt["originalPromptBytes"], pending_prompt["newPromptBytes"])
-            return result
-        finally:
-            if previous_surface is None:
-                os.environ.pop("STARDEW_MCP_SURFACE", None)
-            else:
-                os.environ["STARDEW_MCP_SURFACE"] = previous_surface
-            if previous_token is None:
-                os.environ.pop("STARDEW_DECISION_TOKEN", None)
-            else:
-                os.environ["STARDEW_DECISION_TOKEN"] = previous_token
+            if self.run_dir and scope:
+                path = self.run_dir / "data" / "life-turn.json"
+                with cache_lock(path):
+                    try:
+                        lease = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        lease = {}
+                    if lease.get("requestId") == active_task.request_id:
+                        lease["goalScope"] = scope
+                        path.write_text(json.dumps(lease, ensure_ascii=False), encoding="utf-8")
+        return execute_provider(self, active_task, conversation_id, prompt, token)
 
     def _execute_agy_turn(
         self,
@@ -6337,7 +5896,7 @@ class ChatBridge:
         cmd.extend([
             "--mode", "accept-edits",
             "--dangerously-skip-permissions",
-            "--print-timeout", "10m",
+            "--print-timeout", "0",
         ])
 
         logger.info("Executing agy CLI: %s", " ".join(cmd[:6]) + " ...")
@@ -6359,6 +5918,9 @@ class ChatBridge:
                 if cid != requested_cid:
                     active_task.start_max_idx = -1
                     active_task.start_max_step_idx = -1
+                callback = getattr(self, "_backend_progress_callback", None)
+                if callback is not None:
+                    callback(BackendProgress("agy", "session_ready", cid))
 
             outcome = run_agy_process(active_task, cmd, prompt, conversation_id,
                 run_dir=self._commands_file.parent,
@@ -6805,20 +6367,31 @@ class ChatBridge:
         lease_ws = self._chat_ws
         lease_session = getattr(self,"_player_session_id",None)
         renewal_task = None
-        # Both production providers have a 600-second call deadline. Keep an
-        # additional absolute safety bound in case an executor itself hangs.
-        renewal_deadline = time.monotonic() + 630.0
+        world_version = getattr(self._active_task, "world_change_version", 0)
+        restart_pending = False
         async def renew_active_provider():
+            nonlocal lease_id, world_version, restart_pending
             while True:
                 await asyncio.sleep(getattr(self,"thinking_renew_interval_seconds",1.0))
                 if self._chat_ws is not lease_ws or getattr(self,"_player_session_id",None) != lease_session:
                     return
-                if time.monotonic() >= renewal_deadline:
-                    logger.warning("Thinking renewal stopped at provider safety deadline [%s]", lease_id)
-                    return
                 active = getattr(self,"_active_task",None)
                 if getattr(self,"control_owner",None) == "human" or (active is not None and active.request_id == request_id and active.cancelled):
                     return
+                if active is not None and getattr(active, "world_change_version", 0) != world_version:
+                    # DayEnding releases the old native lease. A new lifecycle
+                    # begins after the new-day observation, never by reviving it.
+                    world_version = active.world_change_version
+                    lease_id = uuid.uuid4().hex[:12]
+                    restart_pending = True
+                native = (self._latest_snapshot_payload or {}).get("native") or ((self._latest_snapshot_payload or {}).get("world") or {}).get("native") or {}
+                if native.get("clockPauseOwner") == "model-thinking":
+                    restart_pending = False
+                if restart_pending and not native.get("endOfNight"):
+                    begin = Envelope.create_agent_thinking(self.instance_id, request_id, "begin", lease_id,
+                        save_id=save_id, game_session_id=lease_session)
+                    if not await self._send_reply(lease_ws, begin):
+                        return
                 renew = Envelope.create_agent_thinking(self.instance_id,request_id,"renew",lease_id,
                     save_id=save_id,game_session_id=lease_session)
                 if not await self._send_reply(lease_ws,renew):
@@ -6846,27 +6419,6 @@ class ChatBridge:
             except Exception:
                 logger.warning("agent.thinking end [%s] send failed", lease_id, exc_info=True)
 
-    async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> bool:
-        if reply.message_type == "chat.reply" and self._active_task is not None and self._active_task.execution_deferred and (
-            reply.payload.get("requestId") == self._active_task.request_id
-        ):
-            reply.payload["readOnly"] = True
-        if reply.message_type in {"chat.reply", "life.chat.reply"} and reply.payload.get("status") in {
-            "completed", "failed", "cancelled", "interrupted", "selected", "decision-completed", "partial", "unknown",
-        }:
-            await self._push_usage_state(ws, str(reply.payload.get("saveId") or ""))
-        if reply.message_type in {"chat.reply", "life.chat.reply", "autonomy.state"} and ws is not None and reply.payload.get("saveId"):
-            save_id = str(reply.payload["saveId"])
-            await self._push_work_state(ws, save_id)
-        if ws is None:
-            return False
-        try:
-            json_text = json.dumps(reply.to_mapping(), ensure_ascii=False)
-            await ws.send_text(json_text)
-            return True
-        except Exception as ex:
-            logger.warning("Failed to send chat reply to WebSocket: %s", ex)
-            return False
 
 
 def main(argv: list[str] | None = None) -> None:

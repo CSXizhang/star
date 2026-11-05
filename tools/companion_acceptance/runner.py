@@ -9,10 +9,13 @@ import argparse
 import asyncio
 import hashlib
 import json
-from pathlib import Path
+import os
+import re
+import sys
 import time
 import uuid
-import sys
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -52,6 +55,8 @@ def count(items, item_id):
 
 
 def summarize_trace(trace):
+    if any(row.get("_provider") == "agy" for row in trace):
+        return summarize_agy_trace(trace)
     calls = []
     messages = 0
     for row in trace:
@@ -74,6 +79,146 @@ def summarize_trace(trace):
                       "nonterminal": "IN_PROGRESS" in text})
     return {"toolCalls": calls, "toolCount": len(calls), "errorCount": sum(c["error"] for c in calls),
             "publicMessages": messages}
+
+
+def decoded(value):
+    try:
+        return json.loads(value) if isinstance(value, str) else value
+    except ValueError:
+        return value
+
+
+def summarize_agy_trace(trace):
+    """Pair single-call planner steps with native transcript receipts; ambiguity stays unknown."""
+    calls, pending = [], None
+    messages = 0
+    for row in trace:
+        if row.get("type") == "PLANNER_RESPONSE":
+            pending = None
+            planned = row.get("tool_calls") or []
+            messages += bool(row.get("content")) and not planned
+            for call in planned:
+                args = call.get("args") or {}
+                mcp = call.get("name") == "call_mcp_tool"
+                record = {"name": (f"mcp__{decoded(args.get('ServerName'))}__{decoded(args.get('ToolName'))}"
+                                   if mcp else call.get("name")),
+                          "input": decoded(args.get("Arguments")) if mcp else args,
+                          "result": None, "error": False, "nonterminal": True,
+                          "step": row.get("step_index"), "conversationId": row.get("conversationId")}
+                calls.append(record)
+                if len(planned) == 1:
+                    pending = record
+        elif row.get("type") == "GENERIC" and pending is not None:
+            content = row.get("_externalOutput", {}).get("text") or row.get("content") or ""
+            body = "\n".join(line for line in content.splitlines()
+                             if not line.startswith(("Created At:", "Completed At:"))).strip()
+            result = decoded(body)
+            pending.update(result=result if isinstance(result, dict) else None,
+                           error=row.get("status") in {"ERROR", "FAILED"} or "Error executing tool" in body,
+                           nonterminal=row.get("status") not in {"DONE", "ERROR", "FAILED"} or "IN_PROGRESS" in body,
+                           resultStep=row.get("step_index"))
+            pending = None
+        elif row.get("type") == "USER_INPUT":
+            pending = None
+    return {"toolCalls": calls, "toolCount": len(calls), "errorCount": sum(c["error"] for c in calls),
+            "publicMessages": messages}
+
+
+def attach_agy_output(row):
+    """Archive only the provider-owned output named by this exact session and step."""
+    content = row.get("content") or ""
+    marker = "The output was large and was saved to: "
+    cid, step = row.get("conversationId"), row.get("step_index")
+    inline_truncated = re.search(r"<truncated \d+ bytes>", content) is not None
+    if (marker not in content and not inline_truncated) or not isinstance(cid, str) or not cid or type(step) is not int:
+        return row
+    if any(c not in "0123456789abcdefABCDEF-" for c in cid):
+        return row
+    expected = Path.home() / ".gemini/antigravity-cli/brain" / cid / ".system_generated/steps" / str(step) / "output.txt"
+    uri = expected.as_uri()
+    if marker in content:
+        uri = content.split(marker, 1)[1].strip()
+        parsed = urlsplit(uri)
+        path = unquote(parsed.path)
+        if os.name == "nt" and len(path) > 2 and path[0] == "/" and path[2] == ":":
+            path = path[1:]
+        if parsed.scheme != "file" or parsed.netloc or Path(path).resolve() != expected.resolve():
+            return row
+    try:
+        raw = expected.read_bytes()
+        text = raw.decode("utf-8-sig")
+        if inline_truncated and not isinstance(json.loads(text), dict):
+            return row
+    except (OSError, UnicodeError, ValueError):
+        return row
+    return {**row, "_externalOutput": {"source": uri, "sha256": hashlib.sha256(raw).hexdigest(),
+                                      "text": text}}
+
+
+def provider_trace(mod):
+    backend = (read(mod / "config/chat-backend.json") or {}).get("backend", "mcode")
+    if backend != "agy":
+        return rows(mod / "data/mcode-public-events.jsonl")
+    ids = dict.fromkeys(r.get("conversationId") for r in rows(mod / "data/agy-turns.jsonl"))
+    result = []
+    for cid in ids:
+        if not isinstance(cid, str) or not cid or any(c not in "0123456789abcdefABCDEF-" for c in cid):
+            continue
+        path = Path.home() / ".gemini/antigravity-cli/brain" / cid / ".system_generated/logs/transcript.jsonl"
+        result.extend(attach_agy_output({**row, "_provider": "agy", "conversationId": cid}) for row in rows(path))
+    return result
+
+
+EXPECTED_GAME_TOOLS = frozenset({"get_status", "query_game", "submit_work", "manage_arrangements",
+                                 "remember", "request_player_decision", "consult", "read_reload_history"})
+
+
+def verify_agy_tool_schemas(server_name, tools):
+    from jsonschema import Draft202012Validator, SchemaError
+
+    names = [tool["name"] for tool in tools]
+    if set(names) != EXPECTED_GAME_TOOLS or len(names) != len(EXPECTED_GAME_TOOLS):
+        raise ValueError("Isolated game service does not expose exactly the eight game tools")
+    expanded = {name: f"mcp_{server_name}_{name}" for name in names}
+    if any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name) for name in expanded.values()):
+        raise ValueError("Expanded acceptance tool name cannot register with agy")
+    for tool in tools:
+        schema = tool.get("inputSchema")
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            raise ValueError("Game tool lacks an object input schema: " + tool["name"])
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as error:
+            raise ValueError("Invalid game tool schema: " + tool["name"]) from error
+    return {"tools": tools, "expandedToolNames": expanded,
+            "schemaSha256": hashlib.sha256(json.dumps(tools, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+
+
+async def verify_agy_binding(run, mod, before):
+    if (read(mod / "config/chat-backend.json") or {}).get("backend") != "agy":
+        return None
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    binding = read(run / "evidence/agy-game-binding.json")
+    if not binding:
+        raise RuntimeError("Missing isolated agy game-service binding")
+    params = StdioServerParameters(command=binding["command"], args=binding["args"],
+                                   env={**os.environ, **binding["env"]})
+    async with asyncio.timeout(45), stdio_client(params) as (reader, writer), ClientSession(reader, writer) as session:
+        await session.initialize()
+        catalogue = await session.list_tools()
+        schemas = verify_agy_tool_schemas(binding["serverName"], [tool.model_dump(mode="json") for tool in catalogue.tools])
+        result = await session.call_tool("get_status", {"detail": True})
+        status = result.structuredContent
+        if not isinstance(status, dict):
+            status = decoded("\n".join(c.text for c in result.content if hasattr(c, "text")))
+    expected = (read(run / "evidence/harness-fixture-startup.json") or {}).get("saveName")
+    if result.isError or not expected or not isinstance(status, dict) or status.get("saveId") != expected:
+        detail = "\n".join(c.text for c in result.content if hasattr(c, "text"))
+        raise RuntimeError("Isolated agy MCP observation does not match the native save: " + detail[:400])
+    proof = {"serverName": binding["serverName"], "saveId": expected, "passed": True, **schemas}
+    write(run / "evidence/agy-binding-verified.json", proof)
+    return proof
 
 
 def native_finished(sample):
@@ -207,6 +352,14 @@ class Runner:
             await self.request("close")
             before = await self.native()
             self.report["before"] = before
+            self.report["agyBindingCheck"] = (read(self.evidence / "agy-binding-verified.json") if self.reset_fixture
+                                              else await verify_agy_binding(self.run, self.mod, before))
+            if self.report["backend"]["backend"] == "agy" and not self.report["agyBindingCheck"]:
+                raise RuntimeError("Missing initial agy binding proof for continued suite")
+            await self.request("harness-observe-contracts")
+            probe_path = max(self.evidence.glob("observation-contract-preset-*.json"), key=lambda p: p.stat().st_mtime)
+            probe = read(probe_path)
+            self.report["observationContract"] = probe
             if spec.get("fixture", self.case) in {"harvest-store", "mature-trees", "walk-pickup", "walk-pickup-full"}:
                 player = before.get("playerTile") or {}
                 targets = fixture.get("nativeReachability") or []
@@ -225,7 +378,7 @@ class Runner:
                     raise TimeoutError("Production bridge did not become ready")
                 await asyncio.sleep(1)
             command_offset = len(rows(self.mod / "chat_commands.jsonl"))
-            trace_offset = len(rows(self.mod / "data" / "mcode-public-events.jsonl"))
+            trace_offset = len(provider_trace(self.mod))
             self.report["traceOffset"] = trace_offset
             await self.request("open-conversation")
             await self.request("text", field="_input", text=instruction)
@@ -259,6 +412,15 @@ class Runner:
             after = await self.native()
             self.report["after"] = after
             checks = evaluate(spec.get("fixture", self.case), before, after, self.samples)
+            activities = probe.get("activities") or {}
+            checks["companion_public_observation_uses_own_actor"] = (
+                activities.get("actorMode") == "companion" and activities.get("actorTile") == probe.get("actorTile")
+                and activities.get("playerTile") is None and activities.get("playerInteractionSupported") is False
+                and activities.get("nativeUi") is None and activities.get("menuChoices") is None
+            )
+            checks["mailbox_blocked_in_observation_and_planning"] = (
+                probe.get("mailboxPassable") is False and probe.get("mailboxEdgePassable") is False
+            )
             if spec.get("then"):
                 self.report["intermediate"] = after
                 await self.request("open-conversation")
@@ -282,10 +444,17 @@ class Runner:
             if self.case == "rest-forestry":
                 checks["rested_to_target"] = any(s.get("companionOnRealBed") is True for s in self.samples) and any((s.get("companionStamina") or 0) >= 80 for s in self.samples)
                 checks["worked_before_full_recovery"] = (after.get("companionStamina") or 0) < 100
-            checks["real_mcode_round_completed"] = terminal.get("provider") == "mcode" and terminal.get("status") == "completed"
-            trace = rows(self.mod / "data" / "mcode-public-events.jsonl")[trace_offset:]
+            checks["real_provider_round_completed"] = terminal.get("provider") == self.report["backend"]["backend"] and terminal.get("status") == "completed"
+            trace = provider_trace(self.mod)[trace_offset:]
             summary = summarize_trace(trace)
             self.report["traceSummary"] = summary
+            rest_results = [(c.get("result") or {}).get("details") or {} for c in summary["toolCalls"]
+                            if "rest" in ((c.get("input") or {}).get("action") or {})]
+            if self.case in {"rest-forestry", "rest-water"}:
+                checks["rest_receipt_has_final_location"] = bool(rest_results) and all(
+                    r.get("finalLocation") == "FarmHouse" and isinstance(r.get("finalTile"), dict)
+                    and isinstance(r["finalTile"].get("x"), int) and isinstance(r["finalTile"].get("y"), int)
+                    for r in rest_results)
             if self.case == "harvest-logistics":
                 self.report["extraClearingCalls"] = sum(
                     "clear_debris" in ((c.get("input") or {}).get("action") or {})
@@ -303,7 +472,7 @@ class Runner:
             checks["real_action_tools_observed"] = any(not c["error"] and isinstance(c["result"], dict) for c in actions)
             checks["action_calls_returned_terminal_results"] = bool(actions) and all(
                 not c["nonterminal"] and (c["error"] or isinstance(c["result"], dict)
-                    and (c["result"].get("status") in {"executed", "completed", "failed", "cancelled", "rejected", "player_update"}
+                    and (c["result"].get("status") in {"executed", "completed", "failed", "cancelled", "rejected", "player_update", "world_update"}
                          or c["result"].get("status") == "no-work" and c["result"].get("targetCount") == 0
                          or c["result"].get("terminalState") in {"succeeded", "failed", "cancelled"})) for c in actions
             )
@@ -316,12 +485,12 @@ class Runner:
             checks["no_solid_overlap_while_moving"] = (after.get("movementSamples") or 0) > 0 and after.get("solidOverlaps") == []
             self.report["checks"] = checks
             self.report["status"] = "passed" if all(checks.values()) else "failed"
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - preserve evidence and close the isolated game on any failure.
             self.report["error"] = f"{type(error).__name__}: {error}"
         finally:
             self.report["elapsedSeconds"] = round(time.time() - started, 1)
             self.report["samples"] = self.samples
-            trace = rows(self.mod / "data" / "mcode-public-events.jsonl")[self.report.get("traceOffset", 0):]
+            trace = provider_trace(self.mod)[self.report.get("traceOffset", 0):]
             write(self.evidence / "preset-trace.json", trace)
             self.report["traceEvents"] = len(trace)
             write(self.evidence / "preset-report.json", self.report)

@@ -717,7 +717,7 @@ def test_dispatch_send_result_loss_keeps_reservation_until_reconciled(
     scheduler = CompanionScheduler(client=client, run_dir=native_compatible_run_dir)
 
     async def run() -> None:
-        with pytest.raises(SchedulerError, match="Task execution error"):
+        with pytest.raises(SchedulerError, match="EXECUTION_UNCONFIRMED:.*commandId=cmd-p"):
             await scheduler.execute_purchase_items(
                 items=[{"itemId": MID, "count": 1}], budget_limit=40,
                 command_id="cmd-p", timeout_seconds=0.01,

@@ -123,8 +123,16 @@ class WebSocketClient:
         for i in range(length):
             masked_payload[i] ^= mask_key[i % 4]
 
-        self._writer.write(header + masked_payload)
-        await self._writer.drain()
+        try:
+            self._writer.write(header + masked_payload)
+            await self._writer.drain()
+        except OSError:
+            self._mark_disconnected()
+            raise
+
+    def _mark_disconnected(self) -> None:
+        self._closed = True
+        self._writer.close()
 
     async def receive_text(self, timeout: float | None = None) -> str:
         if self._closed:
@@ -140,6 +148,10 @@ class WebSocketClient:
                 frame = await asyncio.wait_for(pending, timeout) if timeout is not None else await pending
             except (TimeoutError, asyncio.CancelledError):
                 raise  # The next receive resumes this frame, including if it just completed.
+            except (OSError, asyncio.IncompleteReadError):
+                self._read_task = None
+                self._mark_disconnected()
+                raise
             except Exception:
                 self._read_task = None
                 raise

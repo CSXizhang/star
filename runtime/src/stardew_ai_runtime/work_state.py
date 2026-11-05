@@ -18,7 +18,6 @@ cannot mark an unexecuted task succeeded.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import threading
@@ -29,6 +28,8 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from stardew_ai_runtime.file_lock import lock_file, unlock_file
 
 GOAL_SOURCES = frozenset({"user", "agent"})
 GOAL_STATUSES = frozenset({"active", "paused", "completed", "cancelled"})
@@ -642,26 +643,9 @@ class WorkStore:
         with self._thread_lock:
             self._load()
 
-    @staticmethod
-    def _lock(lock: Any) -> None:
-        if os.name == "nt":
-            import msvcrt
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    _lock = staticmethod(lock_file)
 
-    @staticmethod
-    def _unlock(lock: Any) -> None:
-        with contextlib.suppress(Exception):
-            if os.name == "nt":
-                import msvcrt
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    _unlock = staticmethod(unlock_file)
 
     def _write_unlocked(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -750,13 +734,14 @@ class WorkStore:
                     request["taskIds"] = []
             self._mutate(save_id, retire)
 
-    def request_player_decision(self, save_id: str, goal_id: str, message: str, choices: list[str] | None = None) -> dict[str, Any]:
+    def request_player_decision(self, save_id: str, goal_id: str | None, message: str, choices: list[str] | None = None) -> dict[str, Any]:
         """Explicit model signal, separate from routine completion text."""
         text = message.strip()
         if not text or len(text) > 1000:
             raise WorkStateError("Player decision message must contain 1..1000 characters")
         def mutate(state: SaveWorkState) -> dict[str, Any]:
-            self._find_goal(state, goal_id)
+            if goal_id is not None:
+                self._find_goal(state, goal_id)
             previous = next((n for n in state.notices if n["goalId"] == goal_id and n["message"] == text and not n.get("answeredAt")), None)
             if previous:
                 return dict(previous)
@@ -1540,11 +1525,6 @@ class WorkStore:
                     or any(step.status != "pending" or step.command_id or step.lease_owner for step in task.steps)):
                 raise WorkStateError("JOB_IN_PROGRESS: the dispatched job must settle before it can be changed")
 
-    @staticmethod
-    def _decision_valid(state: SaveWorkState, token: str | None) -> bool:
-        d = state.decision
-        return bool(token and d.get("token") == token
-                    and d.get("expires", 0) > _time.time() and not d.get("selected"))
 
     def revoke_decision(self, save_id: str) -> None:
         def mutate(state: SaveWorkState) -> None:

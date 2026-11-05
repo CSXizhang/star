@@ -120,6 +120,53 @@ public sealed partial class TestDriverMod
         MultiEvent("initial", ObserveMultiDay());
     }
 
+    private void ResumeMultiDayObservation()
+    {
+        ResolveCompanionActor(out _, out var farmer, out _, out _);
+        if (_multiDayActive || farmer == null || !ReferenceEquals(farmer, Game1.player))
+            throw new InvalidOperationException("Multi-day continuation requires the original loaded player, once only.");
+        using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(_evidenceDir!, "harness-fixture-startup.json")));
+        var fixture = document.RootElement;
+        if (fixture.GetProperty("runId").GetString() != _runId
+            || fixture.GetProperty("saveName").GetString() != Constants.SaveFolderName
+            || fixture.GetProperty("mode").GetString() != "multi-day")
+            throw new InvalidOperationException("Multi-day observer metadata belongs to another run/save.");
+        foreach (var tree in fixture.GetProperty("protectedTrees").EnumerateArray())
+            _multiProtected[new Vector2(tree.GetProperty("x").GetInt32(), tree.GetProperty("y").GetInt32())]
+                = tree.GetProperty("identity").GetString()!;
+        foreach (var line in File.ReadLines(Path.Combine(_evidenceDir!, "multi-day-ledger.jsonl")))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            using var record = JsonDocument.Parse(line);
+            var row = record.RootElement;
+            _multiSequence = Math.Max(_multiSequence, row.GetProperty("seq").GetInt32());
+            var payload = row.GetProperty("payload");
+            string? kind = row.GetProperty("type").GetString();
+            if (kind is "crop-planted" or "crop-removed" or "crop-restored")
+                _multiCropId = Math.Max(_multiCropId, payload.GetProperty("id").GetInt32());
+            if (kind == "native-result" && payload.TryGetProperty("commandId", out var command))
+                _multiCommands.Add(command.GetString()!);
+            if (kind == "protected-tree-lost") _multiLost.Add(payload.GetProperty("identity").GetString()!);
+        }
+        // Seed observation baselines from the loaded world. Restored crops must
+        // never appear in the ledger as newly planted crops for a second cycle.
+        var farm = Game1.getFarm();
+        foreach (var pair in farm.terrainFeatures.Pairs)
+            if (pair.Value is HoeDirt { crop: not null } dirt)
+            {
+                int id = ++_multiCropId;
+                _multiCrops[pair.Key] = (dirt.crop, id, dirt.readyForHarvest());
+                MultiEvent("crop-restored", new { id, x=(int)pair.Key.X, y=(int)pair.Key.Y });
+            }
+        _multiDay = Game1.dayOfMonth;
+        _multiMoney = farmer.Money;
+        _multiShipping = JsonSerializer.Serialize(DescribeItems(farm.getShippingBin(farmer)));
+        _freezeTime = false;
+        _multiDayActive = true;
+        Helper.Events.GameLoop.DayEnding += (_, _) => { if (_multiDayActive) MultiEvent("day-ending", ObserveMultiDay()); };
+        MultiEvent("resume", ObserveMultiDay());
+    }
+
     private object ObserveMultiDay()
     {
         var farm=Game1.getFarm(); var farmer=Game1.player;

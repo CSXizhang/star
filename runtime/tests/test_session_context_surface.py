@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+import sqlite3
 
 from support.mcp_scheduler import _grant_decision
 from support.mcp_scheduler import mock_scheduler as _scheduler_fixture
@@ -94,3 +95,35 @@ def test_compaction_rebuilds_same_session_and_external_turns_are_self_contained(
     rows = [json.loads(line) for line in (tmp_path/'data/context-usage.jsonl').read_text().splitlines()]
     assert len(rows) == 4 and all(row['requestedSession'] == 'original' for row in rows)
     assert all(row['usage'] is None for row in rows)  # Bytes are not invented token counts.
+
+
+def test_agy_native_checkpoint_rebuilds_next_prompt_once_without_changing_session(tmp_path, monkeypatch):
+    from stardew_ai_runtime.agent_backends import AgyBackend
+    from stardew_ai_runtime.agy_usage import get_max_step_idx
+
+    db = tmp_path / 'original.db'
+    with sqlite3.connect(db) as con:
+        con.execute('CREATE TABLE steps (idx INTEGER, step_type INTEGER, status INTEGER)')
+        con.execute('INSERT INTO steps VALUES (0,15,3)')
+    monkeypatch.setattr('stardew_ai_runtime.agy_usage.get_conversation_db_path', lambda cid: db)
+    monkeypatch.setattr('stardew_ai_runtime.compatibility.assert_native_compatible', lambda *a: None)
+    bridge = ChatBridge(run_dir=tmp_path, backend='agy', enable_plan_worker=False)
+    context = {'goals': [{'text': '保留南边幼树 ' * 150}], 'inventory': {'freeSlots': 4}}
+    monkeypatch.setattr(bridge, '_decision_context', lambda *a, **k: copy.deepcopy(context))
+    seen = []
+
+    def execute(task, session, prompt):
+        seen.append((session, prompt))
+        if task.request_id == 'compact':
+            with sqlite3.connect(db) as con:
+                con.execute('INSERT INTO steps VALUES (1,23,3)')
+        return {'success': True, 'conversation_id': session}
+
+    monkeypatch.setattr(bridge, '_get_backend', lambda: AgyBackend(execute))
+    for name in ('first', 'compact', 'rebuilt', 'next'):
+        task = ActiveChatTask(request_id=name, save_id='S', start_max_step_idx=get_max_step_idx('original'))
+        bridge._execute_turn(task, 'original', '实时上下文：{}')
+    assert {session for session, _ in seen} == {'original'}
+    assert '上下文增量：' in seen[1][1]
+    assert apply(seen[2][1], None)['goals'] == context['goals']
+    assert '上下文增量：' in seen[3][1]

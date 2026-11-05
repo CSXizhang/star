@@ -79,7 +79,14 @@ class AgyBackend:
         self._execute = execute
 
     def run(self, active_task: ActiveTaskLike, session_id: str | None, prompt: str) -> dict[str, Any]:
-        return self._execute(active_task, session_id, prompt)
+        from .agy_usage import has_new_compaction
+
+        result = self._execute(active_task, session_id, prompt)
+        cid = result.get("conversation_id") or session_id
+        if (session_id is None or cid == session_id) and has_new_compaction(
+                cid, getattr(active_task, "start_max_step_idx", -1)):
+            result["context_compacted"] = True
+        return result
 
 
 class CodexBackend:

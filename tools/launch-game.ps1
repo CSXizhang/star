@@ -261,6 +261,16 @@ Write-Host " Scenario: $Scenario"
 Write-Host " Port:     $Port"
 Write-Host "============================================================"
 
+function Get-AgyAcceptanceServerName {
+    param([Parameter(Mandatory=$true)][string]$RunId)
+    if ([string]::IsNullOrWhiteSpace($RunId)) { throw 'Acceptance run ID is required.' }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($RunId)) }
+    finally { $sha.Dispose() }
+    $hex = [BitConverter]::ToString($bytes).Replace('-','').ToLowerInvariant()
+    return 'star-' + $hex.Substring(0,12)
+}
+
 function Get-AgyConfigDigest {
     param([string]$ConfigPath)
     $digestPython = Join-Path $repoRoot 'runtime/.venv/Scripts/python.exe'
@@ -499,7 +509,7 @@ try {
     Write-Host "Deployed TestDriver Mod to: $driverDest"
 
     if ($PresetAcceptance -and $AcceptanceBackend -eq 'agy') {
-        $acceptanceAgyServer = 'stardew-accept-' + $RunId
+        $acceptanceAgyServer = Get-AgyAcceptanceServerName $RunId
         $acceptanceAgyBefore = Get-AgyConfigDigest $acceptanceAgyConfig
         if (Test-Path -LiteralPath $acceptanceAgyConfig) {
             $existingAgy = Get-Content -LiteralPath $acceptanceAgyConfig -Raw | ConvertFrom-Json
@@ -513,7 +523,7 @@ try {
         & agy mcp add --env "PYTHONPATH=$acceptanceModulePath" --env "STARDEW_TURN_CONTEXT=$acceptanceContext" $acceptanceAgyServer -- $acceptancePython -B -m stardew_ai_runtime.mcp_server --run-dir $prodDest --surface light
         if ($LASTEXITCODE -ne 0) { throw 'Acceptance agy game service registration failed.' }
         $acceptanceAgyRegistered = $true
-        Write-Utf8File (Join-Path $runEvidenceDir 'agy-game-binding.json') (@{ serverName=$acceptanceAgyServer;command=$acceptancePython;args=@('-B','-m','stardew_ai_runtime.mcp_server','--run-dir',$prodDest,'--surface','light');env=@{PYTHONPATH=$acceptanceModulePath;STARDEW_TURN_CONTEXT=$acceptanceContext};otherConfigDigestBefore=$acceptanceAgyBefore } | ConvertTo-Json)
+        Write-Utf8File (Join-Path $runEvidenceDir 'agy-game-binding.json') (@{ serverName=$acceptanceAgyServer;legacyServerName=('stardew-accept-'+$RunId);command=$acceptancePython;args=@('-B','-m','stardew_ai_runtime.mcp_server','--run-dir',$prodDest,'--surface','light');env=@{PYTHONPATH=$acceptanceModulePath;STARDEW_TURN_CONTEXT=$acceptanceContext};otherConfigDigestBefore=$acceptanceAgyBefore } | ConvertTo-Json)
     }
 
     # 7. WRITE PER-RUN SESSION CONFIG & COORDINATION

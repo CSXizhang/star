@@ -1,11 +1,75 @@
 """Acceptance must reject false positives even if a model says it completed."""
 import asyncio
 import importlib.util
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 spec = importlib.util.spec_from_file_location("preset_runner", Path(__file__).with_name("runner.py"))
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+
+
+def test_agy_binding_rejects_missing_or_unregistrable_tools():
+    tools = [{"name": name, "inputSchema": {"type": "object"}} for name in runner.EXPECTED_GAME_TOOLS]
+    with pytest.raises(ValueError, match="eight game tools"):
+        runner.verify_agy_tool_schemas("star-short", tools[:-1])
+    with pytest.raises(ValueError, match="cannot register"):
+        runner.verify_agy_tool_schemas("stardew-accept-multi-day-1105-113312-0ba2", tools)
+    tools[0]["inputSchema"]["required"] = 4
+    with pytest.raises(ValueError, match="Invalid game tool schema"):
+        runner.verify_agy_tool_schemas("star-short", tools)
+
+
+def test_agy_binding_reads_all_schemas_before_observing_save(tmp_path, monkeypatch):
+    import mcp
+    import mcp.client.stdio
+    from mcp.types import Tool
+
+    run = tmp_path / "run"
+    mod = run / "mods/mod"
+    runner.write(mod / "config/chat-backend.json", {"backend": "agy"})
+    runner.write(run / "evidence/agy-game-binding.json", {
+        "serverName": "star-short", "command": "python", "args": [], "env": {}})
+    runner.write(run / "evidence/harness-fixture-startup.json", {"saveName": "saved-world"})
+    actions = []
+
+    @asynccontextmanager
+    async def fake_stdio(params):
+        yield None, None
+
+    class Session:
+        def __init__(self, reader, writer):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def initialize(self):
+            actions.append("initialize")
+
+        async def list_tools(self):
+            actions.append("list_tools")
+            return SimpleNamespace(tools=[Tool(name=name, inputSchema={"type": "object"})
+                                          for name in runner.EXPECTED_GAME_TOOLS])
+
+        async def call_tool(self, name, arguments):
+            actions.append(name)
+            assert arguments == {"detail": True}
+            return SimpleNamespace(structuredContent={"saveId": "saved-world"}, content=[], isError=False)
+
+    monkeypatch.setattr(mcp, "ClientSession", Session)
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", fake_stdio)
+    proof = asyncio.run(runner.verify_agy_binding(run, mod, {}))
+    assert actions == ["initialize", "list_tools", "get_status"]
+    assert len(proof["tools"]) == 8
+    assert proof["saveId"] == "saved-world"
+    assert runner.read(run / "evidence/agy-binding-verified.json")["schemaSha256"] == proof["schemaSha256"]
 
 
 def test_world_evidence_rejects_missing_remaining_and_day_rollover():

@@ -774,6 +774,15 @@ public sealed partial class TestDriverMod : Mod
                 // Isolated runs must survive foreground theft (browser popups, notifications):
                 // vanilla pauses a single-player world when the window loses focus.
                 Game1.options.pauseWhenOutOfFocus = false;
+                if (Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1")
+                {
+                    // A saved continuation keeps its actual location, clock and RNG.
+                    // Only the read-only observer metadata is restored below.
+                    _freezeTime = false;
+                    _scenarioState = ScenarioState.ArrangeScenario;
+                    _tickCounter = 0;
+                    break;
+                }
                 if (!UsesLoopDemoCompletionChannel)
                 {
                     _freezeTime = true;
@@ -799,7 +808,7 @@ public sealed partial class TestDriverMod : Mod
 
             case ScenarioState.ArrangeScenario:
                 _tickCounter++;
-                if (Game1.currentLocation?.Name == "Farm" &&
+                if ((Game1.currentLocation?.Name == "Farm" || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1") &&
                     !Game1.fadeToBlack &&
                     !Game1.fadeIn &&
                     Game1.fadeToBlackAlpha <= 0.001f &&
@@ -1607,6 +1616,7 @@ public sealed partial class TestDriverMod : Mod
             var chest = root.GetProperty("chest");
             _acceptanceChest = chest.ValueKind == JsonValueKind.Null ? null
                 : new Vector2(chest.GetProperty("x").GetInt32(), chest.GetProperty("y").GetInt32());
+            if (_harnessFixtureMode == "multi-day") ResumeMultiDayObservation();
             Monitor.Log("[TestDriver] Continuity: restored observation metadata only; loaded world preserved.", LogLevel.Info);
             return;
         }

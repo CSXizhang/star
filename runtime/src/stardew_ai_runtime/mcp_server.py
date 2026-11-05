@@ -816,10 +816,11 @@ def create_mcp_server(
         return overview if detail or resolved_surface == "internal" else compact_work_overview(overview)
 
     @mcp.tool()
-    async def request_player_decision(goal_id: str, message: str,
+    async def request_player_decision(message: str, goal_id: str | None = None,
                                       choices: Annotated[list[str] | None, Field(min_length=2, max_length=6)] = None) -> dict[str, Any]:
         """Notify the player explicitly about a needed decision or significant discussion.
 
+        A goal is optional; questions do not require creating an active goal.
         Routine progress belongs in the execution log. Identical notices deduplicate
         across restarts. This never grants permission or unpauses work.
         delivered=False on creation means queued, not failed; the bridge delivers

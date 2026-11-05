@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agy_usage import completed_response_after_historical_error
 from .provider_activity import inactivity_deadline
 from .usage_meter import AgyTurnReceipts
 
@@ -201,6 +202,14 @@ def run_agy_process(
         if terminal is None:
             terminal = {"conversation_id": cid, "status": "ERROR", "response": "",
                         "error": "CANCELLED" if cancelled else "TIMEOUT" if timed_out else "AGY_STREAM_RESULT_MISSING"}
+        elif (not cancelled and not timed_out and proc.returncode == 0
+              and session_id and cid == session_id and terminal.get("status") == "ERROR"):
+            response = completed_response_after_historical_error(
+                cid, getattr(active_task, "start_max_step_idx", -1))
+            if response is not None:
+                terminal = {**terminal, "status": "SUCCESS", "response": response,
+                            "provider_status": "ERROR", "reconciled_from": "current_turn_steps"}
+                logger.info("agy cumulative ERROR reconciled with a completed current-turn response")
         return AgyProcessOutcome(json.dumps(terminal, ensure_ascii=False), stderr,
                                  cid, proc.returncode, cancelled, timed_out)
     finally:

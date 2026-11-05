@@ -169,6 +169,31 @@ def provider_trace(mod):
     return result
 
 
+EXPECTED_GAME_TOOLS = frozenset({"get_status", "query_game", "submit_work", "manage_arrangements",
+                                 "remember", "request_player_decision", "consult", "read_reload_history"})
+
+
+def verify_agy_tool_schemas(server_name, tools):
+    from jsonschema import Draft202012Validator, SchemaError
+
+    names = [tool["name"] for tool in tools]
+    if set(names) != EXPECTED_GAME_TOOLS or len(names) != len(EXPECTED_GAME_TOOLS):
+        raise ValueError("Isolated game service does not expose exactly the eight game tools")
+    expanded = {name: f"mcp_{server_name}_{name}" for name in names}
+    if any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name) for name in expanded.values()):
+        raise ValueError("Expanded acceptance tool name cannot register with agy")
+    for tool in tools:
+        schema = tool.get("inputSchema")
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            raise ValueError("Game tool lacks an object input schema: " + tool["name"])
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as error:
+            raise ValueError("Invalid game tool schema: " + tool["name"]) from error
+    return {"tools": tools, "expandedToolNames": expanded,
+            "schemaSha256": hashlib.sha256(json.dumps(tools, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+
+
 async def verify_agy_binding(run, mod, before):
     if (read(mod / "config/chat-backend.json") or {}).get("backend") != "agy":
         return None
@@ -181,6 +206,8 @@ async def verify_agy_binding(run, mod, before):
                                    env={**os.environ, **binding["env"]})
     async with asyncio.timeout(45), stdio_client(params) as (reader, writer), ClientSession(reader, writer) as session:
         await session.initialize()
+        catalogue = await session.list_tools()
+        schemas = verify_agy_tool_schemas(binding["serverName"], [tool.model_dump(mode="json") for tool in catalogue.tools])
         result = await session.call_tool("get_status", {"detail": True})
         status = result.structuredContent
         if not isinstance(status, dict):
@@ -189,7 +216,7 @@ async def verify_agy_binding(run, mod, before):
     if result.isError or not expected or not isinstance(status, dict) or status.get("saveId") != expected:
         detail = "\n".join(c.text for c in result.content if hasattr(c, "text"))
         raise RuntimeError("Isolated agy MCP observation does not match the native save: " + detail[:400])
-    proof = {"serverName": binding["serverName"], "saveId": expected, "passed": True}
+    proof = {"serverName": binding["serverName"], "saveId": expected, "passed": True, **schemas}
     write(run / "evidence/agy-binding-verified.json", proof)
     return proof
 

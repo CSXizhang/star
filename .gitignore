@@ -119,6 +119,7 @@ MagicMock/
 !/tools/run-companion-presets.ps1
 !/tools/run-companion-long.ps1
 !/tools/run-companion-multi-day.ps1
+!/tools/resume-companion-multi-day.ps1
 !/tools/companion_acceptance/
 !/tools/launch-game.ps1
 !/tools/build-testdriver.ps1

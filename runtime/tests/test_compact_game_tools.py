@@ -156,6 +156,26 @@ def test_natural_answer_requires_matching_live_notice_and_original_player_text(t
     asyncio.run(run())
 
 
+def test_player_question_without_goal_is_durable_and_does_not_change_control(tmp_path, mock_scheduler):
+    store = _grant_decision(tmp_path, mock_scheduler)
+    store.set_paused('mock-save-123', True)
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='light')
+        _, notice = await server.call_tool('request_player_decision', {
+            'message': '这块地方留作什么？', 'choices': ['留空', '种花']})
+        _, repeated = await server.call_tool('request_player_decision', {
+            'message': '这块地方留作什么？', 'choices': ['留空', '种花']})
+        assert repeated['id'] == notice['id']
+        assert store.pending_player_notice('mock-save-123')['id'] == notice['id']
+        assert not store.state('mock-save-123').goals
+        assert store.state('mock-save-123').paused
+        store.answer_player_notice('mock-save-123', notice['id'], '留空', 'player-answer')
+        assert store.unresolved_player_notices('mock-save-123') == []
+        with pytest.raises(ToolError, match='goal'):
+            await server.call_tool('request_player_decision', {'message': '另一件事', 'goal_id': 'missing'})
+    asyncio.run(run())
+
+
 def test_upgrade_discards_old_queue_without_cancelling_player_goal(tmp_path, mock_scheduler):
     store = _grant_decision(tmp_path, mock_scheduler)
     goal = store.add_goal('mock-save-123', '照顾农场', source='user')

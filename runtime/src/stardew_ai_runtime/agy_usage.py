@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -220,3 +221,59 @@ def check_new_quota_error(conversation_id: str | None, start_step_idx: int) -> t
     except Exception as ex:
         logger.debug("Failed checking new steps for quota error: %s", ex)
         return False, ""
+
+
+def completed_response_after_historical_error(conversation_id: str, start_step_idx: int) -> str | None:
+    """Reconcile a resumed CLI's cumulative ERROR against its current DB steps.
+
+    agy stores planner responses as step type 15 / DONE (3), with the
+    response in payload field 20: text field 1 and tool calls field 7.
+    Only a completed final response after the captured boundary can override
+    a historical error; unavailable evidence or a new error cannot.
+    """
+    if start_step_idx < 0:
+        return None
+    try:
+        path = get_conversation_db_path(conversation_id)
+        with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as con:
+            historical = con.execute(
+                "SELECT 1 FROM steps WHERE idx <= ? AND step_type = 17 LIMIT 1", (start_step_idx,)
+            ).fetchone()
+            rows = con.execute(
+                "SELECT step_type, status, step_payload, error_details FROM steps WHERE idx > ? ORDER BY idx",
+                (start_step_idx,),
+            ).fetchall()
+        if not historical or not rows or any(kind == 17 for kind, _, _, _ in rows):
+            return None
+        kind, status, payload, error = rows[-1]
+        if kind != 15 or status != 3 or error:
+            return None
+        # Earlier tool errors may have been handled by the model. A failed
+        # action does not make its later completed public response a failure.
+        planner_fields = _parse_protobuf(payload).get(20, [])
+        if len(planner_fields) != 1 or planner_fields[0][0] != 2:
+            return None
+        planner = _parse_protobuf(planner_fields[0][1])
+        if planner.get(7):  # A completed tool-call step is not a final reply.
+            return None
+        text_fields = planner.get(1, [])
+        if len(text_fields) != 1 or text_fields[0][0] != 2:
+            return None
+        return text_fields[0][1].decode("utf-8").strip() or None
+    except (OSError, sqlite3.Error, UnicodeError, TypeError, ValueError):
+        return None
+
+
+def has_new_compaction(conversation_id: str | None, start_step_idx: int) -> bool:
+    """A completed native CHECKPOINT (23), not a drop in token usage."""
+    if not conversation_id:
+        return False
+    try:
+        path = get_conversation_db_path(conversation_id)
+        with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as con:
+            return con.execute(
+                "SELECT 1 FROM steps WHERE idx > ? AND step_type = 23 AND status = 3 LIMIT 1",
+                (start_step_idx,),
+            ).fetchone() is not None
+    except (OSError, sqlite3.Error):
+        return False

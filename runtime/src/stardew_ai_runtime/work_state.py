@@ -734,13 +734,14 @@ class WorkStore:
                     request["taskIds"] = []
             self._mutate(save_id, retire)
 
-    def request_player_decision(self, save_id: str, goal_id: str, message: str, choices: list[str] | None = None) -> dict[str, Any]:
+    def request_player_decision(self, save_id: str, goal_id: str | None, message: str, choices: list[str] | None = None) -> dict[str, Any]:
         """Explicit model signal, separate from routine completion text."""
         text = message.strip()
         if not text or len(text) > 1000:
             raise WorkStateError("Player decision message must contain 1..1000 characters")
         def mutate(state: SaveWorkState) -> dict[str, Any]:
-            self._find_goal(state, goal_id)
+            if goal_id is not None:
+                self._find_goal(state, goal_id)
             previous = next((n for n in state.notices if n["goalId"] == goal_id and n["message"] == text and not n.get("answeredAt")), None)
             if previous:
                 return dict(previous)

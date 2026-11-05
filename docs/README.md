@@ -12,6 +12,7 @@
 - [清理与兼容边界](maintenance-cleanup.md)
 - [当前提示词来源](agent-prompt-integration-notes.md) · [核心指令](agent-core-instructions-draft.md) · [领域指导](agent-domain-guidance-draft.md)
 - [伙伴实机回归](repeatable-companion-acceptance.md) · [双路径、记忆与能力验证](dual-connection-validation.md)
+- [无限材料自主装修实验](creative-farm-experiment.md)：隔离存档、持续材料补给、自主规划施工与实景设计图。
 - [成长设计与实施进度](companion-efficiency-and-play-design.md)
 
 ## 历史资料

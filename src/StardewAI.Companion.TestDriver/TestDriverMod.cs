@@ -410,6 +410,7 @@ public sealed partial class TestDriverMod : Mod
 
         if (_harnessFixtureMode == "mixed-long" && Context.IsWorldReady) TrackMixedWood();
         if (_multiDayActive && Context.IsWorldReady) TrackMultiDay();
+        if (_creativeFarmActive && Context.IsWorldReady) MaintainCreativeFarm();
 
         if (_freezeTime && Context.IsWorldReady && Game1.gameTimeInterval > 0)
         {
@@ -1157,7 +1158,10 @@ public sealed partial class TestDriverMod : Mod
                     if ((_scenario.Equals("free-mode-control", StringComparison.OrdinalIgnoreCase) || _scenario.Equals("daily-chain", StringComparison.OrdinalIgnoreCase)) &&
                         int.TryParse(Environment.GetEnvironmentVariable("STARDEW_AI_OBSERVE_SECONDS"), out var observeSeconds))
                         timeoutTicks = Math.Clamp(observeSeconds, 600, 7200) * 60;
-                    if (doneExists || _tickCounter > timeoutTicks)
+                    // Creative projects run until their monitor records completion or
+                    // an explicit stop. Other regression fixtures retain their deadlines.
+                    bool creativeUntilDone = _scenario == "free-mode-control" && _harnessFixtureMode == "creative-farm";
+                    if (doneExists || (!creativeUntilDone && _tickCounter > timeoutTicks))
                     {
                         Monitor.Log($"[TestDriver] {_scenario} Act wait concluded (DoneFile: {doneExists}, Ticks: {_tickCounter}, Frames: {_loopDemoFrameIndex}).", LogLevel.Info);
                         _tickCounter = 0;
@@ -1740,6 +1744,15 @@ public sealed partial class TestDriverMod : Mod
         if (_scenario.Equals("existing-save-buy5", StringComparison.OrdinalIgnoreCase))
         {
             ArrangeExistingSaveBuy5(farm, farmer, actor);
+            return;
+        }
+
+        // Creative setup owns its empty ground; do not first install a watering fixture.
+        if (_scenario == "free-mode-control" &&
+            Environment.GetEnvironmentVariable("STARDEW_AI_HARNESS_FIXTURE") == "creative-farm")
+        {
+            using var creative = JsonDocument.Parse("{\"mode\":\"creative-farm\"}");
+            ArrangeHarnessFixture(_evidenceDir!, "startup", creative.RootElement);
             return;
         }
 
@@ -3538,6 +3551,7 @@ public sealed partial class TestDriverMod : Mod
         AssertHarnessFixtureBoundary(modEntry);
         string mode = request.GetProperty("mode").GetString() ?? "";
         if (mode == "multi-day") { ArrangeMultiDayFixture(modEntry, outDir, label); return; }
+        if (mode == "creative-farm") { ArrangeCreativeFarmFixture(modEntry, outDir, label); return; }
         if (mode is not ("watering" or "partial-planting" or "harvest-store" or "rest-water" or "water-refill" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long"))
             throw new ArgumentException("Unknown harness fixture mode.");
         if (Game1.currentSeason != "spring")
@@ -4013,6 +4027,10 @@ public sealed partial class TestDriverMod : Mod
         else if (action == "native-growth-fixture")
         {
             ArrangeNativeGrowthFixture(modEntry, outDir, label);
+        }
+        else if (action == "harness-farm-capture")
+        {
+            CaptureCreativeFarm(modEntry, outDir, label);
         }
         else if (action == "harness-capture")
         {
@@ -8126,7 +8144,7 @@ public sealed partial class TestDriverMod : Mod
                     }
                 }
                 else if (!screenshotValid && !(_scenario == "free-mode-control" &&
-                    _harnessFixtureMode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long" or "multi-day"))
+                    _harnessFixtureMode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long" or "multi-day" or "creative-farm"))
                 {
                     _evidence["functionalSkillPassed"] = false;
                     _evidence["gateSuccess"] = false;
@@ -8581,6 +8599,7 @@ public sealed partial class TestDriverMod : Mod
                 ["isRaining"] = Game1.isRaining,
                 ["playerMoney"] = Game1.player.Money,
                 ["multiDay"] = _multiDayActive ? ObserveMultiDay() : null,
+                ["creativeFarm"] = _harnessFixtureMode == "creative-farm" ? ObserveCreativeFarm() : null,
                 ["playerStamina"] = Game1.player.stamina,
                 ["playerLocation"] = Game1.player.currentLocation?.NameOrUniqueName,
                 ["playerTile"] = new { x = (int)Game1.player.Tile.X, y = (int)Game1.player.Tile.Y },

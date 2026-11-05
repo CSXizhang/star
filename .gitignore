@@ -90,6 +90,7 @@ MagicMock/
 !/src/StardewAI.Companion.TestDriver/StardewAI.Companion.TestDriver.csproj
 !/src/StardewAI.Companion.TestDriver/TestDriverMod.cs
 !/src/StardewAI.Companion.TestDriver/TestDriverMod.MultiDay.cs
+!/src/StardewAI.Companion.TestDriver/TestDriverMod.CreativeFarm.cs
 /config/test-runner*.json
 /tests/test_save_isolation.py
 /tests/test_harness_behavioral.py

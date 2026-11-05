@@ -5,7 +5,8 @@ param(
     [string]$Scenario = 'normal-watering',
     [string]$RunId = '',
     [int]$Port = 37788,
-    [int]$TimeoutSeconds = 120,
+    # Zero waits for the owned game to exit without a total wall-clock limit.
+    [ValidateRange(0,2147483647)][int]$TimeoutSeconds = 120,
     [string]$FrozenProdDir = '',
     # Optional expected SHA256 of the deployed production Mod DLL. When set, the run
     # fails fast if the frozen package did not deploy the exact expected assembly
@@ -600,6 +601,7 @@ try {
     $launchTimeUtc = [System.DateTime]::UtcNow
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $orchestratorStarted = $false
+    $completionSignalAt = $null
     while (-not $proc.HasExited) {
         Start-Sleep -Milliseconds 500
         if ($Mode -eq 'scenario' -and -not $orchestratorStarted -and -not $NoOrchestrator) {
@@ -625,7 +627,19 @@ try {
                 }
             }
         }
-        if ($sw.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
+        if ($TimeoutSeconds -eq 0 -and $Scenario -eq 'free-mode-control') {
+            if ($null -eq $completionSignalAt -and (Test-Path -LiteralPath (Join-Path $runEvidenceDir 'free-mode-control-done.json'))) {
+                $completionSignalAt = $sw.Elapsed.TotalSeconds
+            }
+            # This begins only after the monitor has ended, never while it is creating.
+            if ($null -ne $completionSignalAt -and ($sw.Elapsed.TotalSeconds - $completionSignalAt) -gt 120) {
+                Write-Warning "Completed monitor's game did not exit within 120 seconds. Terminating owned PID $launchedPid..."
+                Stop-LaunchedChildProcess $proc $launchedPid $launchedStartTime
+                $timedOut = $true
+                break
+            }
+        }
+        if ($TimeoutSeconds -gt 0 -and $sw.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
             Write-Warning "Process timed out after $TimeoutSeconds seconds! Terminating PID $launchedPid..."
             Stop-LaunchedChildProcess $proc $launchedPid $launchedStartTime
             $timedOut = $true

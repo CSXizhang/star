@@ -1405,6 +1405,14 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
             raise ToolError(f"Toggle animal door failed: {ex}") from None
 
     @mcp.tool()
+    async def wait(game_minutes: Annotated[int, Field(strict=True, ge=1, le=1440)]) -> dict[str, Any]:
+        """Stand still and let native game time pass for the requested minutes (10-minute clock ticks). Use when choosing to wait for opening hours or an event; with thinking-pause enabled, repeated observations do not advance time. Does not fast-forward, sleep, heal or queue later work. Returns elapsed time; cancellation, native UI or a day change returns control for a fresh decision."""
+        try:
+            return _native_action_response("wait", await sched.execute_wait(game_minutes))
+        except (PolicyViolationError, SchedulerError) as ex:
+            raise ToolError(str(ex)) from None
+
+    @mcp.tool()
     async def sleep() -> dict[str, Any]:
         """End the current day natively: walk to the bed, sleep, and settle the new day.
 

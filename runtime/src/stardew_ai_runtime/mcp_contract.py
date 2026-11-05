@@ -540,6 +540,7 @@ _PLAN_OPERATION_CALLS: dict[str, tuple[str, frozenset[str]]] = {
     "navigate_to": ("execute_navigate_to", frozenset({"location_id", "tile", "landmark"})),
     "pause_task": ("pause_task", frozenset()),
     "sleep": ("execute_sleep", frozenset()),
+    "wait": ("execute_wait", frozenset({"game_minutes"})),
     "open_shop": ("open_shop", frozenset({"shop_id", "location_id"})),
     "open_chest": ("open_chest", frozenset({"chest_x", "chest_y", "location_id"})),
     "native_advance": ("execute_native_advance", frozenset({"allow_skip"})),
@@ -625,6 +626,7 @@ BASE_TOOLS = frozenset(
         "resume_task",
         "cancel_task",
         "sleep",
+        "wait",
         "player_control",
         "open_shop",
         # grouped discovery + invocation

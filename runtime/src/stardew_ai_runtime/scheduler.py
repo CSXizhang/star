@@ -3095,6 +3095,17 @@ class CompanionScheduler:
     # same allow-listed skill contract; nothing is simulated client-side.
     # ------------------------------------------------------------------
 
+    async def execute_wait(self, game_minutes: int, command_id: str | None = None) -> dict[str, Any]:
+        """Stand neutrally while the native clock runs, within this same action/session."""
+        if type(game_minutes) is not int or not 1 <= game_minutes <= 1440:
+            raise SchedulerError("game_minutes must be an integer from 1 to 1440")
+        status = await self.get_status()
+        location = (status.get("companion") or {}).get("locationId")
+        if not isinstance(location, str) or not location:
+            raise SchedulerError("Current actor location is unavailable")
+        return await self._execute_native_action("wait", {"locationId": location, "waitMinutes": game_minutes},
+            tiles=[], timeout_seconds=max(30.0, game_minutes * 0.7 + 30.0), command_id=command_id)
+
     async def _execute_native_action(
         self,
         skill_id: str,

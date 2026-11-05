@@ -12,6 +12,23 @@ from stardew_ai_runtime.mcp_server import create_mcp_server
 mock_scheduler = _scheduler_fixture
 
 
+def test_wait_uses_existing_action_entry_and_validates_duration(tmp_path, mock_scheduler):
+    _grant_decision(tmp_path, mock_scheduler)
+    mock_scheduler.execute_wait = AsyncMock(return_value={"status": "completed", "terminalState": "succeeded",
+        "details": {"elapsedGameMinutes": 40, "startTime": 820, "endTime": 900}})
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+        assert len(await server.list_tools()) == 8
+        _, result = await server.call_tool("submit_work", {"action": {"wait": {"game_minutes": 40}}})
+        assert result["terminalState"] == "succeeded"
+        assert result["details"]["elapsedGameMinutes"] == 40
+        mock_scheduler.execute_wait.assert_awaited_once_with(40)
+        with pytest.raises(ToolError):
+            await server.call_tool("submit_work", {"action": {"wait": {"game_minutes": True}}})
+        assert mock_scheduler.execute_wait.await_count == 1
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('operation, method_name', [('clear_debris', 'clear_debris'), ('water_tiles', 'execute_tiles')])
 def test_typed_action_executes_now_and_rechecks_authority(tmp_path, monkeypatch, mock_scheduler, operation, method_name):
     store = _grant_decision(tmp_path, mock_scheduler)

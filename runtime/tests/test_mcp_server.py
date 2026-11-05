@@ -59,7 +59,7 @@ def test_mcp_server_tool_registration(mock_scheduler):
             purchase_items query_chests query_farm_work query_inventory query_planting_options
             query_route query_shop query_wiki read_guidance reconcile_plan_command
             refill_watering_can remember_intent remove_items request_player_decision
-            resume_task rest run_next_step set_autonomy ship_items sleep submit_plan toggle_animal_door
+            resume_task rest wait run_next_step set_autonomy ship_items sleep submit_plan toggle_animal_door
             upgrade_building water_auto water_zone water_tiles withdraw_from_chest work_plan_overview
         """.split())
 

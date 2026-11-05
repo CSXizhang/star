@@ -21,6 +21,7 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "load-extension": frozenset({"locationId", "extensionPackage", "extensionPersist"}),
     "invoke-extension": frozenset({"locationId", "extensionId", "extensionVersion", "extensionKind", "extensionArguments"}),
     "rest": frozenset({"locationId", "targetStamina"}),
+    "wait": frozenset({"locationId", "waitMinutes"}),
     "inspect-player-activities": frozenset({"locationId"}),
     "talk-npc": frozenset({"locationId", "npcName"}),
     "interact-tile": frozenset({"locationId", "tile"}),

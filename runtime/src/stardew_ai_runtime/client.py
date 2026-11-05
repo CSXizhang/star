@@ -450,8 +450,6 @@ class TransportClient:
             self._native_command_revisions.clear()
             self._native_revision_session = session
         if cmd_id not in self._native_command_revisions:
-            if len(self._native_command_revisions) >= 256:
-                raise TransportClientError("Native command replay cache is full for this game session")
             self._native_command_revisions[cmd_id] = self.world_revision if world_revision is None else world_revision
         target_revision = self._native_command_revisions[cmd_id] if world_revision is None else world_revision
 

@@ -541,6 +541,8 @@ public sealed record WaterZoneParameters(
     public int? Facing { get; init; }
     [JsonPropertyName("targetStamina")]
     public float? TargetStamina { get; init; }
+    [JsonPropertyName("waitMinutes")]
+    public int? WaitMinutes { get; init; }
     [JsonPropertyName("extensionId")] public string? ExtensionId { get; init; }
     [JsonPropertyName("extensionVersion")] public string? ExtensionVersion { get; init; }
     [JsonPropertyName("extensionKind")] public string? ExtensionKind { get; init; }

@@ -46,6 +46,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     private readonly NativeActionStateMachine? _nativeActionMachine;
     private readonly IWorldMapGraph _mapGraph;
     private readonly NavigationStateMachine _navigationMachine;
+    private WaitStateMachine? _waitMachine;
     private readonly object _taskLock = new();
 
     private ITransportServer? _transportServer;
@@ -134,6 +135,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     {
         get
         {
+            if (_waitMachine?.IsExecuting == true) return _waitMachine;
             if (extensionMachine?.IsExecuting == true) return extensionMachine;
             if (_fishingMachine?.IsExecuting == true) return _fishingMachine;
             if (_combatMachine?.IsExecuting == true) return _combatMachine;
@@ -275,6 +277,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
     /// </summary>
     public void Update(GameTime? time, long tickCount)
     {
+        _waitMachine?.Update(time, tickCount);
         extensionMachine?.Update(time, tickCount);
         if (_actor is PlayerActor binding && !binding.BindingValid) { _eatingMachine?.Update(time, tickCount); PlayerAuthority?.Release("actor-binding-lost"); return; }
         if (!ActorGuards.IsPlayerBound(_actor)) Rest.Update(time, tickCount, ActiveMachine);
@@ -830,6 +833,19 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 if (_chestObservation == null) { _chestObservation=new(nativePlayer,knownObserver); _chestObservation.Completed += CompleteExecution; }
                 _currentExecuteEnvelope=envelope; _currentExecuteCommandId=payload.CommandId;
                 _chestObservation.Start(payload); rejectResult=null; return true;
+            }
+            if (skillId == "wait") {
+                if (!TryCheckIdle(out var busy)) { rejectResult = BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
+                if (_waitMachine is null) {
+                    _waitMachine = new(_actor, _observer, () => {
+                        if (_actor is PlayerActor player && (!player.BindingValid || PlayerAuthority?.AgentOwns != true))
+                            return "Native player binding or agent control ended.";
+                        return TryDescribeNativeUiBlock(out _, out var message) ? message : null;
+                    });
+                    _waitMachine.Completed += CompleteExecution;
+                }
+                _currentExecuteEnvelope = envelope; _currentExecuteCommandId = payload.CommandId;
+                return _waitMachine.Start(payload, out rejectResult);
             }
             if (skillId == "sleep" && ActorGuards.IsPlayerBound(_actor)) {
                 if (!TryCheckIdle(out var busy)) { rejectResult = BuildRejection(payload,"ACTOR_BUSY",busy!,true); return false; }
@@ -2150,6 +2166,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             PurchaseStateMachine => "purchasing",
             NativeActionStateMachine native => DescribeNativeActivity(native.CurrentRequest?.Kind),
             NavigationStateMachine => "navigating",
+            WaitStateMachine => "waiting",
             _ => "working"
         };
     }
@@ -2178,7 +2195,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         if (machine == null) return "";
         string label = DescribeActivity(machine) switch
         {
-            "watering" => "浇水", "harvesting" => "收获", "navigating" => "赶路",
+            "watering" => "浇水", "harvesting" => "收获", "navigating" => "赶路", "waiting" => "等待",
             "chopping" => "砍树", "clearing" => "清理", "picking-up" => "拾取",
             "refilling" => "补水", "depositing" => "存放物品", "withdrawing" => "取物",
             "planting" => "播种", "hoeing" => "锄地", "eating" => "进食", _ => "工作中"

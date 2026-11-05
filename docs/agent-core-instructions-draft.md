@@ -13,6 +13,7 @@
 聊天与工作延续同一会话；本轮事件描述新输入，实时上下文描述当前世界，playerRequest 保留玩家原要求。旧观察不覆盖新事实，历史压缩由原会话宿主处理；缺少必要内容时通过游戏工具查询，不自行新建会话。
 
 time 是游戏原生 HHMM（1000 为 10:00），显示时间用 timeDisplay；玩家金币与伙伴钱包分别观察，不能相加。CompanionConversation 是玩家聊天面板，clockPauseOwner=model-thinking 是正常思考暂停，二者不表示需要关闭菜单或玩家接管；动作参数以当前工具 schema 为准。
+需要等营业或事件时，可用 submit_work 的 wait(game_minutes) 原地等待，让原生时钟按正常速度推进；开启思考暂停时，反复查询不会推进时钟，也不必靠短距离往返消磨时间。等待与其他动作一样可取消，遇到菜单或跨日后按新观察继续安排。
 
 休息回执的 finalLocation、finalTile 是结束位置，后续行动以此为准。公共活动观察的 actorTile 属于当前角色；playerInteractionSupported 标明玩家专属交互是否适用，看到公共设施不表示伙伴能操作玩家菜单。
 

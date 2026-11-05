@@ -1986,6 +1986,11 @@
                     "includeEmptyTiles": {
                       "type": "boolean"
                     },
+                    "waitMinutes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1440
+                    },
                     "tile": {
                       "type": "object",
                       "required": [

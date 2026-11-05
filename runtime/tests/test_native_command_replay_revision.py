@@ -1,9 +1,8 @@
 """Offline envelope tests; no game effects or live acceptance are simulated."""
 import asyncio
+from unittest.mock import AsyncMock
 
-import pytest
-
-from stardew_ai_runtime.client import TransportClient, TransportClientError
+from stardew_ai_runtime.client import TransportClient
 
 
 def test_native_replay_preserves_revision_but_new_toggle_uses_current_revision():
@@ -48,6 +47,11 @@ async def _capacity_scenario():
     client.save_id, client.game_session_id = "save", "session"
     client._native_revision_session = ("save", "session")
     client._native_command_revisions = {str(i): i for i in range(256)}
-    with pytest.raises(TransportClientError, match="cache is full"):
-        await client.execute_native_action("toggle-animal-door", {"locationId": "Farm", "tiles": [{"x": 1, "y": 1}]}, command_id="new")
+    client.send_envelope = AsyncMock()
+    client.world_revision = 300
+    params = {"locationId": "Farm", "tiles": [{"x": 1, "y": 1}]}
+    await client.execute_native_action("toggle-animal-door", params, command_id="new")
+    assert client.send_envelope.call_args.args[0].payload["expectedWorldRevision"] == 300
+    await client.execute_native_action("toggle-animal-door", params, command_id="0")
+    assert client.send_envelope.call_args.args[0].payload["expectedWorldRevision"] == 0
     assert client._native_command_revisions["0"] == 0

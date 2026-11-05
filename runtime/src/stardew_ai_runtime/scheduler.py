@@ -29,6 +29,7 @@ from typing import Any
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.client import NativeResultUnavailable, TransportClient
 from stardew_ai_runtime.protocol import NATIVE_ACTION_TASK_PREFIXES, Envelope
+from stardew_ai_runtime.websocket_client import WebSocketError
 from stardew_ai_runtime.work_state import PLANT_WORKFLOW_PLAN_ERROR
 
 logger = logging.getLogger("stardew_ai_runtime.scheduler")
@@ -981,10 +982,11 @@ class CompanionScheduler:
                 if not self._client.is_connected:
                     await self._client.connect(timeout=5.0)
                     await self._client.handshake(timeout=5.0)
+                    self._latest_snapshot_data = None
                     try:
                         snapshot_env = await self._client.wait_for_snapshot(timeout=3.0)
                         self._cache_snapshot(snapshot_env)
-                    except Exception:
+                    except TimeoutError:
                         pass
             except Exception as ex:
                 last_error = ex
@@ -1015,7 +1017,7 @@ class CompanionScheduler:
         try:
             snapshot_env = await client.wait_for_snapshot(timeout=0.5)
             self._cache_snapshot(snapshot_env)
-        except Exception:
+        except TimeoutError:
             snapshot_env = client.latest_snapshot
             if snapshot_env is not None:
                 self._cache_snapshot(snapshot_env)
@@ -1024,8 +1026,11 @@ class CompanionScheduler:
             try:
                 snapshot_env = await client.wait_for_snapshot(timeout=3.0)
                 self._cache_snapshot(snapshot_env)
-            except Exception:
-                pass
+            except TimeoutError:
+                raise SchedulerError("Native status unavailable: no world snapshot received") from None
+
+        if not client.is_connected:
+            raise SchedulerError("Native connection lost; cached world state is not current status")
 
     @property
     def latest_world_revision(self) -> int:
@@ -1311,6 +1316,7 @@ class CompanionScheduler:
             "saveId": client.save_id or snap.get("saveId", "unknown"),
             "gameSessionId": client.game_session_id or snap.get("gameSessionId", "unknown"),
             "worldRevision": client.world_revision or snap.get("worldRevision", 0),
+            "observedAt": snap.get("observedAt"),
         }
 
     async def query_farm_work(self) -> dict[str, Any]:
@@ -1587,6 +1593,17 @@ class CompanionScheduler:
                 "message": f"Task '{cur_tid}' is still active on companion after {timeout_seconds}s (status: {cur_status}).",
                 "error": None,
             }
+        except (OSError, WebSocketError) as ex:
+            # Losing the channel says nothing about whether the native action
+            # ran. Release this call's ownership and report the receipt as unknown.
+            command = self._active_task.command_id or requested_command_id if self._active_task else requested_command_id
+            if self._active_task:
+                self._active_task.status = "unknown"
+                self._active_task.is_terminal = True
+            raise SchedulerError(
+                f"EXECUTION_UNCONFIRMED: native connection lost; commandId={command}; "
+                f"query the current action and world before choosing remaining work: {ex}"
+            ) from None
         except Exception as ex:
             if self._active_task:
                 self._active_task.status = "failed"

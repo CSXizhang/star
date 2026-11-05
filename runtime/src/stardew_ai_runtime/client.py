@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -34,6 +36,12 @@ class TransportClient:
         self.instance_id = instance_id or f"runtime-{uuid.uuid4().hex[:8]}"
 
         self._ws: WebSocketClient | None = None
+        self._receiver: asyncio.Task | None = None
+        self._incoming: deque[Envelope] = deque()
+        self._pending_snapshot: Envelope | None = None
+        self._incoming_ready = asyncio.Event()
+        self._receive_error: Exception | None = None
+        self._result_waiters: dict[str, set[asyncio.Future[Envelope]]] = {}
         self._sequence_number = 0
         self.world_revision = 0
         self.save_id: str | None = None
@@ -61,8 +69,16 @@ class TransportClient:
         return seq
 
     async def connect(self, timeout: float = 5.0) -> None:
-        if self._ws is not None:
+        if self.is_connected:
             return
+        if self._ws is not None:
+            await self.close()
+        self._incoming.clear()
+        self._pending_snapshot = None
+        self.latest_snapshot = None
+        self._receive_error = None
+        self._incoming_ready.clear()
+        self._sequence_number = 0
 
         headers: dict[str, str] = {}
         if self.session_token:
@@ -78,6 +94,7 @@ class TransportClient:
                 headers=headers,
                 timeout=timeout,
             )
+            self._receiver = asyncio.create_task(self._receive_loop())
         except (WebSocketError, OSError) as ex:
             raise TransportClientError(
                 f"Failed to connect to ws://{self.host}:{self.port}{path}: {ex}"
@@ -92,11 +109,74 @@ class TransportClient:
     async def receive_envelope(self, timeout: float | None = 5.0) -> Envelope:
         if self._ws is None:
             raise TransportClientError("Not connected to transport server")
-        text = await self._ws.receive_text(timeout=timeout)
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ProtocolError("Received non-object JSON from transport server")
-        return Envelope.from_mapping(data)
+        async with asyncio.timeout(timeout):
+            while True:
+                # Receipts and protocol replies retain their order. Snapshots
+                # coalesce while the model thinks instead of backing up the wire.
+                if self._incoming:
+                    return self._incoming.popleft()
+                if self._receive_error is not None:
+                    raise self._receive_error
+                if not self.is_connected:
+                    raise TransportClientError("Native connection is closed")
+                if self._pending_snapshot is not None:
+                    snapshot, self._pending_snapshot = self._pending_snapshot, None
+                    return snapshot
+                self._incoming_ready.clear()
+                await self._incoming_ready.wait()
+
+    async def _receive_loop(self) -> None:
+        """One reader owns the socket for its entire connected lifetime."""
+        ws = self._ws
+        try:
+            while True:
+                data = json.loads(await ws.receive_text())
+                if not isinstance(data, dict):
+                    raise ProtocolError("Received non-object JSON from transport server")
+                envelope = Envelope.from_mapping(data)
+                if envelope.message_type == "world.snapshot":
+                    self.latest_snapshot = envelope
+                    self._pending_snapshot = envelope
+                elif self._route_result(envelope):
+                    pass
+                else:
+                    self._incoming.append(envelope)
+                self._incoming_ready.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            self._receive_error = ex
+            self._fail_result_waiters(ex)
+            await ws.close()
+        finally:
+            self._incoming_ready.set()
+
+    def _route_result(self, envelope: Envelope) -> bool:
+        command = envelope.payload.get("commandId")
+        waiters = self._result_waiters.get(command, ())
+        error = None
+        if envelope.message_type == "skill.result.status" and envelope.payload.get("status") == "unknown":
+            error = NativeResultUnavailable(f"Native session has no cached result for command {command}")
+        elif envelope.message_type == "protocol.error":
+            waiters = [future for group in self._result_waiters.values() for future in group]
+            error = TransportClientError(f"Protocol error: {envelope.payload}")
+        elif envelope.message_type != "skill.result":
+            return False
+        delivered = False
+        for future in waiters:
+            if not future.done():
+                if error is not None:
+                    future.set_exception(error)
+                else:
+                    future.set_result(envelope)
+                delivered = True
+        return delivered
+
+    def _fail_result_waiters(self, error: Exception) -> None:
+        for group in self._result_waiters.values():
+            for future in group:
+                if not future.done():
+                    future.set_exception(error)
 
     async def handshake(
         self,
@@ -954,14 +1034,44 @@ class TransportClient:
 
     def get_cached_result(self, command_id: str) -> Envelope | None:
         """Returns and clears cached skill.result envelope for command_id if already received."""
-        return self._completed_results.pop(command_id, None)
+        cached = self._completed_results.pop(command_id, None)
+        if cached is not None:
+            return cached
+        for envelope in self._incoming:
+            if envelope.message_type == "skill.result" and envelope.payload.get("commandId") == command_id:
+                self._incoming.remove(envelope)
+                return envelope
+        return None
 
     async def wait_for_result(self, command_id: str, timeout: float = 10.0) -> Envelope:
         """Waits for terminal skill.result matching the target command ID."""
-        if command_id in self._completed_results:
-            env = self._completed_results.pop(command_id)
+        env = self.get_cached_result(command_id)
+        if env is not None:
             self.world_revision = env.world_revision
             return env
+
+        if self._receiver is not None:
+            # A concurrent observation must not consume another call's receipt.
+            # All waiters for this command see the same native result, without
+            # sending another action or acquiring a second socket reader.
+            if self._receive_error is not None:
+                raise self._receive_error
+            if not self.is_connected:
+                raise TransportClientError("Native connection is closed")
+            future = asyncio.get_running_loop().create_future()
+            group = self._result_waiters.setdefault(command_id, set())
+            group.add(future)
+            try:
+                for queued in tuple(self._incoming):
+                    if self._route_result(queued):
+                        self._incoming.remove(queued)
+                env = await asyncio.wait_for(future, timeout)
+                self.world_revision = env.world_revision
+                return env
+            finally:
+                group.discard(future)
+                if not group:
+                    self._result_waiters.pop(command_id, None)
 
         start_time = datetime.now(UTC)
         remaining = timeout
@@ -997,8 +1107,14 @@ class TransportClient:
         raise TimeoutError(f"Timed out waiting for result of command {command_id} after {timeout}s")
 
     async def close(self) -> None:
+        self._fail_result_waiters(TransportClientError("Native connection is closed"))
+        if self._receiver is not None:
+            self._receiver.cancel()
+            await asyncio.gather(self._receiver, return_exceptions=True)
+            self._receiver = None
         if self._ws:
             try:
                 await self._ws.close()
             finally:
                 self._ws = None
+        self._incoming_ready.set()

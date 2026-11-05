@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .provider_activity import inactivity_deadline
 from .usage_meter import AgyTurnReceipts
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ def run_agy_process(
     print/input/output/log options. stdout in the outcome is the unwrapped final
     result JSON, compatible with the existing bridge's terminal parser.
     """
-    if getattr(active_task, "cancelled", False):
+    if getattr(active_task, "cancelled", False) or getattr(active_task, "provider_interrupted", False) is True:
         return AgyProcessOutcome("", "", session_id, None, cancelled=True)
     if any(arg in {"--print", "-p", "--prompt", "--input-format", "--output-format", "--log-file"}
            for arg in command):
@@ -101,13 +102,15 @@ def run_agy_process(
             events.put((channel, None))
 
     def handle_stdout(line: str, *, progress: bool = True) -> None:
-        nonlocal cid, terminal
+        nonlocal cid, terminal, deadline
         try:
             event = json.loads(line)
         except ValueError:
             return
         if not isinstance(event, dict):
             return
+        if event.get("event") in {"init", "step_update", "result"}:
+            deadline = time.monotonic() + timeout_seconds
         if event.get("event") == "init" and isinstance(event.get("conversation_id"), str):
             cid = event["conversation_id"]
             active_task.provider_conversation_id = cid
@@ -157,11 +160,11 @@ def run_agy_process(
         writer.start()
         done: set[str] = set()
         while len(done) < 2:
-            if getattr(active_task, "cancelled", False):
+            if getattr(active_task, "cancelled", False) or getattr(active_task, "provider_interrupted", False) is True:
                 cancelled = True
                 terminate_agy_process(proc)
                 break
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= inactivity_deadline(active_task, deadline, timeout_seconds):
                 timed_out = True
                 terminate_agy_process(proc)
                 break

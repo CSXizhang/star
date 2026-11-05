@@ -18,12 +18,11 @@ public sealed partial class CompanionMechanicsCoordinator
 
     private object InspectPlayerActivities()
     {
-        if (_actor is not PlayerActor p || !p.BindingValid)
-            throw new InvalidOperationException("Native player binding required.");
-        var farmer = p.GameFarmer ?? throw new InvalidOperationException("Player binding lost.");
-        var loc = farmer.currentLocation;
+        var farmer = _actor.GameFarmer ?? throw new InvalidOperationException("Native actor binding required.");
+        var loc = farmer.currentLocation ?? throw new InvalidOperationException("Native actor location unavailable.");
+        bool playerInteractionSupported = ActorGuards.IsPlayerBound(_actor);
         var point = farmer.TilePoint;
-        bool festival = ActorGuards.FestivalFreeRoam;
+        bool festival = ReferenceEquals(loc, Game1.currentLocation) && ActorGuards.FestivalFreeRoam;
         IEnumerable<NPC> visibleNpcs = festival ? Game1.CurrentEvent!.actors : loc.characters;
         var actions = new List<object>();
         var fishing = new List<object>();
@@ -36,8 +35,9 @@ public sealed partial class CompanionMechanicsCoordinator
             {
                 int distance = Math.Abs(x-point.X)+Math.Abs(y-point.Y);
                 row["distanceTiles"] = distance;
-                row["canInteractNow"] = distance <= 1 && (!Game1.eventUp || festival) && Game1.activeClickableMenu is null;
-                row["operation"] = f.GetValueOrDefault("type") switch { "parcel" => "open_chest", "bed" => "sleep", _ => "interact_tile" };
+                row["canInteractNow"] = playerInteractionSupported && distance <= 1 && (!Game1.eventUp || festival) && Game1.activeClickableMenu is null;
+                row["operation"] = f.GetValueOrDefault("type") switch { "parcel" => "open_chest", "bed" => playerInteractionSupported ? "sleep" : "rest", _ => "interact_tile" };
+                row["playerOnly"] = f.GetValueOrDefault("type") is not "bed" || playerInteractionSupported;
             }
             return row;
         }).ToList();
@@ -58,7 +58,7 @@ public sealed partial class CompanionMechanicsCoordinator
                     ["footprint"] = footprint.Select(tile => new {x=tile.X,y=tile.Y}).ToArray(),
                     ["passableApproachTiles"] = approaches.Select(tile => new {x=tile.X,y=tile.Y}).ToArray(),
                     ["canInteractNow"] = !Game1.eventUp && Game1.activeClickableMenu is null
-                        && footprint.Any(tile => p.Tile.IsAdjacentTo(tile)),
+                        && footprint.Any(tile => _actor.Tile.IsAdjacentTo(tile)),
                     ["approachRouteKnown"] = false,
                     ["provenance"] = "current-native-shipping-bin-footprint-and-passability",
                     ["note"] = "Approach tiles are passable observations, not proven routes. Query a selected approach tile if needed; ship_items still requires explicit model-selected items." });
@@ -92,7 +92,7 @@ public sealed partial class CompanionMechanicsCoordinator
             if (!string.IsNullOrWhiteSpace(action) || !string.IsNullOrWhiteSpace(touch))
                 actions.Add(new { tile=new {x,y},action,touchAction=touch,
                     distanceTiles=Math.Abs(x-point.X)+Math.Abs(y-point.Y),
-                    canInteractNow=!string.IsNullOrWhiteSpace(action) && Math.Abs(x-point.X)+Math.Abs(y-point.Y)<=1
+                    canInteractNow=playerInteractionSupported && !string.IsNullOrWhiteSpace(action) && Math.Abs(x-point.X)+Math.Abs(y-point.Y)<=1
                         && (!Game1.eventUp || festival) && Game1.activeClickableMenu is null });
             if (loc.isWaterTile(x,y) && fishing.Count < 24)
             {
@@ -105,7 +105,7 @@ public sealed partial class CompanionMechanicsCoordinator
                 }
             }
         }
-        object? menuChoices = Menus.CompanionMenuClock.IsConversation(Game1.activeClickableMenu) ? null : Game1.activeClickableMenu switch {
+        object? menuChoices = !playerInteractionSupported || Menus.CompanionMenuClock.IsConversation(Game1.activeClickableMenu) ? null : Game1.activeClickableMenu switch {
             DialogueBox {isQuestion:true} question => (question.responses ?? Array.Empty<Response>()).Select((response,i) => new {index=i,label=response.responseText,operation="native_answer"}).ToArray(),
             MineElevatorMenu elevator => elevator.elevators.Select((c,i)=>new {index=i,label=c.name}).ToArray(),
             ItemGrabMenu grab => grab.ItemsToGrabMenu.actualInventory.Select((item,i)=>new {index=i,itemId=item?.QualifiedItemId,name=item?.DisplayName,stack=item?.Stack}).ToArray(),
@@ -115,7 +115,7 @@ public sealed partial class CompanionMechanicsCoordinator
             _ => null
         };
         var festivalExits = new List<object>();
-        if (festival)
+        if (festival && playerInteractionSupported)
         {
             int width = loc.Map.Layers[0].LayerWidth, height = loc.Map.Layers[0].LayerHeight;
             void AddBoundary(int x, int y, int outsideX, int outsideY)
@@ -131,7 +131,9 @@ public sealed partial class CompanionMechanicsCoordinator
             eventIsFestival=Game1.CurrentEvent?.isFestival == true, eventAllowsMovement=festival,
             festivalName=festival ? Game1.CurrentEvent!.FestivalName : null, festivalExits,
             festivalNote=festival ? "Native festival free-roam: same-map movement and interactions are available. Festival clock does not advance to tomorrow by waiting. Native boundary exits open a question; no leave/participate choice is automatic." : null,
-            locationId=loc.NameOrUniqueName,worldRevision=_observer.WorldRevision,playerTile=new{x=point.X,y=point.Y},
+            locationId=loc.NameOrUniqueName,worldRevision=_observer.WorldRevision,
+            actorMode=playerInteractionSupported ? "player" : "companion", actorTile=new{x=point.X,y=point.Y},
+            playerTile=playerInteractionSupported ? new{x=point.X,y=point.Y} : null, playerInteractionSupported,
             scope="current-location-public-observation",interactionRadius=wholeFarm ? (int?)null : 12,fishingRadius=wholeFarm ? (int?)null : 12,
             farmSpatialScope=wholeFarm ? "whole-farm" : null,fixtures,
             // Public current-map transitions are navigation geometry, not hidden
@@ -148,7 +150,7 @@ public sealed partial class CompanionMechanicsCoordinator
                 name=n.Name,displayName=n.displayName,tile=new{x=n.TilePoint.X,y=n.TilePoint.Y},
                 isConversationCharacter=n is not Horse,
                 distanceTiles=Math.Abs(n.TilePoint.X-point.X)+Math.Abs(n.TilePoint.Y-point.Y),
-                canInitiateConversation=n is not Horse && Math.Abs(n.TilePoint.X-point.X)+Math.Abs(n.TilePoint.Y-point.Y)<=1
+                canInitiateConversation=playerInteractionSupported && n is not Horse && Math.Abs(n.TilePoint.X-point.X)+Math.Abs(n.TilePoint.Y-point.Y)<=1
                     && (!Game1.eventUp || festival) && Game1.activeClickableMenu is null,
                 approachRequired=Math.Abs(n.TilePoint.X-point.X)+Math.Abs(n.TilePoint.Y-point.Y)>1
             }).ToArray(),
@@ -158,7 +160,8 @@ public sealed partial class CompanionMechanicsCoordinator
             groundPickupItems=groundItems.Take(48).ToArray(),groundPickupItemsTruncated=groundItems.Count>48,
             groundPickupScope="current-location-supported-native-pickups",
             fishingSpots=fishing.ToArray(),fishingSpotsTruncated=fishing.Count>=24,
-            nativeMenu=Menus.CompanionMenuClock.IsConversation(Game1.activeClickableMenu) ? "CompanionConversation" : Game1.activeClickableMenu?.GetType().Name,menuChoices,nativeUi=CaptureNativeUi(),
+            nativeMenu=playerInteractionSupported ? (Menus.CompanionMenuClock.IsConversation(Game1.activeClickableMenu) ? "CompanionConversation" : Game1.activeClickableMenu?.GetType().Name) : null,
+            menuChoices,nativeUi=playerInteractionSupported ? CaptureNativeUi() : null,
             hasFishingRod=farmer.Items.Any(i=>i is FishingRod),hasWeapon=farmer.Items.OfType<MeleeWeapon>().Any(w=>!w.isScythe()),
             note="Pickup candidates are currently present native loose items or grabbable objects, not cleared terrain. Native proximity may already collect drops: inspect inventoryDelta before scheduling another pickup. NPCs and map actions are live public locations; routes still require native collision. Fish selection/catch and mine contents are unknown until actual native play. No unlock is inferred from a geometric route."
         };

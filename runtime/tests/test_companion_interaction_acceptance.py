@@ -164,6 +164,7 @@ def test_conversation_cache_rejects_switching_to_another_loaded_save(tmp_path, m
         monkeypatch.setenv("STARDEW_LIFE_SAVE_ID", "old-farm")
         data = tmp_path / "data"
         data.mkdir()
+        (data / "life-turn.json").write_text(json.dumps({"requestId": "old-farm-turn", "saveId": "old-farm"}))
         (data / "life-snapshot.json").write_text(json.dumps({
             "saveId": "new-farm", "capturedAt": time.time(), "worldRevision": 1,
             "payload": {"world": {"year": 1, "season": "spring", "dayOfMonth": 2}},

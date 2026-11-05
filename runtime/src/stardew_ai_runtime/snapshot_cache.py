@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -42,4 +43,16 @@ def write_cache(path: Path, value: Any) -> None:
     with cache_lock(path):
         temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-        temp.replace(path)
+        replace_cache_file(temp, path)
+
+
+def replace_cache_file(temp: Path, path: Path) -> None:
+    """Publish while the caller owns cache_lock, tolerating brief Windows handle contention."""
+    for attempt in range(4):
+        try:
+            temp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 3:
+                raise
+            time.sleep(0.05 * (attempt + 1))

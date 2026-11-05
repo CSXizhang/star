@@ -39,7 +39,7 @@ from stardew_ai_runtime.companion_milestones import (
 )
 from stardew_ai_runtime.companion_profile import CompanionProfileStore
 from stardew_ai_runtime.decision_context import water_can_resources
-from stardew_ai_runtime.game_tools import GAME_TOOLS, register_game_tools
+from stardew_ai_runtime.game_tools import GAME_TOOLS, operation_description, register_game_tools
 from stardew_ai_runtime.mcode_wire_schema import mcode_tool_schema
 from stardew_ai_runtime.mcp_contract import (
     _CAPABILITY_EXAMPLES as _CAPABILITY_EXAMPLES,
@@ -200,7 +200,7 @@ def create_mcp_server(
     if resolved_surface == "life":  # Legacy CLI/config name; same live game tools.
         resolved_surface = "light"
     inst = instructions if instructions is not None else DEFAULT_MCP_INSTRUCTIONS
-    if instructions is None:
+    if instructions is None and resolved_surface != "light":
         inst += "持续生产授权后可用set_autonomy(goal_id=...)绑定目标并接续，不改变空闲主动帮忙开关。规模工作分批，由模型选择补水/补给/食物恢复及下一业务。持续生产goal保持active，等待用manage_todo的gameTime/machineReady/resource条件，不轮询倒计时；处理完待办再按需记录下一周期。observe_production提供指定地图地面鸡蛋/水源/食物，鸡蛋用pickup_items；building_services能力组提供原生建造升级购动物目录与服务操作。"
     server_type = _McodeFastMCP if os.environ.get("STARDEW_MCP_WIRE_STYLE") == "mcode" else FastMCP
     mcp = server_type(server_name, instructions=inst)
@@ -684,6 +684,7 @@ def create_mcp_server(
                 },
                 "saveId": res.get("saveId", "unknown"),
                 "worldRevision": res.get("worldRevision", 0),
+                "observedAt": res.get("observedAt"),
             }
         except SchedulerError as ex:
             raise ToolError(f"Failed to get status: {ex}") from None
@@ -1093,7 +1094,7 @@ def create_mcp_server(
         id: str | None = None,
         nodeId: str | None = None,
     ) -> dict[str, Any]:
-        """Milestone plan nodes discussed with the player (near-term key game dates).
+        """Discuss and save milestone nodes in chat or plan. propose saves a suggestion; adopt/revise require player agreement, neither mode grants approval. A clear instruction or "you decide" permits propose and adopt together; a question alone does not. Use the observed "node_id" for adopt/revise/defer/reopen; list with node_id reads its full scope. Saving does not execute actions.
 
         Facts come from the official English Wiki with sourceUrl on every node.
         Actions: list (always allowed), propose/adopt/revise/defer/reopen (write
@@ -1542,7 +1543,7 @@ def create_mcp_server(
         trigger: dict[str, Any] | None = None,
         expiry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Remember a long-term goal (kind='goal') or a future cross-day todo (kind='todo').
+        """Remember a goal or future todo. kind='todo' requires trigger, e.g. {"type":"calendar","year":2,"season":"spring","day":3}; kind='goal' ignores trigger. Inventory and crop triggers are also supported.
 
         Model-created goals are always recorded with source=agent, so the model can
         never label its own idea as a player instruction.
@@ -2204,7 +2205,7 @@ def create_mcp_server(
         assert_life_turn_current()
         client = await sched.ensure_connected()
         token = decision_token()
-        if token:
+        if token and resolved_surface not in {"light", "life"}:
             store = work_for_run()
             store._assert_decision_valid(store.state(client.save_id), token)
         if client.actor_mode != "player":
@@ -2217,7 +2218,7 @@ def create_mcp_server(
 
     @mcp.tool()
     async def observe_player_activities() -> dict[str, Any]:
-        """Read live current-map NPC names/tiles, public map actions and shore stand/facing options. Unobserved future loot or locks remain unknown. Use native walking to approach; touch actions require walking onto their tiles."""
+        """Read the current actor's map NPCs, public actions and shore geometry in either mode. actorTile belongs to that actor; playerInteractionSupported marks player-only interactions, and companion observations do not expose the player's menu. Use native walking to approach; future loot or locks remain unknown."""
         result = await sched.observe_player_activities()
         if isinstance(result.get("activities"), dict):
             await record_observation_recovery(result, lambda sid:
@@ -2516,21 +2517,19 @@ def create_mcp_server(
             state = store.state(sid)
             if state.paused:
                 raise WorkStateError("WORK_STOPPED: work is paused")
-            if not decision_token() and os.environ.get("STARDEW_LIFE_TURN_ID"):
-                # A conversation may start while native work is busy. Acquire
-                # authority at dispatch only once that work has actually settled.
-                token = uuid.uuid4().hex
-                store.begin_decision(sid, token, require_idle=True,
-                                     request_id=os.environ["STARDEW_LIFE_TURN_ID"])
-                os.environ["STARDEW_DECISION_TOKEN"] = token
-                state = store.state(sid)
-            store._assert_decision_valid(state, decision_token())
+            # Immediate execution belongs to the live conversation and native
+            # actor, not the expiring token of the retired short-job queue.
         except WorkStateError as ex:
             raise ToolError(str(ex)) from None
         await validate_actor_operation(name)
-        goal = next((g for g in state.goals if g.id == (state.decision.get("goalScope") or state.decision.get("goalId"))), None)
+        try:
+            lease = read_cache(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "life-turn.json")
+        except FileNotFoundError:
+            lease = {}
+        scope = lease.get("goalScope") or state.decision.get("goalScope") or state.decision.get("goalId")
+        goal = next((g for g in state.goals if g.id == scope), None)
         args = bind_execution_scope_params(name, args, goal.constraints if goal else {})
-        validated = validate_base_arguments(name, args, for_plan=True)
+        validated = validate_base_arguments(name, args)
         parsed = base_metadata[name].arg_model.model_validate(validated)
         previous_wait = getattr(sched, "await_terminal_results", False)
         sched.await_terminal_results = True
@@ -2769,6 +2768,13 @@ def create_mcp_server(
                         os.environ[key] = str(context[key])
                     else:
                         os.environ.pop(key, None)
+            turn_id = os.environ.get("STARDEW_LIFE_TURN_ID")
+            sid = os.environ.get("STARDEW_LIFE_SAVE_ID")
+            if turn_id and sid:
+                from .turn_messages import exchange
+                assert_life_turn_current(allow_control=True)
+                exchange(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "turn-messages.json",
+                         turn_id, sid, ack_world=True)
             def player_updates():
                 turn_id = os.environ.get("STARDEW_LIFE_TURN_ID")
                 sid = os.environ.get("STARDEW_LIFE_SAVE_ID")
@@ -2778,17 +2784,22 @@ def create_mcp_server(
                 from .turn_messages import exchange
                 return exchange(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data" / "turn-messages.json",
                                 turn_id, sid, take=True)
+            def update_fields(updates):
+                return {key: items for key, items in {
+                    "worldEvents": [m for m in updates if m.get("kind") == "world_changed"],
+                    "playerMessages": [m for m in updates if m.get("kind") != "world_changed"],
+                }.items() if items}
             if fn is execute_observed_action:
                 updates = player_updates()
                 if updates:
-                    return {"status": "player_update", "actionExecuted": False,
-                            "playerMessages": updates,
-                            "nextStep": "Respond to the player's new request and reconsider this action before dispatching."}
+                    return {"status": "world_update" if any(m.get("kind") == "world_changed" for m in updates) else "player_update",
+                            "actionExecuted": False, **update_fields(updates),
+                            "nextStep": "Reconsider this action using the new world facts and player requests before dispatching."}
             result = await fn(*args, **kwargs)
             updates = player_updates() if isinstance(result, dict) else []
             if updates:
-                result = {**result, "playerMessages": updates,
-                          "nextStep": "Use the new player request to choose the next action."}
+                result = {**result, **update_fields(updates),
+                          "nextStep": "Use the updated world and player requests to choose the next action."}
             return result
         return guarded
 
@@ -2830,7 +2841,7 @@ def create_mcp_server(
         passive = passive or tool.name == "recall_memory"
         tool.annotations = ToolAnnotations(readOnlyHint=passive, destructiveHint=not passive,
                                            openWorldHint=tool.name in {"query_wiki", "call_capability"})
-        tool.description = "Stardew Valley (SMAPI), current saved game. " + tool.description
+        tool.description = "Stardew Valley (SMAPI), current saved game. " + operation_description(tool, full=True)
         exempt = {"say_to_player", "answer_player_decision", "player_control", "request_player_decision", "begin_game_turn", "submit_plan", "remember_intent", "record_decision_note", "manage_goal", "manage_goals", "manage_plan", "manage_todo", "manage_todos", "manage_milestones", "manage_companion", "call_capability", "set_autonomy", "autonomy_status", "run_next_step", "dispatch_plan_operation", "reconcile_plan_command", "cancel_plan_command", "work_plan_overview"}
         exempt.update({"save_memory", "save_method", "forget_memory", "develop_capability", "manage_capability", "prepare_capability_builder"})
         if tool.name not in exempt and tool.name not in readonly and not tool.name.startswith(("query_", "get_", "list_", "discover_", "observe_")):

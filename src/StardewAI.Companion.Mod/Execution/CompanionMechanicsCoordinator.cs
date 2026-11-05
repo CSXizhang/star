@@ -69,7 +69,9 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         var result = new SkillResultPayload(request.CommandId, request.TaskId, status,
             status == "succeeded" ? 1 : 0, 0, status == "failed" ? 1 : 0, _observer.WorldRevision, new(),
             SkillId: "rest", Details: new Dictionary<string, object> { ["stamina"] = _actor.Stamina,
-                ["targetStamina"] = request.Parameters.TargetStamina!.Value, ["restState"] = Rest.State },
+                ["targetStamina"] = request.Parameters.TargetStamina!.Value, ["restState"] = Rest.State,
+                ["finalLocation"] = _actor.LocationName,
+                ["finalTile"] = new TileCoord(_actor.Tile.X, _actor.Tile.Y) },
             Error: error == null ? null : new SkillResultError("REST_INTERRUPTED", error, null, false));
         _currentExecuteEnvelope = envelope;
         CompleteExecution(result);

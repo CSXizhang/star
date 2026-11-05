@@ -223,7 +223,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         location_id: str = "Farm",
         items: Annotated[list[ItemQuantity] | None, BeforeValidator(_unwrap_item_array)] = None,
     ) -> dict[str, Any]:
-        """Deposit explicitly chosen backpack items into chest at (chest_x, chest_y).
+        """Deposit into chest at (chest_x, chest_y): use either items [{itemId,count}] for exact quantities or item_ids for whole stacks, never both.
 
         Native player mode requires items or item_ids and can store explicitly
         chosen tools. The model decides what to retain, store or ship; no default
@@ -457,7 +457,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
     @mcp.tool()
     async def hoe_tiles(
-        tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], detail: bool = False
+        tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], detail: bool = False,
+        location_id: str = "Farm",
     ) -> dict[str, Any]:
         """Use hoe on the specified non-empty list of dirt tiles to till them.
 
@@ -467,7 +468,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         pre_rev_getter = getattr(sched, "latest_world_revision", 0)
         pre_rev = pre_rev_getter() if callable(pre_rev_getter) else int(pre_rev_getter)
         try:
-            res = await sched.execute_hoe_tiles(tiles=_tile_dicts(tiles))
+            res = await sched.execute_hoe_tiles(tiles=_tile_dicts(tiles), location_id=location_id)
 
             if res.get("status") == "executing" or res.get("terminalState") == "running":
                 return {
@@ -531,7 +532,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
     @mcp.tool()
     async def plant_seeds(
-        seed_item_id: str, tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], detail: bool = False
+        seed_item_id: str, tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], detail: bool = False,
+        location_id: str = "Farm",
     ) -> dict[str, Any]:
         """Plant specified seeds into the declared tilled empty tiles.
 
@@ -541,7 +543,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         pre_rev_getter = getattr(sched, "latest_world_revision", 0)
         pre_rev = pre_rev_getter() if callable(pre_rev_getter) else int(pre_rev_getter)
         try:
-            res = await sched.execute_plant_seeds(seed_item_id=seed_item_id, tiles=_tile_dicts(tiles))
+            res = await sched.execute_plant_seeds(seed_item_id=seed_item_id, tiles=_tile_dicts(tiles), location_id=location_id)
 
             if res.get("status") == "executing" or res.get("terminalState") == "running":
                 return {
@@ -1012,7 +1014,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
     @mcp.tool()
     async def rest(target_stamina: float) -> dict[str, Any]:
-        """Rest the companion in a real bed until the chosen stamina target, then wake.
+        """Rest the companion in a real bed until the chosen stamina target, then wake; the result includes finalLocation and finalTile.
 
         Choose the target from remaining work; full recovery is optional. Player mode uses native sleep instead.
         """

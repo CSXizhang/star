@@ -25,7 +25,7 @@ Rules enforced here:
 * The context is rebuilt from the latest snapshot every time; old snapshots are
   never appended (so it cannot grow without bound). Note this bounds the *payload
   formatter*; it does not erase the provider's own earlier prompt history, which
-  is only bounded by provider-session rotation.
+  is maintained by the original session host through native compaction.
 * Tool results are post-execution facts: once the runtime has a result it is the
   latest fact, and the model is not asked to re-query to confirm it.
 
@@ -772,7 +772,13 @@ def _attach_companion_memory(
 def model_decision_context(context: dict[str, Any]) -> dict[str, Any]:
     """Keep one resource source in prompts without changing the public facts API."""
     result = dict(context)
+    # Tool signatures belong to the registered tool schema, not to every world
+    # snapshot. Clock/wallet interpretation is in the shared game instructions.
+    result.pop("nativeUiContract", None)
+    result.pop("timeFormat", None)
     resources = result.get("resources")
+    if isinstance(resources, dict):
+        resources = result["resources"] = {key: value for key, value in resources.items() if key != "note"}
     companion = resources.get("companion") if isinstance(resources, dict) else None
     if isinstance(companion, dict):
         for alias, canonical in (("inventory", "inventory"), ("stamina", "stamina"),
@@ -782,6 +788,10 @@ def model_decision_context(context: dict[str, Any]) -> dict[str, Any]:
     # Historical ledgers remain queryable; unrelated past requests are not part
     # of the current decision. Keep the uncertainty flag and the current request.
     decision = result.get("decision") or {}
+    task = result.get("currentTask")
+    if isinstance(task, dict):
+        result["currentTask"] = {key: value for key, value in task.items()
+                                 if key not in result or result[key] != value}
     request_ids = {decision.get("requestId"), *decision.get("requestIds", [])}
     totals = result.get("confirmedRequestTotals")
     if isinstance(totals, dict):

@@ -164,22 +164,28 @@ public class CompanionMechanicsCoordinatorTests
         Assert.Null(rejection);
         Assert.Equal(80, coordinator.Rest.RecoveryTarget);
         Assert.Null(coordinator.LastSkillResultPayload);
+        actor.SetLocation("FarmHouse", new TileCoordinate(12, 7));
         coordinator.OnCancelSkill(new SkillCancelPayload("cancel", "test", true, "safe-point"),
             envelope with { CorrelationId = request.CommandId });
         Assert.Equal("cancelled", coordinator.LastSkillResultPayload!.TerminalState);
         Assert.Equal("awake", coordinator.Rest.State);
+        Assert.Equal("FarmHouse", coordinator.LastSkillResultPayload.Details!["finalLocation"]);
+        Assert.Equal(new TileCoord(12, 7), coordinator.LastSkillResultPayload.Details["finalTile"]);
 
         actor.Stamina = 80;
         Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-done" }, envelope, out rejection));
         coordinator.Update(null, 1);
         Assert.Equal("succeeded", coordinator.LastSkillResultPayload!.TerminalState);
         Assert.Equal("rest-done", coordinator.LastSkillResultPayload.CommandId);
+        Assert.Equal("FarmHouse", coordinator.LastSkillResultPayload.Details!["finalLocation"]);
+        Assert.Equal(new TileCoord(12, 7), coordinator.LastSkillResultPayload.Details["finalTile"]);
 
         actor.Stamina = 25;
         Assert.True(coordinator.TryAcceptSkillExecute(request with { CommandId = "rest-blocked" }, envelope, out rejection));
         typeof(CompanionRestController).GetProperty("State")!.SetValue(coordinator.Rest, "waiting-for-bed");
         coordinator.Update(null, 2);
         Assert.Equal("failed", coordinator.LastSkillResultPayload!.TerminalState);
+        Assert.Equal("FarmHouse", coordinator.LastSkillResultPayload.Details!["finalLocation"]);
         Assert.Equal("awake", coordinator.Rest.State);
         Assert.False(coordinator.Rest.IsDaytimeRest);
         Assert.Null(coordinator.Rest.RecoveryTarget);

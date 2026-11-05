@@ -24,11 +24,27 @@ public class CompanionRestRecoveryTests
         return new(actor, new NavigationStateMachine(actor, observer, new SameMapNavigator(observer), new WorldMapGraph()));
     }
 
-    [Theory]
-    [InlineData(0, 270, true)] [InlineData(27, 270, false)] [InlineData(28, 270, false)]
-    [InlineData(20, 100, false)] [InlineData(21, 100, false)] [InlineData(0, 0, false)]
-    public void OnlyExhaustionForcesRest(float stamina, int maximum, bool expected) =>
-        Assert.Equal(expected, CompanionBedtime.NeedsDaytimeRest(stamina, maximum));
+    private sealed class NativeRestActor : MechanicsActor, IFarmerActor
+    {
+        Farmer? IFarmerActor.GameFarmer { get; } = (Farmer)FormatterServices.GetUninitializedObject(typeof(Farmer));
+    }
+
+    [Fact]
+    public void ExhaustionAndLateTimeDoNotTakeOverActiveWork()
+    {
+        int previous = Game1.timeOfDay;
+        try
+        {
+            Game1.timeOfDay = 2400;
+            var rest = CreateRest(new NativeRestActor { Stamina = 0 });
+            var work = new Work();
+            rest.Update(null, 1, work);
+            Assert.Equal("awake", rest.State);
+            Assert.Equal(0, work.PauseRequests);
+            Assert.Empty(work.Cancellations);
+        }
+        finally { Game1.timeOfDay = previous; }
+    }
 
     [Fact]
     public void DaytimeRestWakesAtRequestedTargetInsteadOfMaximum()
@@ -57,26 +73,28 @@ public class CompanionRestRecoveryTests
     }
 
     [Fact]
-    public void PauseKeepsDaytimeSleepAndBedtimePromotesItToOvernightSleep()
+    public void BedtimeDoesNotChangeExplicitRecoveryTarget()
     {
         int previous = Game1.timeOfDay;
         try
         {
             Game1.timeOfDay = 1200;
-            var actor = new MechanicsActor();
+            var actor = new MechanicsActor { Stamina = 2 };
             var rest = CreateRest(actor);
             rest.RestoreSleep(1150, daytime: true);
+            rest.BeginDaytimeRest(80);
             rest.Paused = true;
             rest.Update(null, 1, null);
             Assert.Equal("resting", rest.State);
             rest.Paused = false;
             Game1.timeOfDay = 2330;
             rest.Update(null, 2, null);
-            Assert.Equal("sleeping", rest.State);
-            Assert.False(rest.IsDaytimeRest);
-            Assert.Equal(2330, rest.SleepStartedAt);
+            Assert.Equal("resting", rest.State);
+            Assert.True(rest.IsDaytimeRest);
+            Assert.Equal(1150, rest.SleepStartedAt);
+            actor.Stamina = 80;
             rest.Update(null, 3, null);
-            Assert.Equal("sleeping", rest.State);
+            Assert.Equal("awake", rest.State);
         }
         finally { Game1.timeOfDay = previous; }
     }

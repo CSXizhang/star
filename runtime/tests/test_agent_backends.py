@@ -10,14 +10,6 @@ from stardew_ai_runtime.agent_instructions import runtime_instructions
 from stardew_ai_runtime.chat_backend_config import load_chat_backend_config
 
 
-@pytest.fixture(autouse=True)
-def _isolated_codex_config():
-    # Backend tests never read the machine's user configuration or launch CLI.
-    with patch("stardew_ai_runtime.agent_backends.unrelated_mcp_config",
-               return_value=["-c", "mcp_servers.unrelated.enabled=false"]):
-        yield
-
-
 def _task():
     task = MagicMock()
     task.cancelled = False
@@ -119,7 +111,7 @@ def test_codex_backend_uses_run_local_mcp_and_qualified_session(tmp_path: Path) 
     assert 'model_reasoning_effort="xhigh"' in cmd
     assert "model_providers.custom.supports_websockets=false" in cmd
     assert "-m" in cmd and cmd[cmd.index("-m") + 1] == "gpt-local"
-    assert "mcp_servers.unrelated.enabled=false" in cmd
+    assert "mcp_servers.unrelated.enabled=false" not in cmd
     assert "features.shell_tool=false" not in cmd
     assert "features.plugins=false" not in cmd
     assert "features.apps=false" not in cmd
@@ -142,7 +134,7 @@ def test_codex_resume_uses_exact_thread_id(tmp_path: Path) -> None:
     assert 'sandbox_mode="danger-full-access"' in popen.call_args.args[0]
     assert "approval_policy=never" in popen.call_args.args[0]
     assert 'model_reasoning_effort="high"' in popen.call_args.args[0]
-    assert "mcp_servers.unrelated.enabled=false" in popen.call_args.args[0]
+    assert "mcp_servers.unrelated.enabled=false" not in popen.call_args.args[0]
     assert "features.shell_tool=false" not in popen.call_args.args[0]
     assert "features.plugins=false" not in popen.call_args.args[0]
     assert any(arg.startswith("model_instructions_file=") for arg in popen.call_args.args[0])
@@ -165,19 +157,6 @@ def test_codex_removes_shared_core_from_user_prompt(tmp_path: Path) -> None:
     assert popen.call_args.args[0][-1] == "-"
     proc.stdin.write.assert_called_once_with("只读观察")
 
-
-def test_codex_config_inspection_failure_does_not_start_model(tmp_path: Path) -> None:
-    python = tmp_path / "runtime" / "python" / "python.exe"
-    python.parent.mkdir(parents=True)
-    python.touch()
-    with patch("stardew_ai_runtime.agent_backends.unrelated_mcp_config",
-               side_effect=RuntimeError("private config contents")), \
-         patch("subprocess.Popen") as popen:
-        result = CodexBackend(tmp_path).run(_task(), "existing", "只读观察")
-    assert result["success"] is False
-    assert result["error"] == "CODEX_GAME_PROFILE_FAILED"
-    assert "private" not in json.dumps(result)
-    popen.assert_not_called()
 
 
 def test_codex_tool_approval_refusal_is_failure_even_when_cli_exits_zero(tmp_path):

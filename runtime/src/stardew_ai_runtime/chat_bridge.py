@@ -37,6 +37,7 @@ from typing import Any
 
 from stardew_ai_runtime.agent_backends import (
     AgyBackend,
+    BackendProgress,
     CodexBackend,
     DshBackend,
     KimiBackend,
@@ -157,6 +158,8 @@ from stardew_ai_runtime.scheduler import (
     resolve_discovery,
 )
 from stardew_ai_runtime.snapshot_cache import cache_lock, write_cache
+from stardew_ai_runtime.turn_context import compose_turn_prompt
+from stardew_ai_runtime.turn_execution import TurnExecutionMixin, execute_provider
 from stardew_ai_runtime.usage_display import UsageDisplay
 from stardew_ai_runtime.usage_meter import normalize_usage
 from stardew_ai_runtime.websocket_client import (
@@ -791,6 +794,7 @@ class ActiveChatTask:
     decision_token: str | None = None
     decision_day: str | None = None
     provider_conversation_id: str | None = None
+    original_request: dict[str, Any] | None = None
     instructions_text: str | None = None
     # Full original context is retained only for a provider's fresh-session recovery.
     provider_bootstrap_prompt: str | None = None
@@ -800,9 +804,12 @@ class ActiveChatTask:
     goal_scope: str | None = None
     goal_default: str | None = None
     work_request_ids: list[str] = field(default_factory=list)
+    world_change_at: float | None = None
+    world_change_version: int = 0
+    native_progress_at: float = 0.0
 
 
-class ChatBridge:
+class ChatBridge(TurnExecutionMixin):
     """Bridges WebSocket /chat messages to agy CLI executions with lifecycle and cancel management."""
 
     def __init__(
@@ -880,6 +887,7 @@ class ChatBridge:
         self._last_day_settlement: dict[str, Any] | None = None
         self._last_native_ui_recovery_signal: tuple[Any, ...] | None = None
         self._autonomy_generation = 0
+        self._live_player_wakeups: dict[str, str] = {}
         self._autonomy_last_snapshot_at: dict[str, float] = {}
         self._autonomy_pending_snapshot: dict[str, tuple[Envelope, set[asyncio.Task], WebSocketClient | None]] = {}
         self._autonomy_debounce_tasks: dict[str, asyncio.Task] = {}
@@ -1641,6 +1649,7 @@ class ChatBridge:
             wakeup.cancel()
             await asyncio.gather(wakeup, return_exceptions=True)
         self._autonomy_wakeup_snapshots.pop(save_id, None)
+        self._live_player_wakeups.pop(save_id, None)
         if self._plan_worker is not None:
             await self._plan_worker.stop()
         active = self._active_task.async_task if self._active_task else None
@@ -1749,6 +1758,17 @@ class ChatBridge:
                         envelope.payload if isinstance(envelope.payload, dict) else None
                     )
                     self._latest_snapshot_revision = envelope.world_revision
+                    active = self._active_task
+                    companion = (self._latest_snapshot_payload or {}).get("companion") or {}
+                    if active and companion.get("activeCommandId"):
+                        active.last_native_command_id = companion["activeCommandId"]
+                        # Only changed action facts extend silence, not the clock
+                        # or an otherwise identical periodic snapshot.
+                        progress = tuple(companion.get(k) for k in (
+                            "activeCommandId", "activity", "locationId", "tileX", "tileY", "stamina", "waterCanLevel"))
+                        if progress != getattr(active, "native_progress", None):
+                            active.native_progress = progress
+                            active.native_progress_at = time.monotonic()
                     self._latest_snapshot_observed_at = (
                         self._latest_snapshot_payload.get("observedAt", envelope.sent_at.timestamp())
                         if self._latest_snapshot_payload is not None else None
@@ -1909,7 +1929,8 @@ class ChatBridge:
             return
         if not save_id or self._autonomy is None or envelope.message_type != "world.snapshot":
             return
-        restored = self._restore_accepted_preset_scope(save_id)
+        live_player = self._uses_live_player_loop()
+        restored = None if live_player else self._restore_accepted_preset_scope(save_id)
         if restored:
             rid, goal_id = restored
             reply = Envelope.create_chat_reply(self.instance_id, rid, "selected", "继续已授权的预设目标。",
@@ -1923,7 +1944,7 @@ class ChatBridge:
                     self.instance_id, notice["id"], "player-decision", notice["message"], save_id=save_id))
                 if delivered:
                     self._work_store.acknowledge_player_notice(save_id, notice["id"])
-        if self._preset_business_blocked(save_id):
+        if not live_player and self._preset_business_blocked(save_id):
             await self._maybe_notify_preset_terminal(ws, save_id)
             return
         rest_state = ((envelope.payload or {}).get("companion") or {}).get("restState")
@@ -1940,10 +1961,11 @@ class ChatBridge:
             self._autonomy_wakeup_snapshots[save_id] = (envelope, tracked_tasks, ws)
             return
         state = self._autonomy.state(save_id)
-        if ((not state.enabled and not state.goal_scope) or state.paused
+        if state.paused or (not live_player and (
+                (not state.enabled and not state.goal_scope)
                 or self._autonomy.is_cooling_down(save_id)
                 or rest_state == "resting"
-                or self._bedtime_winding_down(save_id, envelope.payload)):
+                or self._bedtime_winding_down(save_id, envelope.payload))):
             return
         now = time.monotonic()
         previous = self._autonomy_last_snapshot_at.get(save_id)
@@ -1979,7 +2001,9 @@ class ChatBridge:
                     if prepared is None:
                         return
                     fingerprint, prompt = prepared
-                    if not self._autonomy.record_world_event(save_id, fingerprint, current.world_revision):
+                    if live_player:
+                        self._live_player_wakeups[save_id] = fingerprint
+                    elif not self._autonomy.record_world_event(save_id, fingerprint, current.world_revision):
                         return
                     request_id = f"autonomy-{uuid.uuid4().hex}"
                     self._autonomy_requests[request_id] = fingerprint
@@ -2058,6 +2082,8 @@ class ChatBridge:
 
     def _maybe_arm_hold_recovery(self, save_id: str | None, payload: dict[str, Any] | None) -> None:
         """Bound protective recovery by native progress, independently of hold IDs."""
+        if self._uses_live_player_loop():
+            return  # Immediate turns observe the hold directly; no legacy retry budget.
         if not save_id or self._autonomy is None or not isinstance(payload, dict):
             return
         if getattr(self, "actor_mode", None) != "player":
@@ -2132,8 +2158,30 @@ class ChatBridge:
             self._work_store.set_outbox_retry_block(save_id, reason)
         logger.error("Native recovery paused for %s: %s; no further automatic model retries.", save_id, reason)
 
+    def _uses_live_player_loop(self) -> bool:
+        return not self._enable_plan_worker and self.actor_mode == "player"
+
+    def _prepare_live_player_decision(self, envelope: Envelope, save_id: str) -> tuple[str, str] | None:
+        """Wake the existing session from native facts, independent of goal bookkeeping."""
+        if (self.control_owner != "agent" or self._manual_takeover.get(save_id)
+                or self._active_task is not None or self._autonomy.state(save_id).paused
+                or (self._work_store is not None and self._work_store.state(save_id).paused)):
+            return None
+        snapshot = envelope.payload or {}
+        world = snapshot.get("world") or {}
+        native = snapshot.get("native") or world.get("native") or {}
+        hold = native.get("programHold") or {}
+        fingerprint = f"{envelope.game_session_id}:{hold.get('holdId')}:{self._native_recovery_fingerprint(snapshot)}"
+        if self._live_player_wakeups.get(save_id) == fingerprint:
+            return None
+        # handle_chat_submit supplies the normal confirmed-state delta. Do not
+        # duplicate a full snapshot in the synthetic message or open a new session.
+        return fingerprint, "继续当前游戏：结合原要求、最新观察和已完成结果决定下一步，并及时更新目标与进度记录。"
+
     def _prepare_autonomy_decision(self, envelope: Envelope, save_id: str) -> tuple[str, str] | None:
         """Re-evaluate the latest wakeup while owning the single model slot."""
+        if self._uses_live_player_loop():
+            return self._prepare_live_player_decision(envelope, save_id)
         state = self._autonomy.state(save_id)
         if (
             (not state.enabled and not state.goal_scope)
@@ -2961,11 +3009,7 @@ class ChatBridge:
         companion = snapshot.get("companion") or {}
         if companion.get("restState") in {"winding-down", "returning-home", "waiting-for-bed", "sleeping"}:
             return True
-        profile = self._profile_store.get(save_id).get("profile") if self._profile_store else None
-        bedtime = (profile or {}).get("bedtime", 2400)
-        now = (snapshot.get("world") or {}).get("timeOfDay", 600)
-        # Reserve an hour for the current safe action and the actual route home.
-        return isinstance(now, int) and now // 100 * 60 + now % 100 >= bedtime // 100 * 60 + bedtime % 100 - 60
+        return False  # Bedtime is context, not an automatic work prohibition.
 
 
     def _write_life_snapshot(self, save_id: str | None) -> None:
@@ -3229,41 +3273,21 @@ class ChatBridge:
             key = "external:" + key
             # ACP cannot notify us about compaction performed in the original
             # client between attachments. Every external turn is self-contained.
-            self._prompt_delivery.invalidate_session(key, conversation_id)
-        # All event sources share one state schema. The player suffix is opaque.
-        marker = re.search(r"(?m)^(?:玩家说：|玩家指令：)", prompt)
-        boundary = marker.start() if marker else len(prompt)
-        prefix, player = prompt[:boundary], prompt[boundary:]
-        context = model_decision_context(self._decision_context(active_task.save_id, origin="game", query=active_task.prompt))
+        context = self._decision_context(active_task.save_id, origin="game", query=active_task.prompt)
         context["executionOccupied"] = active_task.execution_deferred
         if self._profile_store and active_task.save_id and getattr(self, "connection_source", "builtin") != "external":
             context["profile"] = (self._profile_store.get(active_task.save_id) or {}).get("profile")
         context["milestones"] = self._life_milestone_summary(active_task.save_id, "chat")
-        # Event metadata is not world state: retain it when canonicalizing snapshots.
-        event = {}
-        for match in re.finditer(r"(?m)^实时上下文：([^\n]*)", prefix):
-            original = json.loads(match.group(1))
-            for event_key in ("projectScope", "objective", "wakeReason", "acceptedArrangement",
-                          "boxRange", "idlePreference", "idleHelpEnabled", "autonomyMode"):
-                if event_key in original:
-                    event[event_key] = original[event_key]
         decision = context.get("decision") or {}
-        event.update(requestId=active_task.request_id, executionOccupied=active_task.execution_deferred)
-        event["goalId"] = decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope
-        # These are already represented in the current state; don't inject duplicates from reload.
-        if isinstance(context.get("reloadSummary"), dict):
-            context["reloadSummary"] = {k: v for k, v in context["reloadSummary"].items()
-                                        if k not in {"goals", "agreementsAndPreferences", "decisions"}}
-        replacement = "实时上下文：" + render_decision_context(context)
-        prefix = re.sub(r"(?m)^实时上下文：[^\n]*", lambda _: replacement, prefix)
-        prompt = prefix + "\n本轮任务：" + json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n" + player
-        if getattr(self, "connection_source", "builtin") == "external":
-            prompt = "沿用原对话的身份、角色指令、称呼和记忆；以下只增加当前游戏场景与操作规则。\n" + prompt
+        prompt = compose_turn_prompt(prompt, context, event={
+            "requestId": active_task.request_id,
+            "goalId": decision.get("goalScope") or decision.get("goalId") or active_task.goal_scope,
+        }, external=getattr(self, "connection_source", "builtin") == "external",
+            original_request=getattr(active_task, "original_request", None))
         sent, pending = self._prompt_delivery.prepare(
             key, conversation_id, prompt,
-            load_instruction_bundle(getattr(self, "actor_mode", None)).text)
-        logger.info("Turn payload stateBytes=%s eventBytes=%s sentBytes=%s",
-                    len(replacement.encode()), len(json.dumps(event, ensure_ascii=False).encode()), len(sent.encode()))
+            load_instruction_bundle(getattr(self, "actor_mode", None)).text,
+            self_contained=getattr(self, "connection_source", "builtin") == "external")
         return key, sent, pending
 
     def _acknowledge_prompt_delivery(self, key: str, pending: dict[str, Any],
@@ -3302,81 +3326,10 @@ class ChatBridge:
                 else:
                     os.environ[key] = value
 
-    async def _join_interrupted_provider(self, active_task: ActiveChatTask, future: asyncio.Future) -> None:
-        """Keep the model slot until its executor has restored turn-local state."""
-        active_task.cancelled = True
-        active_task.abort_reason = active_task.abort_reason or "Chat channel closed"
-        proc = active_task.process
-        if proc is not None and proc.poll() is None:
-            try:
-                terminate = getattr(self._backend, "terminate", None)
-                if self.backend_name == "agy":
-                    terminate_agy_process(proc)
-                elif callable(terminate):
-                    terminate(proc)
-                else:
-                    proc.kill()
-            except Exception:
-                logger.warning("Could not stop interrupted provider", exc_info=True)
-        while True:
-            try:
-                active_task.interrupted_result = await asyncio.shield(future)
-                break
-            except asyncio.CancelledError:
-                # Repeated cancel/disconnect requests still cannot abandon an
-                # executor which owns process-global turn environment variables.
-                if future.cancelled():
-                    break
-            except Exception:
-                logger.debug("Interrupted provider exited with an error", exc_info=True)
-                break
 
-    async def _settle_turn_messages(self, active_task, result):
-        if not self.run_dir:
-            return result
-        from .turn_messages import exchange
-        delivered = exchange(self.run_dir / "data" / "turn-messages.json",
-                             active_task.request_id, active_task.save_id)
-        ids = {message["requestId"] for message in delivered}
-        # Tool-boundary delivery is confirmed independently of the turn's outcome.
-        if self._work_store is not None:
-            self._work_store.mark_midflight_consumed(active_task.save_id, list(ids))
-        for item in list(self._life_queue):
-            if item["request_id"] not in ids or item["save_id"] != active_task.save_id:
-                continue
-            self._life_queue.remove(item)
-            await self._send_reply(item.get("ws") or self._chat_ws, Envelope.create_life_chat_reply(
-                self.instance_id, item["request_id"], item["save_id"], status="completed",
-                profile_revision=self._profile_revision(item["save_id"]),
-                memory_revision=self._memory_revision(item["save_id"])))
-        return result
 
-    async def _await_work_provider(
-        self, active_task: ActiveChatTask, conversation_id: str | None, prompt: str,
-    ) -> dict[str, Any]:
-        return await self._await_provider(active_task, self._execute_turn, conversation_id, prompt)
 
-    async def _await_life_provider(
-        self, active_task: ActiveChatTask, conversation_id: str | None,
-        prompt: str, mode: str | None = None,
-    ) -> dict[str, Any]:
-        args = (conversation_id, prompt) if mode is None else (conversation_id, prompt, mode)
-        return await self._await_provider(active_task, self._execute_life_turn, *args)
 
-    async def _await_provider(self, active_task: ActiveChatTask, execute, *args) -> dict[str, Any]:
-        """Join the owned executor before releasing turn state, even on cancellation."""
-        future = asyncio.get_running_loop().run_in_executor(None, execute, active_task, *args)
-        try:
-            async with self._thinking_pause(active_task.request_id, active_task.save_id or None):
-                while not future.done():
-                    await asyncio.wait({future}, timeout=0.1)
-                    await self._apply_life_intent(self._chat_ws, active_task.request_id, active_task.save_id or "")
-                return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await self._join_interrupted_provider(active_task, future)
-            raise
-        finally:
-            await self._settle_turn_messages(active_task, {})
 
     async def _run_life_chat_turn(self, ws: WebSocketClient | None, item: dict[str, Any]) -> None:
         """Run one life-chat turn under the shared single-model-turn lock."""
@@ -3517,7 +3470,7 @@ class ChatBridge:
                     for n in self._work_store.state(save_id).notices) else None
                 self._record_command(
                     request_id=request_id, save_id=save_id,
-                    conversation_id=result.get("conversation_id") or (None if result.get("session_retried") else existing_cid),
+                    conversation_id=result.get("conversation_id") or existing_cid,
                     prompt=text, status="completed" if success else "failed",
                     start_idx=-1, end_idx=-1,
                     usage=self._codex_turn_usage(result) if self.backend_name == "codex" else result.get("usage"),
@@ -3540,7 +3493,7 @@ class ChatBridge:
                     if changed:
                         proposed = max(changed, key=lambda node: node.get("updatedAt", 0))
                         self._life_proposals[save_id] = (proposed["id"], self._profile_revision(save_id), proposed["updatedAt"])
-                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
+                cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat is not None and save_id:
                     self._life_chat.record_session_id(save_id, str(cid))
                     self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
@@ -3937,7 +3890,7 @@ class ChatBridge:
                         self._active_task = previous_active
                     if execution_claimed:
                         await self._release_execution(save_id)
-                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
+                cid = result.get("conversation_id") or existing_cid
                 if cid and self._life_chat:
                     self._life_chat.record_session_id(save_id, str(cid))
                     self._life_chat.record_context(save_id, str(cid), self._request_input_context(result.get("usage")))
@@ -4033,7 +3986,7 @@ class ChatBridge:
         """Refresh configuration metadata without replacing the conversation.
 
         Current instructions and preferences travel with the next turn. Only an
-        explicit provider resume failure requires a replacement session.
+        explicit player connection can change the bound session.
         """
         if save_id:
             fingerprints = self._load_profile_fingerprints()
@@ -4074,39 +4027,6 @@ class ChatBridge:
         except Exception:
             logger.debug("Failed to save session history", exc_info=True)
 
-    def _rotate_provider_session(self, save_id: str | None, *, reason: str) -> str | None:
-        """End the current provider session, keeping the old id in history.
-
-        The next turn starts a fresh session and carries the saved goals, the
-        unfinished/waiting tasks and the live context, so rotation never loses
-        in-progress work. Old session ids stay in ``chat_session_history.json`` so
-        their billing records remain attributable.
-        """
-        if not save_id:
-            return None
-        cid = self.get_conversation_id(save_id)
-        if not cid:
-            return None
-        self._load_session_history()
-        key = f"{self.backend_name}:{save_id}"
-        history = self._session_history.setdefault(key, [])
-        if cid not in history:
-            history.append(cid)
-        self._session_history[key] = history[-20:]
-        self._sessions.pop(key, None)
-        self._sessions.pop(f"life:{key}", None)
-        if self.backend_name == "agy":
-            self._sessions.pop(save_id, None)
-        self._save_sessions()
-        self._save_session_history()
-        self._session_requests[save_id] = 0
-        self._session_context_state[save_id] = {
-            "latestInputContext": None,
-            "maxInputContext": None,
-            "measured": False,
-        }
-        logger.info("Rotated provider session for %s (%s); previous=%s", save_id, reason, cid)
-        return cid
 
     @staticmethod
     def _request_input_context(usage: dict[str, Any] | None) -> int | None:
@@ -4189,6 +4109,13 @@ class ChatBridge:
             except Exception:
                 logger.warning("Day settlement failed for %s", save_id, exc_info=True)
         if settlement and settlement.get("settled"):
+            active = self._active_task
+            if active and not active.cancelled and active.save_id == save_id and self.run_dir:
+                from .turn_messages import day_event, exchange
+                exchange(self.run_dir / "data" / "turn-messages.json", active.request_id, save_id,
+                         publish=[day_event(settlement["day"], self._latest_snapshot_payload or {"world": world})])
+                active.world_change_at = time.monotonic()
+                active.world_change_version += 1
             logger.info(
                 "Settled game day for %s: %s -> %s (archived=%s, carried=%s)",
                 save_id,
@@ -4424,7 +4351,7 @@ class ChatBridge:
         self, ws: WebSocketClient | None, save_id: str | None
     ) -> None:
         """Apply a shared disable immediately on every chat event, not only timeout."""
-        if self._autonomy is None or not save_id:
+        if self._uses_live_player_loop() or self._autonomy is None or not save_id:
             return
         if (
             not self._autonomy.state(save_id).enabled
@@ -5001,7 +4928,6 @@ class ChatBridge:
 
                 # Chat and work share the same bounded session recovery.
                 result = await self._await_work_provider(active_task, existing_cid, prompt)
-                session_retried = bool(result.get("session_retried"))
 
                 # If task was cancelled during execution, handle_chat_cancel already handled reply & record
                 if active_task.cancelled:
@@ -5040,9 +4966,7 @@ class ChatBridge:
                 new_session_established = previous_cid is None
                 self._notify_terminal(status)
                 reply_text = result.get("response", "")
-                if session_retried and result.get("success"):
-                    reply_text = "（会话已失效，已安全新建会话后继续。）\n" + reply_text
-                cid = result.get("conversation_id") or (None if result.get("session_retried") else existing_cid)
+                cid = result.get("conversation_id") or existing_cid
                 if cid and existing_cid and cid != existing_cid:
                     start_max_idx = -1
                 if new_session_established and cid:
@@ -5284,9 +5208,16 @@ class ChatBridge:
                     # the native receipt; a failed socket replays the saved reply.
                     self._settle_delivery(request_id, bool(sent_ok or notification_saved) and bool(result.get("success")))
                 if self._autonomy is not None and save_id and not active_task.execution_deferred:
+                    if self._uses_live_player_loop():
+                        snapshot = self._latest_snapshot_payload or {}
+                        native = snapshot.get("native") or (snapshot.get("world") or {}).get("native") or {}
+                        if (native.get("programHold") or {}).get("active"):
+                            # A native menu/hold cannot produce clock ticks. Let
+                            # the same session inspect it again after this turn.
+                            self._live_player_wakeups.pop(save_id, None)
                     self._autonomy.record_event(save_id, f"chat-terminal:{request_id}:{status}", f"chat.{status}")
                     autonomy_fingerprint = self._autonomy_requests.pop(request_id, None)
-                    if autonomy_fingerprint:
+                    if autonomy_fingerprint and not self._uses_live_player_loop():
                         if status != "completed":
                             self._autonomy.record_action_result(
                                 save_id, autonomy_fingerprint, False, reason=err or f"turn_{status}"
@@ -5902,8 +5833,7 @@ class ChatBridge:
             source_id = goal.constraints.get("playerRequestId") if goal else None
             source = next((r for r in state.requests if r.get("id") == source_id), None)
             if source:
-                prompt += "\n玩家原始指令（保留动作限制、汇报要求与统计范围；当前已采纳范围以目标为准）：" + json.dumps(
-                    {"text": source["text"]}, ensure_ascii=False)
+                active_task.original_request = {"requestId": source["id"], "text": source["text"]}
             self._work_store.begin_decision(
                 save_id, token, goal_scope=scope, goal_default=active_task.goal_default,
                 request_id=source_id if source else active_task.command_id or active_task.request_id,
@@ -5915,48 +5845,17 @@ class ChatBridge:
             )
             active_task.decision_token = token
             active_task.decision_day = self._work_store.state(save_id).last_settled_day
-        previous_token = os.environ.get("STARDEW_DECISION_TOKEN")
-        previous_surface = os.environ.get("STARDEW_MCP_SURFACE")
-        # Capability discovery stays fixed; only cached reads/execution admission differ.
-        os.environ["STARDEW_MCP_SURFACE"] = "light"
-        if active_task.execution_deferred:
-            os.environ.pop("STARDEW_DECISION_TOKEN", None)
-        else:
-            os.environ["STARDEW_DECISION_TOKEN"] = token
-        try:
-            backend = self._get_backend()
-            if hasattr(backend, "progress"):
-                backend.progress = getattr(self, "_backend_progress_callback", None)
-            turn_native_session = getattr(self, "_player_session_id", None)
-            delivery_key, sent_prompt, pending_prompt = self._prepare_prompt_delivery(
-                active_task, conversation_id, prompt, backend)
-            result = backend.run(active_task, conversation_id, sent_prompt)
-            if conversation_id and result.get("conversation_id") not in {None, conversation_id}:
-                # A provider may return an unexpected session; never bless it as
-                # continuity or advance the old conversation's delivery baseline.
-                active_task.provider_input_delivered = False
-                result.update(actual_provider_session_id=result.get("conversation_id"),
-                              success=False, error="PROVIDER_SESSION_CHANGED",
-                              response="后端返回了不同会话；原绑定保留，请检查客户端。", conversation_id=conversation_id)
-            delivered_session = result.get("conversation_id")
-            if delivered_session and (getattr(active_task, "provider_input_delivered", False) or (not active_task.cancelled and not result.get("error"))):
-                self._acknowledge_prompt_delivery(delivery_key, pending_prompt, save_id, str(delivered_session))
-                if self.actor_mode == "player":
-                    self._work_reload_context(active_task.save_id, str(delivered_session), delivered=True,
-                                              expected_game_session_id=turn_native_session)
-            logger.info("Prompt delivery save=%s session=%s version=%s originalBytes=%s newBytes=%s",
-                        active_task.save_id, delivered_session, pending_prompt["version"],
-                        pending_prompt["originalPromptBytes"], pending_prompt["newPromptBytes"])
-            return result
-        finally:
-            if previous_surface is None:
-                os.environ.pop("STARDEW_MCP_SURFACE", None)
-            else:
-                os.environ["STARDEW_MCP_SURFACE"] = previous_surface
-            if previous_token is None:
-                os.environ.pop("STARDEW_DECISION_TOKEN", None)
-            else:
-                os.environ["STARDEW_DECISION_TOKEN"] = previous_token
+            if self.run_dir and scope:
+                path = self.run_dir / "data" / "life-turn.json"
+                with cache_lock(path):
+                    try:
+                        lease = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        lease = {}
+                    if lease.get("requestId") == active_task.request_id:
+                        lease["goalScope"] = scope
+                        path.write_text(json.dumps(lease, ensure_ascii=False), encoding="utf-8")
+        return execute_provider(self, active_task, conversation_id, prompt, token)
 
     def _execute_agy_turn(
         self,
@@ -5997,7 +5896,7 @@ class ChatBridge:
         cmd.extend([
             "--mode", "accept-edits",
             "--dangerously-skip-permissions",
-            "--print-timeout", "10m",
+            "--print-timeout", "0",
         ])
 
         logger.info("Executing agy CLI: %s", " ".join(cmd[:6]) + " ...")
@@ -6019,6 +5918,9 @@ class ChatBridge:
                 if cid != requested_cid:
                     active_task.start_max_idx = -1
                     active_task.start_max_step_idx = -1
+                callback = getattr(self, "_backend_progress_callback", None)
+                if callback is not None:
+                    callback(BackendProgress("agy", "session_ready", cid))
 
             outcome = run_agy_process(active_task, cmd, prompt, conversation_id,
                 run_dir=self._commands_file.parent,
@@ -6465,20 +6367,31 @@ class ChatBridge:
         lease_ws = self._chat_ws
         lease_session = getattr(self,"_player_session_id",None)
         renewal_task = None
-        # Both production providers have a 600-second call deadline. Keep an
-        # additional absolute safety bound in case an executor itself hangs.
-        renewal_deadline = time.monotonic() + 630.0
+        world_version = getattr(self._active_task, "world_change_version", 0)
+        restart_pending = False
         async def renew_active_provider():
+            nonlocal lease_id, world_version, restart_pending
             while True:
                 await asyncio.sleep(getattr(self,"thinking_renew_interval_seconds",1.0))
                 if self._chat_ws is not lease_ws or getattr(self,"_player_session_id",None) != lease_session:
                     return
-                if time.monotonic() >= renewal_deadline:
-                    logger.warning("Thinking renewal stopped at provider safety deadline [%s]", lease_id)
-                    return
                 active = getattr(self,"_active_task",None)
                 if getattr(self,"control_owner",None) == "human" or (active is not None and active.request_id == request_id and active.cancelled):
                     return
+                if active is not None and getattr(active, "world_change_version", 0) != world_version:
+                    # DayEnding releases the old native lease. A new lifecycle
+                    # begins after the new-day observation, never by reviving it.
+                    world_version = active.world_change_version
+                    lease_id = uuid.uuid4().hex[:12]
+                    restart_pending = True
+                native = (self._latest_snapshot_payload or {}).get("native") or ((self._latest_snapshot_payload or {}).get("world") or {}).get("native") or {}
+                if native.get("clockPauseOwner") == "model-thinking":
+                    restart_pending = False
+                if restart_pending and not native.get("endOfNight"):
+                    begin = Envelope.create_agent_thinking(self.instance_id, request_id, "begin", lease_id,
+                        save_id=save_id, game_session_id=lease_session)
+                    if not await self._send_reply(lease_ws, begin):
+                        return
                 renew = Envelope.create_agent_thinking(self.instance_id,request_id,"renew",lease_id,
                     save_id=save_id,game_session_id=lease_session)
                 if not await self._send_reply(lease_ws,renew):
@@ -6506,27 +6419,6 @@ class ChatBridge:
             except Exception:
                 logger.warning("agent.thinking end [%s] send failed", lease_id, exc_info=True)
 
-    async def _send_reply(self, ws: WebSocketClient | None, reply: Envelope) -> bool:
-        if reply.message_type == "chat.reply" and self._active_task is not None and self._active_task.execution_deferred and (
-            reply.payload.get("requestId") == self._active_task.request_id
-        ):
-            reply.payload["readOnly"] = True
-        if reply.message_type in {"chat.reply", "life.chat.reply"} and reply.payload.get("status") in {
-            "completed", "failed", "cancelled", "interrupted", "selected", "decision-completed", "partial", "unknown",
-        }:
-            await self._push_usage_state(ws, str(reply.payload.get("saveId") or ""))
-        if reply.message_type in {"chat.reply", "life.chat.reply", "autonomy.state"} and ws is not None and reply.payload.get("saveId"):
-            save_id = str(reply.payload["saveId"])
-            await self._push_work_state(ws, save_id)
-        if ws is None:
-            return False
-        try:
-            json_text = json.dumps(reply.to_mapping(), ensure_ascii=False)
-            await ws.send_text(json_text)
-            return True
-        except Exception as ex:
-            logger.warning("Failed to send chat reply to WebSocket: %s", ex)
-            return False
 
 
 def main(argv: list[str] | None = None) -> None:

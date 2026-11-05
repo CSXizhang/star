@@ -580,7 +580,7 @@ def test_mcp_server_call_hoe_tiles(mock_scheduler, tmp_path):
         mock_scheduler.execute_hoe_tiles.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "hoe_tiles"
-        assert step.params == {"tiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}], "detail": False}
+        assert step.params == {"tiles": [{"x": 64, "y": 14}, {"x": 65, "y": 14}], "detail": False, "location_id": "Farm"}
 
     asyncio.run(run())
 
@@ -598,7 +598,7 @@ def test_mcp_server_call_plant_seeds(mock_scheduler, tmp_path):
         mock_scheduler.execute_plant_seeds.assert_not_awaited()
         step = store.state("mock-save-123").tasks[0].steps[0]
         assert step.operation == "plant_seeds"
-        assert step.params == {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}], "detail": False}
+        assert step.params == {"seed_item_id": "(O)472", "tiles": [{"x": 64, "y": 14}], "detail": False, "location_id": "Farm"}
 
     asyncio.run(run())
 

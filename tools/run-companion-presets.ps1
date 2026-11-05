@@ -1,7 +1,11 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$ReleaseDir,
     [string]$SavePath = '',
+    [string]$SuiteId = '',
+    [ValidateSet('mcode','agy')][string]$AcceptanceBackend = 'mcode',
+    [string]$AcceptanceModel = '',
+    [ValidateSet('default','low','medium','high')][string]$AcceptanceEffort = 'default',
     [ValidateSet('water-refill','harvest-store','rest-water','mature-trees','walk-pickup','walk-pickup-full','care-guidance','harvest-logistics','rest-forestry')]
     [string[]]$Cases = @('care-guidance','harvest-logistics','rest-forestry'),
     [ValidateRange(60,3600)][int]$TimeoutSeconds = 600
@@ -16,7 +20,7 @@ if (Get-Process -Name 'Stardew Valley','StardewModdingAPI' -ErrorAction Silently
 }
 & (Join-Path $PSScriptRoot 'build-testdriver.ps1') -Configuration Debug
 if ($LASTEXITCODE -ne 0) { throw 'TestDriver build failed.' }
-$suiteId = 'presets-' + (Get-Date -Format 'MMdd-HHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0,4))
+if (-not $SuiteId) { $SuiteId = 'presets-' + (Get-Date -Format 'MMdd-HHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0,4)) }
 $suite = Join-Path $root ".test-runs/$suiteId"
 $runId = "$suiteId-game"
 $run = Join-Path $root ".test-runs/$runId"
@@ -34,7 +38,8 @@ $launchArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',
     ('"' + (Join-Path $PSScriptRoot 'launch-game.ps1') + '"'),
     '-Mode','scenario','-Scenario','free-mode-control','-RunId',$runId,
     '-FrozenProdDir',('"' + $release + '"'),'-NoOrchestrator','-PresetAcceptance',
-    '-TimeoutSeconds',($budget + 420))
+    '-AcceptanceBackend',$AcceptanceBackend,'-AcceptanceEffort',$AcceptanceEffort,'-TimeoutSeconds',($budget + 420))
+if ($AcceptanceModel) { $launchArgs += @('-AcceptanceModel',$AcceptanceModel) }
 if ($SavePath) { $launchArgs += @('-CustomSavePath',('"' + (Resolve-Path -LiteralPath $SavePath).Path + '"')) }
 try {
     $launcher = Start-Process -FilePath $shell -ArgumentList $launchArgs -WindowStyle Hidden -PassThru `

@@ -44,12 +44,12 @@ namespace StardewAI.Companion.Mod.PlayerMode;
 public sealed class PlayerKnownObserver : IWorldObserver
 {
     public void NoteChestOpened(string location,int x,int y) => _knowledge.NoteChestObserved(location,x,y);
-    private readonly GameWorldObserver _inner;
+    private readonly IWorldObserver _inner;
     private readonly PlayerKnowledgeTracker _knowledge;
     private readonly Action<string, LogLevel>? _log;
     private readonly Dictionary<string, (string Stamp, ShopScanInfo Quote)> _shopQuotes = new();
 
-    public PlayerKnownObserver(GameWorldObserver inner, PlayerKnowledgeTracker knowledge, Action<string, LogLevel>? log = null)
+    public PlayerKnownObserver(IWorldObserver inner, PlayerKnowledgeTracker knowledge, Action<string, LogLevel>? log = null)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
         _knowledge = knowledge ?? throw new ArgumentNullException(nameof(knowledge));
@@ -321,42 +321,43 @@ public sealed class PlayerKnownObserver : IWorldObserver
 
     public LivestockScanInfo ScanLivestock(string locationName, int maxBuildings = 12, int maxAnimals = 60)
     {
-        throw new NotSupportedException("Player-mode livestock observation is not supported in phase 1; hidden animal/interior state is not exposed.");
+        if (!IsLocationKnown(locationName)) throw LocationNotKnown(nameof(ScanLivestock), locationName);
+        // Filter before pagination: an unseen interior must not consume the
+        // visible animal budget. A building exterior does not reveal its contents.
+        var scan = _inner.ScanLivestock(locationName, int.MaxValue, int.MaxValue);
+        return VisibleLivestock(scan, locationName, IsLocationKnown, ObservableTile, maxBuildings, maxAnimals);
     }
 
-    private LivestockScanInfo LegacyKnownLivestock(string locationName, int maxBuildings, int maxAnimals)
+    internal static LivestockScanInfo VisibleLivestock(LivestockScanInfo scan, string locationName,
+        Func<string, bool> known, Func<string, TileCoordinate, bool> visible, int maxBuildings, int maxAnimals)
     {
-        if (!IsLocationKnown(locationName))
+        bool CanSee(string location, TileCoordinate tile) => known(location) && visible(location, tile);
+        int budget = Math.Max(0, maxAnimals);
+        bool truncated = scan.AnimalsTruncated;
+        var buildings = new List<AnimalBuildingScanInfo>();
+        var candidates = scan.Buildings.Where(b => CanSee(b.LocationName, b.Tile) || known(b.IndoorsName)).ToList();
+        foreach (var building in candidates.Take(Math.Max(0, maxBuildings)))
         {
-            LogGate($"[PlayerKnownObserver] ScanLivestock('{locationName}') blocked: location is not player-known.");
-            return new LivestockScanInfo(Array.Empty<AnimalBuildingScanInfo>(), Array.Empty<AnimalScanInfo>(), false, false);
+            bool inside = known(building.IndoorsName);
+            var animals = building.Animals.Where(a => CanSee(a.LocationName, a.Tile)).ToList();
+            bool allAnimalsVisible = inside && animals.Count == building.Animals.Count;
+            truncated |= animals.Count > budget || !allAnimalsVisible;
+            var page = animals.Take(budget).ToList();
+            budget -= page.Count;
+            buildings.Add(building with {
+                Animals = page,
+                AnimalCount = allAnimalsVisible ? building.AnimalCount : null,
+                AnimalLimit = inside ? building.AnimalLimit : null,
+                HayCount = inside ? building.HayCount : null,
+                HayCapacity = inside ? building.HayCapacity : null,
+                SiloHayCount = null,
+                ResidentCount = inside ? building.ResidentCount : null,
+                ResidentAnimalIds = inside ? building.ResidentAnimalIds : null,
+            });
         }
-
-        var scan = _inner.ScanLivestock(locationName, maxBuildings, maxAnimals);
-        // The inner scan enumerates animal houses across every loaded map, so even a
-        // visited query map leaks unvisited buildings; drop buildings whose map is
-        // unknown (fail closed). Animals roaming the queried map are on a known map.
-        int dropped = 0;
-        var buildings = new List<AnimalBuildingScanInfo>(scan.Buildings.Count);
-        foreach (var building in scan.Buildings)
-        {
-            if (IsBuildingKnown(building)) buildings.Add(building);
-            else dropped++;
-        }
-        if (dropped > 0)
-        {
-            LogGate($"[PlayerKnownObserver] ScanLivestock('{locationName}') dropped {dropped} building(s) on unvisited maps.");
-            return scan with { Buildings = buildings };
-        }
-        return scan;
-    }
-
-    private bool IsBuildingKnown(AnimalBuildingScanInfo building)
-    {
-        if (IsLocationKnown(building.LocationName)) return true;
-        // Standalone registered AnimalHouse without a parent building: the indoors map
-        // itself is the location, so fall back to its own name.
-        return string.IsNullOrEmpty(building.LocationName) && IsLocationKnown(building.IndoorsName);
+        var roaming = scan.RoamingAnimals.Where(a => a.LocationName == locationName && CanSee(a.LocationName, a.Tile)).ToList();
+        return new(buildings, roaming.Take(budget).ToList(),
+            scan.BuildingsTruncated || candidates.Count > maxBuildings, truncated || roaming.Count > budget);
     }
 
     // ---------------------------------------------------------------------

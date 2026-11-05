@@ -169,8 +169,8 @@ def test_paused_chat_uses_life_surface_and_preserves_existing_work(tmp_path, mon
         assert final["status"] == "completed"
         assert final["requestId"] == "human-readonly"
         assert final["commandId"] == "human-readonly" and final["commandComplete"] is True
-        assert final["readOnly"] is True
-        assert all(r["payload"]["readOnly"] is True for r in replies(ws) if r["messageType"] == "chat.reply")
+        assert "readOnly" not in final
+        assert all("readOnly" not in r["payload"] for r in replies(ws) if r["messageType"] == "chat.reply")
         assert not final.get("resumeWorkRequested", False)
         assert os.environ["STARDEW_DECISION_TOKEN"] == "outer-work-token"
         assert os.environ["STARDEW_MCP_SURFACE"] == "full"

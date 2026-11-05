@@ -9,11 +9,13 @@ import pytest
 from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
 
 
-@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel", "mailbox_error"])
 def test_provider_wait_settles_after_executor_exits(tmp_path, outcome):
     async def run():
         bridge = ChatBridge(run_dir=tmp_path, enable_plan_worker=False)
         bridge._apply_life_intent = AsyncMock()
+        if outcome == "mailbox_error":
+            bridge._apply_life_intent.side_effect = OSError("mailbox unavailable")
         bridge._settle_turn_messages = AsyncMock()
         started, release, exited = threading.Event(), threading.Event(), threading.Event()
 
@@ -46,12 +48,19 @@ def test_provider_wait_settles_after_executor_exits(tmp_path, outcome):
                 await asyncio.sleep(0.05)
                 assert not task.done()
                 bridge._settle_turn_messages.assert_not_awaited()
+            if outcome == "mailbox_error":
+                await asyncio.sleep(.15)
+                assert active.cancelled and not task.done()
+                bridge._settle_turn_messages.assert_not_awaited()
             release.set()
             if outcome == "cancel":
                 with pytest.raises(asyncio.CancelledError):
                     await task
             elif outcome == "error":
                 with pytest.raises(RuntimeError, match="provider failed"):
+                    await task
+            elif outcome == "mailbox_error":
+                with pytest.raises(OSError, match="mailbox unavailable"):
                     await task
             else:
                 assert await task == {"success": True}

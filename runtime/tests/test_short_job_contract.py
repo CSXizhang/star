@@ -43,7 +43,7 @@ def test_provider_shapes_succeed_once_through_bridge_and_fastmcp(tmp_path, monke
 
     monkeypatch.setattr("stardew_ai_runtime.compatibility.assert_native_compatible", lambda _: None)
     monkeypatch.setattr(bridge, "_get_backend", lambda: Provider())
-    bridge._execute_turn(ActiveChatTask(request_id="turn", save_id="save"), None, "浇干地")
+    asyncio.run(bridge._await_work_provider(ActiveChatTask(request_id="turn", save_id="save"), None, "浇干地"))
     assert len(results) == 1
     assert results[0]["goalId"] == goal.id
     assert results[0]["goalCreated"] is False

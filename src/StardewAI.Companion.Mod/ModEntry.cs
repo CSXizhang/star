@@ -393,7 +393,9 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
             if (checkpoint?.SaveId != saveId) checkpoint = null;
             if (checkpoint?.Actor != null) _stateRepository.Save(checkpoint.Actor);
 
-            _observer = new GameWorldObserver(Monitor);
+            _observer = new GameWorldObserver(Monitor) {
+                NativeCollisionActor = () => _actor?.GameFarmer
+            };
             bool isNewCompanion = !_stateRepository.StateExists("companion-1");
             CompanionActorState activeState;
             GameLocation? targetLocation;
@@ -668,29 +670,11 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         }
     }
 
-    /// <summary>
-    /// Late-night unattended guard (player mode): when the agent owns the player but no
-    /// model turn holds a thinking lease and no machine is executing, an idle farmer
-    /// would collapse at 02:00 and roll the day without any business. Hold the clock
-    /// instead; a fresh turn (processing reply / thinking begin) or a human takeover
-    /// releases the hold. Daytime waits (shop hours, crop growth) are never frozen.
-    /// </summary>
-    private void TickUnattendedPassoutGuard()
-    {
-        if (!PlayerModeEnabled || !Context.IsWorldReady || Game1.IsMultiplayer) return;
-        if (_authority is not { AgentOwns: true }) return;
-        if (Game1.timeOfDay < 2500) return;
-        if (_thinking is null || _thinking.FailureReason != null || _thinking.ActiveLeaseId != null) return;
-        if (_coordinator is null || _coordinator.GetActivityStatus() != "idle") return;
-        _thinking.StopForFailure("深夜无执行动作且无模型回合，已保护暂停防止空站昏倒；新回合或接管自动恢复。");
-    }
-
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
         while (_mainThreadActions.TryDequeue(out var action)) action();
         ShowPendingUpdate();
         _thinking?.Tick();
-        TickUnattendedPassoutGuard();
         if (PlayerModeEnabled && e.IsMultipleOf(30) && _coordinator != null && _transportServer != null) { _ = _transportServer.SendSnapshotAsync(_coordinator.CaptureCurrentSnapshot(_observer!.WorldRevision),_observer.WorldRevision); }
         if (PlayerModeEnabled && _actor != null) _knowledge?.NoteLocationVisited(_actor.LocationName);
         if (_decisionEdits.Count > 0 && DateTime.UtcNow - _decisionEditSentAt > TimeSpan.FromSeconds(30))

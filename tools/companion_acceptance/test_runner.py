@@ -1,6 +1,6 @@
 """Acceptance must reject false positives even if a model says it completed."""
-import importlib.util
 import asyncio
+import importlib.util
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("preset_runner", Path(__file__).with_name("runner.py"))
@@ -44,6 +44,40 @@ def test_trace_retains_tool_failures_and_nonterminal_results():
     assert summary["toolCalls"][0]["nonterminal"]
 
 
+def test_agy_native_transcript_pairs_receipt_and_keeps_missing_result_unknown():
+    call = {"name": "call_mcp_tool", "args": {"ServerName": '"isolated"',
+            "ToolName": '"submit_work"', "Arguments": '{"action":{"rest":{"target_stamina":80}}}'}}
+    planner = {"_provider": "agy", "type": "PLANNER_RESPONSE", "step_index": 5, "tool_calls": [call]}
+    receipt = {"_provider": "agy", "type": "GENERIC", "step_index": 6, "status": "DONE",
+               "content": 'Created At: stamp\nCompleted At: stamp\n{"status":"completed","details":{"finalLocation":"FarmHouse","finalTile":{"x":9,"y":9}}}'}
+    summary = runner.summarize_trace([planner, receipt])
+    got = summary["toolCalls"][0]
+    assert got["name"] == "mcp__isolated__submit_work"
+    assert got["input"]["action"]["rest"]["target_stamina"] == 80
+    assert got["result"]["details"]["finalTile"] == {"x": 9, "y": 9}
+    assert not got["nonterminal"]
+    # Parallel generic receipts have no stable tool ID: never guess their pairing.
+    ambiguous = runner.summarize_trace([{**planner, "tool_calls": [call, call]}, receipt])
+    assert all(c["result"] is None and c["nonterminal"] for c in ambiguous["toolCalls"])
+    failed = runner.summarize_trace([planner, {**receipt, "status": "ERROR", "content": "Error executing tool: STALE_DECISION"}])
+    assert failed["errorCount"] == 1 and failed["toolCalls"][0]["result"] is None
+    assert not failed["toolCalls"][0]["nonterminal"]
+
+
+def test_agy_large_receipt_is_archived_only_from_its_own_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.Path, "home", lambda: tmp_path)
+    cid = "a" * 32
+    output = tmp_path / ".gemini/antigravity-cli/brain" / cid / ".system_generated/steps/7/output.txt"
+    output.parent.mkdir(parents=True)
+    output.write_text('{"status":"executed","terminalState":"succeeded"}')
+    row = {"conversationId": cid, "step_index": 7,
+           "content": "The output was large and was saved to: " + output.as_uri()}
+    archived = runner.attach_agy_output(row)
+    assert runner.decoded(archived["_externalOutput"]["text"])["terminalState"] == "succeeded"
+    assert archived["_externalOutput"]["sha256"]
+    assert "_externalOutput" not in runner.attach_agy_output({**row, "step_index": 8})
+
+
 def test_suite_keeps_game_open_and_preserves_failed_scene(tmp_path, monkeypatch):
     calls = []
     evidence = tmp_path / "evidence"
@@ -66,3 +100,21 @@ def test_suite_keeps_game_open_and_preserves_failed_scene(tmp_path, monkeypatch)
                      ("harvest", {"keep_open": True, "reset_fixture": True})]
     assert (evidence / "care/preset-report.md").read_text() == "care"
     assert runner.read(evidence / "free-mode-control-done.json") == {"success": False}
+
+
+def test_agy_inline_truncation_reads_only_complete_same_session_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.Path, "home", lambda: tmp_path)
+    cid = "b" * 32
+    output = tmp_path / ".gemini/antigravity-cli/brain" / cid / ".system_generated/steps/21/output.txt"
+    output.parent.mkdir(parents=True)
+    output.write_text('{"status":"executed","terminalState":"succeeded","completedCount":5}')
+    row = {"conversationId": cid, "step_index": 21,
+           "content": '{"status":"executed",\n<truncated 299 bytes>\n}'}
+    archived = runner.attach_agy_output(row)
+    assert archived["content"] == row["content"]
+    assert runner.decoded(archived["_externalOutput"]["text"])["completedCount"] == 5
+    assert archived["_externalOutput"]["source"] == output.as_uri()
+    assert "_externalOutput" not in runner.attach_agy_output({**row, "conversationId": "c" * 32})
+    assert "_externalOutput" not in runner.attach_agy_output({**row, "step_index": 22})
+    output.write_text('{"terminalState":')
+    assert "_externalOutput" not in runner.attach_agy_output(row)

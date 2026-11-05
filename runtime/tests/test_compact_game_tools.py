@@ -39,9 +39,12 @@ def test_typed_action_executes_now_and_rechecks_authority(tmp_path, monkeypatch,
         assert completion['goal']['status'] == 'completed'
         assert completion['goal']['project']['completionObservation']['worldRevision'] == 1
         store.revoke_decision('mock-save-123')
-        with pytest.raises(ToolError, match='STALE_DECISION'):
+        await server.call_tool('submit_work', args)
+        assert method.await_count == 3
+        store.set_paused('mock-save-123', True)
+        with pytest.raises(ToolError, match='WORK_STOPPED'):
             await server.call_tool('submit_work', args)
-        assert method.await_count == 2
+        assert method.await_count == 3
     asyncio.run(run())
 
 
@@ -158,22 +161,24 @@ def test_occupied_conversation_can_execute_after_owner_settles(tmp_path, monkeyp
     mock_scheduler.execute_tiles = AsyncMock(return_value={
         'status': 'completed', 'terminalState': 'succeeded', 'completedCount': 1})
 
+    mock_scheduler.execute_tiles.side_effect = ToolError('GAME_BUSY: native actor already executing')
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='life')
         args = {'action': {'water_tiles': {'tiles': [{'x': 4, 'y': 5}]}}}
         with pytest.raises(ToolError, match='GAME_BUSY'):
             await server.call_tool('submit_work', args)
         assert store.state('mock-save-123').decision['token'] == 'decision-1'
-        mock_scheduler.execute_tiles.assert_not_awaited()
+        mock_scheduler.execute_tiles.assert_awaited_once()
         store.revoke_decision('mock-save-123')
         store.set_paused('mock-save-123', True)
         with pytest.raises(ToolError, match='WORK_STOPPED'):
             await server.call_tool('submit_work', args)
-        mock_scheduler.execute_tiles.assert_not_awaited()
+        mock_scheduler.execute_tiles.assert_awaited_once()
         store.set_paused('mock-save-123', False)
+        mock_scheduler.execute_tiles.side_effect = None
         _, result = await server.call_tool('submit_work', args)
         assert result['terminalState'] == 'succeeded'
-        mock_scheduler.execute_tiles.assert_awaited_once()
+        assert mock_scheduler.execute_tiles.await_count == 2
     asyncio.run(run())
 
 

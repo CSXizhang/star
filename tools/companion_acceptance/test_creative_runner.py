@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import hashlib
+import json
 import struct
 import sys
 from pathlib import Path
@@ -122,6 +123,50 @@ def test_trace_filter_excludes_unrelated_continuation_goals():
     assert monitor.initial_turn_trace(agy, "player-1", "brief") == agy[:2]
 
 
+def test_agy_midflight_brief_binds_only_after_matching_delivery_receipt():
+    def delivery(request_id, text):
+        return {"_provider": "agy", "conversationId": "same", "type": "GENERIC",
+                "content": "Created At: now\nCompleted At: now\n" + json.dumps({
+                    "playerMessages": [{"requestId": request_id, "text": text}]})}
+
+    prompt = "garden\nfinish the whole project"
+    delivered = delivery("player-1", prompt)
+    planner = {"_provider": "agy", "conversationId": "same", "type": "PLANNER_RESPONSE",
+               "tool_calls": [{"name": "call_mcp_tool", "args": {"ServerName": "game",
+                   "ToolName": "manage_arrangements", "Arguments": {"change": {"manage_goal": {"action": "create"}}}}}]}
+    result = {"_provider": "agy", "conversationId": "same", "type": "GENERIC", "status": "DONE",
+              "content": json.dumps({"goal": {"id": "root"}})}
+    trace = [delivery("someone-else", prompt), delivery("player-1", "other text"), delivered, planner, result,
+             {"_provider": "agy", "conversationId": "same", "type": "USER_INPUT", "content": "continue"}, planner]
+    selected = monitor.initial_turn_trace(trace, "player-1", prompt)
+    assert selected == [delivered, planner, result]
+    calls = monitor.summarize_trace(selected)["toolCalls"]
+    assert monitor.bind_goal({"goals": [{"id": "root"}]}, {}, set(), calls)[0] == "root"
+
+
+def test_blocked_main_completion_ends_with_evidence_instead_of_idle_rounds(tmp_path):
+    runner = setup_run(tmp_path)
+    runner.goal_id = "locked-main"
+    runner.commands = list
+    runner.requested_stop = lambda: False
+    runner.observe_project = lambda trace: {"id": runner.goal_id, "status": "active"}
+    rejected = event("turn", {}, "complete")
+    tool = rejected["event"]["item"]["toolCall"]
+    tool["input"]["change"]["manage_goal"]["goal_id"] = runner.goal_id
+    tool["output"]["details"]["mcp"]["structuredContent"] = {
+        "goalId": runner.goal_id, "blocked": True, "reasonCode": "MAIN_GOAL_LOCKED"}
+    runner.trace = lambda: [rejected]
+
+    async def native():
+        return sample(True)
+
+    runner.native = native
+    with pytest.raises(RuntimeError, match="MAIN_GOAL_LOCKED"):
+        asyncio.run(runner.monitor())
+    assert runner.report["completionBlocked"]["goalId"] == "locked-main"
+    assert monitor.blocked_completion([rejected], "different-project") is None
+
+
 def test_old_chat_completion_or_missing_lease_does_not_settle_completion_turn():
     commands = [{"requestId": "initial", "saveId": "Farm_1", "status": "completed"}]
     assert not monitor.round_settled(None, commands, "initial", "Farm_1")
@@ -135,6 +180,22 @@ def test_completion_metadata_alone_is_not_a_design():
     assert not monitor.design_recorded({"phase": "completed", "completionAssessment": "model-reviewed"})
     assert not monitor.design_recorded({"summary": "wood and stone", "layout": []})
     assert monitor.design_recorded({"summary": "wood and stone", "layout": {"zones": ["storage", "rest"]}})
+
+
+def test_monitor_started_before_launcher_does_not_claim_run_directory(tmp_path):
+    async def check():
+        runner = monitor.CreativeRunner(tmp_path / "not-yet-launched")
+        task = asyncio.create_task(runner.prepare())
+        try:
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            assert not runner.run.exists(), "Launcher must be able to allocate its fresh run directory"
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(check())
 
 
 def setup_run(tmp_path):
@@ -151,6 +212,7 @@ def setup_run(tmp_path):
     monitor.write(cases, {"creative-farm": {"designBrief": "a wood and stone garden", "instruction": "finish this one project", "criteria": CRITERIA}})
     runner = monitor.CreativeRunner(run, cases_file=cases)
     runner.poll_seconds = 0
+    runner.monitor_seconds = 0
     for path in (runner.mod / "StardewAI.Companion.Mod.dll", run / "mods/StardewAI.Companion.TestDriver/StardewAI.Companion.TestDriver.dll"):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"test fixture")

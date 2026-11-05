@@ -51,6 +51,7 @@ public sealed partial class TestDriverMod
     private Farmer? _creativeFarmer;
     private string? _creativeSaveName;
     private int _creativeDay, _creativeSequence, _creativeSupplyEvents;
+    private int _creativeMaintenanceTicks;
     private Point _creativeAnchor;
     private Rectangle _creativeWorkArea;
     private string _creativeWaterBaseline = "";
@@ -215,7 +216,9 @@ public sealed partial class TestDriverMod
                 throw new InvalidOperationException("Creative fixture actor/save/day changed; automatic supply stopped.");
             var coordinator = ReadNativeMember(_creativeModEntry, "_coordinator");
             RecordCreativeNativeResult();
-            if (_tickCounter % 6 != 0 || ReadNativeMember(coordinator, "ActiveMachine") != null
+            // The scenario counter also advances inside WaitingForExternalAct;
+            // its parity is unsuitable for scheduling maintenance on update ticks.
+            if (++_creativeMaintenanceTicks % 6 != 0 || ReadNativeMember(coordinator, "ActiveMachine") != null
                 || ReadNativeMember(ReadNativeMember(_creativeModEntry, "_actor"), "ActiveTaskId") != null
                 || Game1.activeClickableMenu != null || Game1.eventUp || Game1.newDay || Game1.fadeToBlack
                 || Game1.fadeIn || _creativeFarmer.UsingTool || _creativeFarmer.isEating || _creativeFarmer.isInBed.Value)
@@ -407,7 +410,7 @@ public sealed partial class TestDriverMod
             nativeResultCount = _creativeCommands.Count, harnessTimeFrozen = _freezeTime,
             fixedTimeOfDay = CreativeTimeOfDay, timeOfDay = Game1.timeOfDay,
             resourcePolicy = "Only whitelisted materials and stamina are replenished by the test fixture; crafting and placement use production native actions.",
-            recipeCraftCounts = farmer?.craftingRecipes.ToDictionary(pair => pair.Key, pair => pair.Value)
+            recipeCraftCounts = farmer?.craftingRecipes.Keys.ToDictionary(name => name, name => farmer.craftingRecipes[name])
         };
     }
 
@@ -423,14 +426,25 @@ public sealed partial class TestDriverMod
             as Dictionary<string, object> ?? throw new InvalidOperationException("Native map image metadata is missing.");
         string source = image.GetValueOrDefault("path") as string
             ?? throw new InvalidOperationException("Native map image did not report its output path.");
-        byte[] bytes = File.ReadAllBytes(source);
+        // Stardew 1.6.15 writes synchronously but leaves its FileStream open
+        // until finalization. Share that writer handle while copying the PNG.
+        byte[] bytes;
+        using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        using (var buffer = new MemoryStream())
+        {
+            input.CopyTo(buffer);
+            bytes = buffer.ToArray();
+        }
         if (bytes.Length < 24 || !bytes.AsSpan(0, 8).SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }))
             throw new InvalidOperationException("Native farm screenshot is not a complete PNG header.");
+        if (!bytes.AsSpan(bytes.Length - 12).SequenceEqual(new byte[] { 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130 }))
+            throw new InvalidOperationException("Native farm screenshot has not finished writing its PNG trailer.");
         int width = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(16, 4));
         int height = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(20, 4));
         if (width <= 0 || height <= 0) throw new InvalidOperationException("Native farm screenshot has invalid dimensions.");
         string destination = Path.Combine(outDir, $"harness-farm-{label}.png");
-        File.Copy(source, destination, overwrite: false);
+        using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write))
+            output.Write(bytes);
         string sha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(destination))).ToLowerInvariant();
         var state = ObserveCreativeFarm();
         var metadata = new { runId = _runId, label, captured = true, path = destination,

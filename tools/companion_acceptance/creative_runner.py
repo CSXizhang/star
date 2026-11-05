@@ -49,7 +49,14 @@ def goal_operation(call):
     if not isinstance(args, dict):
         return {}
     if str(call.get("name")).endswith("__manage_arrangements"):
-        return (args.get("change") or {}).get("manage_goal") or {}
+        change = args.get("change") or {}
+        if isinstance(change, str):
+            try:
+                change = json.loads(change)
+            except ValueError:
+                return {}
+        operation = change.get("manage_goal") if isinstance(change, dict) else None
+        return operation if isinstance(operation, dict) else {}
     if str(call.get("name")).endswith("__manage_goal"):
         return args
     return {}
@@ -66,9 +73,35 @@ def initial_turn_trace(trace, request_id, prompt):
                 break
             if prompt in str(row.get("content") or ""):
                 started, conversation = True, row.get("conversationId")
+        elif not started and row.get("type") == "GENERIC":
+            # F9 may start autonomy before Enter. The one player brief then
+            # arrives at a tool boundary, not as a provider USER_INPUT step.
+            content = row.get("_externalOutput", {}).get("text") or row.get("content") or ""
+            body = "\n".join(line for line in content.splitlines()
+                             if not line.startswith(("Created At:", "Completed At:"))).strip()
+            try:
+                result = json.loads(body)
+            except ValueError:
+                result = None
+            messages = result.get("playerMessages", []) if isinstance(result, dict) else []
+            if any(isinstance(message, dict) and message.get("requestId") == request_id
+                   and message.get("text") == prompt for message in messages):
+                started, conversation = True, row.get("conversationId")
         if started and row.get("conversationId") == conversation:
             selected.append(row)
     return selected
+
+
+def blocked_completion(trace, goal_id):
+    if not goal_id:
+        return None
+    for call in reversed(summarize_trace(trace)["toolCalls"]):
+        operation = goal_operation(call)
+        if operation.get("action") not in {"complete", "finish"} or operation.get("goal_id") != goal_id:
+            continue
+        result = call.get("result") or {}
+        return result if isinstance(result, dict) and result.get("blocked") is True else None
+    return None
 
 
 def bind_goal(state, request, baseline_ids, calls):
@@ -178,6 +211,7 @@ class CreativeRunner(Runner):
         self.last_project = None
         self.command_offset = self.trace_offset = self.usage_offset = 0
         self.poll_seconds = 1
+        self.monitor_seconds = 15 * 60
         self.report["humanReview"] = {
             "status": "pending", "criteria": ["符合本轮约定的风格", "各区与主路连贯", "保留实用空地", "整体美感"],
             "note": "技术验收与审美评审分别记录；请结合实际农场图评价设计。",
@@ -214,7 +248,8 @@ class CreativeRunner(Runner):
         return result
 
     async def prepare(self):
-        self.evidence.mkdir(parents=True, exist_ok=True)
+        # The launcher owns run-directory allocation and rejects existing paths.
+        # Wait for it before writing anything, including the evidence directory.
         await self.wait(lambda: (read(self.evidence / "harness-coordination.json") or {}).get("state") == "READY_FOR_ACT",
                         "Isolated creative fixture is not ready", 240)
         coord = read(self.evidence / "harness-coordination.json") or {}
@@ -239,7 +274,8 @@ class CreativeRunner(Runner):
         self.prompt = self.spec["designBrief"].strip() + "\n\n" + rendered_instruction
         self.report.update({"fixture": fixture, "designBrief": self.spec["designBrief"], "instruction": self.spec["instruction"],
                             "renderedInstruction": rendered_instruction, "fullPrompt": self.prompt, "prompt": self.prompt,
-                            "criteria": self.criteria, "wallBudgetSeconds": None, "caseDefinitionSha256": sha(self.cases_file),
+                            "criteria": self.criteria, "wallBudgetSeconds": None, "monitorIntervalSeconds": self.monitor_seconds,
+                            "caseDefinitionSha256": sha(self.cases_file),
                             "modSha256": sha(self.mod / "StardewAI.Companion.Mod.dll"),
                             "testDriverSha256": sha(self.run / "mods/StardewAI.Companion.TestDriver/StardewAI.Companion.TestDriver.dll"),
                             "backend": read(self.mod / "config/chat-backend.json")})
@@ -400,6 +436,10 @@ class CreativeRunner(Runner):
                 raise RuntimeError("Creative native snapshot lacks player authority evidence")
             trace, commands = self.trace(), self.commands()
             goal = self.observe_project(trace)
+            rejection = blocked_completion(trace, self.goal_id) if goal and goal.get("status") == "active" else None
+            if rejection:
+                self.report["completionBlocked"] = rejection
+                raise RuntimeError("Project completion was rejected: " + str(rejection.get("reasonCode") or rejection))
             lease = read(self.mod / "data/life-turn.json")
             sessions = {row.get("conversationId") for row in commands if row.get("conversationId")}
             self.report["providerSessions"] = sorted(sessions)
@@ -444,7 +484,7 @@ class CreativeRunner(Runner):
             if completion_deadline and time.monotonic() >= completion_deadline:
                 self.report["stopReason"] = "completed-project-did-not-settle"
                 return
-            await asyncio.sleep(self.poll_seconds)
+            await asyncio.sleep(self.monitor_seconds)
 
     def requested_stop(self):
         request = read(self.evidence / "reviewer-stop.json")

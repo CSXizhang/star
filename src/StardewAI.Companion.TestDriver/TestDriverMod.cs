@@ -699,7 +699,9 @@ public sealed partial class TestDriverMod : Mod
     {
         if (_freezeTime && Context.IsWorldReady)
         {
-            Game1.timeOfDay = e.OldTime;
+            // SMAPI can deliver the fixture's initial 06:00 -> 10:00 change
+            // after setup. Restoring OldTime would undo creative daylight.
+            Game1.timeOfDay = _creativeFarmActive ? CreativeTimeOfDay : e.OldTime;
         }
     }
 

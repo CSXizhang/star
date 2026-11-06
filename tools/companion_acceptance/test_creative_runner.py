@@ -249,6 +249,22 @@ def test_agy_midflight_brief_binds_only_after_matching_delivery_receipt():
     assert selected == [delivered, planner, result]
     calls = monitor.summarize_trace(selected)["toolCalls"]
     assert monitor.bind_goal({"goals": [{"id": "root"}]}, {}, set(), calls)[0] == "root"
+    # The public transcript can truncate Arguments after MCP executes the full
+    # input. Bind only the visible operation and its successful native receipt.
+    wrapped = copy.deepcopy(trace)
+    args = wrapped[3]["tool_calls"][0]["args"]
+    args["Arguments"] = '{"change":{"manage_goal":{"action":"create","project":{"summary":"long\n<truncated 497 bytes>'
+    wrapped[4]["content"] = json.dumps({"goal": {"id": "root", "project": {"summary": "Keep trees", "layout": "Loop trail"}}})
+    selected = monitor.initial_turn_trace(wrapped, "player-1", prompt)
+    calls = monitor.summarize_trace(selected)["toolCalls"]
+    assert monitor.bind_goal({"goals": [{"id": "root"}]}, {}, set(), calls)[0] == "root"
+    clear = copy.deepcopy(planner)
+    clear["tool_calls"][0]["args"].update(ToolName="submit_work", Arguments='{"action":{"clear_debris":{"tiles":[\n<truncated 100 bytes>')
+    cleared = {**result, "content": json.dumps({"skill": "clear-debris", "terminalState": "succeeded"})}
+    assert monitor.design_precedes_clearing([*selected, clear, cleared], "root")
+    assert not monitor.design_precedes_clearing([clear, cleared, *selected], "root")
+    calls[0]["error"] = True
+    assert monitor.bind_goal({"goals": [{"id": "root"}]}, {}, set(), calls)[0] is None
 
 
 def test_blocked_main_completion_ends_with_evidence_instead_of_idle_rounds(tmp_path):

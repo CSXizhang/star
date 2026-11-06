@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import struct
 import time
@@ -77,6 +78,18 @@ def lower_keys(value):
 
 def goal_operation(call):
     args = call.get("input") or {}
+    if isinstance(args, str) and re.search(r"\n<truncated \d+ bytes>$", args):
+        # agy's human-readable transcript truncates long Arguments, while the
+        # paired native receipt is complete. Recover only the visible operation
+        # and receipt's identity, never invent missing layout/coordinates.
+        prefix = r'^\s*\{\s*"change"\s*:\s*\{\s*"manage_goal"\s*:\s*\{\s*"action"\s*:\s*"(create|revise|update|complete|finish)"'
+        match = re.match(prefix, args) if str(call.get("name")).endswith("__manage_arrangements") else None
+        result = call.get("result")
+        if match and not call.get("error") and not call.get("nonterminal") and isinstance(result, dict):
+            goal = result.get("goal")
+            goal_id = goal.get("id") if isinstance(goal, dict) else result.get("goalId")
+            if isinstance(goal_id, str) and goal_id:
+                return {"action": match.group(1), "goal_id": goal_id}
     if not isinstance(args, dict):
         return {}
     if str(call.get("name")).endswith("__manage_arrangements"):
@@ -265,8 +278,9 @@ def design_precedes_clearing(trace, goal_id):
             planned = True
         args = call.get("input")
         action = args.get("action") if isinstance(args, dict) else None
-        if (str(call.get("name")).endswith("__submit_work") and isinstance(action, dict)
-                and {"clear_debris", "cut_grass", "chop_tree"}.intersection(action)):
+        clearing = (isinstance(action, dict) and {"clear_debris", "cut_grass", "chop_tree"}.intersection(action)
+                    or isinstance(result, dict) and result.get("skill") in {"clear-debris", "cut-grass", "chop-tree"})
+        if str(call.get("name")).endswith("__submit_work") and clearing:
             return planned
     return False
 

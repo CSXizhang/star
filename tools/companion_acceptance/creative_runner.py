@@ -283,7 +283,8 @@ def design_precedes_clearing(trace, goal_id):
                     or isinstance(result, dict) and result.get("skill") in {"clear-debris", "cut-grass", "chop-tree"})
         if str(call.get("name")).endswith("__submit_work") and clearing:
             return planned
-    return False
+    # A design may use existing free ground without clearing vegetation.
+    return planned
 
 
 class CreativeRunner(Runner):
@@ -371,8 +372,11 @@ class CreativeRunner(Runner):
                             "modSha256": sha(self.mod / "StardewAI.Companion.Mod.dll"),
                             "testDriverSha256": sha(self.run / "mods/StardewAI.Companion.TestDriver/StardewAI.Companion.TestDriver.dll"),
                             "backend": read(self.mod / "config/chat-backend.json")})
+        references = read(self.mod / "config/reference-images/manifest.json") or {}
+        self.report["referenceImages"] = [{key: entry[key] for key in ("id", "title", "author", "source", "sha256")}
+                                          for entry in references.get("images", [])]
         write(self.evidence / "creative-farm-brief.json", {key: self.report[key] for key in (
-            "designBrief", "instruction", "renderedInstruction", "fullPrompt", "criteria")})
+            "designBrief", "instruction", "renderedInstruction", "fullPrompt", "criteria", "referenceImages")})
         await self.request("close")
         before = await self.native()
         self.report["before"] = before
@@ -571,6 +575,16 @@ class CreativeRunner(Runner):
                 raise RuntimeError("Creative project changed provider session")
             ledger = rows(self.evidence / "creative-farm-ledger.jsonl")
             checks = world_checks(self.report["before"], sample, self.criteria, ledger)
+            if self.report.get("referenceImages"):
+                returned = set()
+                for call in summarize_trace(trace)["toolCalls"]:
+                    args = call.get("input")
+                    request = args.get("request") if isinstance(args, dict) else None
+                    operation = request.get("read_reference_image") if isinstance(request, dict) else None
+                    if (str(call.get("name")).endswith("__consult") and isinstance(operation, dict)
+                            and not call.get("error") and not call.get("nonterminal")):
+                        returned.add(operation.get("image_id"))
+                checks["selected_reference_images_returned"] = all(item["id"] in returned for item in self.report["referenceImages"])
             checks["same_project_completed"] = bool(goal and goal.get("status") == "completed")
             checks["project_design_recorded"] = bool(goal and design_recorded(goal.get("project"))
                                                       and self.report.get("recordedDesignObserved"))

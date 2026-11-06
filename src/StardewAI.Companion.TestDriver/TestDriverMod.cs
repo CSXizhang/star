@@ -1162,7 +1162,8 @@ public sealed partial class TestDriverMod : Mod
                         timeoutTicks = Math.Clamp(observeSeconds, 600, 7200) * 60;
                     // Creative projects run until their monitor records completion or
                     // an explicit stop. Other regression fixtures retain their deadlines.
-                    bool creativeUntilDone = _scenario == "free-mode-control" && _harnessFixtureMode == "creative-farm";
+                    bool creativeUntilDone = _scenario == "free-mode-control" && (_harnessFixtureMode == "creative-farm"
+                        || Environment.GetEnvironmentVariable("STARDEW_AI_OBSERVE_SECONDS") == "0");
                     if (doneExists || (!creativeUntilDone && _tickCounter > timeoutTicks))
                     {
                         Monitor.Log($"[TestDriver] {_scenario} Act wait concluded (DoneFile: {doneExists}, Ticks: {_tickCounter}, Frames: {_loopDemoFrameIndex}).", LogLevel.Info);

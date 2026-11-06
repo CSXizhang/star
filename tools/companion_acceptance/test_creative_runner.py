@@ -100,6 +100,7 @@ def test_design_must_precede_first_clearing_attempt_for_the_same_project(monkeyp
     clear = {"name": "mcp__game__submit_work", "input": {"action": {"clear_debris": {"tiles": []}}}}
     monkeypatch.setattr(monitor, "summarize_trace", lambda calls: {"toolCalls": calls})
     assert monitor.design_precedes_clearing([plan, clear], "project")
+    assert monitor.design_precedes_clearing([plan], "project")
     assert not monitor.design_precedes_clearing([clear, plan], "project")
     assert not monitor.design_precedes_clearing([plan, clear], "another-project")
     unplanned = call({"id": "project", "project": {}})

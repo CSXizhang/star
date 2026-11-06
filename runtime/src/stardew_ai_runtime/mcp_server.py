@@ -850,7 +850,8 @@ def create_mcp_server(
         goal as a user instruction. Player-authored goals come from the chat path.
         project is a partial update that preserves omitted fields. It stores the current plan: phase, nextAction, blocker, prerequisites, window,
         progress, reason and farmRegion (locationId, bounds, reservedPaths, expansionDirection).
-        Keep summary concise; revise after actual results. It does not grant execution authority.
+        Keep summary concise; revise after actual results. Nonempty project.remaining prevents completion;
+        resolve the recorded work and explicitly update remaining to []. It does not grant execution authority.
         It never grants authority or proves completion; assess completion from current game observations.
 
         ``kind`` classifies the goal: 'main' is the single long-running main goal

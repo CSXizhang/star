@@ -40,11 +40,19 @@ def test_partial_construction_frontloads_real_remaining_obstacles_without_retry(
 def test_completion_keeps_submitted_as_built_layout_without_unlocking_main(tmp_path, mock_scheduler):
     store = _grant_decision(tmp_path, mock_scheduler)
     goal = store.add_goal("mock-save-123", "Build the farm", source="agent")
-    store.revise_goal("mock-save-123", goal.id, project={"layout":"initial proposal", "preserve":"west trees"})
+    store.revise_goal("mock-save-123", goal.id, project={"layout":"initial proposal", "preserve":"west trees",
+        "remaining":["Connect the woodland route"]})
     main = store.add_goal("mock-save-123", "Long-term farm", source="agent", kind="main")
     async def run():
         server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
         final = {"summary":"Built and observed", "layout":"Revised lakeside terrace and actual access"}
+        with pytest.raises(ToolError, match="PROJECT_UNRESOLVED"):
+            await server.call_tool("manage_arrangements", {"change":{"manage_goal": {
+                "action":"complete", "goal_id":goal.id, "project":final}}})
+        unchanged = store.state("mock-save-123").goals[0]
+        assert unchanged.status == "active" and unchanged.project["layout"] == "initial proposal"
+        assert unchanged.project["remaining"] == ["Connect the woodland route"]
+        final["remaining"] = []
         _, result = await server.call_tool("manage_arrangements", {"change":{"manage_goal": {
             "action":"complete", "goal_id":goal.id, "project":final}}})
         assert result["goal"]["status"] == "completed"

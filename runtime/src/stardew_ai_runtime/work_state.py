@@ -1137,6 +1137,12 @@ class WorkStore:
             if not completed and not restored and completion_observation is None:
                 raise WorkStateError("PROJECT_NO_EXECUTION: observe the game before assessing completion")
             final_project = {**goal.project, **(project or {})}
+            if final_project.get("remaining"):
+                raise WorkStateError(
+                    "PROJECT_UNRESOLVED: project.remaining still records unfinished work; "
+                    "verify those items against the game and continue the original project. "
+                    "After actually resolving them, explicitly update remaining to []."
+                )
             if len(json.dumps(final_project, ensure_ascii=False)) > 24000:
                 raise WorkStateError("project notes must fit within 24000 characters")
             goal.status = "completed"

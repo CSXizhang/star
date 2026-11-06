@@ -121,7 +121,7 @@ Kimi 用户首次使用还需在**安装后的伙伴文件夹**运行 `kimi`，�
 - [参与开发](CONTRIBUTING.md)：源码构建、测试与贡献。
 - [清理与兼容边界](docs/maintenance-cleanup.md)：旧组合种植接口迁移及仍保留的兼容入口。
 - [可重复实机验收](docs/repeatable-companion-acceptance.md)：固定任务、隔离存档、实际结果与 trace 报告。
-- [无限材料自主装修实验](docs/creative-farm-experiment.md)：从原始春夏农场开始，一次要求由 Agent 独立设计并建设林间星庭农庄；开放原生草籽、花饰及合法叠放，无总时限，低频记录过程并保存实景、布局与存档，按原始要求分别核对完成声明和实际成果。
+- [无限材料自主装修实验](docs/creative-farm-experiment.md)：从原始春夏农场开始，一次要求由 Agent 独立设计并建设林间星庭农庄；开放原生草籽、花饰及合法叠放，无总时限，低频记录过程并保存实景、布局与存档，按原始要求分别核对完成声明和实际成果；记录中还有未完项时不能结束工程。
 - [通信协议](protocol/README.md)：工具与消息约定。
 
 代码采用 [Apache License 2.0](LICENSE)。本项目为非官方项目，Stardew Valley、SMAPI 及其他依赖的名称、资源和权利归各自权利人所有。

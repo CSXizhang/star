@@ -2197,7 +2197,7 @@ def create_mcp_server(
         except Exception as ex:
             raise ToolError(f"Unexpected error querying chests: {ex}") from None
 
-    register_native_tools(mcp, sched, record_observation_recovery, work_for_run)
+    register_native_tools(mcp, sched, record_observation_recovery, work_for_run, run_dir)
 
     @mcp.tool()
     async def player_control(action: str) -> dict[str, Any]:
@@ -2843,7 +2843,7 @@ def create_mcp_server(
 
     readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "read_guidance", "read_reload_history", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
     declared_tools = {t.name: t for t in mcp._tool_manager.list_tools()}
-    readonly.update({"recall_memory", "inspect_capabilities", "learned_query"})
+    readonly.update({"recall_memory", "inspect_capabilities", "learned_query", "read_reference_image"})
     native_tools = {name: tool.fn for name, tool in declared_tools.items()}
     wire_param_shapes = {}
     def wire_type(shape):

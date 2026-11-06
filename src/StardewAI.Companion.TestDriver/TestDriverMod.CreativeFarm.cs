@@ -479,22 +479,8 @@ public sealed partial class TestDriverMod
             || bounds.X < 0 || bounds.Y < 0 || bounds.Right > map.Layers[0].LayerWidth || bounds.Bottom > map.Layers[0].LayerHeight
             || ReadNativeMember(ReadNativeMember(modEntry, "_authority"), "AgentOwns") is not false))
             throw new InvalidOperationException("Detail capture requires valid map bounds and settled player control.");
-        bool hadRegion = map.Properties.TryGetValue("ScreenshotRegion", out var originalRegion);
-        Dictionary<string, object> image;
-        try
-        {
-            // Native ScreenshotRegion uses inclusive tile corners. Restore it
-            // immediately; no world objects, player position or pixels are edited.
-            if (region is Rectangle area)
-                map.Properties["ScreenshotRegion"] = $"{area.X} {area.Y} {area.Right - 1} {area.Bottom - 1}";
-            image = observer.GetType().GetMethod("InspectMapImage")!.Invoke(observer, new object[] { "Farm" })
-                as Dictionary<string, object> ?? throw new InvalidOperationException("Native map image metadata is missing.");
-        }
-        finally
-        {
-            if (hadRegion) map.Properties["ScreenshotRegion"] = originalRegion;
-            else map.Properties.Remove("ScreenshotRegion");
-        }
+        var image = observer.GetType().GetMethod("InspectMapImage")!.Invoke(observer, new object?[] { "Farm", region })
+            as Dictionary<string, object> ?? throw new InvalidOperationException("Native map image metadata is missing.");
         string source = image.GetValueOrDefault("path") as string
             ?? throw new InvalidOperationException("Native map image did not report its output path.");
         // Stardew 1.6.15 writes synchronously but leaves its FileStream open

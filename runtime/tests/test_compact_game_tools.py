@@ -186,7 +186,12 @@ def test_mcode_declares_fixed_typed_operations_without_generic_params(tmp_path, 
         # Typed arguments plus a short semantic description for every operation.
         # Useful examples and memory operations may grow modestly; catch an
         # accidental full legacy-schema expansion rather than shave guidance.
-        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 65000
+        assert queries['observe_map_image']['properties']['region']['properties']['width']['type'] == 'integer'
+        references = tools['consult'].inputSchema['properties']['request']['properties']
+        assert references['read_reference_image']['properties']['image_id']['type'] == 'string'
+        # Local image regions and the selected-reference operation add typed
+        # fields; retain a small envelope instead of including legacy schemas.
+        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 68000
     asyncio.run(run())
 
 

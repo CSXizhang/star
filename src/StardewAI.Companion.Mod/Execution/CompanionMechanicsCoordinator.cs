@@ -914,7 +914,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                         : skillId == "inspect-machines" ? _observer.InspectMachines(payload.Parameters.LocationId)
                         : skillId == "inspect-production" ? _observer.InspectProduction(payload.Parameters.LocationId, _actor)
                         : skillId == "inspect-crafting" ? _observer.InspectCrafting(_actor)
-                        : _observer.InspectMapImage(payload.Parameters.LocationId);
+                        : _observer.InspectMapImage(payload.Parameters.LocationId, payload.Parameters.Region is { } imageRegion ? new Rectangle(imageRegion.X, imageRegion.Y, imageRegion.Width, imageRegion.Height) : null);
                     var result = new SkillResultPayload(payload.CommandId, payload.TaskId, "succeeded", 0, 0, 0,
                         _observer.WorldRevision, new(), new SkillResultResources(0, 0, 0), SkillId: skillId,
                         Details: new Dictionary<string, object> { [skillId == "inspect-player-activities" ? "activities" : skillId == "inspect-shop" ? "shop" : skillId == "inspect-livestock" ? "livestock" : skillId == "inspect-route" ? "route" : skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-planting" ? "planting" : skillId == "inspect-crafting" ? "crafting" : skillId == "inspect-building-services" ? "buildingServices" : skillId == "inspect-machines" ? "machines" : skillId == "inspect-production" ? "production" : "mapImage"] = space });

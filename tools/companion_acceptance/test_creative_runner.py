@@ -15,6 +15,17 @@ import creative_runner as monitor
 CRITERIA = {"minPathTiles": 24, "minChests": 2, "minRestObjects": 1, "minLights": 2}
 
 
+def test_open_creation_accepts_actual_paving_without_requiring_any_facility():
+    after = sample(True)
+    after["creativeFarm"]["layout"] = [item for item in layout() if item["kind"] == "floor"]
+    after["creativeFarm"]["counts"] = {"pathTiles": 24, "chests": 0, "restObjects": 0, "lights": 0}
+    after["creativeFarm"]["operationAccess"] = []
+    checks = monitor.world_checks(sample(), after, {"requireAccessibleFixtures": True}, ledger())
+    assert all(checks.values())
+    assert not any(key.startswith("minimum_") for key in checks)
+    assert not monitor.world_checks(sample(), sample(), {}, [])["autonomous_construction_recorded"]
+
+
 def test_closeups_choose_real_campfire_instead_of_repeating_workshop_brazier():
     farm = {"workArea": {"width": 80, "height": 65}, "layout": [
         {"x": 50, "y": 17, "categories": ["chest"], "origin": "agent-or-native", "itemId": "(BC)130"},

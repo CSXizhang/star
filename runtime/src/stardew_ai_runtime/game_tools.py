@@ -12,7 +12,7 @@ GAME_TOOLS = frozenset({"get_status", "query_game", "submit_work", "manage_arran
                         "remember", "request_player_decision", "consult", "read_reload_history"})
 
 OPERATION_HELP = {
-    "manage_goal": 'Finite work defaults to stage: {"change":{"manage_goal":{"action":"create","text":"Build the farm"}}}. Keep original requirements, actual layout and remaining work separate. Nonempty project.remaining blocks completion; resolve and set []. Verify full scope, not a reduced plan. Explicit main stays protected.',
+    "manage_goal": 'Finite work defaults to stage: {"change":{"manage_goal":{"action":"create","text":"Create a farm"}}}. Record intent, current plan and remaining work; self-chosen designs may change while honoring player constraints. Nonempty project.remaining blocks completion; resolve and set []. Final descriptions must match real results. Explicit main stays protected.',
     "pickup_items": "Collect existing loose drops or directly grabbable ground items at observed tiles. effects.collectedItems lists accepted itemId/quality/stack, including partial collection; completedCount counts targets. Drops may move or be collected while walking; no-item means nothing eligible remains there. Current observations do not identify who caused a change. Does not open chests or clear obstacles.",
     "ship_items": "Ship the listed backpack items through the native shipping bin. Call submit_work with {\"action\":{\"ship_items\":{\"items\":[{\"itemId\":\"(O)24\",\"count\":1}]}}}. Use current inventory and the player's request to choose items and counts; do not omit the ship_items wrapper.",
     "refill_watering_can": "Refill once on the companion's current map. Omit tiles to use observed native water sources; max_tiles limits candidate sources, not refills. Explicit tiles are alternative water-source tiles, not standing positions. A full can needs no refill. If unreachable, inspect obstacles and decide whether to clear them before retrying or changing source.",
@@ -81,7 +81,7 @@ def register_game_tools(mcp, implementations, declarations, operations, *, execu
     Action = model("GameAction", operations)
     Arrangement = model("Arrangement", {"manage_milestones", "manage_companion", "remember_intent", "manage_goal", "manage_todo", "set_autonomy", "develop_capability", "manage_capability", "prepare_capability_builder"})
     Memory = model("Memory", {"save_memory", "save_method", "forget_memory", "record_decision_note", "answer_player_decision", "say_to_player"})
-    Reference = model("Reference", {"recall_memory", "query_wiki", "read_guidance", "inspect_capabilities"})
+    Reference = model("Reference", {"recall_memory", "query_wiki", "read_guidance", "inspect_capabilities", "read_reference_image"})
 
     async def invoke(value):
         name, args = value.selected()
@@ -129,7 +129,7 @@ def register_game_tools(mcp, implementations, declarations, operations, *, execu
     remember.__annotations__ = {"entry": Memory, "return": dict[str, Any]}
 
     async def consult(request):
-        """Recall companion memories or learned methods, read guidance, or look up wiki knowledge.
+        """Recall companion memories or learned methods, read guidance/selected reference images, or look up wiki knowledge.
 
         Example: {"request":{"recall_memory":{"query":"雨天 海边"}}}.
         Use kind='method' inside recall_memory to find learned approaches; note_id reads a full note.

@@ -39,7 +39,7 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "inspect-crafting": frozenset({"locationId"}),
     "craft-items": frozenset({"locationId", "recipeName", "itemCount"}),
     "move-building": frozenset({"locationId", "buildingName", "tile"}),
-    "inspect-map-image": frozenset({"locationId"}),
+    "inspect-map-image": frozenset({"locationId", "region"}),
     "inspect-location": frozenset({"locationId", "region"}),
     "inspect-planting": frozenset({"locationId", "region"}),
     "inspect-route": frozenset({"locationId", "tile"}),

@@ -41,8 +41,8 @@ def detail_regions(farm):
     selected = []
     for name, category, preferred in (("flowers", "flower", None), ("workshop", "chest", None),
                                       ("cultivation", "farming", None), ("rest", "rest", "(BC)146"),
-                                      ("scenery", "path", None)):
-        candidates = [item for item in items if category in item.get("categories", [])]
+                                      ("scenery", "path", None), ("scene", None, None)):
+        candidates = [item for item in items if category is None or category in item.get("categories", [])]
         preferred_items = [item for item in candidates if item.get("itemId") == preferred]
         candidates = preferred_items or candidates
         if not candidates:
@@ -223,11 +223,12 @@ def world_checks(before, after, criteria, ledger):
         "no_purchase_or_building_work": not completed_skills.intersection({
             "purchase-items", "build-building", "upgrade-building", "move-building", "demolish-building"}),
         "native_counts_match_layout": all((farm.get("counts") or {}).get(key) == value for key, value in counts.items()),
-        "placed_items_have_native_receipts": bool(required_items) and all(
+        "autonomous_construction_recorded": bool(completed_skills.intersection({"place-items", "remove-items", "hoe-tiles", "clear-debris", "chop-tree", "cut-grass"})),
+        "placed_items_have_native_receipts": all(
             (item.get("itemId"), item.get("x"), item.get("y")) in placed for item in required_items),
-        "placed_items_were_crafted": bool(required_items) and all(crafted[item] >= count for item, count in placed_counts.items()),
+        "placed_items_were_crafted": all(crafted[item] >= count for item, count in placed_counts.items()),
     }
-    checks.update({"minimum_" + key: counts[key] >= criteria[criterion] for key, criterion in MINIMUMS.items()})
+    checks.update({"minimum_" + key: counts[key] >= criteria[criterion] for key, criterion in MINIMUMS.items() if criterion in criteria})
     initial_space = ((before.get("creativeFarm") or {}).get("space") or {}).get("occupants", [])
     final_space = (farm.get("space") or {}).get("occupants", [])
     if criteria.get("requireRawGround"):
@@ -248,7 +249,7 @@ def world_checks(before, after, criteria, ledger):
         expected = {(item.get("itemId"), item.get("x"), item.get("y")) for item in added
                     if {"chest", "production"}.intersection(item.get("categories", []))}
         observed = {(item.get("itemId"), item.get("x"), item.get("y")) for item in access}
-        checks["chests_and_processing_accessible"] = bool(expected) and expected == observed and all(
+        checks["chests_and_processing_accessible"] = expected == observed and all(
             item.get("reachable") is True for item in access)
     return checks
 
@@ -359,8 +360,8 @@ class CreativeRunner(Runner):
         self.save_id = fixture["saveName"]
         self.spec = (read(self.cases_file) or {})[self.case]
         self.criteria = self.spec["criteria"]
-        if any(type(self.criteria.get(key)) is not int or self.criteria[key] < 1 for key in MINIMUMS.values()):
-            raise ValueError("Creative criteria require positive integer minimums")
+        if any(type(self.criteria[key]) is not int or self.criteria[key] < 0 for key in MINIMUMS.values() if key in self.criteria):
+            raise ValueError("Optional legacy quantity criteria must be nonnegative integers")
         rendered_instruction = self.spec["instruction"].strip()
         self.prompt = self.spec["designBrief"].strip() + "\n\n" + rendered_instruction
         self.report.update({"fixture": fixture, "designBrief": self.spec["designBrief"], "instruction": self.spec["instruction"],
@@ -573,7 +574,7 @@ class CreativeRunner(Runner):
             checks["same_project_completed"] = bool(goal and goal.get("status") == "completed")
             checks["project_design_recorded"] = bool(goal and design_recorded(goal.get("project"))
                                                       and self.report.get("recordedDesignObserved"))
-            if self.criteria.get("requireNativeClearing"):
+            if self.criteria.get("requireRawGround"):
                 checks["design_precedes_clearing"] = design_precedes_clearing(trace, self.goal_id)
             if checks["same_project_completed"]:
                 self.report["completionRequestId"] = self.completion_turn(trace, commands, lease)

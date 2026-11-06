@@ -107,13 +107,13 @@ public sealed class PlayerKnownObserver : IWorldObserver
         return _inner.InspectLocation(locationName, IsFarm(locationName) ? region : VisibleRegion(region));
     }
 
-    public Dictionary<string, object> InspectMapImage(string locationName)
+    public Dictionary<string, object> InspectMapImage(string locationName, Rectangle? region = null)
     {
         // A screenshot of the rendered map is only possible for the current map; keep
         // the interface's not-supported shape for anything else (the inner observer
         // would reject it as well, as a non-current-map screenshot).
         if (!IsCurrentLocation(locationName)) throw LocationNotKnown(nameof(InspectMapImage), locationName);
-        return _inner.InspectMapImage(locationName);
+        return _inner.InspectMapImage(locationName, region);
     }
 
     public TileDirtState GetDirtState(string locationName, TileCoordinate tile)

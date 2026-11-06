@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 import uuid
@@ -10,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 from pydantic import BeforeValidator, Field
 
 from stardew_ai_runtime.mcp_contract import (
@@ -40,7 +42,7 @@ from stardew_ai_runtime.work_state import (
 logger = logging.getLogger("stardew_ai_runtime.mcp_server")
 
 
-def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observation_recovery, work_for_run) -> None:
+def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observation_recovery, work_for_run, run_dir=None) -> None:
     @mcp.tool()
     async def query_planting_options(detail: bool = False, location_id: str = "Farm", region: SpatialRegion | None = None) -> dict[str, Any]:
         """Query companion seeds, season, tillable dirt and tilled empty tiles for planting.
@@ -951,14 +953,27 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
-    async def observe_map_image(location_id: str = "Farm") -> Image:
+    async def read_reference_image(image_id: str | None = None) -> CallToolResult:
+        """List selected local inspiration images; pass a listed image_id to receive its actual pixels and source.
+
+        Optional references are not current-world observations or required building content.
+        No network, arbitrary filenames or shell access is needed.
+        """
+        from .reference_images import read_reference_image as read_image
+        manifest = Path(run_dir) / "config/reference-images/manifest.json" if run_dir else None
+        return read_image(image_id, manifest)
+
+    @mcp.tool()
+    async def observe_map_image(location_id: str = "Farm", region: SpatialRegion | None = None) -> CallToolResult:
         """See a native map PNG for design, only when player is already on that map.
 
-        Returns image content to the model, never requires shell/file access.
-        Use observe_farm_space for exact tile identities; screenshots are visual references.
+        Omit region for the full map; {x,y,width,height} returns a real local view.
+        Image includes absolute tile bounds, pixel mapping and capture revision.
+        Use full views for composition, close-ups for objects/occlusion/edges,
+        and observe_farm_space for exact tile identities. Does not move the player.
         """
         try:
-            result = await sched.query_map_image(location_id=location_id)
+            result = await sched.query_map_image(location_id=location_id, region=region.model_dump() if isinstance(region, SpatialRegion) else region)
             image_path = Path(str(result.get("path") or "")).resolve()
             allowed_root = (Path(tempfile.gettempdir()) / "StardewAI.Companion" / "map-images").resolve()
             if (not image_path.is_relative_to(allowed_root) or image_path.suffix.lower() != ".png"
@@ -969,7 +984,10 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
             data = image_path.read_bytes()
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise ToolError("Native map image is not PNG")
-            return Image(data=data, format="png")
+            metadata = {key: value for key, value in result.items() if key != "path"}
+            metadata["kind"] = "map_image"
+            return CallToolResult(content=[Image(data=data, format="png").to_image_content(),
+                TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))], structuredContent=metadata)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
 

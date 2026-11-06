@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory=$true)][string]$ReleaseDir,
     [string]$SavePath = '',
     [string]$DesignBriefPath = '',
+    [string]$ReferenceImagesManifest = '',
     [string]$SuiteId = '',
     [ValidateSet('mcode','agy')][string]$AcceptanceBackend = 'mcode',
     [string]$AcceptanceModel = '',
@@ -16,6 +17,7 @@ $ErrorActionPreference = 'Stop'
 $creative = $Cases -contains 'creative-farm'
 if ($creative -and $Cases.Count -ne 1) { throw 'creative-farm 使用独立创作环境，请单独运行该场景。' }
 if ($DesignBriefPath -and -not $creative) { throw '-DesignBriefPath 仅用于 creative-farm。' }
+if ($ReferenceImagesManifest -and -not $creative) { throw '-ReferenceImagesManifest 仅用于 creative-farm。' }
 $designBrief = ''
 if ($DesignBriefPath) {
     $designBrief = Get-Content -LiteralPath $DesignBriefPath -Raw -Encoding UTF8
@@ -66,6 +68,10 @@ if ($AcceptanceModel) { $launchArgs += @('-AcceptanceModel',$AcceptanceModel) }
 if ($SavePath) { $launchArgs += @('-CustomSavePath',('"' + (Resolve-Path -LiteralPath $SavePath).Path + '"')) }
 $launcher = $null
 $runnerExit = 1
+$previousReferenceManifest = $env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST
+if ($ReferenceImagesManifest) {
+    $env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST = (Resolve-Path -LiteralPath $ReferenceImagesManifest).Path
+}
 try {
     $launcher = Start-Process -FilePath $shell -ArgumentList $launchArgs -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $suite 'launch.log') -RedirectStandardError (Join-Path $suite 'launch.err')
@@ -76,6 +82,7 @@ try {
     }
     $runnerExit = $LASTEXITCODE
 } finally {
+    $env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST = $previousReferenceManifest
     if ($creative -and $launcher) {
         # Even a monitor import/startup failure must release this owned game.
         # The launcher has a separate shutdown timeout after this done signal.

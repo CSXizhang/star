@@ -137,8 +137,16 @@ def test_map_image_is_mcp_content_and_rejects_arbitrary_file(tmp_path, monkeypat
         compact = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="light")
         compact_result = await compact.call_tool("query_game", {"query": {"observe_map_image": {}}})
         assert compact_result.content[0].type == "image"
-        assert compact_result.content[0].data == result[0].data
-        assert result[0].type == "image" and result[0].mimeType == "image/png"
+        assert compact_result.content[0].data == result.content[0].data
+        assert result.content[0].type == "image" and result.content[0].mimeType == "image/png"
+        area = {"x": 10, "y": 20, "width": 12, "height": 8}
+        scheduler.query_map_image.return_value.update(region=area, capturedRevision=19, pixelsPerTile=32)
+        detail = await compact.call_tool("query_game", {"query": {"observe_map_image": {"region": area}}})
+        scheduler.query_map_image.assert_awaited_with(location_id="Farm", region=area)
+        assert detail.structuredContent["region"] == area
+        assert detail.structuredContent["capturedRevision"] == 19
+        assert '"pixelsPerTile": 32' in detail.content[1].text
+        assert "path" not in detail.structuredContent
         scheduler.query_map_image.return_value = {"path": str(tmp_path / "private.png")}
         with pytest.raises(ToolError, match="controlled image directory"):
             await server.call_tool("observe_map_image", {})

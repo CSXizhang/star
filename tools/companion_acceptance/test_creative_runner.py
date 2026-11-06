@@ -344,6 +344,36 @@ def setup_run(tmp_path):
     return runner
 
 
+@pytest.mark.parametrize("responds", [True, False])
+def test_native_snapshot_waits_for_busy_game_thread_but_still_times_out_on_real_silence(tmp_path, monkeypatch, responds):
+    runner = setup_run(tmp_path)
+    elapsed = 0
+    request = runner.evidence / "free-mode-native-snapshot-request.txt"
+    labels = set()
+
+    async def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+        if request.exists():
+            label = request.read_text(encoding="utf-8")
+            labels.add(label)
+            if responds and elapsed >= 45:
+                request.unlink()
+                monitor.write(runner.evidence / f"free-mode-native-{label}.json",
+                              {"runId": runner.run.name, "companionObserved": True})
+
+    monkeypatch.setattr(monitor.time, "monotonic", lambda: elapsed)
+    monkeypatch.setattr(monitor.asyncio, "sleep", sleep)
+    if responds:
+        assert asyncio.run(runner.native())["runId"] == runner.run.name
+        assert len(runner.samples) == 1
+    else:
+        with pytest.raises(TimeoutError, match="No native snapshot"):
+            asyncio.run(runner.native())
+        assert not runner.samples
+    assert len(labels) == 1
+
+
 def png_capture(runner, label, actual):
     # Only the PNG header is needed by the receipt verifier, not image decoding.
     raw = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR" + struct.pack(">II", 1280, 1024)

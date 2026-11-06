@@ -305,6 +305,12 @@ class CreativeRunner(Runner):
             "note": "技术验收与审美评审分别记录；请结合实际农场图评价设计。",
         }
 
+    async def native(self):
+        # Dense raw-farm navigation can occupy the game thread beyond the
+        # ordinary preset's 30-second receipt window. Wait for this same label;
+        # never retry actions or stop a healthy project for that short delay.
+        return await super().native(timeout=120)
+
     def state(self):
         return (read(self.mod / "data/work-state.json") or {}).get(self.save_id) or {}
 

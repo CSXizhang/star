@@ -583,7 +583,13 @@ class CreativeRunner(Runner):
                     operation = request.get("read_reference_image") if isinstance(request, dict) else None
                     if (str(call.get("name")).endswith("__consult") and isinstance(operation, dict)
                             and not call.get("error") and not call.get("nonterminal")):
-                        returned.add(operation.get("image_id"))
+                        if operation.get("image_id") is not None:
+                            returned.add(operation["image_id"])
+                        else:
+                            # The current no-ID contract returns all staged pixels.
+                            # AGY may expose successful image output as attachments,
+                            # so parsed JSON alone is not a delivery prerequisite.
+                            returned.update(item["id"] for item in self.report["referenceImages"])
                 checks["selected_reference_images_returned"] = all(item["id"] in returned for item in self.report["referenceImages"])
             checks["same_project_completed"] = bool(goal and goal.get("status") == "completed")
             checks["project_design_recorded"] = bool(goal and design_recorded(goal.get("project"))

@@ -954,7 +954,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
     @mcp.tool()
     async def read_reference_image(image_id: str | None = None) -> CallToolResult:
-        """List selected local inspiration images; pass a listed image_id to receive its actual pixels and source.
+        """View all selected local inspiration images and sources; optional image_id views one again.
 
         Optional references are not current-world observations or required building content.
         No network, arbitrary filenames or shell access is needed.

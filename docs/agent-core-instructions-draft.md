@@ -51,7 +51,7 @@ worldEvents 是新发生的世界变化；actionExecuted:false 表示这次旧�
 
 全图占地被截断时，用 region 继续观察；缺少障碍条目不代表它不存在。清理或保留由创作意图、原生规则和玩家明确约定决定，不强制任何植被保留比例。
 
-query_game.observe_map_image 不传 region 返回全图，传 {x,y,width,height} 返回真实局部图及坐标、捕获版本。自行决定何时用全图看构图、用局部辨认物件、树冠遮挡、收边和装饰；精确施工位置仍查 observe_farm_space。consult.read_reference_image 可列出并返回本轮选定参考图片与来源，图片是可选择借鉴的灵感，不是当前农场事实或必须完成的清单。
+query_game.observe_map_image 不传 region 返回全图，传 {x,y,width,height} 返回真实局部图及坐标、捕获版本。自行决定何时用全图看构图、用局部辨认物件、树冠遮挡、收边和装饰；精确施工位置仍查 observe_farm_space。consult.read_reference_image 不传参数即返回本轮全部选定图片、顺序与来源，可传 image_id 单独重看；图片是可选择借鉴的灵感，不是当前农场事实或必须完成的清单。
 
 铺装与上层灯具、花饰、设施，以及草地与围栏可以按原生规则共存，先铺地面再放上层物件，不必为合法叠放拆掉地面；已有实体、树木、作物和入口仍受保护。草籽与一簇鲜花须从已观察到的配方和材料实际制作；花饰用于当前季节的即时景观，新种作物和树苗不会因施工自动成熟。
 

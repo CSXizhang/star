@@ -24,7 +24,9 @@ def test_selected_reference_pixels_and_source_reach_existing_consult_only(tmp_pa
         game = create_mcp_server(run_dir=tmp_path, scheduler=MagicMock(), surface="light")
         assert {tool.name for tool in await game.list_tools()} == GAME_TOOLS
         catalog = await game.call_tool("consult", {"request": {"read_reference_image": {}}})
-        assert len(catalog.content) == 1 and catalog.structuredContent["images"][0]["source"] == entry["source"]
+        assert len(catalog.content) == 2 and catalog.structuredContent["images"][0]["source"] == entry["source"]
+        assert base64.b64decode(catalog.content[0].data) == data
+        assert catalog.structuredContent["imageOrder"] == ["inspiration"]
         shown = await game.call_tool("consult", {"request": {"read_reference_image": {"image_id": "inspiration"}}})
         assert base64.b64decode(shown.content[0].data) == data
         assert shown.content[0].type == "image"

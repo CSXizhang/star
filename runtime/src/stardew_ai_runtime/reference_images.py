@@ -26,11 +26,13 @@ def read_reference_image(image_id: str | None = None, manifest_path: Path | None
     catalog = [{key: entry[key] for key in ("id", "title", "author", "source", "sha256")} for entry in entries]
     metadata = {"kind": "reference_image", "images": catalog,
                 "purpose": "Optional inspiration, not a building checklist or evidence of the current farm."}
+    selected = entries if image_id is None else [item for item in entries if item["id"] == image_id]
+    if image_id is not None and not selected:
+        raise ToolError("Unknown reference image ID; omit image_id to view available images")
+    metadata["images"] = [item for item in catalog if image_id is None or item["id"] == image_id]
+    metadata["imageOrder"] = [entry["id"] for entry in selected]
     content = []
-    if image_id is not None:
-        entry = next((item for item in entries if item["id"] == image_id), None)
-        if entry is None:
-            raise ToolError("Unknown reference image ID; omit image_id to list available images")
+    for entry in selected:
         path = (root / entry["file"]).resolve()
         if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
             raise ToolError("Reference image must be a bounded file inside its manifest directory")
@@ -41,6 +43,5 @@ def read_reference_image(image_id: str | None = None, manifest_path: Path | None
         if fmt is None:
             raise ToolError("Reference image must be PNG or JPEG")
         content.append(Image(data=data, format=fmt).to_image_content())
-        metadata["images"] = [item for item in catalog if item["id"] == image_id]
     content.append(TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)))
     return CallToolResult(content=content, structuredContent=metadata)

@@ -402,9 +402,14 @@ public sealed partial class TestDriverMod
         var poseType = assembly.GetType("StardewAI.Companion.Mod.Domain.AuthoritativePose")!;
         var facingType = assembly.GetType("StardewAI.Companion.Mod.Domain.FacingDirection")!;
         object Tile(int x, int y) => Activator.CreateInstance(tileType, x, y)!;
-        var anchor = Tile(_creativeAnchor.X, _creativeAnchor.Y);
+        // The initial standing tile is not a reserved entrance or design constraint.
+        // Check actual navigation from the actor, including all originally reachable entrances.
+        if (_creativeFarmer?.currentLocation != farm)
+            return (false, null, "actor-not-on-farm");
+        var currentAnchor = _creativeFarmer.TilePoint;
+        var anchor = Tile(currentAnchor.X, currentAnchor.Y);
         if (observer.GetType().GetMethod("IsTilePassable")!.Invoke(observer, new[] { (object)"Farm", anchor }) is not true)
-            return (false, null, "initial-access-anchor-blocked");
+            return (false, null, "actor-access-anchor-blocked");
         var pose = Activator.CreateInstance(poseType, "Farm", anchor, Enum.ToObject(facingType, 2))!;
         var method = navigator.GetType().GetMethods().Single(candidate => candidate.Name == "FindPathToInteract"
             && candidate.GetParameters()[0].ParameterType == poseType);
@@ -449,7 +454,8 @@ public sealed partial class TestDriverMod
             layout, space = CreativeSpace(), operationAccess, buildingsPreserved = changed.Length == 0, changedOriginalBuildings = changed,
             extraBuildings = currentBuildings.Keys.Except(_creativeBuildings.Keys).ToArray(),
             waterTilesPreserved = CreativeWaterFingerprint(farm) == _creativeWaterBaseline,
-            accessAnchor = new { x = _creativeAnchor.X, y = _creativeAnchor.Y }, entrances,
+            accessAnchor = farmer == null ? null : new { x = farmer.TilePoint.X, y = farmer.TilePoint.Y },
+            initialAccessAnchor = new { x = _creativeAnchor.X, y = _creativeAnchor.Y }, entrances,
             entrancesReachable = entrances.Any(entrance => entrance.initiallyReachable)
                 && entrances.Where(entrance => entrance.initiallyReachable).All(entrance => entrance.reachable),
             supplyLedgerSequence = _creativeSequence, supplyEvents = _creativeSupplyEvents,

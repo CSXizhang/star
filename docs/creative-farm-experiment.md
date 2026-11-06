@@ -12,7 +12,7 @@
 
 可选灵感来自 [Crowshadow](https://forums.stardewvalley.net/threads/my-perfect-and-only-farm-10-years-300-hours.4782/)、[Bloodless](https://forums.stardewvalley.net/threads/my-one-and-only-farm-finally-fully-updated.34643/) 与 [Overhill Farm](https://forums.stardewvalley.net/threads/overhill-farm.5823/)。它们启发空间组织、材料搭配与生活感，模型可以自由借鉴或另选方向；参考里的地图、建筑和植物不代表本轮可用能力，实际配方和空间观察才是依据。
 
-本地清单 `manifest.json` 的 `images` 保存每张图的 `id`、`title`、`author`、`source`、相邻文件名 `file` 和 `sha256`；通过 `-ReferenceImagesManifest` 选择少量 PNG/JPEG。启动器只将列出的图和清单复制到隔离运行的 `config/reference-images/`，同一 `consult.read_reference_image` 操作不传参数列出来源，传 `image_id` 返回真实 MCP 图片和来源说明；八个具名入口保持不变，不修改客户端的额外工具配置。
+本地清单 `manifest.json` 的 `images` 保存每张图的 `id`、`title`、`author`、`source`、相邻文件名 `file` 和 `sha256`；通过 `-ReferenceImagesManifest` 选择少量 PNG/JPEG。启动器只将列出的图和清单复制到隔离运行的 `config/reference-images/`，同一 `consult.read_reference_image` 操作不传参数即返回全部选定图片、顺序与来源，传 `image_id` 可单独重看；八个具名入口保持不变，不修改客户端的额外工具配置。
 
 `query_game.observe_map_image` 不传 `region` 保持原生全图，传 `{x,y,width,height}` 返回原生局部截图，附绝对格点范围、像素关系和捕获版本。临时 ScreenshotRegion 在成功或异常后恢复，不移动角色；模型自行选择观察时机，精确施工仍使用结构化空间观察。图片类型单测不等于真实后端理解，正式运行前需用选定后端结合参考图、局部画面和真实物件做小范围核对。
 
@@ -197,3 +197,10 @@
 第二次约 3 分 29 秒，当前项目选择的 agy／gemini-3.8-flash 实际打开三张参考图附件，并描述 Crowshadow 的彩色建筑、蘑菇树与池塘、Bloodless 的金钟对称构图和四口彩色鱼塘等未在任务中提供的细节；随后自行选择蜂房水景区域，使用局部图与相同范围的结构化观察，辨认木地板/篝火叠放和树冠遮挡，未移动或施工。人工对照真实 PNG 确认图片接收与理解，并非只验证路径或 MCP image 类型；客户端公开记录截断长回复中段，包括 Overhill 的完整说明，因此不把摘录当完整回答，也不宣称物件识别完全无误。
 
 参考图及来源清单只在本地实验输入和隔离运行中保存；客户端将 MCP 图片/长回执作为附件时，只允许接收该游戏工具明确返回的内容，不扩大信息来源。两次图片核对分别保留为 `pr17-free-vision-01/02`，新的原始农场开放创作正式结果另行记录。
+
+
+### 开放创作第一轮：保存真实结果，修复图片默认输入和通行验收
+
+源码 `37dd435`、完整包 `pr17-free-create-ready-03` 的第一轮约 14 分 36 秒自行完成并保存，模型选择只装修农舍前庭，建成 67 格铺装、蜂房花饰及露天工坊。原始报告为 incomplete，原图、项目和存档独立保留在 `pr17-free-create-formal-01-game`；此轮只读取了参考目录，未打开参考图片，不能算带参考图片的完整创作验证。
+
+针对真实遗漏，`consult.read_reference_image` 不传参数改为直接返回选定图片及顺序来源，可按 ID 重看，避免只有目录进入输入。另修复验收误判：模型把灯放在最初站立格，旧检查因此将所有入口与设施判为不可达；现在从角色实际位置检查所有原来可达的入口和实际建成设施，不把初始站立格变成隐含的永久禁建点。历史报告不重写，修复后另行核对并完整运行。

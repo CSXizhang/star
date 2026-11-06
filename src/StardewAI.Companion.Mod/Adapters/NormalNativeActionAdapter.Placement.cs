@@ -24,7 +24,7 @@ public sealed partial class NormalNativeActionAdapter
         var farmer = actor.GameFarmer;
         if (loc is null || farmer is null || !ReferenceEquals(farmer.currentLocation, loc))
             return NativeActionStepResult.Precondition("Companion is not on the requested map.", "wrong-map");
-        if (!actor.Tile.IsAdjacentTo(target.Tile) && actor.Tile != target.Tile)
+        if (!actor.Tile.IsAdjacentTo(target.Tile))
             return NativeActionStepResult.Precondition("Placement requires an adjacent tile.", "not-adjacent");
         var source = farmer.Items.OfType<StardewValley.Object>().FirstOrDefault(i => SameItem(i.QualifiedItemId, request.ItemId) && i.Stack > 0);
         if (source is null)

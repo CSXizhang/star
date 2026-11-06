@@ -994,7 +994,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
     async def place_items(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
         """Place copies of one real backpack item at the declared tiles.
 
-        Native placement rules, inventory consumption and partial results apply.
+        Walk to an adjacent standing tile, then apply native placement rules,
+        inventory consumption and partial results.
         Upper items may coexist with flooring/grass when native rules permit;
         existing objects, trees, crops and entrances remain protected.
         """

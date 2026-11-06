@@ -463,6 +463,11 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
 
     private bool IsReadyToInteract()
     {
+        // Native solid-object placement rejects the player's own footprint.
+        // Use the same adjacent approach for every placement, including floors,
+        // so a following upper-layer item never executes from inside its tile.
+        if (_currentRequest!.Kind == NativeActionKind.PlaceItems)
+            return _actor.Tile.IsAdjacentTo(_currentTarget.Tile);
         if (_currentRequest!.Kind == NativeActionKind.MoveBuilding)
             return _actor.Tile == new TileCoordinate(_currentTarget.Tile.X - 1, _currentTarget.Tile.Y)
                 || _actor.Tile == new TileCoordinate(_currentTarget.Tile.X, _currentTarget.Tile.Y - 1);

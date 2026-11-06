@@ -8,6 +8,31 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class NativeActionStateMachineTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PlacementStepsOffTargetOrRejectsWithoutActingInsideTheDestination(bool surroundTarget)
+    {
+        var target = new TileCoordinate(10, 10);
+        var (machine, actor, observer, adapter) = CreateHarness(initialTile: target);
+        if (surroundTarget)
+            foreach (var tile in new[] { new TileCoordinate(9, 10), new TileCoordinate(11, 10),
+                new TileCoordinate(10, 9), new TileCoordinate(10, 11) }) observer.SetPassable(tile, false);
+        Assert.True(machine.Start(Request(NativeActionKind.PlaceItems, target), out _));
+        machine.StepTicks(400);
+        if (surroundTarget)
+        {
+            Assert.Equal(0, adapter.CallCount);
+            Assert.Equal("unreachable", Assert.Single(machine.FinalResult!.Skipped).Reason);
+        }
+        else
+        {
+            Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+            Assert.Equal(1, adapter.CallCount);
+            Assert.True(actor.Tile.IsAdjacentTo(target));
+        }
+    }
+
     [Fact]
     public void ClumpUsesReachableFarEdgeWithoutWalkingInsideOrCountingEachSwingAsRemoval()
     {

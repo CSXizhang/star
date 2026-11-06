@@ -161,7 +161,7 @@ def world_checks(before, after, criteria, ledger):
     crafted, placed = construction_evidence(ledger)
     completed_skills = {receipt.get("skillid") for row in ledger if row.get("type") == "native-result"
                         for receipt in [lower_keys(row.get("payload"))] if receipt.get("completedcount", 0) > 0}
-    required_items = [item for item in added if set(item.get("categories", [])) & set(CATEGORIES.values())]
+    required_items = [item for item in added if item.get("categories")]
     placed_counts = Counter(item.get("itemId") for item in required_items)
     checks = {
         "creative_fixture_active": farm.get("active") is True and not farm.get("error"),
@@ -182,12 +182,34 @@ def world_checks(before, after, criteria, ledger):
         "placed_items_were_crafted": bool(required_items) and all(crafted[item] >= count for item, count in placed_counts.items()),
     }
     checks.update({"minimum_" + key: counts[key] >= criteria[criterion] for key, criterion in MINIMUMS.items()})
+    initial_space = ((before.get("creativeFarm") or {}).get("space") or {}).get("occupants", [])
+    final_space = (farm.get("space") or {}).get("occupants", [])
+    if criteria.get("requireRawGround"):
+        checks["raw_source_ground_observed"] = all(any(item.get("kind") == kind for item in initial_space)
+                                                  for kind in ("Tree", "Grass", "resource-clump", "object"))
+    if criteria.get("requireNativeClearing"):
+        checks["native_clearing_recorded"] = bool(completed_skills.intersection({"clear-debris", "cut-grass", "chop-tree"}))
+    if criteria.get("requirePreservedVegetation"):
+        for kind in ("Tree", "Grass"):
+            original = {(item.get("x"), item.get("y")) for item in initial_space if item.get("kind") == kind}
+            retained = {(item.get("x"), item.get("y")) for item in final_space if item.get("kind") == kind}
+            checks["original_" + kind.lower() + "_retained"] = bool(original & retained)
+    if criteria.get("requireProcessingAndCultivation"):
+        checks["processing_facilities_built"] = any("production" in item.get("categories", []) for item in added)
+        checks["cultivation_space_built"] = any(item.get("kind") == "HoeDirt" for item in final_space)
+    if criteria.get("requireAccessibleFixtures"):
+        access = farm.get("operationAccess") or []
+        expected = {(item.get("itemId"), item.get("x"), item.get("y")) for item in added
+                    if {"chest", "production"}.intersection(item.get("categories", []))}
+        observed = {(item.get("itemId"), item.get("x"), item.get("y")) for item in access}
+        checks["chests_and_processing_accessible"] = bool(expected) and expected == observed and all(
+            item.get("reachable") is True for item in access)
     return checks
 
 
 def round_settled(lease, commands, request_id, save_id):
     return (isinstance(lease, dict) and lease.get("saveId") == save_id and "requestId" in lease
-            and lease["requestId"] is None and bool(request_id)
+            and lease["requestId"] != request_id and bool(request_id)
             and any(row.get("requestId") == request_id and row.get("saveId") == save_id
                     and row.get("status") == "completed" for row in commands))
 
@@ -198,6 +220,21 @@ def design_recorded(project):
     summary, layout = project.get("summary"), project.get("layout")
     return (isinstance(summary, str) and bool(summary.strip()) and isinstance(layout, (str, list, dict))
             and bool(layout.strip() if isinstance(layout, str) else layout))
+
+
+def design_precedes_clearing(trace, goal_id):
+    planned = False
+    for call in summarize_trace(trace)["toolCalls"]:
+        result = call.get("result") or {}
+        goal = result.get("goal") or {} if isinstance(result, dict) else {}
+        if (goal_operation(call).get("action") in {"create", "update"} and not call.get("error")
+                and goal.get("id") == goal_id and design_recorded(goal.get("project"))):
+            planned = True
+        action = (call.get("input") or {}).get("action") or {}
+        if (str(call.get("name")).endswith("__submit_work") and isinstance(action, dict)
+                and {"clear_debris", "cut_grass", "chop_tree"}.intersection(action)):
+            return planned
+    return False
 
 
 class CreativeRunner(Runner):
@@ -212,6 +249,9 @@ class CreativeRunner(Runner):
         self.command_offset = self.trace_offset = self.usage_offset = 0
         self.poll_seconds = 1
         self.monitor_seconds = 15 * 60
+        self.last_progress_capture = time.monotonic()
+        self.progress_capture_count = 0
+        self.last_captured_work_count = 0
         self.report["humanReview"] = {
             "status": "pending", "criteria": ["符合本轮约定的风格", "各区与主路连贯", "保留实用空地", "整体美感"],
             "note": "技术验收与审美评审分别记录；请结合实际农场图评价设计。",
@@ -227,8 +267,8 @@ class CreativeRunner(Runner):
     def trace(self):
         return provider_trace(self.mod)[self.trace_offset:]
 
-    async def capture(self, name):
-        response = await self.request("harness-farm-capture")
+    async def capture(self, name, region=None):
+        response = await self.request("harness-farm-capture", **({"region": region} if region else {}))
         label = response["label"]
         metadata = read(self.evidence / f"harness-farm-{label}.json") or {}
         source = self.evidence / f"harness-farm-{label}.png"
@@ -267,10 +307,7 @@ class CreativeRunner(Runner):
         self.criteria = self.spec["criteria"]
         if any(type(self.criteria.get(key)) is not int or self.criteria[key] < 1 for key in MINIMUMS.values()):
             raise ValueError("Creative criteria require positive integer minimums")
-        rendered_instruction = self.spec["instruction"].strip() + (
-            f"\n本轮最低交付规模：至少{self.criteria['minPathTiles']}格铺路、{self.criteria['minChests']}只箱子、"
-            f"{self.criteria['minRestObjects']}处休息物，以及{self.criteria['minLights']}处光源。"
-        )
+        rendered_instruction = self.spec["instruction"].strip()
         self.prompt = self.spec["designBrief"].strip() + "\n\n" + rendered_instruction
         self.report.update({"fixture": fixture, "designBrief": self.spec["designBrief"], "instruction": self.spec["instruction"],
                             "renderedInstruction": rendered_instruction, "fullPrompt": self.prompt, "prompt": self.prompt,
@@ -290,7 +327,13 @@ class CreativeRunner(Runner):
         if any((farm.get("counts") or {}).get(key) != 0 for key in MINIMUMS):
             raise RuntimeError("Creative fixture must start without supplied finished decorations")
         self.report["agyBindingCheck"] = await verify_agy_binding(self.run, self.mod, before)
+        if self.criteria.get("requireRawGround"):
+            occupants = (farm.get("space") or {}).get("occupants", [])
+            if fixture.get("groundPrecleared") is not False or not all(
+                    any(item.get("kind") == kind for item in occupants) for kind in ("Tree", "Grass", "resource-clump", "object")):
+                raise RuntimeError("Creative farm must retain the source's raw vegetation and obstacles")
         await self.capture("before")
+        await self.save_current("initial")
         deadline = time.monotonic() + 120
         while True:
             ui = await self.request("snapshot")
@@ -322,10 +365,31 @@ class CreativeRunner(Runner):
         await self.request("text", field="_input", text=self.prompt)
         await self.request("key", key="Enter", expectedMenuType=CHAT_MENU)
         self.dispatched = True
+        await self.wait_for_brief_receipt()
         try:
             await self.request("key", key="Escape", expectedMenuType=CHAT_MENU)
         except RuntimeError as error:
             self.report["initialChatCloseSkipped"] = str(error)
+
+    async def wait_for_brief_receipt(self):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            matches = [request for request in self.state().get("requests", [])
+                       if request.get("id") not in self.baseline_requests and request.get("origin") in {"player", "player-midflight"}
+                       and request.get("text") == self.prompt]
+            if len(matches) > 1:
+                raise RuntimeError("More than one initial player brief was recorded")
+            if matches:
+                self.request_record = dict(matches[0])
+                self.report["initialRequest"] = self.request_record
+                return
+            ui = await self.request("snapshot")
+            if ui.get("chatStatus") == "Failed":
+                explanation = next((entry.get("Text") for entry in reversed(ui.get("conversation") or [])
+                                    if entry.get("IsPlayer") is False), "No production request receipt")
+                raise RuntimeError("Initial design brief rejected: " + str(explanation))
+            await asyncio.sleep(self.poll_seconds)
+        raise TimeoutError("Initial design brief has no production request receipt; it was not resubmitted")
 
     def observe_project(self, trace):
         state = self.state()
@@ -399,8 +463,8 @@ class CreativeRunner(Runner):
             await asyncio.sleep(self.poll_seconds)
         raise TimeoutError("Final takeover did not settle the agent and native action")
 
-    async def save_current(self):
-        label = f"creative-save-{self.token}"
+    async def save_current(self, stage="final"):
+        label = f"creative-{stage}-save-{self.token}"
         path = self.evidence / "lifecycle-request.json"
         await self.wait(lambda: not path.exists(), "Lifecycle request pending")
         write(path, {"label": label, "action": "save-current"})
@@ -414,7 +478,12 @@ class CreativeRunner(Runner):
                  for path in sorted(folder.rglob("*")) if path.is_file() and path.resolve().is_relative_to(folder)]
         if not (folder / self.save_id).is_file() or not files:
             raise RuntimeError("Final native save file is missing")
-        self.report["savedFarm"] = {"receipt": receipt, "directory": str(folder.relative_to(self.run)), "files": files,
+        if stage == "initial":
+            initial_folder = self.run / "initial-save" / self.save_id
+            shutil.copytree(folder, initial_folder)
+            files = [{**item, "path": str(initial_folder.relative_to(self.run) / Path(item["path"]).name)} for item in files]
+            folder = initial_folder
+        self.report["initialSavedFarm" if stage == "initial" else "savedFarm"] = {"receipt": receipt, "directory": str(folder.relative_to(self.run)), "files": files,
                                     "modelMarkedProjectComplete": (self.report.get("project") or {}).get("status") == "completed"}
 
     async def monitor(self):
@@ -445,10 +514,13 @@ class CreativeRunner(Runner):
             self.report["providerSessions"] = sorted(sessions)
             if len(sessions) > 1:
                 raise RuntimeError("Creative project changed provider session")
-            checks = world_checks(self.report["before"], sample, self.criteria, rows(self.evidence / "creative-farm-ledger.jsonl"))
+            ledger = rows(self.evidence / "creative-farm-ledger.jsonl")
+            checks = world_checks(self.report["before"], sample, self.criteria, ledger)
             checks["same_project_completed"] = bool(goal and goal.get("status") == "completed")
             checks["project_design_recorded"] = bool(goal and design_recorded(goal.get("project"))
                                                       and self.report.get("recordedDesignObserved"))
+            if self.criteria.get("requireNativeClearing"):
+                checks["design_precedes_clearing"] = design_precedes_clearing(trace, self.goal_id)
             if checks["same_project_completed"]:
                 self.report["completionRequestId"] = self.completion_turn(trace, commands, lease)
                 completion_deadline = completion_deadline or time.monotonic() + 60
@@ -467,6 +539,9 @@ class CreativeRunner(Runner):
             if checks["same_project_completed"] and checks["completion_round_settled"] and checks["native_action_finished"]:
                 # A model's premature completion ends as incomplete evidence;
                 # never turn it into success or send a corrective prompt.
+                # The completed executor's terminal receipt is sufficient even
+                # if normal free-play already opened a follow-up turn. Delivery
+                # cancels that turn instead of waiting to catch a brief idle gap.
                 # Recheck world/ledger after final takeover: the TestDriver may
                 # append its last native receipt on the next game tick.
                 self.report["stopReason"] = "project-completed"
@@ -484,7 +559,39 @@ class CreativeRunner(Runner):
             if completion_deadline and time.monotonic() >= completion_deadline:
                 self.report["stopReason"] = "completed-project-did-not-settle"
                 return
-            await asyncio.sleep(self.monitor_seconds)
+            work_count = sum(receipt.get("completedcount", 0) > 0
+                             and receipt.get("skillid") in {"clear-debris", "chop-tree", "cut-grass", "place-items", "remove-items", "hoe-tiles"}
+                             for row in ledger if row.get("type") == "native-result" for receipt in [lower_keys(row.get("payload"))])
+            if (self.progress_capture_count < 4 and time.monotonic() - self.last_progress_capture >= 15 * 60
+                    and work_count > self.last_captured_work_count
+                    and farm.get("actorLocation") == "Farm"):
+                self.last_progress_capture = time.monotonic()
+                try:
+                    await self.capture(f"progress-{self.progress_capture_count + 1}")
+                    self.progress_capture_count += 1
+                    self.last_captured_work_count = work_count
+                except (RuntimeError, TimeoutError) as error:
+                    self.report.setdefault("optionalCaptureSkipped", []).append(str(error))
+            # Progress/world captures remain infrequent. Only existing local
+            # control, goal and terminal receipts are checked between them.
+            await self.wait_for_monitor_signal()
+
+    async def wait_for_monitor_signal(self):
+        deadline = time.monotonic() + self.monitor_seconds
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(2, max(0, deadline - time.monotonic())))
+            control = read(self.evidence / "creative-farm-control.json") or {}
+            if control.get("runId") == self.run.name and (control.get("error") or control.get("active") is False
+                                                          or control.get("agentOwns") is False):
+                return
+            if self.requested_stop():
+                return
+            goals = self.state().get("goals", [])
+            if any(goal.get("id") not in self.baseline_goals and goal.get("status") in {"completed", "cancelled"}
+                   for goal in goals if self.goal_id is None or goal.get("id") == self.goal_id):
+                return
+            if any(command.get("status") in {"failed", "cancelled", "error"} for command in self.commands()):
+                return
 
     def requested_stop(self):
         request = read(self.evidence / "reviewer-stop.json")
@@ -495,13 +602,19 @@ class CreativeRunner(Runner):
         return False
 
     def write_design(self):
+        history = [{"action": goal_operation(call).get("action"), "project": goal.get("project")}
+                   for call in (self.report.get("traceSummary") or {}).get("toolCalls", [])
+                   for goal in [((call.get("result") or {}).get("goal") or {}) if isinstance(call.get("result"), dict) else {}]
+                   if goal.get("id") == self.goal_id and goal_operation(call) and goal.get("project")]
         design = {"designBrief": self.report.get("designBrief"), "projectBinding": self.report.get("projectBinding"),
                   "goal": self.report.get("project"), "actualLayout": (self.report.get("after", {}).get("creativeFarm") or {}).get("layout"),
-                  "captures": self.report.get("captures"), "humanReview": self.report["humanReview"], "savedFarm": self.report.get("savedFarm")}
+                  "projectHistory": history, "captures": self.report.get("captures"), "humanReview": self.report["humanReview"],
+                  "savedFarm": self.report.get("savedFarm")}
         write(self.evidence / "creative-farm-design.json", design)
         lines = ["# 自主装修实景设计说明", "", str(design["designBrief"] or ""), "",
                  "以下保留模型完整项目记录；真实布局、全农场截图与隔离存档另存于同目录的 JSON 报告中。",
-                 "", "## 项目方案与施工记录", "", "```json", json.dumps(design["goal"], ensure_ascii=False, indent=2), "```", "",
+                 "", "## 初始方案与施工调整", "", "```json", json.dumps(history, ensure_ascii=False, indent=2), "```", "",
+                 "## 最终项目记录", "", "```json", json.dumps(design["goal"], ensure_ascii=False, indent=2), "```", "",
                  "## 实际农场", ""]
         for name, capture in (design["captures"] or {}).items():
             label = {"before": "开工前", "final": "本轮结束时"}.get(name, name)
@@ -534,6 +647,23 @@ class CreativeRunner(Runner):
         checks["final_isolated_save_written"] = True
         if capture_error is not None:
             raise RuntimeError("Final capture failed; the isolated farm was still saved") from capture_error
+        # Native close-ups of actual built fixtures, after saving and takeover.
+        # Framing never supplies construction coordinates or edits the image.
+        farm = after.get("creativeFarm") or {}
+        bounds = farm.get("workArea") or {}
+        width, height = min(24, bounds.get("width", 0)), min(18, bounds.get("height", 0))
+        if width > 0 and height > 0:
+            for name, category in (("workshop", "chest"), ("rest", "rest"), ("cultivation", "farming")):
+                item = next((item for item in farm.get("layout", []) if category in item.get("categories", [])
+                             and item.get("origin") == "agent-or-native"), None)
+                if item is None:
+                    continue
+                region = {"x": max(0, min(item["x"] - width // 2, bounds["width"] - width)),
+                          "y": max(0, min(item["y"] - height // 2, bounds["height"] - height)), "width": width, "height": height}
+                try:
+                    await self.capture("detail-" + name, region)
+                except (RuntimeError, TimeoutError) as error:
+                    self.report.setdefault("optionalCaptureSkipped", []).append(str(error))
 
     async def execute(self):
         started = time.time()

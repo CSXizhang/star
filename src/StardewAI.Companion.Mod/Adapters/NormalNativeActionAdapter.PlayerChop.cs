@@ -14,6 +14,7 @@ public sealed partial class NormalNativeActionAdapter
     private string? PreparePlayerChop(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
         _playerChopBefore.Clear(); // Coordinator allows one active action only.
+        _playerClumpBefore = null;
         var location = ResolveLocation(request.LocationId);
         var tile = new Vector2(target.Tile.X, target.Tile.Y);
         var axe = actor.FindTool<Axe>();
@@ -35,14 +36,12 @@ public sealed partial class NormalNativeActionAdapter
             _playerChopBefore[key] = (tree.health.Value, tree.stump.Value, animate, null);
             return animate ? "Axe" : null;
         }
-        // Large clumps need their own native upgrade/footprint contract. This
-        // primitive intentionally exposes that limitation before any real swing.
-        _playerChopBefore[key] = (0, false, false, "No ordinary wild tree at this tile; large resource clumps are not supported by player chop_tree.");
-        return null;
+        return PreparePlayerClump(actor, request, target);
     }
 
     private NativeActionStepResult VerifyPlayerChop(PlayerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
+        if (_playerClumpBefore != null) return VerifyPlayerClump(actor, request, target);
         string key = ChopKey(request, target);
         if (!_playerChopBefore.Remove(key, out var before))
             return NativeActionStepResult.Failed("Missing native chop preflight; no tree result inferred.");

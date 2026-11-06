@@ -15,6 +15,80 @@ import creative_runner as monitor
 CRITERIA = {"minPathTiles": 24, "minChests": 2, "minRestObjects": 1, "minLights": 2}
 
 
+@pytest.mark.parametrize("signal", ["takeover", "completed", "provider-error"])
+def test_terminal_local_receipt_wakes_long_progress_interval_without_game_queries(tmp_path, monkeypatch, signal):
+    runner = setup_run(tmp_path)
+    runner.save_id = "Farm_1"
+    runner.baseline_goals = set()
+    runner.goal_id = "project"
+    runner.monitor_seconds = 900
+    runner.command_offset = 0
+    if signal == "takeover":
+        monitor.write(runner.evidence / "creative-farm-control.json", {"runId": runner.run.name, "active": True, "agentOwns": False})
+    elif signal == "completed":
+        monitor.write(runner.mod / "data/work-state.json", {"Farm_1": {"goals": [{"id": "project", "status": "completed"}]}})
+    else:
+        monitor.append(runner.mod / "chat_commands.jsonl", {"saveId": "Farm_1", "status": "failed"})
+    sleeps = []
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        assert len(sleeps) == 1, "A terminal receipt must not wait for the 15-minute interval"
+    monkeypatch.setattr(monitor.asyncio, "sleep", sleep)
+    asyncio.run(runner.wait_for_monitor_signal())
+    assert sleeps == [2]
+
+
+def test_raw_landscape_and_native_clearing_cannot_be_replaced_by_decoration_counts():
+    before, after = sample(), sample(True)
+    initial = [{"kind": kind, "x": index, "y": 2} for index, kind in enumerate(("Tree", "Grass", "resource-clump", "object"))]
+    before["creativeFarm"]["space"] = {"occupants": initial}
+    after["creativeFarm"]["space"] = {"occupants": initial[:2]}
+    criteria = {**CRITERIA, "requireRawGround": True, "requireNativeClearing": True, "requirePreservedVegetation": True}
+    checks = monitor.world_checks(before, after, criteria, ledger())
+    assert checks["raw_source_ground_observed"] and checks["original_tree_retained"] and checks["original_grass_retained"]
+    assert not checks["native_clearing_recorded"]
+    cleared = {"type": "native-result", "payload": {"skillId": "clear-debris", "completedCount": 1, "terminalState": "succeeded"}}
+    checks = monitor.world_checks(before, after, criteria, [*ledger(), cleared])
+    assert checks["native_clearing_recorded"]
+    after["creativeFarm"]["space"]["occupants"] = []
+    checks = monitor.world_checks(before, after, criteria, [*ledger(), cleared])
+    assert not checks["original_tree_retained"] and not checks["original_grass_retained"]
+
+
+def test_decoration_counts_do_not_hide_blocked_or_unobserved_chest_access():
+    after = sample(True)
+    criteria = {**CRITERIA, "requireAccessibleFixtures": True}
+    access = [{**item, "reachable": True} for item in after["creativeFarm"]["layout"] if "chest" in item["categories"]]
+    after["creativeFarm"]["operationAccess"] = access
+    assert monitor.world_checks(sample(), after, criteria, ledger())["chests_and_processing_accessible"]
+    access[1]["reachable"] = False
+    assert not monitor.world_checks(sample(), after, criteria, ledger())["chests_and_processing_accessible"]
+    access.pop()
+    assert not monitor.world_checks(sample(), after, criteria, ledger())["chests_and_processing_accessible"]
+
+
+def test_design_must_precede_first_clearing_attempt_for_the_same_project(monkeypatch):
+    plan = call({"id": "project", "project": {"summary": "Keep the grove", "layout": "Route around the trees"}})
+    clear = {"name": "mcp__game__submit_work", "input": {"action": {"clear_debris": {"tiles": []}}}}
+    monkeypatch.setattr(monitor, "summarize_trace", lambda calls: {"toolCalls": calls})
+    assert monitor.design_precedes_clearing([plan, clear], "project")
+    assert not monitor.design_precedes_clearing([clear, plan], "project")
+    assert not monitor.design_precedes_clearing([plan, clear], "another-project")
+
+
+def test_rejected_brief_stops_instead_of_monitoring_unrelated_autoplay(tmp_path):
+    runner = setup_run(tmp_path)
+    runner.save_id, runner.prompt, runner.baseline_requests = "Farm_1", "full design brief", set()
+    actions = []
+    async def request(action, **params):
+        actions.append(action)
+        return {"chatStatus": "Failed", "conversation": [{"IsPlayer": False, "Text": "text too long"}]}
+    runner.request = request
+    with pytest.raises(RuntimeError, match="Initial design brief rejected: text too long"):
+        asyncio.run(runner.wait_for_brief_receipt())
+    assert actions == ["snapshot"]  # Never resend the brief or hand control back.
+
+
 def layout():
     items = [{"kind": "floor", "itemId": "(O)328", "x": x, "y": 0, "width": 1, "height": 1,
               "origin": "agent-or-native", "categories": ["path"]} for x in range(24)]
@@ -167,10 +241,11 @@ def test_blocked_main_completion_ends_with_evidence_instead_of_idle_rounds(tmp_p
     assert monitor.blocked_completion([rejected], "different-project") is None
 
 
-def test_old_chat_completion_or_missing_lease_does_not_settle_completion_turn():
+def test_only_actual_completion_receipt_settles_even_if_followup_autonomy_started():
     commands = [{"requestId": "initial", "saveId": "Farm_1", "status": "completed"}]
     assert not monitor.round_settled(None, commands, "initial", "Farm_1")
-    assert not monitor.round_settled({"saveId": "Farm_1", "requestId": "autonomy-2"}, commands, "initial", "Farm_1")
+    assert monitor.round_settled({"saveId": "Farm_1", "requestId": "autonomy-2"}, commands, "initial", "Farm_1")
+    assert not monitor.round_settled({"saveId": "Farm_1", "requestId": "initial"}, commands, "initial", "Farm_1")
     assert not monitor.round_settled({"saveId": "Farm_1", "requestId": None}, commands, "autonomy-2", "Farm_1")
     commands.append({"requestId": "autonomy-2", "saveId": "Farm_1", "status": "completed"})
     assert monitor.round_settled({"saveId": "Farm_1", "requestId": None}, commands, "autonomy-2", "Farm_1")
@@ -253,6 +328,7 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
             owns = not owns
         if action == "key" and params.get("key") == "Enter":
             request_record = {"id": "initial", "text": runner.prompt, "origin": "player", "goalId": None}
+            monitor.write(runner.mod / "data/work-state.json", {"Farm_1": {"requests": [request_record], "goals": []}})
         if action == "harness-farm-capture":
             label = f"capture-{len(actions)}"
             png_capture(runner, label, actual)
@@ -292,7 +368,7 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
         if path.exists():
             save_request = monitor.read(path)
             folder = runner.run / "saves/Farm_1"
-            folder.mkdir()
+            folder.mkdir(exist_ok=True)
             (folder / "Farm_1").write_text("native saved farm")
             monitor.write(runner.evidence / f"lifecycle-{save_request['label']}.json",
                           {**save_request, "saveName": "Farm_1", "worldReady": True})
@@ -311,7 +387,8 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
     assert report["wallBudgetSeconds"] is None
     assert report["elapsedSeconds"] == round_seconds * 3
     assert len(runner.samples) <= 1  # Full history is on disk, not retained throughout an overnight run.
-    assert "24格铺路" in report["renderedInstruction"] and "24格铺路" in report["fullPrompt"]
+    assert report["fullPrompt"] == "a wood and stone garden\n\nfinish this one project"
+    assert (runner.run / report["initialSavedFarm"]["directory"] / "Farm_1").is_file()
     assert report["instruction"] == "finish this one project"
     assert report["humanReview"]["status"] == "pending"
     assert report["completionRequestId"] == "autonomy-2"

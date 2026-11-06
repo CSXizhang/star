@@ -45,6 +45,9 @@ internal static class FarmSpaceObserver
         foreach (var pair in location.terrainFeatures.Pairs)
             occupants.Add(new { kind = pair.Value.GetType().Name,
                 itemId = pair.Value is Flooring floor ? floor.GetData()?.ItemId : null,
+                growthStage = pair.Value is Tree tree ? (int?)tree.growthStage.Value : null,
+                stump = pair.Value is Tree trunk ? (bool?)trunk.stump.Value : null,
+                grassDensity = pair.Value is Grass grass ? (int?)grass.numberOfWeeds.Value : null,
                 x = (int)pair.Key.X, y = (int)pair.Key.Y, width = 1, height = 1 });
         foreach (var furniture in location.furniture)
         {
@@ -79,7 +82,12 @@ internal static class FarmSpaceObserver
         foreach (var feature in location.resourceClumps)
         {
             var box = feature.getBoundingBox();
-            occupants.Add(new { kind = "resource-clump", x = box.X / 64, y = box.Y / 64,
+            var requirement = Adapters.NativeResourceClumps.Requirement(feature.parentSheetIndex.Value);
+            occupants.Add(new { kind = "resource-clump", nativeId = feature.parentSheetIndex.Value,
+                health = feature.health.Value, requiredTool = requirement.Tool, minimumUpgradeLevel = requirement.Level,
+                playerAction = requirement.Tool == "Axe" ? "chop_tree" : requirement.Tool == "Pickaxe" ? "clear_debris" : null,
+                targetHint = "Any observed footprint tile identifies this clump; navigation checks reachable native hit edges.",
+                x = box.X / 64, y = box.Y / 64,
                 width = Math.Max(1, box.Width / 64), height = Math.Max(1, box.Height / 64) });
         }
         var rows = new List<string>();

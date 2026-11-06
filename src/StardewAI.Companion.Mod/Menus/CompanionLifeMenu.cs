@@ -5,6 +5,7 @@ using Microsoft.Xna.Framework.Input;
 using StardewValley;
 using StardewValley.Menus;
 using StardewAI.Companion.Mod.Domain;
+using StardewAI.Companion.Mod.Transport;
 
 namespace StardewAI.Companion.Mod.Menus;
 
@@ -212,7 +213,7 @@ public sealed class CompanionLifeMenu : IClickableMenu
         if (_chatInput is null)
         {
             _chatInput = new TextBox(tbTex, null, Game1.smallFont, Game1.textColor)
-            { limitWidth = false, textLimit = 500 };
+            { limitWidth = false, textLimit = LifeChatSubmitPayload.MaxTextLength };
         }
         int chatInputY = yPositionOnScreen + h - 64;
         _chatInput.X = xPositionOnScreen + 24;

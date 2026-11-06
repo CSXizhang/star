@@ -69,6 +69,7 @@ public sealed partial class GameWorldObserver : IWorldObserver
         string path = stem + ".png";
         if (string.IsNullOrEmpty(result) || !File.Exists(path) || new FileInfo(path).Length == 0)
             throw new InvalidOperationException("The native map screenshot did not produce an image.");
+        NativeMapImageFile.EnsureComplete(path);
         return new Dictionary<string, object> { ["locationId"] = locationName, ["path"] = path,
             ["mimeType"] = "image/png", ["scale"] = 0.5, ["capturedRevision"] = WorldRevision,
             ["region"] = "native map screenshot region (custom maps may define ScreenshotRegion)" };

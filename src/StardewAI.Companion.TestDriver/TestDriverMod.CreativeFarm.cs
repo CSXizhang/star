@@ -21,7 +21,8 @@ public sealed partial class TestDriverMod
     private const int CreativeOutputSlots = 12;
     private static readonly string[] CreativeMaterialIds = {
         "(O)388", "(O)390", "(O)771", "(O)709", "(O)92", "(O)382",
-        "(O)378", "(O)334", "(O)335", "(O)338"
+        "(O)378", "(O)334", "(O)335", "(O)338", "(O)336", "(O)337",
+        "(O)330", "(O)787", "(O)725", "(O)724", "(O)86", "(O)726", "(O)178"
     };
     private static readonly (string Name, string[] Categories)[] CreativeRecipeCandidates = {
         ("Wood Path", new[] { "path" }), ("Gravel Path", new[] { "path" }),
@@ -38,7 +39,19 @@ public sealed partial class TestDriverMod
         ("Stump Brazier", new[] { "rest", "light" }),
         ("Furnace", new[] { "production" }),
         ("Charcoal Kiln", new[] { "production" }),
-        ("Recycling Machine", new[] { "production" })
+        ("Recycling Machine", new[] { "production" }),
+        ("Weathered Floor", new[] { "path" }), ("Crystal Floor", new[] { "path" }),
+        ("Brick Floor", new[] { "path" }), ("Straw Floor", new[] { "path" }),
+        ("Crystal Path", new[] { "path" }),
+        ("Wood Lamp-post", new[] { "light" }), ("Iron Lamp-post", new[] { "light" }),
+        ("Wood Sign", new[] { "decoration" }), ("Stone Sign", new[] { "decoration" }),
+        ("Scarecrow", new[] { "decoration", "farming" }), ("Deluxe Scarecrow", new[] { "decoration", "farming" }),
+        ("Sprinkler", new[] { "farming" }), ("Quality Sprinkler", new[] { "farming" }),
+        ("Iridium Sprinkler", new[] { "farming" }),
+        ("Keg", new[] { "production" }), ("Preserves Jar", new[] { "production" }),
+        ("Bee House", new[] { "production" }), ("Mayonnaise Machine", new[] { "production" }),
+        ("Cheese Press", new[] { "production" }), ("Loom", new[] { "production" }),
+        ("Seed Maker", new[] { "production" })
     };
 
     private sealed record CreativeLayoutItem(string kind, string itemId, string name,
@@ -52,6 +65,7 @@ public sealed partial class TestDriverMod
     private string? _creativeSaveName;
     private int _creativeDay, _creativeSequence, _creativeSupplyEvents;
     private int _creativeMaintenanceTicks;
+    private string? _creativeControlSignal;
     private Point _creativeAnchor;
     private Rectangle _creativeWorkArea;
     private string _creativeWaterBaseline = "";
@@ -84,7 +98,11 @@ public sealed partial class TestDriverMod
         var tools = farmer.Items.OfType<Tool>().ToList();
         if (!tools.OfType<StardewValley.Tools.Axe>().Any()) tools.Add(new StardewValley.Tools.Axe());
         if (!tools.OfType<StardewValley.Tools.Pickaxe>().Any()) tools.Add(new StardewValley.Tools.Pickaxe());
-        if (tools.Count + CreativeMaterialIds.Length > 36 - CreativeOutputSlots)
+        if (!tools.OfType<StardewValley.Tools.Hoe>().Any()) tools.Add(new StardewValley.Tools.Hoe());
+        if (!tools.OfType<StardewValley.Tools.MeleeWeapon>().Any(tool => tool.isScythe())) tools.Add(new StardewValley.Tools.MeleeWeapon("47"));
+        int requiredSlots = farmer.Items.Count(item => item != null) + tools.Count(tool => !farmer.Items.Contains(tool))
+            + CreativeMaterialIds.Count(id => !farmer.Items.Any(item => item?.QualifiedItemId == id));
+        if (requiredSlots > 36 - CreativeOutputSlots)
             throw new InvalidOperationException("Creative fixture cannot reserve twelve output slots alongside the existing tools and material whitelist.");
 
         // Validate the real recipes and native placement support before changing the clone.
@@ -100,7 +118,7 @@ public sealed partial class TestDriverMod
             var recipe = new CraftingRecipe(candidate.Name, false);
             var output = recipe.createItem();
             if (output is not StardewValley.Object item || item is StorageFurniture || item.heldObject.Value is not null
-                || !(item is Furniture || item.bigCraftable.Value || item.IsFloorPathItem() || item.IsFenceItem()))
+                || !(item is Furniture || item.bigCraftable.Value || item.IsFloorPathItem() || item.IsFenceItem() || item.IsSprinkler()))
             { rejected.Add(new { name = candidate.Name, reason = "not-supported-by-current-place-items" }); continue; }
             if (CreativeMaterialIds.Contains(output.QualifiedItemId, StringComparer.Ordinal)
                 || recipe.recipeList.Count == 0 || recipe.recipeList.Any(ingredient => ingredient.Value <= 0
@@ -127,21 +145,14 @@ public sealed partial class TestDriverMod
         _creativeWorkArea = new Rectangle(0, 0, map.LayerWidth, map.LayerHeight);
         _creativeWaterBaseline = CreativeWaterFingerprint(farm);
         foreach (var pair in CreativeBuildingSignatures(farm)) _creativeBuildings.Add(pair.Key, pair.Value);
-        var beforeClearing = CreativeLayout(farm);
+        var initialSpace = CreativeSpace();
         var initialInventory = DescribeItems(farmer.Items);
         var originalRecipes = farmer.craftingRecipes.Keys.ToArray();
 
-        // This is preparation of the disposable clone, never agent work. Static map
-        // layers, water, buildings and their interiors/entrances are left intact.
-        var cleared = new { objects = farm.objects.Count(), terrain = farm.terrainFeatures.Count(),
+        // Retain the exact source ground. Only the model's native actions may clear it.
+        var originalGround = new { objects = farm.objects.Count(), terrain = farm.terrainFeatures.Count(),
             furniture = farm.furniture.Count, largeTerrain = farm.largeTerrainFeatures.Count,
             resourceClumps = farm.resourceClumps.Count, debris = farm.debris.Count };
-        farm.objects.Clear();
-        farm.terrainFeatures.Clear();
-        farm.furniture.Clear();
-        farm.largeTerrainFeatures.Clear();
-        farm.resourceClumps.Clear();
-        farm.debris.Clear();
         _harnessFixtureTiles.Clear();
         _harnessFixtureInitiallyEmpty.Clear();
         _acceptanceChest = null;
@@ -150,13 +161,18 @@ public sealed partial class TestDriverMod
         _acceptanceSapling = null;
 
         farmer.MaxItems = 36; // One-time clone setup; never overwrite capacity every tick.
-        farmer.Items.Clear();
-        foreach (var tool in tools) farmer.Items.Add(tool);
+        foreach (var tool in tools)
+        {
+            if (!farmer.Items.Contains(tool)) farmer.addItemToInventory(tool);
+            if (tool is StardewValley.Tools.Axe or StardewValley.Tools.Pickaxe or StardewValley.Tools.Hoe or StardewValley.Tools.WateringCan)
+                tool.UpgradeLevel = 4;
+        }
         while (farmer.Items.Count < farmer.MaxItems) farmer.Items.Add(null);
         farmer.craftingRecipes.Clear();
         foreach (string name in acceptedNames) farmer.craftingRecipes.Add(name, 0);
         foreach (var material in materials)
             _creativeMaterialTargets.Add(material.QualifiedItemId, Math.Min(999, material.maximumStackSize()));
+        farmer.maxStamina.Value = Math.Max(farmer.MaxStamina, 1000);
         Game1.timeOfDay = CreativeTimeOfDay;
         Game1.gameTimeInterval = 0;
         _freezeTime = true;
@@ -175,22 +191,24 @@ public sealed partial class TestDriverMod
                 catch (Exception error) { StopCreativeFarm(error); }
             }));
         _creativeFarmActive = true;
+        PublishCreativeControl();
         PublishCreativeSnapshot();
         var initial = ObserveCreativeFarm();
         var fixture = new {
             runId = _runId, label, mode = "creative-farm", actorMode = "player", actorId = farmer.UniqueMultiplayerID,
             saveName = _creativeSaveName, isolatedSavesPath = StardewValley.Program.GetSavesFolder(),
             locationId = "Farm", workArea = new { x = 0, y = 0, width = map.LayerWidth, height = map.LayerHeight },
-            description = "隔离标准农场，地面已清场；建筑、水体、地图与出入口保留。材料在动作空闲边界自动补足，只有白名单原生配方，没有预放的道路、箱子或装饰成品。请自行制作并布置木石主路、储物制作角与带照明的休息角，留出走道和空地。",
+            description = "未经预先清场的隔离标准农场，完整保留原始树草、杂物和大型障碍；先观察并记录整体设计及保留区域，再自行用原生工具清理施工区域。基础材料在空闲边界补足，已有物品不被覆盖，成品须亲手制作摆放；自行拾取、入箱并管理背包。",
             materialPolicy = new { mode = "refill-basic-materials-at-native-idle-boundaries", inventoryCapacity = 36,
                 reservedInitialOutputSlots = CreativeOutputSlots, materials = materials.Select(item => new {
                     itemId = item.QualifiedItemId, name = item.DisplayName, target = _creativeMaterialTargets[item.QualifiedItemId] }).ToArray(),
                 finishedItemsGranted = false, chestMaterialsConsumedAutomatically = false,
-                tools = "Existing tools retained; a missing native axe or pickaxe is supplied as a construction tool." },
+                tools = tools.Select(tool => new { name = tool.GetType().Name, upgradeLevel = tool.UpgradeLevel }).ToArray() },
             environment = new { fixedTimeOfDay = CreativeTimeOfDay, clockFrozen = true,
-                stamina = "restored-to-native-maximum-at-idle-boundaries", scope = "creative-farm-isolated-test-only" },
+                stamina = "restored-to-fixture-maximum-at-idle-boundaries", maxStamina = farmer.MaxStamina,
+                scope = "creative-farm-isolated-test-only" },
             recipeWhitelist = recipes, rejectedRecipes = rejected, originalRecipes, originalInventory = initialInventory,
-            cleared, beforeClearing, initialLayout = CreativeLayout(farm),
+            groundPrecleared = false, originalGround, initialSpace, initialLayout = CreativeLayout(farm),
             protectedBuildings = _creativeBuildings.Select(pair => JsonSerializer.Deserialize<JsonElement>(pair.Value)).ToArray(),
             accessAnchor = new { x = _creativeAnchor.X, y = _creativeAnchor.Y },
             entrances = _creativeEntrances.Select(entrance => new { id = entrance.Id,
@@ -215,6 +233,7 @@ public sealed partial class TestDriverMod
                 || Constants.SaveFolderName != _creativeSaveName || Game1.Date.TotalDays != _creativeDay)
                 throw new InvalidOperationException("Creative fixture actor/save/day changed; automatic supply stopped.");
             var coordinator = ReadNativeMember(_creativeModEntry, "_coordinator");
+            PublishCreativeControl();
             RecordCreativeNativeResult();
             // The scenario counter also advances inside WaitingForExternalAct;
             // its parity is unsuitable for scheduling maintenance on update ticks.
@@ -244,6 +263,7 @@ public sealed partial class TestDriverMod
         _creativeFarmError = error.GetBaseException().Message;
         _creativeFarmActive = false;
         _freezeTime = false;
+        PublishCreativeControl();
         Monitor.Log($"[TestDriver] Creative supply stopped: {_creativeFarmError}", LogLevel.Error);
     }
 
@@ -270,6 +290,17 @@ public sealed partial class TestDriverMod
             return true;
         }
         return false;
+    }
+
+    private void PublishCreativeControl()
+    {
+        string signal = JsonSerializer.Serialize(new { runId = _runId, active = _creativeFarmActive,
+            error = _creativeFarmError, agentOwns = ReadNativeMember(ReadNativeMember(_creativeModEntry, "_authority"), "AgentOwns") });
+        if (signal == _creativeControlSignal) return;
+        string path = Path.Combine(_evidenceDir!, "creative-farm-control.json");
+        File.WriteAllText(path + ".tmp", signal);
+        File.Move(path + ".tmp", path, overwrite: true);
+        _creativeControlSignal = signal;
     }
 
     private void PublishCreativeSnapshot()
@@ -346,13 +377,13 @@ public sealed partial class TestDriverMod
             throw new InvalidOperationException("Creative fixture found no entrance reachable by the production navigator from the initial player position.");
     }
 
-    private (bool Reachable, object? Standing, string? Error) CreativeEntranceRoute(CreativeEntrance entrance)
+    private (bool Reachable, object? Standing, string? Error) CreativeEntranceRoute(CreativeEntrance entrance, bool allowTargetObject = false)
     {
         var farm = Game1.getFarm();
         var entranceTile = new Vector2(entrance.X, entrance.Y);
         var entranceBounds = new Rectangle(entrance.X * 64, entrance.Y * 64, 64, 64);
-        if (farm.objects.TryGetValue(entranceTile, out var obstacle) && !obstacle.isPassable()
-            || farm.furniture.Any(item => !item.isPassable() && item.GetBoundingBox().Intersects(entranceBounds)))
+        if (!allowTargetObject && (farm.objects.TryGetValue(entranceTile, out var obstacle) && !obstacle.isPassable()
+            || farm.furniture.Any(item => !item.isPassable() && item.GetBoundingBox().Intersects(entranceBounds))))
             return (false, null, "entrance-blocked-by-placed-item");
         var observer = ReadNativeMember(_creativeModEntry, "_observer")!;
         var navigator = ReadNativeMember(_creativeModEntry, "_navigator")!;
@@ -391,6 +422,11 @@ public sealed partial class TestDriverMod
                 reachable = route.Reachable, standingTile = route.Standing, error = route.Error };
         }).ToArray();
         var farmer = _creativeFarmer;
+        var operationAccess = added.Where(item => item.categories.Contains("chest") || item.categories.Contains("production"))
+            .Select(item => {
+                var route = CreativeEntranceRoute(new("placed-item", item.x, item.y, item.name), allowTargetObject: true);
+                return new { item.itemId, item.x, item.y, reachable = route.Reachable, standingTile = route.Standing, error = route.Error };
+            }).ToArray();
         return new {
             fixtureId = _runId, active = _creativeFarmActive, error = _creativeFarmError, actorMode = "player",
             actorId = farmer?.UniqueMultiplayerID, actorLocation = farmer?.currentLocation?.NameOrUniqueName,
@@ -400,7 +436,7 @@ public sealed partial class TestDriverMod
             inventoryCapacity = farmer?.MaxItems, reservedInitialOutputSlots = CreativeOutputSlots,
             workArea = new { x = _creativeWorkArea.X, y = _creativeWorkArea.Y, width = _creativeWorkArea.Width, height = _creativeWorkArea.Height },
             counts = new { pathTiles = Count("path"), chests = Count("chest"), restObjects = Count("rest"), lights = Count("light") },
-            layout, buildingsPreserved = changed.Length == 0, changedOriginalBuildings = changed,
+            layout, space = CreativeSpace(), operationAccess, buildingsPreserved = changed.Length == 0, changedOriginalBuildings = changed,
             extraBuildings = currentBuildings.Keys.Except(_creativeBuildings.Keys).ToArray(),
             waterTilesPreserved = CreativeWaterFingerprint(farm) == _creativeWaterBaseline,
             accessAnchor = new { x = _creativeAnchor.X, y = _creativeAnchor.Y }, entrances,
@@ -414,7 +450,13 @@ public sealed partial class TestDriverMod
         };
     }
 
-    private void CaptureCreativeFarm(object modEntry, string outDir, string label)
+    private object CreativeSpace()
+    {
+        var observer = ReadNativeMember(_creativeModEntry, "_observer")!;
+        return observer.GetType().GetMethod("InspectLocation")!.Invoke(observer, new object?[] { "Farm", null })!;
+    }
+
+    private void CaptureCreativeFarm(object modEntry, string outDir, string label, Rectangle? region = null)
     {
         if (_harnessFixtureMode != "creative-farm" || _creativeModEntry == null || !Context.IsWorldReady
             || Constants.SaveFolderName != _creativeSaveName || Game1.currentLocation is not Farm
@@ -422,8 +464,27 @@ public sealed partial class TestDriverMod
             throw new InvalidOperationException("Creative farm image requires the original isolated farm with no active menu or fade; it never moves the player.");
         AssertHarnessFixtureBoundary(modEntry);
         var observer = ReadNativeMember(modEntry, "_observer")!;
-        var image = observer.GetType().GetMethod("InspectMapImage")!.Invoke(observer, new object[] { "Farm" })
-            as Dictionary<string, object> ?? throw new InvalidOperationException("Native map image metadata is missing.");
+        var map = Game1.currentLocation.Map;
+        if (region is Rectangle bounds && (bounds.Width <= 0 || bounds.Height <= 0
+            || bounds.X < 0 || bounds.Y < 0 || bounds.Right > map.Layers[0].LayerWidth || bounds.Bottom > map.Layers[0].LayerHeight
+            || ReadNativeMember(ReadNativeMember(modEntry, "_authority"), "AgentOwns") is not false))
+            throw new InvalidOperationException("Detail capture requires valid map bounds and settled player control.");
+        bool hadRegion = map.Properties.TryGetValue("ScreenshotRegion", out var originalRegion);
+        Dictionary<string, object> image;
+        try
+        {
+            // Native ScreenshotRegion uses inclusive tile corners. Restore it
+            // immediately; no world objects, player position or pixels are edited.
+            if (region is Rectangle area)
+                map.Properties["ScreenshotRegion"] = $"{area.X} {area.Y} {area.Right - 1} {area.Bottom - 1}";
+            image = observer.GetType().GetMethod("InspectMapImage")!.Invoke(observer, new object[] { "Farm" })
+                as Dictionary<string, object> ?? throw new InvalidOperationException("Native map image metadata is missing.");
+        }
+        finally
+        {
+            if (hadRegion) map.Properties["ScreenshotRegion"] = originalRegion;
+            else map.Properties.Remove("ScreenshotRegion");
+        }
         string source = image.GetValueOrDefault("path") as string
             ?? throw new InvalidOperationException("Native map image did not report its output path.");
         // Stardew 1.6.15 writes synchronously but leaves its FileStream open
@@ -449,7 +510,7 @@ public sealed partial class TestDriverMod
         var state = ObserveCreativeFarm();
         var metadata = new { runId = _runId, label, captured = true, path = destination,
             sha256, width, height, timestampUtc = DateTime.UtcNow.ToString("o"),
-            locationId = "Farm", nativeImage = image, creativeFarm = state, layout = CreativeLayout(Game1.getFarm()),
+            locationId = "Farm", nativeImage = image, detailRegion = region, creativeFarm = state, layout = CreativeLayout(Game1.getFarm()),
             provenance = "Native GameWorldObserver.InspectMapImage / takeMapScreenshot; original PNG copied without image editing." };
         File.WriteAllText(Path.Combine(outDir, $"harness-farm-{label}.json"), JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true }));
         File.WriteAllText(Path.Combine(outDir, $"creative-farm-layout-{label}.json"), JsonSerializer.Serialize(state));

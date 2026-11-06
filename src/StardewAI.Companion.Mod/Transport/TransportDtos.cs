@@ -740,7 +740,10 @@ public sealed record LifeChatSubmitPayload(
     [property: JsonPropertyName("resolveNotice"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ResolveNotice = false,
     [property: JsonPropertyName("noticeAction"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? NoticeAction = null,
     [property: JsonPropertyName("noticeIds"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? NoticeIds = null
-);
+)
+{
+    public const int MaxTextLength = 8192;
+}
 
 /// <summary>
 /// §1.2 life.chat.reply (Py→C#).

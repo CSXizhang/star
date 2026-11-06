@@ -7,7 +7,23 @@ import pytest
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.decision_context import build_decision_context
 from stardew_ai_runtime.scheduler import CompanionScheduler, PolicyViolationError
-from stardew_ai_runtime.work_state import WorkStore
+from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+
+
+def test_first_model_project_defaults_to_completable_stage_without_unlocking_main(tmp_path):
+    store = WorkStore(tmp_path / "work.json")
+    project = store.add_goal("a", "Design and build the farm", source="agent")
+    assert project.kind == "stage" and project.parent_id is None
+    store.complete_goal("a", project.id, completion_observation={"worldRevision": 2})
+    assert store.state("a").goals[0].status == "completed"
+    main = store.add_goal("a", "Long-term farm stewardship", source="user")
+    stage = store.add_goal("a", "Build a pond terrace", source="agent")
+    assert stage.kind == "stage" and stage.parent_id == main.id
+    store.complete_goal("a", stage.id, completion_observation={"worldRevision": 3})
+    assert next(goal for goal in store.state("a").goals if goal.id == main.id).status == "active"
+    protected = store.add_goal("b", "Explicit long-term main", source="agent", kind="main")
+    with pytest.raises(WorkStateError, match="MAIN_GOAL_LOCKED"):
+        store.complete_goal("b", protected.id, completion_observation={"worldRevision": 4})
 
 
 def test_terminal_wake_is_durable_and_save_scoped(tmp_path):

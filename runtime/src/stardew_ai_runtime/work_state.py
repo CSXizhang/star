@@ -832,12 +832,12 @@ class WorkStore:
             nonlocal goal, resolved_kind, resolved_parent
             active_main = self._active_main_goal(state)
             if kind is None:
-                # Default hierarchy: a preset assignment is always the main
-                # goal; anything else becomes the first main goal when none is
-                # active yet, otherwise a stage hung off the active main.
+                # An ordinary model-created project must be completable even
+                # when it is the first goal in a save. Explicit player/preset
+                # authorization retains its existing long-term protection.
                 resolved_kind = (
                     "main"
-                    if source == "preset" or active_main is None
+                    if source == "preset" or source == "user" and active_main is None
                     else "stage"
                 )
             else:

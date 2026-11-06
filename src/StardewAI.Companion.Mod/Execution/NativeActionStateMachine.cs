@@ -334,6 +334,15 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
         }
 
         _currentTarget = _pendingTargets[_currentTargetIndex];
+        var alternatives = _adapter.GetInteractionTargets(_actor, _currentRequest!, _currentTarget);
+        if (alternatives.Count > 1)
+        {
+            var reachable = alternatives.Select(target => (Target: target,
+                Path: _navigator.FindPathToInteract(_actor, _currentRequest!.LocationId, target.Tile)))
+                .Where(candidate => candidate.Path.Success).OrderBy(candidate => candidate.Path.Steps.Count).FirstOrDefault();
+            if (reachable.Target != null)
+                _currentTarget = _pendingTargets[_currentTargetIndex] = reachable.Target;
+        }
         if (IsReadyToInteract())
         {
             CurrentState = ExecutionState.Facing;
@@ -439,7 +448,7 @@ public sealed class NativeActionStateMachine : ISkillExecutionMachine
             return;
         }
         var animationTool = _adapter.GetAnimationTool(_actor, _currentRequest!, _currentTarget);
-        if (ActorGuards.IsPlayerBound(_actor) && animationTool is null && _currentRequest!.Kind is NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.RefillWateringCan) {
+        if (ActorGuards.IsPlayerBound(_actor) && animationTool is null && _currentRequest!.Kind is NativeActionKind.RefillWateringCan) {
             FinishExecution(ExecutionState.Failed,"The requested native tool/target is unavailable; no action was performed.","NATIVE_TOOL_UNAVAILABLE"); return;
         }
         if (animationTool is not null)

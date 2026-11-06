@@ -893,7 +893,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 _ => null
             };
             if (ActorGuards.IsPlayerBound(_actor) && nativeKind.HasValue && nativeKind.Value is not
-                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems))
+                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems))
             {
                 rejectResult=BuildRejection(payload,"PLAYER_ACTION_UNSUPPORTED","This action has not been enabled in the native player farming phase.",false);
                 return false;

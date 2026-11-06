@@ -11,6 +11,9 @@ namespace StardewAI.Companion.Mod.Tests;
 public sealed class TestNativeActionAdapter : INativeActionAdapter
 {
     public int CallCount { get; private set; }
+    public IReadOnlyList<NativeActionTarget>? InteractionTargets { get; set; }
+    public IReadOnlyList<NativeActionTarget> GetInteractionTargets(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
+        => InteractionTargets ?? new[] { target };
     public List<(NativeActionKind Kind, NativeActionTarget Target)> Calls { get; } = new();
     public float StaminaCostPerAction { get; set; } = 1.0f;
     public bool SimulatePrecondition { get; set; }

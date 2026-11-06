@@ -14,6 +14,10 @@ public sealed partial class NormalNativeActionAdapter
         !string.IsNullOrWhiteSpace(first) && !string.IsNullOrWhiteSpace(second) &&
         string.Equals(ItemRegistry.QualifyItemId(first), ItemRegistry.QualifyItemId(second), StringComparison.Ordinal);
 
+    private static Tool? ConstructionRemovalTool(IFarmerActor actor, StardewValley.Object? obj) =>
+        new Tool?[] { actor.FindTool<Pickaxe>(), actor.FindTool<Axe>() }.FirstOrDefault(tool => tool != null
+            && (obj is not Fence fence || fence.isGate.Value || fence.IsValidRemovalTool(tool)));
+
     private NativeActionStepResult PlaceItems(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
         var loc = ResolveLocation(request.LocationId);
@@ -100,11 +104,13 @@ public sealed partial class NormalNativeActionAdapter
         string? actualId = obj?.QualifiedItemId ?? floor?.GetData()?.ItemId;
         if (!SameItem(actualId, request.ItemId))
             return NativeActionStepResult.Precondition($"Target identity changed: found '{actualId}', expected '{request.ItemId}'.", "target-changed");
-        if (obj is Chest || obj?.heldObject.Value is not null || obj?.IsTapper() == true || obj?.CanBeGrabbed == true)
+        // CanBeGrabbed is also true on ordinary placed fences/machines/sprinklers;
+        // spawned forage is protected separately from the construction whitelist.
+        if (obj is Chest || obj?.heldObject.Value is not null || obj?.IsTapper() == true || obj?.isSpawnedObject.Value == true)
             return NativeActionStepResult.Precondition("Storage, filled machines, tappers and forage are protected from construction removal.", "protected-object");
         if (obj is not null && !(obj is Fence || obj.bigCraftable.Value || obj.IsSprinkler()))
             return NativeActionStepResult.Precondition("This object is not a supported construction removal target.", "unsupported-removal-target");
-        Tool? tool = actor.FindTool<Pickaxe>() ?? (Tool?)actor.FindTool<Axe>();
+        Tool? tool = ConstructionRemovalTool(actor, obj);
         if (tool is null)
             return NativeActionStepResult.Precondition("Removal needs a pickaxe or axe in the companion inventory.", "missing-tool", playerActionRequired: true);
         if (actor.FreeInventorySlots < 1)

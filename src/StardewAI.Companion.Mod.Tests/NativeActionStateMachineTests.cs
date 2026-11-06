@@ -9,6 +9,26 @@ namespace StardewAI.Companion.Mod.Tests;
 public class NativeActionStateMachineTests
 {
     [Fact]
+    public void ClumpUsesReachableFarEdgeWithoutWalkingInsideOrCountingEachSwingAsRemoval()
+    {
+        var (machine, actor, observer, adapter) = CreateHarness(initialTile: new TileCoordinate(11, 13));
+        var origin = new TileCoordinate(10, 11);
+        var edge = new TileCoordinate(11, 12);
+        foreach (var tile in new[] { origin, new TileCoordinate(11, 11), new TileCoordinate(10, 12), edge,
+                     new TileCoordinate(9, 11), new TileCoordinate(10, 10) }) observer.SetPassable(tile, false);
+        adapter.InteractionTargets = new[] { new NativeActionTarget(origin), new NativeActionTarget(edge) };
+        adapter.AnimationTool = "Pickaxe";
+        adapter.ContinueCallsBeforeSuccess = 2;
+        Assert.True(machine.Start(Request(NativeActionKind.ClearDebris, origin), out _));
+        machine.StepTicks(400);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Single(machine.FinalResult.Effects);
+        Assert.Equal(3, adapter.CallCount);
+        Assert.All(adapter.Calls, call => Assert.Equal(edge, call.Target.Tile));
+        Assert.Equal(new TileCoordinate(11, 13), actor.Tile);
+    }
+
+    [Fact]
     public void AlreadyFullCanSatisfiesRefillWithoutVisitingOtherSourcesOrInventingAnEffect()
     {
         var (machine, actor, observer, adapter) = CreateHarness();

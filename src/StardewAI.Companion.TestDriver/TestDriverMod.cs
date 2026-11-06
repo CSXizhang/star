@@ -1749,7 +1749,7 @@ public sealed partial class TestDriverMod : Mod
             return;
         }
 
-        // Creative setup owns its empty ground; do not first install a watering fixture.
+        // Creative setup preserves raw ground; never install a watering fixture first.
         if (_scenario == "free-mode-control" &&
             Environment.GetEnvironmentVariable("STARDEW_AI_HARNESS_FIXTURE") == "creative-farm")
         {
@@ -4032,7 +4032,10 @@ public sealed partial class TestDriverMod : Mod
         }
         else if (action == "harness-farm-capture")
         {
-            CaptureCreativeFarm(modEntry, outDir, label);
+            Rectangle? region = request.TryGetProperty("region", out var area)
+                ? new Rectangle(area.GetProperty("x").GetInt32(), area.GetProperty("y").GetInt32(),
+                    area.GetProperty("width").GetInt32(), area.GetProperty("height").GetInt32()) : null;
+            CaptureCreativeFarm(modEntry, outDir, label, region);
         }
         else if (action == "harness-capture")
         {

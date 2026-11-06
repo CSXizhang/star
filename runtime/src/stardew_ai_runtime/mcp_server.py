@@ -844,7 +844,7 @@ def create_mcp_server(
         kind: Literal["main", "stage", "daily"] | None = None,
         parent_id: str | None = None,
     ) -> dict[str, Any]:
-        """Create/revise/pause/resume/complete/cancel/list long-term goals for the current save.
+        """Manage projects; creation defaults to a completable stage, even for the first project.
 
         Model-created goals are recorded with source=agent; the model cannot label a
         goal as a user instruction. Player-authored goals come from the chat path.
@@ -855,7 +855,7 @@ def create_mcp_server(
 
         ``kind`` classifies the goal: 'main' is the single long-running main goal
         (only one active main goal is allowed; preset-sourced goals are 'main'),
-        'stage' is the default for model-created subordinate goals, 'daily' marks
+        'stage' is the default for model-created finite projects (with or without a parent), 'daily' marks
         day-scoped work; ``parent_id`` links a goal to its main goal. Speculative
         conclusions must NOT be written as goals or constraints — mark them as
         speculation with the memory tools instead.
@@ -2549,7 +2549,7 @@ def create_mcp_server(
                         "nextStep": "Decide whether this obstruction can and should be cleared under player preferences; do not repeat the same blocked route blindly."}
                 except Exception as ex:
                     result["obstructionObservation"] = {"status": "unavailable", "error": str(ex)}
-            if name in {"harvest_auto", "harvest_tiles", "chop_tree", "clear_debris", "cut_grass", "pickup_items"} and isinstance(result, dict):
+            if name in {"harvest_auto", "harvest_tiles", "chop_tree", "clear_debris", "cut_grass", "pickup_items", "remove_items"} and isinstance(result, dict):
                 try:
                     snapshot = getattr(sched, "latest_snapshot", None) or {}
                     companion = (snapshot.get("payload") or {}).get("companion") or {}

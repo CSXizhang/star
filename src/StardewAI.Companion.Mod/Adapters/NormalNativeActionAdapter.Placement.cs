@@ -53,9 +53,12 @@ public sealed partial class NormalNativeActionAdapter
             try
             {
                 farmer.CurrentToolIndex = farmer.Items.IndexOf(source);
-                // The real caller owns placement predicates, source identity,
-                // furniture cursor handling and reduceActiveItemByOne.
-                accepted = Utility.tryToPlaceItem(loc, source, target.Tile.X * 64, target.Tile.Y * 64);
+                // Placement initializes passive machine output on its argument.
+                // Isolate that native mutation to one unit, while the native
+                // caller consumes the selected inventory stack. Furniture keeps
+                // its original identity for native cursor recovery on refusal.
+                var unit = source is Furniture ? source : (StardewValley.Object)source.getOne();
+                accepted = Utility.tryToPlaceItem(loc, unit, target.Tile.X * 64, target.Tile.Y * 64);
             }
             finally { farmer.CurrentToolIndex = previous; }
             bool changed = loc.objects.TryGetValue(tile, out var nativeObject) && SameItem(nativeObject.QualifiedItemId, source.QualifiedItemId)

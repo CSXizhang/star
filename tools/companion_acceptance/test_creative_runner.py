@@ -15,6 +15,23 @@ import creative_runner as monitor
 CRITERIA = {"minPathTiles": 24, "minChests": 2, "minRestObjects": 1, "minLights": 2}
 
 
+def test_closeups_choose_real_campfire_instead_of_repeating_workshop_brazier():
+    farm = {"workArea": {"width": 80, "height": 65}, "layout": [
+        {"x": 50, "y": 17, "categories": ["chest"], "origin": "agent-or-native", "itemId": "(BC)130"},
+        {"x": 52, "y": 18, "categories": ["rest", "light"], "origin": "agent-or-native", "itemId": "(BC)144"},
+        {"x": 70, "y": 36, "categories": ["rest", "light"], "origin": "agent-or-native", "itemId": "(BC)146"},
+        {"x": 2, "y": 2, "categories": ["flower"], "origin": "baseline", "itemId": "(BC)108"},
+    ]}
+    original = copy.deepcopy(farm)
+    regions = dict(monitor.detail_regions(farm))
+    assert set(regions) == {"workshop", "rest"}
+    rest = regions["rest"]
+    assert rest["x"] <= 70 < rest["x"] + rest["width"]
+    assert rest["y"] <= 36 < rest["y"] + rest["height"]
+    assert not (rest["x"] <= 52 < rest["x"] + rest["width"] and rest["y"] <= 18 < rest["y"] + rest["height"])
+    assert farm == original
+
+
 @pytest.mark.parametrize("signal", ["takeover", "completed", "provider-error"])
 def test_terminal_local_receipt_wakes_long_progress_interval_without_game_queries(tmp_path, monkeypatch, signal):
     runner = setup_run(tmp_path)

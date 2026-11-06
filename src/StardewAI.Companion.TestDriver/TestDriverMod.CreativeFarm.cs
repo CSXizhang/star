@@ -20,9 +20,12 @@ public sealed partial class TestDriverMod
     private const int CreativeTimeOfDay = 1000;
     private const int CreativeOutputSlots = 12;
     private static readonly string[] CreativeMaterialIds = {
-        "(O)388", "(O)390", "(O)771", "(O)709", "(O)92", "(O)382",
-        "(O)378", "(O)334", "(O)335", "(O)338", "(O)336", "(O)337",
-        "(O)330", "(O)787", "(O)725", "(O)724", "(O)86", "(O)726", "(O)178"
+        "(O)388", "(O)390", "(O)771", "(O)709", "(O)382",
+        "(O)378", "(O)334", "(O)335", "(O)338", "(O)336",
+        "(O)330", "(O)725", "(O)724", "(O)86", "(O)726",
+        // Flower seeds are crafting ingredients, not instant mature crops.
+        // Omit unused sap/hay and iridium-sprinkler ingredients to retain 12 output slots.
+        "(O)427", "(O)429", "(O)453", "(O)455"
     };
     private static readonly (string Name, string[] Categories)[] CreativeRecipeCandidates = {
         ("Wood Path", new[] { "path" }), ("Gravel Path", new[] { "path" }),
@@ -51,7 +54,9 @@ public sealed partial class TestDriverMod
         ("Keg", new[] { "production" }), ("Preserves Jar", new[] { "production" }),
         ("Bee House", new[] { "production" }), ("Mayonnaise Machine", new[] { "production" }),
         ("Cheese Press", new[] { "production" }), ("Loom", new[] { "production" }),
-        ("Seed Maker", new[] { "production" })
+        ("Seed Maker", new[] { "production" }),
+        ("Grass Starter", new[] { "vegetation" }),
+        ("Tub o' Flowers", new[] { "flower", "decoration" })
     };
 
     private sealed record CreativeLayoutItem(string kind, string itemId, string name,
@@ -95,6 +100,8 @@ public sealed partial class TestDriverMod
             || farmer.currentLocation is not Farm farm || Game1.whichFarm != 0
             || Game1.IsMultiplayer || !Game1.IsMasterGame)
             throw new InvalidOperationException("Creative farm requires a standard-farm, single-player isolated clone with the native player actor, once only.");
+        if (Game1.currentSeason is not ("spring" or "summer"))
+            throw new InvalidOperationException("Creative farm needs an original spring/summer save so native flower tubs are visibly in season; the fixture never changes the season.");
         var tools = farmer.Items.OfType<Tool>().ToList();
         if (!tools.OfType<StardewValley.Tools.Axe>().Any()) tools.Add(new StardewValley.Tools.Axe());
         if (!tools.OfType<StardewValley.Tools.Pickaxe>().Any()) tools.Add(new StardewValley.Tools.Pickaxe());
@@ -118,7 +125,8 @@ public sealed partial class TestDriverMod
             var recipe = new CraftingRecipe(candidate.Name, false);
             var output = recipe.createItem();
             if (output is not StardewValley.Object item || item is StorageFurniture || item.heldObject.Value is not null
-                || !(item is Furniture || item.bigCraftable.Value || item.IsFloorPathItem() || item.IsFenceItem() || item.IsSprinkler()))
+                || !(item is Furniture || item.bigCraftable.Value || item.IsFloorPathItem() || item.IsFenceItem() || item.IsSprinkler()
+                    || item.QualifiedItemId == "(O)297"))
             { rejected.Add(new { name = candidate.Name, reason = "not-supported-by-current-place-items" }); continue; }
             if (CreativeMaterialIds.Contains(output.QualifiedItemId, StringComparer.Ordinal)
                 || recipe.recipeList.Count == 0 || recipe.recipeList.Any(ingredient => ingredient.Value <= 0
@@ -135,6 +143,8 @@ public sealed partial class TestDriverMod
         if (new[] { "path", "chest", "rest", "light" }.Any(category =>
                 !_creativeItemCategories.Values.Any(categories => categories.Contains(category))))
             throw new InvalidOperationException("Native recipe/placement preflight did not provide every required creative category: path, chest, rest, light.");
+        if (!acceptedNames.Contains("Grass Starter") || !acceptedNames.Contains("Tub o' Flowers"))
+            throw new InvalidOperationException("Native grass starter and flower tub recipes/materials must both pass preflight.");
 
         _creativeModEntry = modEntry;
         _creativeFarmer = farmer;

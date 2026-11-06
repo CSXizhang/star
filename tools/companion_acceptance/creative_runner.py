@@ -28,6 +28,37 @@ from runner import (
 
 MINIMUMS = {"pathTiles": "minPathTiles", "chests": "minChests", "restObjects": "minRestObjects", "lights": "minLights"}
 CATEGORIES = {"pathTiles": "path", "chests": "chest", "restObjects": "rest", "lights": "light"}
+
+
+def detail_regions(farm):
+    """Frame built scenes, keeping flower/rest views away from duplicate workshops."""
+    bounds = farm.get("workArea") or {}
+    width, height = min(24, bounds.get("width", 0)), min(18, bounds.get("height", 0))
+    if width <= 0 or height <= 0:
+        return []
+    items = [item for item in farm.get("layout", []) if item.get("origin") == "agent-or-native"]
+    selected = []
+    for name, category, preferred in (("flowers", "flower", None), ("workshop", "chest", None),
+                                      ("cultivation", "farming", None), ("rest", "rest", "(BC)146"),
+                                      ("scenery", "path", None)):
+        candidates = [item for item in items if category in item.get("categories", [])]
+        preferred_items = [item for item in candidates if item.get("itemId") == preferred]
+        candidates = preferred_items or candidates
+        if not candidates:
+            continue
+        center_x = sum(item["x"] for item in candidates) / len(candidates)
+        center_y = sum(item["y"] for item in candidates) / len(candidates)
+        for item in sorted(candidates, key=lambda item: (item["x"]-center_x)**2 + (item["y"]-center_y)**2):
+            region = {"x": max(0, min(item["x"] - width // 2, bounds["width"] - width)),
+                      "y": max(0, min(item["y"] - height // 2, bounds["height"] - height)),
+                      "width": width, "height": height}
+            if any(max(0, min(region["x"]+width, old["x"]+width)-max(region["x"], old["x"]))
+                   * max(0, min(region["y"]+height, old["y"]+height)-max(region["y"], old["y"]))
+                   > width * height * .65 for _, old in selected):
+                continue
+            selected.append((name, region))
+            break
+    return selected
 CHAT_MENU = "StardewAI.Companion.Mod.Menus.CompanionConversationMenu"
 
 
@@ -649,21 +680,11 @@ class CreativeRunner(Runner):
             raise RuntimeError("Final capture failed; the isolated farm was still saved") from capture_error
         # Native close-ups of actual built fixtures, after saving and takeover.
         # Framing never supplies construction coordinates or edits the image.
-        farm = after.get("creativeFarm") or {}
-        bounds = farm.get("workArea") or {}
-        width, height = min(24, bounds.get("width", 0)), min(18, bounds.get("height", 0))
-        if width > 0 and height > 0:
-            for name, category in (("workshop", "chest"), ("rest", "rest"), ("cultivation", "farming")):
-                item = next((item for item in farm.get("layout", []) if category in item.get("categories", [])
-                             and item.get("origin") == "agent-or-native"), None)
-                if item is None:
-                    continue
-                region = {"x": max(0, min(item["x"] - width // 2, bounds["width"] - width)),
-                          "y": max(0, min(item["y"] - height // 2, bounds["height"] - height)), "width": width, "height": height}
-                try:
-                    await self.capture("detail-" + name, region)
-                except (RuntimeError, TimeoutError) as error:
-                    self.report.setdefault("optionalCaptureSkipped", []).append(str(error))
+        for name, region in detail_regions(after.get("creativeFarm") or {}):
+            try:
+                await self.capture("detail-" + name, region)
+            except (RuntimeError, TimeoutError) as error:
+                self.report.setdefault("optionalCaptureSkipped", []).append(str(error))
 
     async def execute(self):
         started = time.time()

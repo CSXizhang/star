@@ -995,6 +995,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         """Place copies of one real backpack item at the declared tiles.
 
         Native placement rules, inventory consumption and partial results apply.
+        Upper items may coexist with flooring/grass when native rules permit;
+        existing objects, trees, crops and entrances remain protected.
         """
         try:
             return await sched.place_items(tiles=_tile_dicts(tiles), item_id=item_id, location_id=location_id)

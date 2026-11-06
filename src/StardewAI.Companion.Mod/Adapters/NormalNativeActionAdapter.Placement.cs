@@ -38,7 +38,12 @@ public sealed partial class NormalNativeActionAdapter
         var tile = new Vector2(target.Tile.X, target.Tile.Y);
         if (_observer.IsWarpOrDoorTile(request.LocationId, target.Tile))
             return NativeActionStepResult.Precondition("Entrance/warp tiles must stay clear.", "protected-entrance");
-        if (loc.objects.ContainsKey(tile) || loc.terrainFeatures.ContainsKey(tile) || loc.GetFurnitureAt(tile) is not null)
+        loc.terrainFeatures.TryGetValue(tile, out var originalTerrain);
+        bool upperItem = source is Furniture || source.bigCraftable.Value || source.IsFenceItem() || source.IsSprinkler();
+        // Preserve ground layers: native predicates decide which upper items can
+        // coexist with flooring/grass. Never replace trees, crops or an entity.
+        if (loc.objects.ContainsKey(tile) || loc.GetFurnitureAt(tile) is not null
+            || originalTerrain is not null && !(upperItem && originalTerrain is Flooring or Grass))
             return NativeActionStepResult.Precondition("Target already contains an object or terrain feature; inspect before changing it.", "occupied");
         if (ActorGuards.IsPlayerBound(actor))
         {
@@ -55,10 +60,13 @@ public sealed partial class NormalNativeActionAdapter
             finally { farmer.CurrentToolIndex = previous; }
             bool changed = loc.objects.TryGetValue(tile, out var nativeObject) && SameItem(nativeObject.QualifiedItemId, source.QualifiedItemId)
                 || loc.furniture.Any(f => f.TileLocation == tile && SameItem(f.QualifiedItemId, source.QualifiedItemId))
-                || loc.terrainFeatures.TryGetValue(tile, out var nativeFeature) && nativeFeature is Flooring or Tree or FruitTree or Bush or Grass;
+                || loc.terrainFeatures.TryGetValue(tile, out var nativeFeature) && !ReferenceEquals(nativeFeature, originalTerrain)
+                    && nativeFeature is Flooring or Tree or FruitTree or Bush or Grass;
+            bool groundPreserved = originalTerrain is null || loc.terrainFeatures.TryGetValue(tile, out var remainingTerrain)
+                && ReferenceEquals(remainingTerrain, originalTerrain);
             int consumed = quantityBefore - actor.GetItemCount(source.QualifiedItemId);
-            if (!accepted || !changed || consumed != 1)
-                return NativeActionStepResult.Failed($"Native placement result={accepted}, placed entity={changed}, consumed={consumed}. Reobserve; no depletion or recovery was fabricated.");
+            if (!accepted || !changed || !groundPreserved || consumed != 1)
+                return NativeActionStepResult.Failed($"Native placement result={accepted}, placed entity={changed}, ground preserved={groundPreserved}, consumed={consumed}. Reobserve; no depletion or recovery was fabricated.");
             return NativeActionStepResult.Succeeded("placed", itemId: source.QualifiedItemId, itemCount: 1);
         }
         var placed = (StardewValley.Object)source.getOne();
@@ -69,7 +77,7 @@ public sealed partial class NormalNativeActionAdapter
             bool accepted = placed.placementAction(loc, target.Tile.X * 64, target.Tile.Y * 64, farmer);
             bool changed = loc.objects.TryGetValue(tile, out var obj) && SameItem(obj.QualifiedItemId, source.QualifiedItemId)
                 || loc.furniture.Any(f => f.TileLocation == tile && SameItem(f.QualifiedItemId, source.QualifiedItemId))
-                || loc.terrainFeatures.TryGetValue(tile, out var feature) && (feature is Flooring floor
+                || loc.terrainFeatures.TryGetValue(tile, out var feature) && !ReferenceEquals(feature, originalTerrain) && (feature is Flooring floor
                     ? SameItem(floor.GetData()?.ItemId, source.QualifiedItemId)
                     : feature is Tree or FruitTree or Bush or Grass);
             // placementAction creates the placed entity; the native caller consumes the inventory unit.
@@ -79,8 +87,10 @@ public sealed partial class NormalNativeActionAdapter
                 source.Stack--;
                 if (source.Stack <= 0) farmer.Items[farmer.Items.IndexOf(source)] = null;
             }
-            if (!accepted || !changed)
-                return NativeActionStepResult.Failed($"Native placement result={accepted}; expected placed entity verified={changed}. Re-observe before retrying.");
+            bool groundPreserved = originalTerrain is null || loc.terrainFeatures.TryGetValue(tile, out var remainingTerrain)
+                && ReferenceEquals(remainingTerrain, originalTerrain);
+            if (!accepted || !changed || !groundPreserved)
+                return NativeActionStepResult.Failed($"Native placement result={accepted}; expected placed entity verified={changed}, ground preserved={groundPreserved}. Re-observe before retrying.");
             return NativeActionStepResult.Succeeded("placed", itemId: request.ItemId, itemCount: 1);
         });
     }

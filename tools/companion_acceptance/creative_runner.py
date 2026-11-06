@@ -31,6 +31,42 @@ MINIMUMS = {"pathTiles": "minPathTiles", "chests": "minChests", "restObjects": "
 CATEGORIES = {"pathTiles": "path", "chests": "chest", "restObjects": "rest", "lights": "light"}
 
 
+def agy_image_views(trace, reference_ids):
+    """AGY offloads pixels: a successful MCP return alone is not a viewed image."""
+    calls = summarize_trace(trace)["toolCalls"]
+    def normalized(value):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            pass
+        return re.sub(r"/+", "/", str(value).replace("\\", "/").removeprefix("file:///")).casefold()
+    viewed_refs, full, local = set(), 0, 0
+    for call in calls:
+        if call.get("error") or call.get("nonterminal"):
+            continue
+        args = call.get("input") or {}
+        if not isinstance(args, dict):
+            continue
+        reference = (args.get("request") or {}).get("read_reference_image")
+        map_image = (args.get("query") or {}).get("observe_map_image")
+        if reference is None and map_image is None:
+            continue
+        receipt = next((row for row in trace if row.get("step_index") == call.get("resultStep")
+                        and row.get("conversationId") == call.get("conversationId")), {})
+        attachments = re.findall(r"\[Resource offloaded to (file:///[^\]]+)\]", receipt.get("content", ""))
+        opened = {normalized((reader.get("input") or {}).get("Path")) for reader in calls
+                  if reader.get("name") == "read_file" and not reader.get("error") and not reader.get("nonterminal")
+                  and reader.get("conversationId") == call.get("conversationId")
+                  and reader.get("step", -1) > call.get("resultStep", -1)}
+        if reference is not None:
+            ids = [reference["image_id"]] if reference.get("image_id") else reference_ids
+            viewed_refs.update(image_id for image_id, path in zip(ids, attachments) if normalized(path) in opened)
+        elif attachments and all(normalized(path) in opened for path in attachments):
+            local += bool(map_image.get("region"))
+            full += not map_image.get("region")
+    return {"referenceIds": sorted(viewed_refs), "fullMapViews": full, "regionMapViews": local}
+
+
 def detail_regions(farm):
     """Frame built scenes, keeping flower/rest views away from duplicate workshops."""
     bounds = farm.get("workArea") or {}
@@ -591,6 +627,12 @@ class CreativeRunner(Runner):
                             # so parsed JSON alone is not a delivery prerequisite.
                             returned.update(item["id"] for item in self.report["referenceImages"])
                 checks["selected_reference_images_returned"] = all(item["id"] in returned for item in self.report["referenceImages"])
+                if self.report.get("backend", {}).get("backend") == "agy":
+                    ids = [item["id"] for item in self.report["referenceImages"]]
+                    views = agy_image_views(trace, ids)
+                    self.report["imageViews"] = views
+                    checks["selected_reference_images_viewed"] = set(ids) <= set(views["referenceIds"])
+                    checks["native_full_map_image_viewed"] = views["fullMapViews"] > 0
             checks["same_project_completed"] = bool(goal and goal.get("status") == "completed")
             checks["project_design_recorded"] = bool(goal and design_recorded(goal.get("project"))
                                                       and self.report.get("recordedDesignObserved"))

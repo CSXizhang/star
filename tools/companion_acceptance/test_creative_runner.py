@@ -15,6 +15,34 @@ import creative_runner as monitor
 CRITERIA = {"minPathTiles": 24, "minChests": 2, "minRestObjects": 1, "minLights": 2}
 
 
+def test_agy_offloaded_images_require_successful_open_of_exact_returned_attachment():
+    trace = []
+    def call(name, args, output, status="DONE"):
+        step = len(trace)
+        trace.extend([
+            {"_provider": "agy", "conversationId": "session", "step_index": step, "type": "PLANNER_RESPONSE",
+             "tool_calls": [{"name": name, "args": args}]},
+            {"_provider": "agy", "conversationId": "session", "step_index": step + 1, "type": "GENERIC",
+             "status": status, "content": output}])
+    refs = ["file:///C:/run/media_0.png", "file:///C:/run/media_1.png"]
+    call("call_mcp_tool", {"ServerName": "star", "ToolName": "consult",
+                          "Arguments": json.dumps({"request": {"read_reference_image": {}}})},
+         "\n".join(f"[Resource offloaded to {path}]" for path in refs))
+    assert monitor.agy_image_views(trace, ["one", "two"])["referenceIds"] == []
+    call("read_file", {"Path": json.dumps("C:\\run\\media_0.png")}, "image pixels")
+    call("read_file", {"Path": json.dumps("C:/other/media_1.png")}, "unrelated image")
+    call("read_file", {"Path": json.dumps("C:/run/media_1.png")}, "read failed", status="ERROR")
+    assert monitor.agy_image_views(trace, ["one", "two"])["referenceIds"] == ["one"]
+    call("read_file", {"Path": json.dumps("C:/run/media_1.png")}, "image pixels")
+    call("call_mcp_tool", {"ServerName": "star", "ToolName": "query_game",
+                          "Arguments": json.dumps({"query": {"observe_map_image": {"location_id": "Farm"}}})},
+         "[Resource offloaded to file:///C:/run/full.png]")
+    call("read_file", {"Path": json.dumps("C:/run/full.png")}, "native pixels")
+    call("call_mcp_tool", {"ServerName": "star", "ToolName": "submit_work", "Arguments": "{truncated"}, "{}")
+    assert monitor.agy_image_views(trace, ["one", "two"]) == {
+        "referenceIds": ["one", "two"], "fullMapViews": 1, "regionMapViews": 0}
+
+
 def test_open_creation_accepts_actual_paving_without_requiring_any_facility():
     after = sample(True)
     after["creativeFarm"]["layout"] = [item for item in layout() if item["kind"] == "floor"]

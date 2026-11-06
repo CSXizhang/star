@@ -957,6 +957,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         """View all selected local inspiration images and sources; optional image_id views one again.
 
         Optional references are not current-world observations or required building content.
+        If the client offloads pixels, open the returned image attachments before interpreting them.
         No network, arbitrary filenames or shell access is needed.
         """
         from .reference_images import read_reference_image as read_image
@@ -966,6 +967,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
     @mcp.tool()
     async def observe_map_image(location_id: str = "Farm", region: SpatialRegion | None = None) -> CallToolResult:
         """See a native map PNG for design, only when player is already on that map.
+        If the client offloads pixels, open the returned image attachment before visual review.
 
         Omit region for the full map; {x,y,width,height} returns a real local view.
         Image includes absolute tile bounds, pixel mapping and capture revision.

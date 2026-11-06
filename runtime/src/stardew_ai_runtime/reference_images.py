@@ -25,7 +25,8 @@ def read_reference_image(image_id: str | None = None, manifest_path: Path | None
             raise ToolError(f"Reference image manifest unavailable: {error}") from None
     catalog = [{key: entry[key] for key in ("id", "title", "author", "source", "sha256")} for entry in entries]
     metadata = {"kind": "reference_image", "images": catalog,
-                "purpose": "Optional inspiration, not a building checklist or evidence of the current farm."}
+                "purpose": "Optional inspiration, not a building checklist or evidence of the current farm.",
+                "viewingInstruction": "If the client offloads images to attachments, open those image attachments with its image viewer. Paths and metadata alone are not visual input. Images follow imageOrder."}
     selected = entries if image_id is None else [item for item in entries if item["id"] == image_id]
     if image_id is not None and not selected:
         raise ToolError("Unknown reference image ID; omit image_id to view available images")

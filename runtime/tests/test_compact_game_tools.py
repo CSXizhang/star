@@ -12,6 +12,31 @@ from stardew_ai_runtime.mcp_server import create_mcp_server
 mock_scheduler = _scheduler_fixture
 
 
+def test_partial_construction_frontloads_real_remaining_obstacles_without_retry(tmp_path, mock_scheduler):
+    store = _grant_decision(tmp_path, mock_scheduler)
+    mock_scheduler.latest_snapshot = {"payload": {"companion": {"locationId": "Farm"}}}
+    partial = {"status": "executed", "terminalState": "partially-succeeded", "commandId": "native-partial",
+        "completedCount": 1, "skippedCount": 1, "failedCount": 0,
+        "effects": [{"state": "placed", "tile": {"x": 5, "y": 7}, "itemId": "(O)328"},
+                    {"state": "skipped", "tile": {"x": 6, "y": 7}, "reason": "occupied"}]}
+    mock_scheduler.place_items = AsyncMock(return_value=partial)
+    tree = {"kind": "Tree", "x": 6, "y": 7, "width": 1, "height": 1, "growthStage": 5}
+    mock_scheduler.query_farm_space = AsyncMock(return_value={"capturedRevision": 2, "occupants": [tree], "occupantsTruncated": False})
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+        _, result = await server.call_tool("submit_work", {"action": {"place_items": {
+            "item_id": "(O)328", "tiles": [{"x": 5, "y": 7}, {"x": 6, "y": 7}]}}})
+        assert next(iter(result)) == "remainingWork"
+        assert result["remainingWork"]["unresolvedTargets"] == [{"x": 6, "y": 7, "reason": "occupied"}]
+        assert result["remainingWork"]["observation"]["occupants"] == [tree]
+        assert result["commandId"] == "native-partial" and result["completedCount"] == 1
+        assert result["effects"] == partial["effects"]
+        mock_scheduler.place_items.assert_awaited_once()
+        mock_scheduler.query_farm_space.assert_awaited_once_with(location_id="Farm", region={"x": 5, "y": 6, "width": 3, "height": 3})
+        assert not store.state("mock-save-123").tasks
+    asyncio.run(run())
+
+
 def test_wait_uses_existing_action_entry_and_validates_duration(tmp_path, mock_scheduler):
     _grant_decision(tmp_path, mock_scheduler)
     mock_scheduler.execute_wait = AsyncMock(return_value={"status": "completed", "terminalState": "succeeded",

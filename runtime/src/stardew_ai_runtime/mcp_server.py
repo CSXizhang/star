@@ -2536,6 +2536,42 @@ def create_mcp_server(
         sched.await_terminal_results = True
         try:
             result = await native_tools[name](**{key: getattr(parsed, key) for key in type(parsed).model_fields})
+            if (name in {"place_items", "hoe_tiles", "clear_debris", "cut_grass", "chop_tree"}
+                    and isinstance(result, dict) and result.get("terminalState") in {"partially-succeeded", "failed", "rejected"}):
+                # Put actual unfinished targets before long successful-effect lists:
+                # providers may truncate the middle of a large native receipt.
+                details = result.get("details") or {}
+                candidates = [x for x in result.get("effects", []) if x.get("state") in {"failed", "skipped"}]
+                for field in ("failedTiles", "skippedTiles", "failed", "skipped"):
+                    candidates.extend(details.get(field) or [])
+                remaining = {}
+                for entry in candidates:
+                    if not isinstance(entry, dict):
+                        continue
+                    tile = entry.get("tile") or entry
+                    x, y = tile.get("x"), tile.get("y")
+                    if type(x) is int and type(y) is int:
+                        remaining[(x, y)] = {"x": x, "y": y, "reason": entry.get("reason")}
+                if not remaining and not result.get("completedCount"):
+                    remaining = {(tile["x"], tile["y"]): dict(tile) for tile in args.get("tiles", [])}
+                review = {"unresolvedTargets": list(remaining.values()),
+                    "nextStep": "This action did not finish all requested work. Reobserve remaining targets; decide whether to clear, preserve and redesign, or recover inventory. Update the actual project layout and finish every requested functional area before completing the project. No work was queued or retried."}
+                if remaining:
+                    try:
+                        xs, ys = zip(*remaining, strict=True)
+                        left, top = max(0, min(xs) - 1), max(0, min(ys) - 1)
+                        region = {"x": left, "y": top, "width": max(xs) - left + 2, "height": max(ys) - top + 2}
+                        snapshot = getattr(sched, "latest_snapshot", None) or {}
+                        pose = (snapshot.get("payload") or {}).get("companion") or {}
+                        space = await sched.query_farm_space(location_id=args.get("location_id") or pose.get("locationId") or "Farm", region=region)
+                        occupants = [o for o in space.get("occupants", []) if any(
+                            o.get("x", -1000) - 1 <= x < o.get("x", -1000) + o.get("width", 1) + 1
+                            and o.get("y", -1000) - 1 <= y < o.get("y", -1000) + o.get("height", 1) + 1 for x, y in remaining)]
+                        review["observation"] = {"region": region, "capturedRevision": space.get("capturedRevision"),
+                            "occupants": occupants[:128], "occupantsTruncated": bool(space.get("occupantsTruncated")) or len(occupants) > 128}
+                    except Exception as ex:
+                        review["observation"] = {"status": "unavailable", "error": str(ex)}
+                result = {"remainingWork": review, **result}
             if name in {"navigate_to", "ship_items"} and isinstance(result, dict) and result.get("terminalState") in {"failed", "rejected"}:
                 try:
                     status = await sched.get_status()

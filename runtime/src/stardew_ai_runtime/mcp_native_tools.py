@@ -1233,7 +1233,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
     @mcp.tool()
     async def clear_debris(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], location_id: str = "Farm") -> dict[str, Any]:
-        """Clear explicitly selected native weeds, stones or twigs on the given tiles.
+        """Clear observed weeds, stones, twigs or boulders; use cut_grass for Grass terrain and chop_tree for trees, stumps or logs. Unreachable targets require clearing a reachable approach or choosing another route first.
 
         The native tool choice is the game's own rule: weeds with the Hoe/Axe, stones
         with the Pickaxe, twigs with the Axe/Pickaxe. Crops, machines, chests and

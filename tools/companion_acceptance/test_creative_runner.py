@@ -91,6 +91,22 @@ def test_design_must_precede_first_clearing_attempt_for_the_same_project(monkeyp
     assert monitor.design_precedes_clearing([plan, clear], "project")
     assert not monitor.design_precedes_clearing([clear, plan], "project")
     assert not monitor.design_precedes_clearing([plan, clear], "another-project")
+    unplanned = call({"id": "project", "project": {}})
+    revision = call(plan["result"]["goal"], action="revise")
+    assert monitor.design_precedes_clearing([unplanned, revision, clear], "project")
+    assert not monitor.design_precedes_clearing([unplanned, clear, revision], "project")
+
+
+def test_invalid_model_arguments_do_not_crash_monitor_or_count_as_a_design(monkeypatch):
+    invalid = {"name": "mcp__game__submit_work", "input": '"invalid arguments"', "error": True}
+    bad_goal = call("not a goal object")
+    plan = call({"id": "project", "project": {"summary": "Keep the grove", "layout": "Route around it"}})
+    clear = {"name": "mcp__game__submit_work", "input": {"action": {"clear_debris": {"tiles": []}}}}
+    monkeypatch.setattr(monitor, "summarize_trace", lambda calls: {"toolCalls": calls})
+    assert monitor.design_precedes_clearing([invalid, bad_goal, plan, clear], "project")
+    assert not monitor.design_precedes_clearing([invalid, bad_goal, clear], "project")
+    state = {"goals": [{"id": "project", "kind": "stage"}]}
+    assert monitor.bind_goal(state, {}, set(), [bad_goal, plan])[0] == "project"
 
 
 def test_rejected_brief_stops_instead_of_monitoring_unrelated_autoplay(tmp_path):

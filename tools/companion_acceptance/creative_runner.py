@@ -145,8 +145,10 @@ def bind_goal(state, request, baseline_ids, calls):
     for call in calls:
         if goal_operation(call).get("action") != "create" or call.get("error") or call.get("nonterminal"):
             continue
-        result = call.get("result") or {}
-        goal = result.get("goal") or {}
+        result = call.get("result")
+        goal = result.get("goal") if isinstance(result, dict) else None
+        if not isinstance(goal, dict):
+            continue
         if goal.get("id") in goals and goal["id"] not in baseline_ids:
             created[goal["id"]] = goal
     new_ids = set(goals) - baseline_ids
@@ -257,11 +259,12 @@ def design_precedes_clearing(trace, goal_id):
     planned = False
     for call in summarize_trace(trace)["toolCalls"]:
         result = call.get("result") or {}
-        goal = result.get("goal") or {} if isinstance(result, dict) else {}
-        if (goal_operation(call).get("action") in {"create", "update"} and not call.get("error")
-                and goal.get("id") == goal_id and design_recorded(goal.get("project"))):
+        goal = result.get("goal") if isinstance(result, dict) else None
+        if (goal_operation(call).get("action") in {"create", "revise", "update"} and not call.get("error")
+                and isinstance(goal, dict) and goal.get("id") == goal_id and design_recorded(goal.get("project"))):
             planned = True
-        action = (call.get("input") or {}).get("action") or {}
+        args = call.get("input")
+        action = args.get("action") if isinstance(args, dict) else None
         if (str(call.get("name")).endswith("__submit_work") and isinstance(action, dict)
                 and {"clear_debris", "cut_grass", "chop_tree"}.intersection(action)):
             return planned

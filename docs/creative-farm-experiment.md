@@ -10,7 +10,7 @@
 
 当前设计要求是建设适合全景与局部展示的“林间星庭农庄”：迎宾庭院、开阔的中央星庭、多个工匠小院、多组田园、蜂房花园、沿塘平台、林间休息庭，以及西南和外围步道小景，以连续主路和游览回路组织全场。完整原文在上述 designBrief 中；位置、尺度、形状、材料与顺序由模型决定，先记录整体方案和保留区域，施工后对照全图继续处理遮挡、断路、空缺，再保存实际布局和正常收尾。
 
-参考[ Crowshadow 的作品](https://forums.stardewvalley.net/threads/my-perfect-and-only-farm-10-years-300-hours.4782/)中主路、分区庭院与局部场景的层次，[Bloodless 的作品](https://forums.stardewvalley.net/threads/my-one-and-only-farm-finally-fully-updated.34643/)中中央构图、统一铺装与重复节奏，以及[Overhill Farm](https://forums.stardewvalley.net/threads/overhill-farm.5823/)中草岛、林间步道、池塘与生产物件的自然组合；仅借鉴空间组织，形成原创方案。Overhill 使用森林地图，本轮仍为标准农场，不复制参考中的建筑、新成长花田或未开放物件。
+参考[Crowshadow 的作品](https://forums.stardewvalley.net/threads/my-perfect-and-only-farm-10-years-300-hours.4782/)中主路、分区庭院与局部场景的层次，[Bloodless 的作品](https://forums.stardewvalley.net/threads/my-one-and-only-farm-finally-fully-updated.34643/)中中央构图、统一铺装与重复节奏，以及[Overhill Farm](https://forums.stardewvalley.net/threads/overhill-farm.5823/)中草岛、林间步道、池塘与生产物件的自然组合；仅借鉴空间组织，形成原创方案。Overhill 使用森林地图，本轮仍为标准农场，不复制参考中的建筑、新成长花田或未开放物件。
 
 本轮只发送一次完整要求，不补施工坐标、不逐步催促，也不增加交付后的改造挑战。有限工程默认创建可完成的 `stage`，已有长期 `main` 的授权和保护规则保持不变；未完成工程沿用原会话继续执行，完成后由既有本地状态触发截图、保存和退出。
 
@@ -31,7 +31,7 @@
 
 无限补给只存在于 TestDriver 的隔离预设中。生产 Mod 的制作、物品放置和资源规则保持原生行为。材料补给在动作空闲边界发生，避免改变执行中一次制作的成本和回执。
 
-材料盘以四种花种替换无用的树液、干草及铱制洒水器材料，保留十二个初始成品空槽，普通与优质洒水器仍可制作。上层灯具、花饰、设施和围栏在原生允许时可以与铺装、草地共存，摆放回执核对新增物件、消耗和底层保留；树木、作物、已有实体和入口仍受保护。
+材料盘以四种花种替换无用的树液、干草、铱锭和织布机用松焦油，保留十二个初始成品空槽，保留电池组以制作灯柱，普通与优质洒水器仍可制作。上层灯具、花饰、设施和围栏在原生允许时可以与铺装、草地共存，摆放回执核对新增物件、消耗和底层保留；树木、作物、已有实体和入口仍受保护。
 
 ## 完成与评审
 

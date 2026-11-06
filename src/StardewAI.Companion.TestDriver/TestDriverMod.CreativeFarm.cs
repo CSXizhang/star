@@ -22,9 +22,9 @@ public sealed partial class TestDriverMod
     private static readonly string[] CreativeMaterialIds = {
         "(O)388", "(O)390", "(O)771", "(O)709", "(O)382",
         "(O)378", "(O)334", "(O)335", "(O)338", "(O)336",
-        "(O)330", "(O)725", "(O)724", "(O)86", "(O)726",
+        "(O)330", "(O)725", "(O)724", "(O)86", "(O)787",
         // Flower seeds are crafting ingredients, not instant mature crops.
-        // Omit unused sap/hay and iridium-sprinkler ingredients to retain 12 output slots.
+        // Omit unused sap/hay, iridium bars and loom resin; retain batteries for lamp-posts.
         "(O)427", "(O)429", "(O)453", "(O)455"
     };
     private static readonly (string Name, string[] Categories)[] CreativeRecipeCandidates = {

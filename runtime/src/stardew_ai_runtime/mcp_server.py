@@ -913,7 +913,7 @@ def create_mcp_server(
                         if current.get("saveId") != sid or current.get("companion", {}).get("currentTask"):
                             raise ToolError("Observe the current game's remaining work after its action stops.")
                         observation = {"worldRevision": current.get("worldRevision"), "world": current.get("world", {})}
-                    goal = store.complete_goal(sid, goal_id or "", completion_observation=observation)
+                    goal = store.complete_goal(sid, goal_id or "", completion_observation=observation, project=project)
                 except Exception as ex:
                     if "MAIN_GOAL_LOCKED" in str(ex):
                         return {"saveId": sid, "goalId": goal_id, "blocked": True,

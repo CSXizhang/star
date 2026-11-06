@@ -37,6 +37,28 @@ def test_partial_construction_frontloads_real_remaining_obstacles_without_retry(
     asyncio.run(run())
 
 
+def test_completion_keeps_submitted_as_built_layout_without_unlocking_main(tmp_path, mock_scheduler):
+    store = _grant_decision(tmp_path, mock_scheduler)
+    goal = store.add_goal("mock-save-123", "Build the farm", source="agent")
+    store.revise_goal("mock-save-123", goal.id, project={"layout":"initial proposal", "preserve":"west trees"})
+    main = store.add_goal("mock-save-123", "Long-term farm", source="agent", kind="main")
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+        final = {"summary":"Built and observed", "layout":"Revised lakeside terrace and actual access"}
+        _, result = await server.call_tool("manage_arrangements", {"change":{"manage_goal": {
+            "action":"complete", "goal_id":goal.id, "project":final}}})
+        assert result["goal"]["status"] == "completed"
+        persisted = store.state("mock-save-123").goals[0].project
+        assert persisted["layout"] == final["layout"] and persisted["summary"] == final["summary"]
+        assert persisted["preserve"] == "west trees" and persisted["completionObservation"]["worldRevision"] == 1
+        _, blocked = await server.call_tool("manage_arrangements", {"change":{"manage_goal": {
+            "action":"complete", "goal_id":main.id, "project":final}}})
+        assert blocked["reasonCode"] == "MAIN_GOAL_LOCKED"
+        protected = next(g for g in store.state("mock-save-123").goals if g.id == main.id)
+        assert protected.status == "active" and protected.project == {}
+    asyncio.run(run())
+
+
 def test_wait_uses_existing_action_entry_and_validates_duration(tmp_path, mock_scheduler):
     _grant_decision(tmp_path, mock_scheduler)
     mock_scheduler.execute_wait = AsyncMock(return_value={"status": "completed", "terminalState": "succeeded",

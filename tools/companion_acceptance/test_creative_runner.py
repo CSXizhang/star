@@ -157,7 +157,7 @@ def test_decoration_counts_do_not_hide_blocked_or_unobserved_chest_access():
     assert not monitor.world_checks(sample(), after, criteria, ledger())["chests_and_processing_accessible"]
 
 
-def test_design_must_precede_first_clearing_attempt_for_the_same_project(monkeypatch):
+def test_planning_chronology_observes_first_clearing_for_the_same_project(monkeypatch):
     plan = call({"id": "project", "project": {"summary": "Keep the grove", "layout": "Route around the trees"}})
     clear = {"name": "mcp__game__submit_work", "input": {"action": {"clear_debris": {"tiles": []}}}}
     monkeypatch.setattr(monitor, "summarize_trace", lambda calls: {"toolCalls": calls})
@@ -459,6 +459,11 @@ def png_capture(runner, label, actual):
 @pytest.mark.parametrize("round_seconds", [0, 4000], ids=["ordinary-rounds", "continues-beyond-one-hour"])
 def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_path, monkeypatch, round_seconds):
     runner = setup_run(tmp_path)
+    cases = monitor.read(runner.cases_file)
+    cases[runner.case]["criteria"]["requireRawGround"] = True
+    monitor.write(runner.cases_file, cases)
+    startup = runner.evidence / "harness-fixture-startup.json"
+    monitor.write(startup, {**monitor.read(startup), "groundPrecleared": False})
     trace, actions = [], []
     native_count = 0
     owns = False
@@ -497,6 +502,13 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
         if native_count >= 2:
             actual = sample(True)
             if native_count == 2:
+                # Exploring the ground before writing a project note is valid;
+                # the full delivery still needs native work, a project and save.
+                trace.append({"requestId": "initial", "event": {"item": {
+                    "type": "tool_call", "toolCall": {"name": "mcp__game__submit_work",
+                    "input": {"action": {"clear_debris": {"tiles": [{"x": 12, "y": 18}]}}},
+                    "status": 2, "output": {"details": {"mcp": {"structuredContent": {
+                        "skill": "clear-debris", "terminalState": "succeeded", "completedCount": 1}}}}}}}})
                 trace.append(event("initial", copy.deepcopy(goal)))
                 monitor.append(runner.mod / "chat_commands.jsonl", {"requestId": "initial", "saveId": "Farm_1",
                                "status": "completed", "conversationId": "same-session", "provider": "mcode"})
@@ -511,6 +523,8 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
             monitor.write(runner.mod / "data/work-state.json", {"Farm_1": {"requests": [request_record], "goals": [goal]}})
             monitor.write(runner.mod / "data/life-turn.json", {"saveId": "Farm_1", "requestId": None})
         actual["creativeFarm"]["agentOwns"] = owns
+        actual["creativeFarm"]["space"] = {"occupants": [
+            {"kind": kind, "x": i, "y": 0} for i, kind in enumerate(("Tree", "Grass", "resource-clump", "object"))]}
         runner.samples.append(copy.deepcopy(actual))  # Same retention as the inherited native() implementation.
         return copy.deepcopy(actual)
 
@@ -537,6 +551,8 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
     report = monitor.read(runner.evidence / "creative-farm-report.json")
     assert report["status"] == "passed" and all(report["checks"].values())
     assert report["technicalPassed"] is True
+    assert report["planningObservation"]["designPrecedesClearing"] is False
+    assert "design_precedes_clearing" not in report["checks"]
     assert report["wallBudgetSeconds"] is None
     assert report["elapsedSeconds"] == round_seconds * 3
     assert len(runner.samples) <= 1  # Full history is on disk, not retained throughout an overnight run.

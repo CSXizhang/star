@@ -378,7 +378,7 @@ class CreativeRunner(Runner):
         self.progress_capture_count = 0
         self.last_captured_work_count = 0
         self.report["humanReview"] = {
-            "status": "pending", "criteria": ["符合本轮约定的风格", "各区与主路连贯", "保留实用空地", "整体美感"],
+            "status": "pending", "criteria": ["符合玩家约定的作品意图", "整体观感与空间关系", "实际使用体验", "模型说明与实景一致"],
             "note": "技术验收与审美评审分别记录；请结合实际农场图评价设计。",
         }
 
@@ -675,8 +675,10 @@ class CreativeRunner(Runner):
             checks["same_project_completed"] = bool(goal and goal.get("status") == "completed")
             checks["project_design_recorded"] = bool(goal and design_recorded(goal.get("project"))
                                                       and self.report.get("recordedDesignObserved"))
-            if self.criteria.get("requireRawGround"):
-                checks["design_precedes_clearing"] = design_precedes_clearing(trace, self.goal_id)
+            # Chronology is evidence for human review, not a prescribed creative
+            # workflow. Exploring/clearing before writing notes may be valid.
+            self.report["planningObservation"] = {
+                "designPrecedesClearing": design_precedes_clearing(trace, self.goal_id)}
             if checks["same_project_completed"]:
                 self.report["completionRequestId"] = self.completion_turn(trace, commands, lease)
                 completion_deadline = completion_deadline or time.monotonic() + 60

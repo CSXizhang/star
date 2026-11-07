@@ -8,7 +8,9 @@
 
 默认设计约定保存在 `tools/companion_acceptance/cases.json` 的 `creative-farm.designBrief`：
 
-当前要求是自由改造原始农场，做成模型认真设计、愿意展示且适合长期生活使用的地方。模型自行选择建设内容、风格、布局与施工顺序，结合真实全景和局部调整方案，在现有项目记录中简短保留创作意图、当前安排与未完事项；不规定分区数量、面积、图案、回路、物件数量或植被保留比例。
+当前交付对象是整座农场的一件完整作品：从全景看出整体构思、空间联系、景观层次和值得近看的细节。模型自行选择主题、内容、风格、布局与树草取舍，把建成空间、保留的自然景观及留白纳入整体关系，不要求每个角落施工，也不规定分区、图案、数量或覆盖率。
+
+实际任务仍由 `designBrief + instruction` 原文拼接、单次发送并核对运行层收件原文；现有 `summary`、`layout`、`remaining` 保存整体构思、当前安排和未完事项，方案可改，玩家约定的交付范围保留。收尾使用最后一次施工后实际查看的全景及必要局部，对照整场作品目标继续处理问题；不要求固定精修轮数或没有任何不足，通用核心说明不把整场目标强加给其他局部任务。
 
 可选灵感来自 [Crowshadow](https://forums.stardewvalley.net/threads/my-perfect-and-only-farm-10-years-300-hours.4782/)、[Bloodless](https://forums.stardewvalley.net/threads/my-one-and-only-farm-finally-fully-updated.34643/) 与 [Overhill Farm](https://forums.stardewvalley.net/threads/overhill-farm.5823/)。它们启发空间组织、材料搭配与生活感，模型可以自由借鉴或另选方向；参考里的地图、建筑和植物不代表本轮可用能力，实际配方和空间观察才是依据。
 

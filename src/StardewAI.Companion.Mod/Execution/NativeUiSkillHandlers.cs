@@ -185,9 +185,42 @@ public sealed partial class CompanionMechanicsCoordinator
             }
             if (menu is ShippingMenu or LevelUpMenu or SaveGameMenu)
             {
-                rejectResult = BuildRejection(payload, "MENU_OWNED_BY_SLEEP_FLOW",
-                    $"The native {menu.GetType().Name} belongs to the overnight sleep flow and is owned by the sleep skill; do not advance it here.", retryable: false);
-                return false;
+                if (_sleepMachine?.CanResumeOwnedOvernight == true)
+                {
+                    rejectResult = BuildRejection(payload, "MENU_OWNED_BY_SLEEP_FLOW",
+                        $"The native {menu.GetType().Name} belongs to this actor's committed sleep; resume it with sleep.", retryable: false);
+                    return false;
+                }
+                // Pass-out during ordinary work can start an overnight without a
+                // sleep command. Continue its native UI, without claiming a bed
+                // sleep or skipping the save enumerator.
+                if (menu is SaveGameMenu)
+                {
+                    rejectResult = BuildRejection(payload, "NATIVE_SAVE_IN_PROGRESS",
+                        "Native saving owns this menu. Wait for its update and observe again; no close input was sent.", true);
+                    return false;
+                }
+                if (menu is LevelUpMenu { isProfessionChooser: true })
+                {
+                    rejectResult = BuildRejection(payload, "CHOICE_REQUIRED",
+                        "This level-up requires an explicit profession choice; no default profession or close input was sent.", false);
+                    return false;
+                }
+                if (menu is ShippingMenu shipping)
+                {
+                    var button = shipping.currentPage == -1 ? shipping.okButton : shipping.backButton;
+                    if (!shipping.CanReceiveInput() || button is null)
+                    {
+                        rejectResult = BuildRejection(payload, "MENU_NOT_READY_TO_CLOSE",
+                            "The native overnight summary is still transitioning; observe again before continuing.", true);
+                        return false;
+                    }
+                    _actor.Halt();
+                    shipping.receiveLeftClick(button.bounds.Center.X, button.bounds.Center.Y);
+                    return CompleteNativeUiSkill(payload, envelope, "advanced-overnight-summary", NativeUiDetails());
+                }
+                // Informational LevelUpMenu uses the ordinary native exit below;
+                // its cleanup grants the level perk and removes the pending level.
             }
 
             if (menu is ConfirmationDialog)

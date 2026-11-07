@@ -2281,7 +2281,9 @@ def create_mcp_server(
         Waiting does not end a festival. Rejection reasonCodes: EVENT_ACTIVE (scripted event),
         FESTIVAL_FREE_ROAM (observe and choose an available native action),
         CHOICE_REQUIRED (list options, then native_answer), MENU_OWNED_BY_SLEEP_FLOW
-        (leave sleep-flow menus alone), NAME_INPUT_REQUIRED (NamingMenu needs
+        (resume the already committed sleep command). Overnight information after
+        natural pass-out can be advanced; SaveGameMenu is never dismissed and
+        profession choices are never implicit. NAME_INPUT_REQUIRED (NamingMenu needs
         explicit native_menu_select text; closing it does not complete naming),
         NOTHING_TO_ADVANCE (no native UI to act on).
         """

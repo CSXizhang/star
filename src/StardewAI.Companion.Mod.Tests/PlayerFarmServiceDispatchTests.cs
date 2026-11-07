@@ -46,6 +46,52 @@ public sealed class PlayerFarmServiceDispatchTests
     }
 
     [Fact]
+    public void UnownedOvernightInformationCanAdvanceButSaveChoiceAndTakeoverStayProtected()
+    {
+        using var world = new World();
+        var coordinator = world.Coordinator(new TestNativeActionAdapter());
+        coordinator.PlayerAuthority!.RequestAgent("test");
+        var request = Request("native-advance", new WaterZoneParameters("FarmHouse"));
+        var level = (OvernightInformation)RuntimeHelpers.GetUninitializedObject(typeof(OvernightInformation));
+        SetMenu(level);
+        Assert.True(coordinator.TryAcceptSkillExecute(request, Envelope(), out var rejected), rejected?.Error?.Message);
+        Assert.True(level.Confirmed);
+        Assert.Null(Game1.activeClickableMenu);
+
+        level.Confirmed = false;
+        level.isProfessionChooser = true;
+        SetMenu(level);
+        Assert.False(coordinator.TryAcceptSkillExecute(request, Envelope(), out rejected));
+        Assert.Equal("CHOICE_REQUIRED", rejected!.Error?.Code);
+        Assert.False(level.Confirmed);
+
+        var saving = (SaveGameMenu)RuntimeHelpers.GetUninitializedObject(typeof(SaveGameMenu));
+        SetMenu(saving);
+        Assert.False(coordinator.TryAcceptSkillExecute(request, Envelope(), out rejected));
+        Assert.Equal("NATIVE_SAVE_IN_PROGRESS", rejected!.Error?.Code);
+        Assert.Same(saving, Game1.activeClickableMenu);
+
+        level.isProfessionChooser = false;
+        SetMenu(level);
+        coordinator.PlayerAuthority.Takeover("F9");
+        Assert.False(coordinator.TryAcceptSkillExecute(request, Envelope(), out rejected));
+        Assert.Equal("PLAYER_CONTROL_NOT_HELD", rejected!.Error?.Code);
+        Assert.False(level.Confirmed);
+        Assert.Same(level, Game1.activeClickableMenu);
+    }
+
+    private sealed class OvernightInformation : LevelUpMenu
+    {
+        public bool Confirmed;
+        public override bool readyToClose() => true;
+        public override void receiveKeyPress(Microsoft.Xna.Framework.Input.Keys key)
+        {
+            Confirmed = true;
+            SetMenu(null);
+        }
+    }
+
+    [Fact]
     public void NativeShopQuoteReusesMatchingOpenMenuWithoutClosingItAndRejectsOtherShop()
     {
         using var world = new World();

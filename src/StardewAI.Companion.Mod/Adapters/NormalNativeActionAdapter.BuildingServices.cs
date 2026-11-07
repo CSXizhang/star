@@ -94,10 +94,18 @@ public sealed partial class NormalNativeActionAdapter
             else
             {
                 var tile = request.DestinationTile!.Value;
-                if (!farm.buildStructure(request.BuildingType, new Vector2(tile.X, tile.Y), actor.GameFarmer!, out var built, false, false))
+                bool accepted = false;
+                Building? built = null;
+                // Native isBuildable reads Buildable/Diggable from currentLocation,
+                // even when buildStructure is called on the farm from Robin's shop.
+                // Scope only the synchronous native call, with no player warp or
+                // location-change event, and restore the counter map in finally.
+                NativeToolLocationContext.Run(farm, () => accepted = farm.buildStructure(
+                    request.BuildingType, new Vector2(tile.X, tile.Y), actor.GameFarmer!, out built, false, false));
+                if (!accepted)
                     return false;
                 committed = true;
-                if (built.isUnderConstruction()) Game1.netWorldState.Value.MarkUnderConstruction(data.Builder, built);
+                if (built!.isUnderConstruction()) Game1.netWorldState.Value.MarkUnderConstruction(data.Builder, built);
             }
             return true;
         }, () => committed || farm.buildings.Count != beforeCount,
@@ -334,6 +342,13 @@ public sealed partial class NormalNativeActionAdapter
     // A bounded read-only shortlist makes relocation a real option for the agent.
     // Never poke/clear tiles or invoke buildStructure while observing candidates.
     private static TileCoordinate[] FindClearBuildingSites(Farm farm, BuildingData data)
+    {
+        TileCoordinate[] result = Array.Empty<TileCoordinate>();
+        NativeToolLocationContext.Run(farm, () => result = FindClearBuildingSitesInContext(farm, data));
+        return result;
+    }
+
+    private static TileCoordinate[] FindClearBuildingSitesInContext(Farm farm, BuildingData data)
     {
         var layer = farm.Map?.Layers.FirstOrDefault();
         if (layer is null || data.Size.X <= 0 || data.Size.Y <= 0

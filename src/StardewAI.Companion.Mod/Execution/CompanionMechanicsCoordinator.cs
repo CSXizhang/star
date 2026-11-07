@@ -788,7 +788,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             if (skillId=="native-menu-select") return TryAcceptPlayerInteraction(payload,envelope,out rejectResult);
             if (ActorGuards.IsPlayerBound(_actor) && !skillId.StartsWith("inspect-")
                 && !(skillId == "sleep" && _sleepMachine?.CanResumeOwnedOvernight == true)
-                && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items")) {
+                && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items",
+                    allowedShopId: skillId == "purchase-items" ? payload.Parameters.ShopId : null)) {
                 rejectResult=BuildRejection(payload,uiCode,uiMessage,true,NativeUiDetails()); return false;
             }
             if (skillId is "discover-extension-api" or "list-extensions" or "load-extension" or "invoke-extension") return TryAcceptExtension(payload,envelope,out rejectResult);
@@ -893,7 +894,10 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 _ => null
             };
             if (ActorGuards.IsPlayerBound(_actor) && nativeKind.HasValue && nativeKind.Value is not
-                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems))
+                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems
+                 or NativeActionKind.BuildBuilding or NativeActionKind.PurchaseAnimal or NativeActionKind.FeedAnimals
+                 or NativeActionKind.PetAnimal or NativeActionKind.ToggleAnimalDoor
+                 or NativeActionKind.InsertMachine or NativeActionKind.CollectMachine))
             {
                 rejectResult=BuildRejection(payload,"PLAYER_ACTION_UNSUPPORTED","This action has not been enabled in the native player farming phase.",false);
                 return false;

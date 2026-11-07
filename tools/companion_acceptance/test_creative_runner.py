@@ -54,6 +54,40 @@ def test_open_creation_accepts_actual_paving_without_requiring_any_facility():
     assert not monitor.world_checks(sample(), sample(), {}, [])["autonomous_construction_recorded"]
 
 
+def test_native_services_require_opt_in_receipts_completed_buildings_and_access():
+    before, after = sample(), sample(True)
+    after.update(day=5, timeOfDay=1200)
+    farm = after["creativeFarm"]
+    farm.update(nativeDays=True, harnessTimeFrozen=False, fixedTimeOfDay=None,
+                initialTotalDays=0, totalDays=4, extraBuildings=["coop"], buildings=[{
+                    "id": "coop", "type": "Coop", "underConstruction": False,
+                    "doorReachable": True, "residentIds": [123]}])
+    criteria = {"nativeFarmServices": True, "allowedBuildingTypes": ["Coop", "Barn", "Silo"]}
+    def receipt(command, skill, state, item):
+        return {"type": "native-result", "payload": {"CommandId": command, "SkillId": skill,
+                "TerminalState": "succeeded", "CompletedCount": 1,
+                "Effects": [{"state": state, "itemId": item, "stack": 1}]}}
+    order = receipt("order", "build-building", "building-construction-ordered", "Coop")
+    purchase = receipt("buy", "purchase-animal", "animal-purchased", "White Chicken")
+    records = [*ledger(), order, purchase]
+    assert all(monitor.world_checks(before, after, criteria, records).values())
+    default = monitor.world_checks(before, after, {}, records)
+    assert not default["fixed_daylight"] and not default["no_buildings_added"]
+    assert not default["no_purchase_or_building_work"]
+    missing = monitor.world_checks(before, after, criteria, ledger())
+    assert not missing["new_buildings_native_and_authorized"]
+    assert not missing["new_animals_have_native_purchases"]
+    farm["buildings"][0]["underConstruction"] = True
+    assert not monitor.world_checks(before, after, criteria, records)["new_buildings_ready_and_accessible"]
+    farm["buildings"][0].update(underConstruction=False, doorReachable=False)
+    assert not monitor.world_checks(before, after, criteria, records)["new_buildings_ready_and_accessible"]
+    farm["buildings"][0].update(doorReachable=True, residentIds=[123, 456])
+    assert not monitor.world_checks(before, after, criteria, [*records, purchase])["new_animals_have_native_purchases"]
+    farm["buildings"][0]["type"] = "Fish Pond"
+    records.append(receipt("pond", "build-building", "building-construction-ordered", "Fish Pond"))
+    assert not monitor.world_checks(before, after, criteria, records)["new_buildings_native_and_authorized"]
+
+
 def test_closeups_choose_real_campfire_instead_of_repeating_workshop_brazier():
     farm = {"workArea": {"width": 80, "height": 65}, "layout": [
         {"x": 50, "y": 17, "categories": ["chest"], "origin": "agent-or-native", "itemId": "(BC)130"},

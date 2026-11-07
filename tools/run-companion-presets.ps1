@@ -4,6 +4,7 @@ param(
     [string]$SavePath = '',
     [string]$DesignBriefPath = '',
     [string]$ReferenceImagesManifest = '',
+    [switch]$NativeFarmServices,
     [string]$SuiteId = '',
     [ValidateSet('mcode','agy')][string]$AcceptanceBackend = 'mcode',
     [string]$AcceptanceModel = '',
@@ -18,6 +19,7 @@ $creative = $Cases -contains 'creative-farm'
 if ($creative -and $Cases.Count -ne 1) { throw 'creative-farm 使用独立创作环境，请单独运行该场景。' }
 if ($DesignBriefPath -and -not $creative) { throw '-DesignBriefPath 仅用于 creative-farm。' }
 if ($ReferenceImagesManifest -and -not $creative) { throw '-ReferenceImagesManifest 仅用于 creative-farm。' }
+if ($NativeFarmServices -and -not $creative) { throw '-NativeFarmServices 仅用于 creative-farm。' }
 $designBrief = ''
 if ($DesignBriefPath) {
     $designBrief = Get-Content -LiteralPath $DesignBriefPath -Raw -Encoding UTF8
@@ -42,8 +44,13 @@ $specs = Get-Content -LiteralPath $specPath -Raw -Encoding UTF8 | ConvertFrom-Js
 Copy-Item -LiteralPath $specPath -Destination (Join-Path $suite 'cases.json')
 if ($designBrief) {
     $specs.'creative-farm'.designBrief = $designBrief.Trim()
-    $specs | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $suite 'cases.json') -Encoding UTF8
 }
+if ($NativeFarmServices) {
+    $specs.'creative-farm'.instruction = $specs.'creative-farm'.nativeServicesInstruction
+    $specs.'creative-farm'.criteria | Add-Member -NotePropertyName nativeFarmServices -NotePropertyValue $true
+    $specs.'creative-farm'.criteria | Add-Member -NotePropertyName allowedBuildingTypes -NotePropertyValue @('Coop','Barn','Silo')
+}
+$specs | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $suite 'cases.json') -Encoding UTF8
 $first = $specs.($Cases[0])
 $env:STARDEW_AI_ENV_STARDEW_AI_HARNESS_FIXTURE = if ($first.fixture) { $first.fixture } else { $Cases[0] }
 $env:STARDEW_AI_ENV_STARDEW_AI_HARNESS_STAMINA = [string]$first.stamina
@@ -69,6 +76,8 @@ if ($SavePath) { $launchArgs += @('-CustomSavePath',('"' + (Resolve-Path -Litera
 $launcher = $null
 $runnerExit = 1
 $previousReferenceManifest = $env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST
+$previousNativeDays = $env:STARDEW_AI_ENV_STARDEW_AI_CREATIVE_NATIVE_DAYS
+$env:STARDEW_AI_ENV_STARDEW_AI_CREATIVE_NATIVE_DAYS = if ($NativeFarmServices) { '1' } else { '0' }
 if ($ReferenceImagesManifest) {
     $env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST = (Resolve-Path -LiteralPath $ReferenceImagesManifest).Path
 }
@@ -83,6 +92,7 @@ try {
     $runnerExit = $LASTEXITCODE
 } finally {
     $env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST = $previousReferenceManifest
+    $env:STARDEW_AI_ENV_STARDEW_AI_CREATIVE_NATIVE_DAYS = $previousNativeDays
     if ($creative -and $launcher) {
         # Even a monitor import/startup failure must release this owned game.
         # The launcher has a separate shutdown timeout after this done signal.

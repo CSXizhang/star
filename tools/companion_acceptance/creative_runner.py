@@ -74,8 +74,11 @@ def detail_regions(farm):
     if width <= 0 or height <= 0:
         return []
     items = [item for item in farm.get("layout", []) if item.get("origin") == "agent-or-native"]
+    items += [{"x": b["x"] + b["width"] // 2, "y": b["y"] + b["height"] // 2,
+               "categories": ["livestock"]} for b in farm.get("buildings", [])
+              if b.get("id") in farm.get("extraBuildings", []) and b.get("type") in {"Coop", "Barn"}]
     selected = []
-    for name, category, preferred in (("flowers", "flower", None), ("workshop", "chest", None),
+    for name, category, preferred in (("livestock", "livestock", None), ("flowers", "flower", None), ("workshop", "chest", None),
                                       ("cultivation", "farming", None), ("rest", "rest", "(BC)146"),
                                       ("scenery", "path", None), ("scene", None, None)):
         candidates = [item for item in items if category is None or category in item.get("categories", [])]
@@ -264,6 +267,42 @@ def world_checks(before, after, criteria, ledger):
             (item.get("itemId"), item.get("x"), item.get("y")) in placed for item in required_items),
         "placed_items_were_crafted": all(crafted[item] >= count for item, count in placed_counts.items()),
     }
+    if criteria.get("nativeFarmServices"):
+        checks.pop("fixed_daylight")
+        checks.pop("no_buildings_added")
+        checks.pop("no_purchase_or_building_work")
+        checks["native_day_environment"] = (farm.get("nativeDays") is True
+            and farm.get("harnessTimeFrozen") is False
+            and isinstance(farm.get("totalDays"), int)
+            and isinstance(farm.get("initialTotalDays"), int)
+            and farm["totalDays"] >= farm["initialTotalDays"])
+        orders, purchases = Counter(), 0
+        seen = set()
+        for row in ledger:
+            receipt = lower_keys(row.get("payload"))
+            if (row.get("type") != "native-result" or not receipt.get("commandid")
+                    or receipt["commandid"] in seen
+                    or receipt.get("terminalstate") not in {"succeeded", "partially-succeeded"}):
+                continue
+            seen.add(receipt["commandid"])
+            for effect in receipt.get("effects") or []:
+                if effect.get("state") == "building-construction-ordered":
+                    orders[effect.get("itemId")] += effect.get("stack", 0)
+                elif effect.get("state") == "animal-purchased":
+                    purchases += effect.get("stack", 0)
+        buildings = farm.get("buildings") or []
+        additions = [b for b in buildings if b.get("id") in farm.get("extraBuildings", [])]
+        counts_by_type = Counter(b.get("type") for b in additions)
+        checks["new_buildings_native_and_authorized"] = (
+            len(additions) == len(farm.get("extraBuildings", []))
+            and set(counts_by_type) <= set(criteria.get("allowedBuildingTypes", []))
+            and all(count <= orders[kind] for kind, count in counts_by_type.items()))
+        checks["new_buildings_ready_and_accessible"] = all(
+            b.get("underConstruction") is False and b.get("doorReachable") is True for b in additions)
+        residents = {animal for b in buildings for animal in b.get("residentIds", [])}
+        original_residents = {animal for b in (before.get("creativeFarm") or {}).get("buildings", [])
+                              for animal in b.get("residentIds", [])}
+        checks["new_animals_have_native_purchases"] = len(residents - original_residents) <= purchases
     checks.update({"minimum_" + key: counts[key] >= criteria[criterion] for key, criterion in MINIMUMS.items() if criterion in criteria})
     initial_space = ((before.get("creativeFarm") or {}).get("space") or {}).get("occupants", [])
     final_space = (farm.get("space") or {}).get("occupants", [])

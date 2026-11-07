@@ -64,6 +64,8 @@ public sealed partial class TestDriverMod
     private sealed record CreativeEntrance(string Id, int X, int Y, string Target, bool InitiallyReachable = false);
 
     private bool _creativeFarmActive;
+    private bool _creativeNativeDays;
+    private int _creativeInitialDay;
     private string? _creativeFarmError;
     private object? _creativeModEntry;
     private Farmer? _creativeFarmer;
@@ -150,6 +152,8 @@ public sealed partial class TestDriverMod
         _creativeFarmer = farmer;
         _creativeSaveName = Constants.SaveFolderName;
         _creativeDay = Game1.Date.TotalDays;
+        _creativeInitialDay = _creativeDay;
+        _creativeNativeDays = Environment.GetEnvironmentVariable("STARDEW_AI_CREATIVE_NATIVE_DAYS") == "1";
         _creativeAnchor = farmer.TilePoint;
         var map = farm.Map.Layers[0];
         _creativeWorkArea = new Rectangle(0, 0, map.LayerWidth, map.LayerHeight);
@@ -183,9 +187,12 @@ public sealed partial class TestDriverMod
         foreach (var material in materials)
             _creativeMaterialTargets.Add(material.QualifiedItemId, Math.Min(999, material.maximumStackSize()));
         farmer.maxStamina.Value = Math.Max(farmer.MaxStamina, 1000);
-        Game1.timeOfDay = CreativeTimeOfDay;
-        Game1.gameTimeInterval = 0;
-        _freezeTime = true;
+        if (!_creativeNativeDays)
+        {
+            Game1.timeOfDay = CreativeTimeOfDay;
+            Game1.gameTimeInterval = 0;
+        }
+        _freezeTime = !_creativeNativeDays;
         _harnessFixtureMode = "creative-farm";
         RefillCreativeMaterials("initial");
 
@@ -214,7 +221,8 @@ public sealed partial class TestDriverMod
                     itemId = item.QualifiedItemId, name = item.DisplayName, target = _creativeMaterialTargets[item.QualifiedItemId] }).ToArray(),
                 finishedItemsGranted = false, chestMaterialsConsumedAutomatically = false,
                 tools = tools.Select(tool => new { name = tool.GetType().Name, upgradeLevel = tool.UpgradeLevel }).ToArray() },
-            environment = new { fixedTimeOfDay = CreativeTimeOfDay, clockFrozen = true,
+            environment = new { fixedTimeOfDay = _creativeNativeDays ? (int?)null : CreativeTimeOfDay, clockFrozen = _freezeTime,
+                nativeDays = _creativeNativeDays, serviceFundsReplenished = _creativeNativeDays,
                 stamina = "restored-to-fixture-maximum-at-idle-boundaries", maxStamina = farmer.MaxStamina,
                 scope = "creative-farm-isolated-test-only" },
             recipeWhitelist = recipes, rejectedRecipes = rejected, originalRecipes, originalInventory = initialInventory,
@@ -232,7 +240,7 @@ public sealed partial class TestDriverMod
         _evidence["harnessFixture"] = fixture;
         CreativeEvent("initial", initial);
         WriteFreeModeNativeSnapshot(outDir, label);
-        Monitor.Log($"[TestDriver] Creative farm ready: {recipes.Count} native recipes, materials only, fixed daylight, twelve output slots reserved.", LogLevel.Info);
+        Monitor.Log($"[TestDriver] Creative farm ready: {recipes.Count} native recipes, native days/services={_creativeNativeDays}, twelve output slots reserved.", LogLevel.Info);
     }
 
     private void MaintainCreativeFarm()
@@ -240,8 +248,14 @@ public sealed partial class TestDriverMod
         try
         {
             if (_creativeModEntry == null || _creativeFarmer == null || !ReferenceEquals(_creativeFarmer, Game1.player)
-                || Constants.SaveFolderName != _creativeSaveName || Game1.Date.TotalDays != _creativeDay)
+                || Constants.SaveFolderName != _creativeSaveName || (!_creativeNativeDays && Game1.Date.TotalDays != _creativeDay))
                 throw new InvalidOperationException("Creative fixture actor/save/day changed; automatic supply stopped.");
+            if (_creativeNativeDays && Game1.Date.TotalDays != _creativeDay)
+            {
+                if (Game1.newDay || Game1.fadeToBlack || Game1.fadeIn || Game1.activeClickableMenu != null) return;
+                CreativeEvent("native-day-changed", new { previousTotalDays = _creativeDay, totalDays = Game1.Date.TotalDays });
+                _creativeDay = Game1.Date.TotalDays;
+            }
             var coordinator = ReadNativeMember(_creativeModEntry, "_coordinator");
             PublishCreativeControl();
             RecordCreativeNativeResult();
@@ -292,10 +306,15 @@ public sealed partial class TestDriverMod
         }
         float staminaBefore = farmer.Stamina;
         farmer.Stamina = farmer.MaxStamina;
-        if (supplied.Count > 0 || staminaBefore != farmer.Stamina)
+        int moneyBefore = farmer.Money;
+        // A replenished wallet funds native purchases, not a cumulative spending budget.
+        // Never supplies buildings, animals or finished objects.
+        if (_creativeNativeDays && farmer.Money < 1000000) farmer.Money = 1000000;
+        if (supplied.Count > 0 || staminaBefore != farmer.Stamina || moneyBefore != farmer.Money)
         {
             _creativeSupplyEvents++;
             CreativeEvent("material-supply", new { reason, items = supplied, staminaBefore, staminaAfter = farmer.Stamina,
+                moneyBefore, moneyAfter = farmer.Money,
                 source = "isolated-test-fixture", finishedItemsGranted = false });
             return true;
         }
@@ -377,7 +396,7 @@ public sealed partial class TestDriverMod
         foreach (var door in farm.doors.Pairs) Add(door.Key.X, door.Key.Y, door.Value);
         foreach (var building in farm.buildings)
         {
-            if (building.daysOfConstructionLeft.Value > 0) continue;
+            if (building.daysOfConstructionLeft.Value > 0 || building.humanDoor is not { X: >= 0, Y: >= 0 }) continue;
             var door = building.getPointForHumanDoor();
             if (door.X >= 0 && door.Y >= 0) Add(door.X, door.Y, building.GetIndoorsName() ?? building.buildingType.Value);
         }
@@ -437,6 +456,17 @@ public sealed partial class TestDriverMod
                 reachable = route.Reachable, standingTile = route.Standing, error = route.Error };
         }).ToArray();
         var farmer = _creativeFarmer;
+        var buildings = farm.buildings.Select(building => {
+            var door = building.getPointForHumanDoor();
+            var route = building.humanDoor is { X: >= 0, Y: >= 0 } && door.X >= 0 && door.Y >= 0
+                ? CreativeEntranceRoute(new("building-door", door.X, door.Y, building.buildingType.Value))
+                : (Reachable: true, Standing: (object?)null, Error: (string?)null);
+            return new { id = building.id.Value.ToString(), type = building.buildingType.Value,
+                x = building.tileX.Value, y = building.tileY.Value, width = building.tilesWide.Value, height = building.tilesHigh.Value,
+                underConstruction = building.isUnderConstruction(), doorReachable = route.Reachable,
+                residentIds = building.GetIndoors() is AnimalHouse house ? house.animalsThatLiveHere.ToArray() : Array.Empty<long>() };
+        }).ToArray();
+        var livestock = _creativeNativeDays ? ObserveCreativeNativeLivestock(_creativeModEntry!) : null;
         var operationAccess = added.Where(item => item.categories.Contains("chest") || item.categories.Contains("production"))
             .Select(item => {
                 var route = CreativeEntranceRoute(new("placed-item", item.x, item.y, item.name), allowTargetObject: true);
@@ -453,6 +483,7 @@ public sealed partial class TestDriverMod
             counts = new { pathTiles = Count("path"), chests = Count("chest"), restObjects = Count("rest"), lights = Count("light") },
             layout, space = CreativeSpace(), operationAccess, buildingsPreserved = changed.Length == 0, changedOriginalBuildings = changed,
             extraBuildings = currentBuildings.Keys.Except(_creativeBuildings.Keys).ToArray(),
+            buildings, livestock, nativeDays = _creativeNativeDays, initialTotalDays = _creativeInitialDay, totalDays = Game1.Date.TotalDays,
             waterTilesPreserved = CreativeWaterFingerprint(farm) == _creativeWaterBaseline,
             accessAnchor = farmer == null ? null : new { x = farmer.TilePoint.X, y = farmer.TilePoint.Y },
             initialAccessAnchor = new { x = _creativeAnchor.X, y = _creativeAnchor.Y }, entrances,
@@ -460,10 +491,21 @@ public sealed partial class TestDriverMod
                 && entrances.Where(entrance => entrance.initiallyReachable).All(entrance => entrance.reachable),
             supplyLedgerSequence = _creativeSequence, supplyEvents = _creativeSupplyEvents,
             nativeResultCount = _creativeCommands.Count, harnessTimeFrozen = _freezeTime,
-            fixedTimeOfDay = CreativeTimeOfDay, timeOfDay = Game1.timeOfDay,
-            resourcePolicy = "Only whitelisted materials and stamina are replenished by the test fixture; crafting and placement use production native actions.",
+            fixedTimeOfDay = _creativeNativeDays ? (int?)null : CreativeTimeOfDay, timeOfDay = Game1.timeOfDay,
+            resourcePolicy = _creativeNativeDays
+                ? "Whitelisted materials, stamina and service money are replenished. Days, construction, purchases and animal care use native rules."
+                : "Only whitelisted materials and stamina are replenished by the test fixture; crafting and placement use production native actions.",
             recipeCraftCounts = farmer?.craftingRecipes.Keys.ToDictionary(name => name, name => farmer.craftingRecipes[name])
         };
+    }
+
+    // Audit only: reuse the native observer without changing the model's visibility
+    // rules. This is also available on a read-only reload, without arranging a fixture.
+    private object? ObserveCreativeNativeLivestock(object modEntry)
+    {
+        var observer = ReadNativeMember(modEntry, "_observer")!;
+        observer = ReadNativeMember(observer, "_inner") ?? observer;
+        return observer.GetType().GetMethod("ScanLivestock")!.Invoke(observer, new object[] { "Farm", 12, 60 });
     }
 
     private object CreativeSpace()

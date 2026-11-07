@@ -8606,6 +8606,8 @@ public sealed partial class TestDriverMod : Mod
                 ["playerMoney"] = Game1.player.Money,
                 ["multiDay"] = _multiDayActive ? ObserveMultiDay() : null,
                 ["creativeFarm"] = _harnessFixtureMode == "creative-farm" ? ObserveCreativeFarm() : null,
+                ["nativeFarmLivestock"] = modInstance != null && Environment.GetEnvironmentVariable("STARDEW_AI_CREATIVE_NATIVE_DAYS") == "1"
+                    ? ObserveCreativeNativeLivestock(modInstance) : null,
                 ["playerStamina"] = Game1.player.stamina,
                 ["playerLocation"] = Game1.player.currentLocation?.NameOrUniqueName,
                 ["playerTile"] = new { x = (int)Game1.player.Tile.X, y = (int)Game1.player.Tile.Y },

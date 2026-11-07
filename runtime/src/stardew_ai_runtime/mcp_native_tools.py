@@ -696,6 +696,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         Requires companion to be inside the target shop location and adjacent to the counter.
         Companion mode buys directly here after navigate_to; do not insert the
         player-only open_shop operation. The adapter rechecks the native shop state.
+        In player mode, resolve any native shop-choice question first, then keep the
+        matching ShopMenu open while purchasing; another shop or held cursor item blocks it.
         Stock, limited stock status, dynamic unit price, and budget/funds limits are evaluated.
         Accepts items list where each item has itemId and count (1..36 items).
         budget_limit is this command's cost check, filled by the model from the native
@@ -1085,6 +1087,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
         Navigate to the carpenter's ScienceHouse counter first; location_id and tile
         specify the remote Farm construction site. The game controls construction days.
+        This operation places the order directly at the counter; keep native menus
+        closed rather than opening CarpenterMenu before calling it.
         """
         try:
             return _native_action_response("build-building", await sched.build_building(
@@ -1115,6 +1119,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         location_id='Farm' is the destination building's map, not the visited AnimalShop.
         Native stock, housing capacity and companion money determine the purchase. Fill budget_limit from the observed native price;
         no daily purchase allowance is required. Each step purchases one animal.
+        Keep the service menu closed; this operation performs the native counter transaction.
         """
         try:
             return _native_action_response("purchase-animal", await sched.purchase_animal(

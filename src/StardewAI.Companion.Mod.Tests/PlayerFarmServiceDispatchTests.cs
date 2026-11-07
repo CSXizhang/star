@@ -46,6 +46,32 @@ public sealed class PlayerFarmServiceDispatchTests
     }
 
     [Fact]
+    public void DecisionDoesNotInterruptNativeEventOutroWhenEventUpAlreadyCleared()
+    {
+        using var world = new World();
+        var controller = (Menus.CompanionDialogueController)RuntimeHelpers.GetUninitializedObject(typeof(Menus.CompanionDialogueController));
+        var entry = new CompanionConversationEntry("notice", "Companion", "Choose", "1:spring:1", false,
+            Choices: new[] { "Mushrooms", "Bats" });
+        var nativeEvent = (Event)RuntimeHelpers.GetUninitializedObject(typeof(Event));
+        Game1.currentLocation.currentEvent = nativeEvent;
+        Assert.False(Game1.eventUp);
+        controller.OpenDecision(entry, (_, _) => throw new InvalidOperationException("No answer was authorized."));
+        Assert.Null(Game1.activeClickableMenu);
+        Assert.Same(nativeEvent, Game1.currentLocation.currentEvent);
+        Game1.currentLocation.currentEvent = null;
+        var fadeField = AccessTools.Field(typeof(Game1), "screenFade");
+        var fadeBefore = fadeField.GetValue(null);
+        try
+        {
+            fadeField.SetValue(null, RuntimeHelpers.GetUninitializedObject(fadeField.FieldType));
+            Game1.fadeToBlack = true;
+            controller.OpenDecision(entry, (_, _) => throw new InvalidOperationException("No answer was authorized."));
+            Assert.Null(Game1.activeClickableMenu);
+        }
+        finally { fadeField.SetValue(null, fadeBefore); }
+    }
+
+    [Fact]
     public void UnownedOvernightInformationCanAdvanceButSaveChoiceAndTakeoverStayProtected()
     {
         using var world = new World();

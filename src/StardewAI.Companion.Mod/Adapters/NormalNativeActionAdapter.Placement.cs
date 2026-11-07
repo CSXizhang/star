@@ -41,9 +41,12 @@ public sealed partial class NormalNativeActionAdapter
         loc.terrainFeatures.TryGetValue(tile, out var originalTerrain);
         bool upperItem = source is Furniture || source.bigCraftable.Value || source.IsFenceItem() || source.IsSprinkler();
         // Preserve ground layers: native predicates decide which upper items can
-        // coexist with flooring/grass. Never replace trees, crops or an entity.
+        // coexist with flooring, grass or crop-free soil. Never replace trees,
+        // crops or an entity; retain the existing ground after native placement.
+        bool compatibleGround = originalTerrain is Flooring or Grass
+            || originalTerrain is HoeDirt { crop: null };
         if (loc.objects.ContainsKey(tile) || loc.GetFurnitureAt(tile) is not null
-            || originalTerrain is not null && !(upperItem && originalTerrain is Flooring or Grass))
+            || originalTerrain is not null && !(upperItem && compatibleGround))
             return NativeActionStepResult.Precondition("Target already contains an object or terrain feature; inspect before changing it.", "occupied");
         if (ActorGuards.IsPlayerBound(actor))
         {

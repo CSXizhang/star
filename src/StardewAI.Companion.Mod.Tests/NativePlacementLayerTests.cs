@@ -84,6 +84,7 @@ public sealed class NativePlacementLayerTests
     [Theory]
     [InlineData("floor", "native-placement-refused")]
     [InlineData("grass", "native-placement-refused")]
+    [InlineData("soil", "native-placement-refused")]
     [InlineData("tree", "occupied")]
     [InlineData("crop", "occupied")]
     [InlineData("object", "occupied")]
@@ -114,9 +115,21 @@ public sealed class NativePlacementLayerTests
                 "floor" => (Flooring)RuntimeHelpers.GetUninitializedObject(typeof(Flooring)),
                 "grass" => (Grass)RuntimeHelpers.GetUninitializedObject(typeof(Grass)),
                 "tree" => (Tree)RuntimeHelpers.GetUninitializedObject(typeof(Tree)),
-                "crop" => (HoeDirt)RuntimeHelpers.GetUninitializedObject(typeof(HoeDirt)),
+                "crop" or "soil" => (HoeDirt)RuntimeHelpers.GetUninitializedObject(typeof(HoeDirt)),
                 _ => null
             };
+            if (terrain is HoeDirt dirt)
+            {
+                var nativeCrop = new NetRef<Crop>();
+                AccessTools.Field(typeof(HoeDirt), "netCrop").SetValue(dirt, nativeCrop);
+                if (ground == "crop")
+                {
+                    var crop = (Crop)RuntimeHelpers.GetUninitializedObject(typeof(Crop));
+                    AccessTools.Field(typeof(Crop), "<NetFields>k__BackingField")
+                        .SetValue(crop, new NetFields("placement-test-crop").SetOwner(crop));
+                    nativeCrop.Value = crop;
+                }
+            }
             if (terrain != null) location.terrainFeatures.Add(tile, terrain);
             var occupied = new StardewValley.Object { ItemId = "390" };
             if (ground == "object") location.objects.Add(tile, occupied);
@@ -128,7 +141,7 @@ public sealed class NativePlacementLayerTests
             var result = adapter.Execute(new PlacementActor(farmer), request, request.Targets[0]);
             Assert.False(result.Success);
             Assert.Equal(reason, result.SkipReason);
-            Assert.Equal(ground is "floor" or "grass" ? 1 : 0, source.NativeChecks);
+            Assert.Equal(ground is "floor" or "grass" or "soil" ? 1 : 0, source.NativeChecks);
             Assert.Equal(2, source.Stack);
             if (terrain != null) Assert.Same(terrain, location.terrainFeatures[tile]);
             if (ground == "object") Assert.Same(occupied, location.objects[tile]);

@@ -1018,7 +1018,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
         Walk to an adjacent standing tile, then apply native placement rules,
         inventory consumption and partial results.
-        Upper items may coexist with flooring/grass when native rules permit;
+        Upper items may coexist with flooring, grass or crop-free tilled soil when native rules permit;
         existing objects, trees, crops and entrances remain protected.
         """
         try:

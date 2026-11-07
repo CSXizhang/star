@@ -5,7 +5,8 @@ param(
     [string]$Scenario = 'normal-watering',
     [string]$RunId = '',
     [int]$Port = 37788,
-    [int]$TimeoutSeconds = 120,
+    # Zero waits for the owned game to exit without a total wall-clock limit.
+    [ValidateRange(0,2147483647)][int]$TimeoutSeconds = 120,
     [string]$FrozenProdDir = '',
     # Optional expected SHA256 of the deployed production Mod DLL. When set, the run
     # fails fast if the frozen package did not deploy the exact expected assembly
@@ -483,6 +484,26 @@ try {
         }
         $presetConfig = Join-Path $prodDest 'config'
         New-Item -ItemType Directory -Path $presetConfig -Force | Out-Null
+        # Selected experiment images live only in this isolated run, accessible
+        # to the same eight MCP tools regardless of who launches the backend.
+        if ($env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST) {
+            $referenceManifest = (Resolve-Path -LiteralPath $env:STARDEW_AI_ENV_STARDEW_AI_REFERENCE_IMAGES_MANIFEST).Path
+            $referenceRoot = Split-Path -Parent $referenceManifest
+            $referenceData = Get-Content -LiteralPath $referenceManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+            $referenceTarget = Join-Path $presetConfig 'reference-images'
+            New-Item -ItemType Directory -Path $referenceTarget -Force | Out-Null
+            foreach ($reference in $referenceData.images) {
+                if ([IO.Path]::GetFileName($reference.file) -ne $reference.file -or $reference.file -in @('.', '..', 'manifest.json')) {
+                    throw 'Reference images must use plain local filenames.'
+                }
+                $referenceFile = Join-Path $referenceRoot $reference.file
+                if ((Get-FileHash -LiteralPath $referenceFile -Algorithm SHA256).Hash -ne $reference.sha256) {
+                    throw 'Reference image source hash mismatch.'
+                }
+                Copy-Item -LiteralPath $referenceFile -Destination (Join-Path $referenceTarget $reference.file)
+            }
+            Copy-Item -LiteralPath $referenceManifest -Destination (Join-Path $referenceTarget 'manifest.json')
+        }
         Write-Utf8File (Join-Path $presetConfig 'chat-backend.json') (@{backend=$AcceptanceBackend;effort=$AcceptanceEffort;model=$AcceptanceModel} | ConvertTo-Json -Compress)
         # This suite explicitly exercises the built-in entry. Keep the choice
         # inside its isolated Mod copy; never change the player's installation.
@@ -600,6 +621,7 @@ try {
     $launchTimeUtc = [System.DateTime]::UtcNow
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $orchestratorStarted = $false
+    $completionSignalAt = $null
     while (-not $proc.HasExited) {
         Start-Sleep -Milliseconds 500
         if ($Mode -eq 'scenario' -and -not $orchestratorStarted -and -not $NoOrchestrator) {
@@ -625,7 +647,19 @@ try {
                 }
             }
         }
-        if ($sw.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
+        if ($TimeoutSeconds -eq 0 -and $Scenario -eq 'free-mode-control') {
+            if ($null -eq $completionSignalAt -and (Test-Path -LiteralPath (Join-Path $runEvidenceDir 'free-mode-control-done.json'))) {
+                $completionSignalAt = $sw.Elapsed.TotalSeconds
+            }
+            # This begins only after the monitor has ended, never while it is creating.
+            if ($null -ne $completionSignalAt -and ($sw.Elapsed.TotalSeconds - $completionSignalAt) -gt 120) {
+                Write-Warning "Completed monitor's game did not exit within 120 seconds. Terminating owned PID $launchedPid..."
+                Stop-LaunchedChildProcess $proc $launchedPid $launchedStartTime
+                $timedOut = $true
+                break
+            }
+        }
+        if ($TimeoutSeconds -gt 0 -and $sw.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
             Write-Warning "Process timed out after $TimeoutSeconds seconds! Terminating PID $launchedPid..."
             Stop-LaunchedChildProcess $proc $launchedPid $launchedStartTime
             $timedOut = $true

@@ -788,7 +788,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             if (skillId=="native-menu-select") return TryAcceptPlayerInteraction(payload,envelope,out rejectResult);
             if (ActorGuards.IsPlayerBound(_actor) && !skillId.StartsWith("inspect-")
                 && !(skillId == "sleep" && _sleepMachine?.CanResumeOwnedOvernight == true)
-                && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items")) {
+                && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items",
+                    allowedShopId: skillId == "purchase-items" ? payload.Parameters.ShopId : null)) {
                 rejectResult=BuildRejection(payload,uiCode,uiMessage,true,NativeUiDetails()); return false;
             }
             if (skillId is "discover-extension-api" or "list-extensions" or "load-extension" or "invoke-extension") return TryAcceptExtension(payload,envelope,out rejectResult);
@@ -893,7 +894,10 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 _ => null
             };
             if (ActorGuards.IsPlayerBound(_actor) && nativeKind.HasValue && nativeKind.Value is not
-                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems))
+                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems
+                 or NativeActionKind.BuildBuilding or NativeActionKind.PurchaseAnimal or NativeActionKind.FeedAnimals
+                 or NativeActionKind.PetAnimal or NativeActionKind.ToggleAnimalDoor
+                 or NativeActionKind.InsertMachine or NativeActionKind.CollectMachine))
             {
                 rejectResult=BuildRejection(payload,"PLAYER_ACTION_UNSUPPORTED","This action has not been enabled in the native player farming phase.",false);
                 return false;
@@ -914,7 +918,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                         : skillId == "inspect-machines" ? _observer.InspectMachines(payload.Parameters.LocationId)
                         : skillId == "inspect-production" ? _observer.InspectProduction(payload.Parameters.LocationId, _actor)
                         : skillId == "inspect-crafting" ? _observer.InspectCrafting(_actor)
-                        : _observer.InspectMapImage(payload.Parameters.LocationId);
+                        : _observer.InspectMapImage(payload.Parameters.LocationId, payload.Parameters.Region is { } imageRegion ? new Rectangle(imageRegion.X, imageRegion.Y, imageRegion.Width, imageRegion.Height) : null);
                     var result = new SkillResultPayload(payload.CommandId, payload.TaskId, "succeeded", 0, 0, 0,
                         _observer.WorldRevision, new(), new SkillResultResources(0, 0, 0), SkillId: skillId,
                         Details: new Dictionary<string, object> { [skillId == "inspect-player-activities" ? "activities" : skillId == "inspect-shop" ? "shop" : skillId == "inspect-livestock" ? "livestock" : skillId == "inspect-route" ? "route" : skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-planting" ? "planting" : skillId == "inspect-crafting" ? "crafting" : skillId == "inspect-building-services" ? "buildingServices" : skillId == "inspect-machines" ? "machines" : skillId == "inspect-production" ? "production" : "mapImage"] = space });

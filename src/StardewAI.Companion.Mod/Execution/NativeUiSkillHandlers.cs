@@ -65,7 +65,7 @@ public sealed partial class CompanionMechanicsCoordinator
                 ProgramHold: ProgramHoldProvider?.Invoke(),
                 ClockPauseOwner: ClockPauseOwnerProvider?.Invoke(),
                 PlayerActionSupport: ActorGuards.IsPlayerBound(_actor)
-                    ? new[] { "refill_watering_can", "clear_debris:includes-native-mine-stones", "cut_grass", "chop_tree:ordinary-wild-trees-only", "apply_fertilizer", "pickup_items", "eat_food:one-selected-native-backpack-unit", "craft_items:native-learned-recipe-click", "place_items:native-inventory-placement", "observe_player_activities", "talk_npc", "interact_tile", "fish:requires-owned-rod", "attack:requires-owned-weapon", "native_menu_select:observed-item-or-elevator-or-crafting-cursor-or-explicit-naming-text" }
+                    ? new[] { "refill_watering_can", "clear_debris:includes-native-stones-and-pickaxe-resource-clumps", "cut_grass", "chop_tree:wild-trees-and-axe-resource-clumps-with-native-upgrade-gates", "apply_fertilizer", "pickup_items", "eat_food:one-selected-native-backpack-unit", "craft_items:native-learned-recipe-click", "place_items:native-inventory-placement", "remove_items:matching-observed-item-with-native-tool-protects-storage-and-filled-machines", "build_building:native-Robin-counter-order-and-normal-construction-days", "purchase_animal:native-Marnie-counter-and-completed-housing", "feed_animals:native-hay-troughs", "pet_animal", "toggle_animal_door", "insert_machine", "collect_machine", "observe_player_activities", "talk_npc", "interact_tile", "fish:requires-owned-rod", "attack:requires-owned-weapon", "native_menu_select:observed-item-or-elevator-or-crafting-cursor-or-explicit-naming-text" }
                     : null,
                 NamingInput: menu is NamingMenu naming ? DescribeNativeNamingInput(naming) : null);
         }
@@ -80,7 +80,7 @@ public sealed partial class CompanionMechanicsCoordinator
     /// screen. Returns the rejection code/message describing the blocking native
     /// state and the skill that resolves it (native-advance / native-answer).
     /// </summary>
-    private static bool TryDescribeNativeUiBlock(out string code, out string message, bool allowFestival = false)
+    private static bool TryDescribeNativeUiBlock(out string code, out string message, bool allowFestival = false, string? allowedShopId = null)
     {
         code = null!;
         message = null!;
@@ -118,6 +118,8 @@ public sealed partial class CompanionMechanicsCoordinator
             }
             if (Menus.CompanionMenuClock.HasBlockingMenu && Game1.activeClickableMenu is { } menu)
             {
+                if (allowedShopId is not null && menu is ShopMenu shop && shop.ShopId == allowedShopId && shop.heldItem is null)
+                    return false;
                 code = "MENU_OPEN";
                 message = $"A native menu ({menu.GetType().Name}) is open; dismiss it with native-advance (where supported) before dispatching business skills.";
                 return true;
@@ -183,9 +185,42 @@ public sealed partial class CompanionMechanicsCoordinator
             }
             if (menu is ShippingMenu or LevelUpMenu or SaveGameMenu)
             {
-                rejectResult = BuildRejection(payload, "MENU_OWNED_BY_SLEEP_FLOW",
-                    $"The native {menu.GetType().Name} belongs to the overnight sleep flow and is owned by the sleep skill; do not advance it here.", retryable: false);
-                return false;
+                if (_sleepMachine?.CanResumeOwnedOvernight == true)
+                {
+                    rejectResult = BuildRejection(payload, "MENU_OWNED_BY_SLEEP_FLOW",
+                        $"The native {menu.GetType().Name} belongs to this actor's committed sleep; resume it with sleep.", retryable: false);
+                    return false;
+                }
+                // Pass-out during ordinary work can start an overnight without a
+                // sleep command. Continue its native UI, without claiming a bed
+                // sleep or skipping the save enumerator.
+                if (menu is SaveGameMenu)
+                {
+                    rejectResult = BuildRejection(payload, "NATIVE_SAVE_IN_PROGRESS",
+                        "Native saving owns this menu. Wait for its update and observe again; no close input was sent.", true);
+                    return false;
+                }
+                if (menu is LevelUpMenu { isProfessionChooser: true })
+                {
+                    rejectResult = BuildRejection(payload, "CHOICE_REQUIRED",
+                        "This level-up requires an explicit profession choice; no default profession or close input was sent.", false);
+                    return false;
+                }
+                if (menu is ShippingMenu shipping)
+                {
+                    var button = shipping.currentPage == -1 ? shipping.okButton : shipping.backButton;
+                    if (!shipping.CanReceiveInput() || button is null)
+                    {
+                        rejectResult = BuildRejection(payload, "MENU_NOT_READY_TO_CLOSE",
+                            "The native overnight summary is still transitioning; observe again before continuing.", true);
+                        return false;
+                    }
+                    _actor.Halt();
+                    shipping.receiveLeftClick(button.bounds.Center.X, button.bounds.Center.Y);
+                    return CompleteNativeUiSkill(payload, envelope, "advanced-overnight-summary", NativeUiDetails());
+                }
+                // Informational LevelUpMenu uses the ordinary native exit below;
+                // its cleanup grants the level perk and removes the pending level.
             }
 
             if (menu is ConfirmationDialog)
@@ -334,17 +369,15 @@ public sealed partial class CompanionMechanicsCoordinator
                 return started;
             }
             _actor.Halt();
-            bool accepted = Game1.currentLocation!.answerDialogueAction($"{questionKey}_{choice.responseKey}", null);
-            if (!accepted)
-            {
-                rejectResult = BuildRejection(payload, "ANSWER_REJECTED",
-                    $"The native dialogue handler rejected '{questionKey}_{choice.responseKey}'.", retryable: false);
-                return false;
-            }
-            // The normal DialogueBox response path also cleans up its question; only
-            // close that exact menu, never a newly opened overnight screen.
-            if (ReferenceEquals(Game1.activeClickableMenu, question))
-                question.closeDialogue();
+            // Use the actual response-click path. Direct answerDialogueAction can
+            // replace the question with CarpenterMenu before closeDialogue runs,
+            // leaving dialogueUp stuck even after the service menu is dismissed.
+            // DialogueBox clears that flag before dispatching the native response
+            // and preserves the new menu's own lifecycle.
+            question.selectedResponse = choiceIndex;
+            question.receiveLeftClick(question.x + question.width / 2, question.y + question.height / 2, true);
+            if (ReferenceEquals(Game1.activeClickableMenu, question) && !question.transitioning)
+            { rejectResult = BuildRejection(payload, "QUESTION_NOT_READY", "Question text/input is still settling; the answer is not confirmed. Observe again before retrying.", true); return false; }
 
             return CompleteNativeUiSkill(payload, envelope, "answered", new Dictionary<string, object>
             {

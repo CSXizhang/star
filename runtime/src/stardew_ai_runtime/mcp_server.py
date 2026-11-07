@@ -844,18 +844,20 @@ def create_mcp_server(
         kind: Literal["main", "stage", "daily"] | None = None,
         parent_id: str | None = None,
     ) -> dict[str, Any]:
-        """Create/revise/pause/resume/complete/cancel/list long-term goals for the current save.
+        """Manage projects; creation defaults to a completable stage, even for the first project.
 
         Model-created goals are recorded with source=agent; the model cannot label a
         goal as a user instruction. Player-authored goals come from the chat path.
         project is a partial update that preserves omitted fields. It stores the current plan: phase, nextAction, blocker, prerequisites, window,
         progress, reason and farmRegion (locationId, bounds, reservedPaths, expansionDirection).
-        Keep summary concise; revise after actual results. It does not grant execution authority.
+        Keep summary, layout and remaining concise; revise the plan after actual results while preserving the player's agreed delivery scope.
+        Assess completion against that scope and observations after the final action, not just the agent's smaller chosen plan. Nonempty project.remaining prevents completion;
+        resolve the recorded work and explicitly update remaining to []. It does not grant execution authority.
         It never grants authority or proves completion; assess completion from current game observations.
 
         ``kind`` classifies the goal: 'main' is the single long-running main goal
         (only one active main goal is allowed; preset-sourced goals are 'main'),
-        'stage' is the default for model-created subordinate goals, 'daily' marks
+        'stage' is the default for model-created finite projects (with or without a parent), 'daily' marks
         day-scoped work; ``parent_id`` links a goal to its main goal. Speculative
         conclusions must NOT be written as goals or constraints — mark them as
         speculation with the memory tools instead.
@@ -913,7 +915,7 @@ def create_mcp_server(
                         if current.get("saveId") != sid or current.get("companion", {}).get("currentTask"):
                             raise ToolError("Observe the current game's remaining work after its action stops.")
                         observation = {"worldRevision": current.get("worldRevision"), "world": current.get("world", {})}
-                    goal = store.complete_goal(sid, goal_id or "", completion_observation=observation)
+                    goal = store.complete_goal(sid, goal_id or "", completion_observation=observation, project=project)
                 except Exception as ex:
                     if "MAIN_GOAL_LOCKED" in str(ex):
                         return {"saveId": sid, "goalId": goal_id, "blocked": True,
@@ -2196,7 +2198,7 @@ def create_mcp_server(
         except Exception as ex:
             raise ToolError(f"Unexpected error querying chests: {ex}") from None
 
-    register_native_tools(mcp, sched, record_observation_recovery, work_for_run)
+    register_native_tools(mcp, sched, record_observation_recovery, work_for_run, run_dir)
 
     @mcp.tool()
     async def player_control(action: str) -> dict[str, Any]:
@@ -2279,7 +2281,9 @@ def create_mcp_server(
         Waiting does not end a festival. Rejection reasonCodes: EVENT_ACTIVE (scripted event),
         FESTIVAL_FREE_ROAM (observe and choose an available native action),
         CHOICE_REQUIRED (list options, then native_answer), MENU_OWNED_BY_SLEEP_FLOW
-        (leave sleep-flow menus alone), NAME_INPUT_REQUIRED (NamingMenu needs
+        (resume the already committed sleep command). Overnight information after
+        natural pass-out can be advanced; SaveGameMenu is never dismissed and
+        profession choices are never implicit. NAME_INPUT_REQUIRED (NamingMenu needs
         explicit native_menu_select text; closing it does not complete naming),
         NOTHING_TO_ADVANCE (no native UI to act on).
         """
@@ -2536,6 +2540,42 @@ def create_mcp_server(
         sched.await_terminal_results = True
         try:
             result = await native_tools[name](**{key: getattr(parsed, key) for key in type(parsed).model_fields})
+            if (name in {"place_items", "hoe_tiles", "clear_debris", "cut_grass", "chop_tree"}
+                    and isinstance(result, dict) and result.get("terminalState") in {"partially-succeeded", "failed", "rejected"}):
+                # Put actual unfinished targets before long successful-effect lists:
+                # providers may truncate the middle of a large native receipt.
+                details = result.get("details") or {}
+                candidates = [x for x in result.get("effects", []) if x.get("state") in {"failed", "skipped"}]
+                for field in ("failedTiles", "skippedTiles", "failed", "skipped"):
+                    candidates.extend(details.get(field) or [])
+                remaining = {}
+                for entry in candidates:
+                    if not isinstance(entry, dict):
+                        continue
+                    tile = entry.get("tile") or entry
+                    x, y = tile.get("x"), tile.get("y")
+                    if type(x) is int and type(y) is int:
+                        remaining[(x, y)] = {"x": x, "y": y, "reason": entry.get("reason")}
+                if not remaining and not result.get("completedCount"):
+                    remaining = {(tile["x"], tile["y"]): dict(tile) for tile in args.get("tiles", [])}
+                review = {"unresolvedTargets": list(remaining.values()),
+                    "nextStep": "This action did not finish all requested work. Reobserve remaining targets; decide whether to clear, preserve and redesign, or recover inventory. Update the actual project layout and finish every requested functional area before completing the project. No work was queued or retried."}
+                if remaining:
+                    try:
+                        xs, ys = zip(*remaining, strict=True)
+                        left, top = max(0, min(xs) - 1), max(0, min(ys) - 1)
+                        region = {"x": left, "y": top, "width": max(xs) - left + 2, "height": max(ys) - top + 2}
+                        snapshot = getattr(sched, "latest_snapshot", None) or {}
+                        pose = (snapshot.get("payload") or {}).get("companion") or {}
+                        space = await sched.query_farm_space(location_id=args.get("location_id") or pose.get("locationId") or "Farm", region=region)
+                        occupants = [o for o in space.get("occupants", []) if any(
+                            o.get("x", -1000) - 1 <= x < o.get("x", -1000) + o.get("width", 1) + 1
+                            and o.get("y", -1000) - 1 <= y < o.get("y", -1000) + o.get("height", 1) + 1 for x, y in remaining)]
+                        review["observation"] = {"region": region, "capturedRevision": space.get("capturedRevision"),
+                            "occupants": occupants[:128], "occupantsTruncated": bool(space.get("occupantsTruncated")) or len(occupants) > 128}
+                    except Exception as ex:
+                        review["observation"] = {"status": "unavailable", "error": str(ex)}
+                result = {"remainingWork": review, **result}
             if name in {"navigate_to", "ship_items"} and isinstance(result, dict) and result.get("terminalState") in {"failed", "rejected"}:
                 try:
                     status = await sched.get_status()
@@ -2549,7 +2589,7 @@ def create_mcp_server(
                         "nextStep": "Decide whether this obstruction can and should be cleared under player preferences; do not repeat the same blocked route blindly."}
                 except Exception as ex:
                     result["obstructionObservation"] = {"status": "unavailable", "error": str(ex)}
-            if name in {"harvest_auto", "harvest_tiles", "chop_tree", "clear_debris", "cut_grass", "pickup_items"} and isinstance(result, dict):
+            if name in {"harvest_auto", "harvest_tiles", "chop_tree", "clear_debris", "cut_grass", "pickup_items", "remove_items"} and isinstance(result, dict):
                 try:
                     snapshot = getattr(sched, "latest_snapshot", None) or {}
                     companion = (snapshot.get("payload") or {}).get("companion") or {}
@@ -2806,7 +2846,7 @@ def create_mcp_server(
 
     readonly = {"get_status", "query_inventory", "query_chests", "query_farm_work", "query_wiki", "read_guidance", "read_reload_history", "query_shop", "query_animals", "query_machines", "query_buildings", "query_debris", "query_location", "work_plan_overview"}
     declared_tools = {t.name: t for t in mcp._tool_manager.list_tools()}
-    readonly.update({"recall_memory", "inspect_capabilities", "learned_query"})
+    readonly.update({"recall_memory", "inspect_capabilities", "learned_query", "read_reference_image"})
     native_tools = {name: tool.fn for name, tool in declared_tools.items()}
     wire_param_shapes = {}
     def wire_type(shape):

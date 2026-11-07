@@ -120,7 +120,7 @@ def test_terminal_only_cid_is_bound_and_private_receipt_omits_prompt(tmp_path):
     assert "私有输入不进账本" not in data
 
 
-@pytest.mark.parametrize("case", ["completed", "handled-tool-error", "unresolved-tool-error", "fresh-error", "tool-only", "old-response", "nonzero-exit"])
+@pytest.mark.parametrize("case", ["completed", "recovered-stream-error", "initial-recovered-stream-error", "unknown-resume-boundary", "no-error-evidence", "handled-tool-error", "unresolved-tool-error", "fresh-error", "tool-only", "old-response", "nonzero-exit"])
 def test_resumed_cumulative_error_requires_completed_current_turn(tmp_path, monkeypatch, case):
     db = tmp_path / "conversation.db"
     # Native agy step 15: field 20 contains planner text (field 1) or calls (7).
@@ -128,7 +128,10 @@ def test_resumed_cumulative_error_requires_completed_current_turn(tmp_path, monk
     payload = b"\xa2\x01" + bytes([len(planner)]) + planner
     with sqlite3.connect(db) as con:
         con.execute("CREATE TABLE steps (idx INTEGER, step_type INTEGER, status INTEGER, step_payload BLOB, error_details BLOB)")
-        con.execute("INSERT INTO steps VALUES (10,17,4,?,NULL)", (b"old quota error",))
+        if case not in {"recovered-stream-error", "initial-recovered-stream-error", "no-error-evidence"}:
+            con.execute("INSERT INTO steps VALUES (10,17,4,?,NULL)", (b"old quota error",))
+        if case in {"recovered-stream-error", "initial-recovered-stream-error"}:
+            con.execute("INSERT INTO steps VALUES (11,17,3,?,NULL)", (b"The stream was interrupted",))
         if case == "handled-tool-error":
             con.execute("INSERT INTO steps VALUES (11,132,7,?,?)", (b"tool failed", b"tool error"))
         if case != "old-response":
@@ -139,16 +142,17 @@ def test_resumed_cumulative_error_requires_completed_current_turn(tmp_path, monk
             con.execute("INSERT INTO steps VALUES (13,132,7,?,?)", (b"tool failed", b"tool error"))
     monkeypatch.setattr("stardew_ai_runtime.agy_usage.get_conversation_db_path", lambda cid: db)
     task = _task()
-    task.start_max_step_idx = 10
+    task.start_max_step_idx = -1 if case in {"initial-recovered-stream-error", "unknown-resume-boundary"} else 10
     command = _fake(tmp_path,
         "sys.stdin.read()\n"
         "print(json.dumps({'event':'result','result':{'conversation_id':CID,'status':'ERROR',"
         "'response':'historical reply','error':'old quota error'}}),flush=True)\n"
         + ("sys.exit(1)\n" if case == "nonzero-exit" else ""))
-    outcome = run_agy_process(task, command, "continue", session_id=CID, run_dir=tmp_path, timeout_seconds=5)
+    outcome = run_agy_process(task, command, "continue",
+        session_id=None if case == "initial-recovered-stream-error" else CID, run_dir=tmp_path, timeout_seconds=5)
     result = json.loads(outcome.stdout)
     receipt = json.loads((tmp_path / "data/agy-turns.jsonl").read_text(encoding="utf-8").splitlines()[-1])
-    if case in {"completed", "handled-tool-error"}:
+    if case in {"completed", "handled-tool-error", "recovered-stream-error", "initial-recovered-stream-error"}:
         assert result["status"] == "SUCCESS" and result["response"] == "fresh"
         assert result["provider_status"] == "ERROR"
         assert receipt["status"] == "completed"

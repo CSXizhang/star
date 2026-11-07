@@ -832,12 +832,12 @@ class WorkStore:
             nonlocal goal, resolved_kind, resolved_parent
             active_main = self._active_main_goal(state)
             if kind is None:
-                # Default hierarchy: a preset assignment is always the main
-                # goal; anything else becomes the first main goal when none is
-                # active yet, otherwise a stage hung off the active main.
+                # An ordinary model-created project must be completable even
+                # when it is the first goal in a save. Explicit player/preset
+                # authorization retains its existing long-term protection.
                 resolved_kind = (
                     "main"
-                    if source == "preset" or active_main is None
+                    if source == "preset" or source == "user" and active_main is None
                     else "stage"
                 )
             else:
@@ -1114,7 +1114,7 @@ class WorkStore:
         )
 
     def complete_goal(self, save_id: str, goal_id: str, *, verified_native_boundary: dict | None = None,
-                      completion_observation: dict | None = None) -> Goal:
+                      completion_observation: dict | None = None, project: dict[str, Any] | None = None) -> Goal:
         """Close the model's project assessment without inventing native effects."""
         preset_finalize = self._check_preset_completion(save_id, goal_id)
         def mutate(state: SaveWorkState) -> Goal:
@@ -1136,8 +1136,17 @@ class WorkStore:
                             and verified_native_boundary["endDay"] > verified_native_boundary["startDay"])
             if not completed and not restored and completion_observation is None:
                 raise WorkStateError("PROJECT_NO_EXECUTION: observe the game before assessing completion")
+            final_project = {**goal.project, **(project or {})}
+            if final_project.get("remaining"):
+                raise WorkStateError(
+                    "PROJECT_UNRESOLVED: project.remaining still records unfinished work; "
+                    "verify those items against the game and continue the original project. "
+                    "After actually resolving them, explicitly update remaining to []."
+                )
+            if len(json.dumps(final_project, ensure_ascii=False)) > 24000:
+                raise WorkStateError("project notes must fit within 24000 characters")
             goal.status = "completed"
-            goal.project = {**goal.project, "phase": "completed", "completionAssessment": "model-reviewed",
+            goal.project = {**final_project, "phase": "completed", "completionAssessment": "model-reviewed",
                             "completedTaskIds": completed[-64:]}
             if completion_observation is not None:
                 goal.project["completionObservation"] = completion_observation

@@ -55,7 +55,7 @@ public sealed partial class GameWorldObserver : IWorldObserver
         return observation;
     }
 
-    public Dictionary<string, object> InspectMapImage(string locationName)
+    public Dictionary<string, object> InspectMapImage(string locationName, Rectangle? region = null)
     {
         if (!IsMainThread) throw new InvalidOperationException("Map screenshots require the game thread.");
         if (Game1.currentLocation is null || !string.Equals(Game1.currentLocation.NameOrUniqueName, locationName, StringComparison.OrdinalIgnoreCase))
@@ -65,13 +65,20 @@ public sealed partial class GameWorldObserver : IWorldObserver
         // The native API appends .png and Path.Combine preserves this rooted name.
         // Neither the user nor a model can supply a filename or arbitrary output path.
         string stem = Path.Combine(directory, Guid.NewGuid().ToString("N"));
-        string? result = Game1.game1.takeMapScreenshot(0.5f, stem, null);
+        Rectangle capturedArea = default;
+        string? result = NativeMapImageRegion.Capture(Game1.currentLocation.Map, region, area =>
+        {
+            capturedArea = area;
+            return Game1.game1.takeMapScreenshot(0.5f, stem, null);
+        });
         string path = stem + ".png";
         if (string.IsNullOrEmpty(result) || !File.Exists(path) || new FileInfo(path).Length == 0)
             throw new InvalidOperationException("The native map screenshot did not produce an image.");
+        NativeMapImageFile.EnsureComplete(path);
         return new Dictionary<string, object> { ["locationId"] = locationName, ["path"] = path,
             ["mimeType"] = "image/png", ["scale"] = 0.5, ["capturedRevision"] = WorldRevision,
-            ["region"] = "native map screenshot region (custom maps may define ScreenshotRegion)" };
+            ["region"] = new { x = capturedArea.X, y = capturedArea.Y, width = capturedArea.Width, height = capturedArea.Height },
+            ["pixelsPerTile"] = 32, ["coordinateSystem"] = "Absolute map tiles; image top-left is region.x/y, x right, y down. Use structured space for exact occupants." };
     }
 
     public Dictionary<string, object> InspectCrafting(IFarmerActor actor)

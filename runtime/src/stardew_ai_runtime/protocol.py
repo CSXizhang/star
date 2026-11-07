@@ -39,7 +39,7 @@ NATIVE_ACTION_SKILLS: dict[str, frozenset[str]] = {
     "inspect-crafting": frozenset({"locationId"}),
     "craft-items": frozenset({"locationId", "recipeName", "itemCount"}),
     "move-building": frozenset({"locationId", "buildingName", "tile"}),
-    "inspect-map-image": frozenset({"locationId"}),
+    "inspect-map-image": frozenset({"locationId", "region"}),
     "inspect-location": frozenset({"locationId", "region"}),
     "inspect-planting": frozenset({"locationId", "region"}),
     "inspect-route": frozenset({"locationId", "tile"}),
@@ -1529,8 +1529,8 @@ class LifeChatSubmitPayload:
             raise ProtocolError("life.chat.submit: saveId is required")
         if mode not in _LIFE_CHAT_MODES:
             raise ProtocolError(f"life.chat.submit: invalid mode '{mode}'")
-        if not text or not (1 <= len(text) <= 500):
-            raise ProtocolError("life.chat.submit: text must be 1..500 chars")
+        if not text or not (1 <= len(text) <= 8192):
+            raise ProtocolError("life.chat.submit: text must be 1..8192 chars")
         accepted = value.get("acceptedNodeId")
         if accepted is not None and (mode != "plan" or not isinstance(accepted, str) or not accepted.strip()):
             raise ProtocolError("acceptedNodeId requires plan mode and a non-empty proposal id")

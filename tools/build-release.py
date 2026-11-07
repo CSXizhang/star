@@ -121,7 +121,8 @@ def build(args) -> Path:
     (package / "使用说明.md").write_text(guide, encoding="utf-8")
     copy_file(ROOT / "CONTRIBUTING.md", package / "CONTRIBUTING.md")
     for name in ("release-guide.md", "companion-guide.md", "mcp.md", "farm-projects.md", "agent-self-integration.md",
-                 "companion-efficiency-and-play-design.md", "dual-connection-validation.md", "maintenance-cleanup.md"):
+                 "companion-efficiency-and-play-design.md", "dual-connection-validation.md", "maintenance-cleanup.md",
+                 "creative-farm-experiment.md", "woodstone-farm-design.md"):
         copy_file(ROOT / "docs" / name, package / "docs" / name)
     release_notes = ROOT / "docs" / f"release-notes-{args.version}.md"
     if release_notes.is_file():

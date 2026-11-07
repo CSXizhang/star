@@ -223,15 +223,20 @@ def check_new_quota_error(conversation_id: str | None, start_step_idx: int) -> t
         return False, ""
 
 
-def completed_response_after_historical_error(conversation_id: str, start_step_idx: int) -> str | None:
+def completed_response_after_historical_error(
+    conversation_id: str, start_step_idx: int, *, initial_turn: bool = False,
+) -> str | None:
     """Reconcile a resumed CLI's cumulative ERROR against its current DB steps.
 
     agy stores planner responses as step type 15 / DONE (3), with the
     response in payload field 20: text field 1 and tool calls field 7.
     Only a completed final response after the captured boundary can override
-    a historical error; unavailable evidence or a new error cannot.
+    an earlier error, including a stream interruption recovered within this
+    turn. An error after that response, or unfinished work, remains a failure.
     """
-    if start_step_idx < 0:
+    # -1 is a known empty boundary only for a conversation created by this
+    # invocation. An unreadable baseline on a resumed session is not evidence.
+    if start_step_idx < 0 and not (initial_turn and start_step_idx == -1):
         return None
     try:
         path = get_conversation_db_path(conversation_id)
@@ -243,7 +248,7 @@ def completed_response_after_historical_error(conversation_id: str, start_step_i
                 "SELECT step_type, status, step_payload, error_details FROM steps WHERE idx > ? ORDER BY idx",
                 (start_step_idx,),
             ).fetchall()
-        if not historical or not rows or any(kind == 17 for kind, _, _, _ in rows):
+        if not rows or not (historical or any(kind == 17 for kind, _, _, _ in rows)):
             return None
         kind, status, payload, error = rows[-1]
         if kind != 15 or status != 3 or error:

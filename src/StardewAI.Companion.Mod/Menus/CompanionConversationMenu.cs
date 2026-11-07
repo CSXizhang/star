@@ -4,6 +4,7 @@ using Microsoft.Xna.Framework.Input;
 using StardewValley;
 using StardewValley.Menus;
 using StardewAI.Companion.Mod.Domain;
+using StardewAI.Companion.Mod.Transport;
 
 namespace StardewAI.Companion.Mod.Menus;
 
@@ -33,7 +34,7 @@ public sealed class CompanionConversationMenu : IClickableMenu
     {
         _state = state; _submit = submit; _dialogue = dialogue; _connection = connection; _openRecords = openRecords;
         _input = new TextBox(Game1.content.Load<Texture2D>(@"LooseSprites\textBox"), null, Game1.smallFont, Game1.textColor)
-            { limitWidth = false, textLimit = 500, Text = DraftText };
+            { limitWidth = false, textLimit = LifeChatSubmitPayload.MaxTextLength, Text = DraftText };
         _input.OnEnterPressed += _ => Send(false);
         var selected = state.PendingDecisions.FirstOrDefault(e => e.DecisionId == (noticeId ?? DraftDecisionId));
         _replyTo = selected?.DecisionId;

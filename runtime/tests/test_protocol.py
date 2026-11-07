@@ -455,6 +455,8 @@ def test_life_chat_submit_payload_validation() -> None:
         )
     with pytest.raises(ProtocolError):
         LifeChatSubmitPayload.from_mapping({"requestId": "", "saveId": "s", "text": "x"})
+    with pytest.raises(ProtocolError, match="1..8192"):
+        LifeChatSubmitPayload.from_mapping({"requestId": "r", "saveId": "s", "text": "x" * 8193})
 
 
 def test_life_chat_reply_factory_has_no_token_or_session_fields() -> None:

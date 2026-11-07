@@ -3337,13 +3337,15 @@ class CompanionScheduler:
             "move-building", {"locationId": location_id, "buildingName": building_name, "tile": validated[0]},
             tiles=validated, timeout_seconds=timeout_seconds, task_id=task_id, command_id=command_id)
 
-    async def query_map_image(self, location_id: str = "Farm") -> dict[str, Any]:
+    async def query_map_image(self, location_id: str = "Farm", region: dict[str, int] | None = None) -> dict[str, Any]:
         """Request a native screenshot of the current player map without moving them."""
         if not isinstance(location_id, str) or not location_id.strip():
             raise PolicyViolationError("location_id must be a non-empty string")
-        result = await self._execute_native_action(
-            "inspect-map-image", {"locationId": location_id.strip()}, tiles=[]
-        )
+        parameters: dict[str, Any] = {"locationId": location_id.strip()}
+        if region is not None:
+            self._validate_spatial_region(region)
+            parameters["region"] = dict(region)
+        result = await self._execute_native_action("inspect-map-image", parameters, tiles=[])
         details = result.get("details") or {}
         if isinstance(details, dict) and isinstance(details.get("mapImage"), dict):
             return details["mapImage"]

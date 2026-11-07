@@ -12,6 +12,61 @@ from stardew_ai_runtime.mcp_server import create_mcp_server
 mock_scheduler = _scheduler_fixture
 
 
+def test_partial_construction_frontloads_real_remaining_obstacles_without_retry(tmp_path, mock_scheduler):
+    store = _grant_decision(tmp_path, mock_scheduler)
+    mock_scheduler.latest_snapshot = {"payload": {"companion": {"locationId": "Farm"}}}
+    partial = {"status": "executed", "terminalState": "partially-succeeded", "commandId": "native-partial",
+        "completedCount": 1, "skippedCount": 1, "failedCount": 0,
+        "effects": [{"state": "placed", "tile": {"x": 5, "y": 7}, "itemId": "(O)328"},
+                    {"state": "skipped", "tile": {"x": 6, "y": 7}, "reason": "occupied"}]}
+    mock_scheduler.place_items = AsyncMock(return_value=partial)
+    tree = {"kind": "Tree", "x": 6, "y": 7, "width": 1, "height": 1, "growthStage": 5}
+    mock_scheduler.query_farm_space = AsyncMock(return_value={"capturedRevision": 2, "occupants": [tree], "occupantsTruncated": False})
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+        _, result = await server.call_tool("submit_work", {"action": {"place_items": {
+            "item_id": "(O)328", "tiles": [{"x": 5, "y": 7}, {"x": 6, "y": 7}]}}})
+        assert next(iter(result)) == "remainingWork"
+        assert result["remainingWork"]["unresolvedTargets"] == [{"x": 6, "y": 7, "reason": "occupied"}]
+        assert result["remainingWork"]["observation"]["occupants"] == [tree]
+        assert result["commandId"] == "native-partial" and result["completedCount"] == 1
+        assert result["effects"] == partial["effects"]
+        mock_scheduler.place_items.assert_awaited_once()
+        mock_scheduler.query_farm_space.assert_awaited_once_with(location_id="Farm", region={"x": 5, "y": 6, "width": 3, "height": 3})
+        assert not store.state("mock-save-123").tasks
+    asyncio.run(run())
+
+
+def test_completion_keeps_submitted_as_built_layout_without_unlocking_main(tmp_path, mock_scheduler):
+    store = _grant_decision(tmp_path, mock_scheduler)
+    goal = store.add_goal("mock-save-123", "Build the farm", source="agent")
+    store.revise_goal("mock-save-123", goal.id, project={"layout":"initial proposal", "preserve":"west trees",
+        "remaining":["Connect the woodland route"]})
+    main = store.add_goal("mock-save-123", "Long-term farm", source="agent", kind="main")
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface="light")
+        final = {"summary":"Built and observed", "layout":"Revised lakeside terrace and actual access"}
+        with pytest.raises(ToolError, match="PROJECT_UNRESOLVED"):
+            await server.call_tool("manage_arrangements", {"change":{"manage_goal": {
+                "action":"complete", "goal_id":goal.id, "project":final}}})
+        unchanged = store.state("mock-save-123").goals[0]
+        assert unchanged.status == "active" and unchanged.project["layout"] == "initial proposal"
+        assert unchanged.project["remaining"] == ["Connect the woodland route"]
+        final["remaining"] = []
+        _, result = await server.call_tool("manage_arrangements", {"change":{"manage_goal": {
+            "action":"complete", "goal_id":goal.id, "project":final}}})
+        assert result["goal"]["status"] == "completed"
+        persisted = store.state("mock-save-123").goals[0].project
+        assert persisted["layout"] == final["layout"] and persisted["summary"] == final["summary"]
+        assert persisted["preserve"] == "west trees" and persisted["completionObservation"]["worldRevision"] == 1
+        _, blocked = await server.call_tool("manage_arrangements", {"change":{"manage_goal": {
+            "action":"complete", "goal_id":main.id, "project":final}}})
+        assert blocked["reasonCode"] == "MAIN_GOAL_LOCKED"
+        protected = next(g for g in store.state("mock-save-123").goals if g.id == main.id)
+        assert protected.status == "active" and protected.project == {}
+    asyncio.run(run())
+
+
 def test_wait_uses_existing_action_entry_and_validates_duration(tmp_path, mock_scheduler):
     _grant_decision(tmp_path, mock_scheduler)
     mock_scheduler.execute_wait = AsyncMock(return_value={"status": "completed", "terminalState": "succeeded",
@@ -131,7 +186,12 @@ def test_mcode_declares_fixed_typed_operations_without_generic_params(tmp_path, 
         # Typed arguments plus a short semantic description for every operation.
         # Useful examples and memory operations may grow modestly; catch an
         # accidental full legacy-schema expansion rather than shave guidance.
-        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 65000
+        assert queries['observe_map_image']['properties']['region']['properties']['width']['type'] == 'integer'
+        references = tools['consult'].inputSchema['properties']['request']['properties']
+        assert references['read_reference_image']['properties']['image_id']['type'] == 'string'
+        # Local image regions and the selected-reference operation add typed
+        # fields; retain a small envelope instead of including legacy schemas.
+        assert len(json.dumps([t.model_dump() for t in tools.values()])) < 68000
     asyncio.run(run())
 
 

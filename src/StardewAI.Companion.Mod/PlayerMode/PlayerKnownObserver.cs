@@ -107,13 +107,13 @@ public sealed class PlayerKnownObserver : IWorldObserver
         return _inner.InspectLocation(locationName, IsFarm(locationName) ? region : VisibleRegion(region));
     }
 
-    public Dictionary<string, object> InspectMapImage(string locationName)
+    public Dictionary<string, object> InspectMapImage(string locationName, Rectangle? region = null)
     {
         // A screenshot of the rendered map is only possible for the current map; keep
         // the interface's not-supported shape for anything else (the inner observer
         // would reject it as well, as a non-current-map screenshot).
         if (!IsCurrentLocation(locationName)) throw LocationNotKnown(nameof(InspectMapImage), locationName);
-        return _inner.InspectMapImage(locationName);
+        return _inner.InspectMapImage(locationName, region);
     }
 
     public TileDirtState GetDirtState(string locationName, TileCoordinate tile)
@@ -383,6 +383,7 @@ public sealed class PlayerKnownObserver : IWorldObserver
         }
         // Read stock exclusively from the menu the player has actually opened.
         if (Game1.activeClickableMenu is not StardewValley.Menus.ShopMenu shop
+            || shop.ShopId != shopId
             || Game1.currentLocation?.NameOrUniqueName != shopLocation)
         {
             if (_shopQuotes.TryGetValue(shopId,out var remembered) && remembered.Stamp == stamp)
@@ -396,7 +397,7 @@ public sealed class PlayerKnownObserver : IWorldObserver
         }).ToArray();
         var quote = new ShopScanInfo(shopId,"observed",true,true,null,Array.Empty<string>(),shop.currency,
             actor.GameFarmer?.Money,"observed",items,
-            ErrorMessage:$"Native menu observed on {Game1.Date} at {Game1.timeOfDay}; this is remembered quotation, not a continuously open menu. Purchase reopens and validates actual price and stock.",
+            ErrorMessage:$"Native menu observed on {Game1.Date} at {Game1.timeOfDay}; purchases validate actual price and stock in this matching menu, or reopen it when possible. Resolve any native shop-choice question explicitly.",
             LocationId:shopLocation, InteractionTile:metadata.InteractionTile);
         _shopQuotes[shopId]=(stamp,quote);
         return quote;

@@ -694,7 +694,7 @@ CAPABILITY_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "movement": ("get_status", "query_route", "navigate_to"),
     "native_ui": ("get_status", "observe_player_activities", "talk_npc", "interact_tile", "fish", "attack", "native_menu_select", "native_advance", "native_answer"),
-    "knowledge": ("read_guidance", "query_wiki"),
+    "knowledge": ("read_guidance", "query_wiki", "read_reference_image"),
     "learning": ("inspect_capabilities", "develop_capability", "prepare_capability_builder", "manage_capability", "learned_query", "learned_action"),
     "memory": ("save_memory", "save_method", "recall_memory", "forget_memory", "manage_goal", "manage_plan", "manage_todo", "record_decision_note", "work_plan_overview"),
 }

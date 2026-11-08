@@ -8,7 +8,7 @@
 
 默认设计约定保存在 `tools/companion_acceptance/cases.json` 的 `creative-farm.designBrief`：
 
-本轮使用[有参考的自主创作任务](reference-farm-design.md)，由 Agent 理解玩家意图与真实玩家农场图片，根据当前场地自主决定建设范围、内容、风格和布局。参考启发主体规模、空间关系、材料与生活细节，不自动成为建筑、田块、动物或道路数量和位置的清单；明确的玩家功能与保留要求持续有效。
+本轮使用玩家确认的[中等规模田园任务](reference-farmstead-design.md)，明确以农舍周边为核心，包含相互联系的生活庭院、实际耕作与养殖空间；具体位置、规模、数量、风格与施工顺序仍由 Agent 根据真实场地决定。上一轮[自由范围任务](reference-farm-design.md)保持原样。参考启发主体规模、空间关系、材料与生活细节，不自动成为建筑、田块、动物或道路数量和位置的清单；明确的玩家功能与保留要求持续有效。
 
 实际任务仍由 `designBrief + instruction` 原文拼接、单次发送并核对运行层收件原文；现有 `summary`、`layout`、`remaining` 是按需更新的工作笔记，保留构思、当前安排及需要接续的事项，创作与观察顺序由模型决定。完成度围绕玩家约定的作品范围与最后施工后的真实画面判断，允许拆改与发展方案；没有固定施工阶段、填写节点、观察次数或精修轮数，通用说明遵循玩家约定的范围，既不强加整场目标，也不预排施工顺序。
 
@@ -28,7 +28,7 @@
 
 使用参考图片或玩家确认的设计时，可同时传 `-DesignBriefPath`、`-ReferenceImagesManifest` 和 `-NativeFarmServices`，沿用同一 creative-farm 工程与八个工具入口；不传开关时保持下面的固定白天规则。开关选择 `nativeServicesInstruction` 替换默认环境说明，完整任务仍只发送一次。图片角色由玩家约定决定，既可作为自由创作灵感，也可作为确认的施工设计；真实地形、原生尺寸和服务规则优先。
 
-本轮执行时传 `-DesignBriefPath docs/reference-farm-design.md -NativeFarmServices`，并用 `-ReferenceImagesManifest` 指定来源明确的真实玩家作品；三段创作要求只补充当前环境事实。旧[木石田园要求](woodstone-farm-design.md)及 `6e54a28` 成果仅作历史比较，本轮不将其概念图、数量或布局写入输入。
+本轮执行时传 `-DesignBriefPath docs/reference-farmstead-design.md -NativeFarmServices`，并用 `-ReferenceImagesManifest` 指定来源明确的真实玩家作品；玩家确认的创作要求只补充当前环境事实，不预设施工坐标或阶段。旧[木石田园要求](woodstone-farm-design.md)及 `6e54a28` 成果仅作历史比较，本轮不将其概念图、数量或布局写入输入。
 
 该模式不冻结时钟，允许原生睡眠跨日，保留现有思考暂停和正常营业时间。空闲边界将钱包不足一百万的部分补足并记录差额，白名单材料和体力照常补给，没有累计费用上限；建筑、动物、作物和成品不注入，由模型原生订建、等待工期、购买、种植与照料。
 

@@ -1215,7 +1215,7 @@ def test_reference_farm_brief_passes_real_submit_validation_without_truncation(t
         bridge = _bridge(tmp_path)
         root = Path(__file__).resolve().parents[2]
         spec = json.loads((root / "tools/companion_acceptance/cases.json").read_text(encoding="utf-8"))["creative-farm"]
-        text = (root / "docs/reference-farm-design.md").read_text(encoding="utf-8").strip() + "\n\n" + spec["nativeServicesInstruction"]
+        text = (root / "docs/reference-farmstead-design.md").read_text(encoding="utf-8").strip() + "\n\n" + spec["nativeServicesInstruction"]
         assert len(text) > 500  # The original wire limit rejected this actual brief.
         ws = AsyncMock()
         with patch.object(bridge, "_execute_life_turn", return_value={"success": True, "response": "收到完整工程"}) as execute:

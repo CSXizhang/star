@@ -348,7 +348,7 @@ def crop_water_facts(farm_work: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def water_can_resources(companion: dict[str, Any]) -> dict[str, Any]:
+def water_can_resources(companion: dict[str, Any], inventory: dict[str, Any] | None = None) -> dict[str, Any]:
     """One model-facing meaning for legacy native water quantity fields."""
     current = companion.get("waterCanLevel")
     capacity = companion.get("maxWaterCanLevel")
@@ -357,14 +357,17 @@ def water_can_resources(companion: dict[str, Any]) -> dict[str, Any]:
     known_current = type(current) is int and current >= 0
     known_capacity = type(capacity) is int and capacity > 0
     valid_pair = known_current and known_capacity and current <= capacity
+    can = next((slot for slot in (inventory or {}).get("slots", [])
+                if isinstance(slot, dict) and slot.get("isTool")
+                and slot.get("itemId") in {"(T)WateringCan", "WateringCan"}), {})
     return {
         "currentWater": current,
         "capacity": capacity,
         "isFull": current == capacity if valid_pair else None,
         "isEmpty": current == 0 if known_current else None,
         "unit": "浇水次数",
-        "upgradeLevel": None,
-        "note": "currentWater 是壶内剩余水量，capacity 是装满后的容量；工具升级等级未被原生快照发布，不可从水量推断。",
+        "upgradeLevel": can.get("upgradeLevel"),
+        "note": "currentWater 是壶内剩余水量，capacity 是装满后的容量；upgradeLevel 来自同次库存观察，缺失为未知，不可从水量推断。",
     }
 
 
@@ -502,7 +505,7 @@ def build_decision_context(
         identity = ({"itemId": slot["itemId"]}
                     if isinstance(slot.get("itemId"), str) and slot["itemId"] else {})
         if slot.get("isTool"):
-            tools.append({**identity, "name": name})
+            tools.append({**identity, "name": name, "upgradeLevel": slot.get("upgradeLevel")})
         else:
             quality = slot.get("quality")
             quality = quality if isinstance(quality, int) and not isinstance(quality, bool) else UNKNOWN
@@ -520,7 +523,7 @@ def build_decision_context(
     water_can = companion_snapshot.get("waterCanLevel")
     tool_resources: dict[str, Any] = {}
     if water_can is not None:
-        tool_resources["waterCan"] = water_can_resources(companion_snapshot)
+        tool_resources["waterCan"] = water_can_resources(companion_snapshot, inventory)
     inventory_block["toolResources"] = tool_resources
 
     work = work if isinstance(work, dict) else {}

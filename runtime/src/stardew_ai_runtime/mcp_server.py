@@ -587,7 +587,8 @@ def create_mcp_server(
             for key in ("waterCanLevel", "maxWaterCanLevel"):
                 if key not in native:
                     native[key] = cached_companion.get(key)
-        water = water_can_resources(native)
+        inventory = payload.get("inventory") if same_observation and isinstance(payload, dict) else None
+        water = water_can_resources(native, inventory if isinstance(inventory, dict) else None)
         output["companion"] = {key: value for key, value in companion.items()
                                if key not in {"waterCanLevel", "maxWaterCanLevel"}}
         output["companion"]["waterCan"] = water

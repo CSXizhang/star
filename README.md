@@ -128,7 +128,7 @@ Kimi 用户首次使用还需在**安装后的伙伴文件夹**运行 `kimi`，�
 - [参与开发](CONTRIBUTING.md)：源码构建、测试与贡献。
 - [清理与兼容边界](docs/maintenance-cleanup.md)：旧组合种植接口迁移及仍保留的兼容入口。
 - [可重复实机验收](docs/repeatable-companion-acceptance.md)：固定任务、隔离存档、实际结果与 trace 报告。
-- [无限材料自主农场创作](docs/creative-farm-experiment.md)：原始春夏农场、一次开放任务、无累计预算，Agent 自选创意并原生施工；参考图与真实局部图进入现有工具，未完事项与实际布局持续记录，技术检查和看图点评分开，素材与存档仅本地交付。
+- [有参考的自主农场创作](docs/creative-farm-experiment.md)：一次简短任务，真实玩家作品作为灵感；Agent 根据原始农场与实际能力自选范围、方案并原生施工。可启用真实跨日和农牧服务，无累计预算；工具等级进入库存和默认上下文，技术结果与看图点评分别记录，素材与存档仅本地交付。
 - [通信协议](protocol/README.md)：工具与消息约定。
 
 代码采用 [Apache License 2.0](LICENSE)。本项目为非官方项目，Stardew Valley、SMAPI 及其他依赖的名称、资源和权利归各自权利人所有。

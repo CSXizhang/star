@@ -1415,6 +1415,11 @@
                           },
                           "isTool": {
                             "type": "boolean"
+                          },
+                          "upgradeLevel": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                            "description": "Observed native tool upgrade level; zero is basic, absent/null is unknown. Independent of quality and watering-can fill."
                           }
                         },
                         "additionalProperties": false

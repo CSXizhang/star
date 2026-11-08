@@ -1210,11 +1210,12 @@ def test_long_reply_reaches_game_without_silent_truncation(tmp_path):
     asyncio.run(run())
 
 
-def test_complete_farm_brief_passes_real_submit_validation_without_truncation(tmp_path):
+def test_reference_farm_brief_passes_real_submit_validation_without_truncation(tmp_path):
     async def run():
         bridge = _bridge(tmp_path)
-        spec = json.loads((Path(__file__).resolve().parents[2] / "tools/companion_acceptance/cases.json").read_text(encoding="utf-8"))["creative-farm"]
-        text = spec["designBrief"] + "\n\n" + spec["instruction"]
+        root = Path(__file__).resolve().parents[2]
+        spec = json.loads((root / "tools/companion_acceptance/cases.json").read_text(encoding="utf-8"))["creative-farm"]
+        text = (root / "docs/reference-farm-design.md").read_text(encoding="utf-8").strip() + "\n\n" + spec["nativeServicesInstruction"]
         assert len(text) > 500  # The original wire limit rejected this actual brief.
         ws = AsyncMock()
         with patch.object(bridge, "_execute_life_turn", return_value={"success": True, "response": "收到完整工程"}) as execute:

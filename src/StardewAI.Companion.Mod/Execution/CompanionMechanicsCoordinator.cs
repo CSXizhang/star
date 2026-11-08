@@ -1838,7 +1838,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             try
             {
                 var slots = _actor.GetInventorySnapshot()
-                    .Select(i => new InventorySlotSnapshot(i.SlotIndex, i.ItemId, i.Name, i.DisplayName, i.Stack, i.Quality, i.IsTool))
+                .Select(i => new InventorySlotSnapshot(i.SlotIndex, i.ItemId, i.Name, i.DisplayName, i.Stack, i.Quality, i.IsTool,
+                    i.IsTool ? i.UpgradeLevel : null))
                     .ToList();
                 inventory = new CompanionInventorySnapshot(
                     Capacity: _actor.InventoryCapacity,

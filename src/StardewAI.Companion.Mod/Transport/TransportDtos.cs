@@ -138,7 +138,8 @@ public sealed record InventorySlotSnapshot(
     [property: JsonPropertyName("displayName"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? DisplayName = null,
     [property: JsonPropertyName("stack")] int Stack = 1,
     [property: JsonPropertyName("quality")] int Quality = 0,
-    [property: JsonPropertyName("isTool"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsTool = false
+    [property: JsonPropertyName("isTool"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsTool = false,
+    [property: JsonPropertyName("upgradeLevel"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? UpgradeLevel = null
 );
 
 public sealed record CompanionInventorySnapshot(

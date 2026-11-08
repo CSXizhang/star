@@ -1,10 +1,14 @@
-"""All model observation entry points agree on water quantity and unknown tool grade."""
+"""Model observation entry points agree on water quantity and observed tool grade."""
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from stardew_ai_runtime.decision_context import build_compact_summary, build_decision_context, water_can_resources
+from stardew_ai_runtime.decision_context import (
+    build_compact_summary,
+    build_decision_context,
+    water_can_resources,
+)
 from stardew_ai_runtime.mcp_server import create_mcp_server
 
 

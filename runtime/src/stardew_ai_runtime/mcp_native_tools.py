@@ -990,6 +990,12 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
                 raise ToolError("Native map image is not PNG")
             metadata = {key: value for key, value in result.items() if key != "path"}
             metadata["kind"] = "map_image"
+            metadata["viewingInstruction"] = (
+                "这是原生截图的捕获回执，不是看图结论。请查看随回执附带的真实图片；"
+                "若客户端显示 Resource offloaded 或图片附件路径，先用客户端图片查看器打开该附件，"
+                "再根据实际像素评估构图、遮挡与细节。只读路径、坐标或物件清单不等于查看画面；"
+                "无法打开时如实说明，不能声称已完成视觉复查。"
+            )
             return CallToolResult(content=[Image(data=data, format="png").to_image_content(),
                 TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))], structuredContent=metadata)
         except (PolicyViolationError, SchedulerError) as ex:
@@ -1017,7 +1023,9 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         """Place copies of one real backpack item at the declared tiles.
 
         Walk to an adjacent standing tile, then apply native placement rules,
-        inventory consumption and partial results.
+        inventory consumption and partial results. Read nearbyOperationAccess in the
+        receipt: a valid placement can block an older machine/chest. Re-observe
+        machines for wider access and processing state; placed does not mean running.
         Upper items may coexist with flooring, grass or crop-free tilled soil when native rules permit;
         existing objects, trees, crops and entrances remain protected.
         """
@@ -1145,7 +1153,10 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
     async def observe_machines(location_id: str = "Farm") -> dict[str, Any]:
         """Observe placed machines only: idle / processing (minutes left) / ready output.
 
-        Returns real native state. `isReady=true` means collect_machine can collect it.
+        Returns real native state plus operationAccess for machines/chests.
+        reachable=false is a current native route failure; null means actor on another map.
+        Placed, accessible, processing and ready are different facts. An idle machine
+        without input has not demonstrated production. `isReady=true` means output is ready.
         Observe before creating a machineReady todo for an exact location/tile.
         Processing minutes are informative, not a reason to poll repeatedly.
         """

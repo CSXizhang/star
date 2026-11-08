@@ -459,7 +459,9 @@ def _request_is_pending(state: SaveWorkState, request: dict[str, Any]) -> bool:
     if request.get("origin") == "player-midflight" and not request.get("consumedByDelivery"):
         return True
     request_id = request.get("id")
-    if any(g.status == "active" and g.constraints.get("playerRequestId") == request_id
+    if any(g.status in {"active", "paused"}
+           and (g.constraints.get("playerRequestId") == request_id
+                or (request.get("origin") in {"player", "player-midflight"} and request.get("goalId") == g.id))
            for g in state.goals):
         return True
     if state.decision.get("requestId") == request_id and not state.decision.get("finished"):
@@ -3635,6 +3637,32 @@ class WorkStore:
                 raise WorkStateError(f"unknown request '{request_id}'")
             self._find_goal(state, goal_id).constraints["playerRequestId"] = request_id
         self._mutate(save_id, mutate)
+
+    def bind_goal_feedback(self, save_id: str, goal_id: str, request_ids: set[str]) -> None:
+        """Keep received feedback with the revised project without replacing its source."""
+        def mutate(state: SaveWorkState) -> None:
+            goal = self._find_goal(state, goal_id)
+            original = goal.constraints.get("playerRequestId")
+            for request in state.requests:
+                if (request.get("id") in request_ids and request.get("id") != original
+                        and request.get("origin") in {"player", "player-midflight"}
+                        and not request.get("workStopped")
+                        and request.get("goalId") in {None, goal_id}):
+                    request["goalId"] = goal_id
+        self._mutate(save_id, mutate)
+
+    def goal_player_request(self, save_id: str, goal_id: str) -> dict[str, Any] | None:
+        """Literal original and chronological player updates, separate from the chosen plan."""
+        state = self.state(save_id)
+        goal = self._find_goal(state, goal_id)
+        original = next((r for r in state.requests if r.get("id") == goal.constraints.get("playerRequestId")), None)
+        updates = [{"requestId": r["id"], "text": r["text"]} for r in state.requests
+                   if r.get("goalId") == goal_id and r is not original
+                   and r.get("origin") in {"player", "player-midflight"} and not r.get("workStopped")]
+        result = {"requestId": original["id"], "text": original["text"]} if original else {}
+        if updates:
+            result["updates"] = updates
+        return result or None
 
     def find_request_for_task(self, save_id: str, task_id: str) -> dict[str, Any] | None:
         state = self.state(save_id)

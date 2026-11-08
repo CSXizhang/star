@@ -1,6 +1,6 @@
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
@@ -10,6 +10,142 @@ from support.mcp_scheduler import mock_scheduler as _scheduler_fixture
 from stardew_ai_runtime.mcp_server import create_mcp_server
 
 mock_scheduler = _scheduler_fixture
+
+
+@pytest.mark.parametrize('ingress', ['chat', 'tool-boundary'])
+def test_created_project_preserves_player_contract_across_revision_and_next_turn(tmp_path, monkeypatch, mock_scheduler, ingress):
+    from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
+    from stardew_ai_runtime.turn_messages import exchange
+    from stardew_ai_runtime.work_state import WorkStore
+
+    store = _grant_decision(tmp_path, mock_scheduler)
+    sid = 'mock-save-123'
+    original = '建设内容丰富的田园生活空间，庭院、耕作和养殖应自然联系，保留西边树林。'
+    store.record_request(sid, 'original', original)
+    store.record_request(sid, 'ambient', '结合当前目标安排下一步', origin='autonomy')
+    store.record_request(sid, 'unrelated', '昨天的闲聊')
+    store.begin_decision(sid, 'decision-1', request_id='original' if ingress == 'chat' else 'ambient')
+    monkeypatch.setenv('STARDEW_DECISION_TOKEN', 'decision-1')
+    monkeypatch.setenv('STARDEW_LIFE_TURN_ID', 'turn')
+    monkeypatch.setenv('STARDEW_LIFE_SAVE_ID', sid)
+    (tmp_path / 'data/life-turn.json').write_text(json.dumps({'requestId': 'turn', 'saveId': sid}))
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='light')
+        if ingress == 'tool-boundary':
+            exchange(tmp_path / 'data/turn-messages.json', 'turn', sid,
+                     publish=[{'requestId': 'original', 'text': original}])
+            _, delivery = await server.call_tool('manage_arrangements', {'change': {'manage_goal': {'action': 'list'}}})
+            assert delivery['playerMessages'][0]['text'] == original
+        _, created = await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'create', 'text': '小庭院方案', 'constraints': {'playerRequestId': 'unrelated'}}}})
+        goal = created['goal']
+        assert goal['constraints']['playerRequestId'] == 'original'
+        await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'revise', 'goal_id': goal['id'], 'text': '修改自选方案',
+            'constraints': {'preserve': 'west trees', 'playerRequestId': 'unrelated'},
+            'project': {'summary': '模型修改了布局', 'remaining': ['继续施工']}}}})
+        return goal['id']
+
+    goal_id = asyncio.run(run())
+    monkeypatch.setattr('stardew_ai_runtime.compatibility.assert_native_compatible', lambda _: None)
+    bridge = ChatBridge(run_dir=tmp_path, backend='mcode', internal_plan_client=MagicMock())
+    bridge._work_store = WorkStore(store.state_path)
+    seen = []
+    backend = MagicMock()
+    backend.run.side_effect = lambda task, session, prompt: seen.append(prompt) or {'success': True}
+    monkeypatch.setattr(bridge, '_get_backend', lambda: backend)
+    bridge._execute_turn(ActiveChatTask('autonomy-next', sid, goal_scope=goal_id), None, '模型修改后的简短方案')
+    assert original in seen[0]
+    assert bridge._work_store.state(sid).decision['requestId'] == 'original'
+
+
+def test_new_project_does_not_claim_unread_or_ambiguous_historical_player_requests(tmp_path, monkeypatch, mock_scheduler):
+    from stardew_ai_runtime.turn_messages import exchange
+    store = _grant_decision(tmp_path, mock_scheduler)
+    sid = 'mock-save-123'
+    for rid in ('old', 'first', 'second'):
+        store.record_request(sid, rid, rid)
+    monkeypatch.setenv('STARDEW_LIFE_TURN_ID', 'turn')
+    monkeypatch.setenv('STARDEW_LIFE_SAVE_ID', sid)
+    (tmp_path / 'data/life-turn.json').write_text(json.dumps({'requestId': 'turn', 'saveId': sid}))
+    exchange(tmp_path / 'data/turn-messages.json', 'turn', sid,
+             publish=[{'requestId': rid, 'text': rid} for rid in ('first', 'second')])
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='light')
+        for title in ('before delivery', 'after ambiguous delivery'):
+            _, created = await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+                'action': 'create', 'text': title, 'constraints': {'playerRequestId': 'old'}}}})
+            assert 'playerRequestId' not in created['goal']['constraints']
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('ingress', ['chat', 'tool-boundary'])
+def test_project_feedback_survives_plan_rewrite_trimming_and_reload(tmp_path, monkeypatch, mock_scheduler, ingress):
+    from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
+    from stardew_ai_runtime.turn_messages import exchange
+    from stardew_ai_runtime.work_state import WorkStore
+
+    store = _grant_decision(tmp_path, mock_scheduler)
+    sid = 'mock-save-123'
+    original = '完成田园，保留树林。'
+    feedback = '保留当前布局，让主体作物长成，处理池边遮挡，再查看真实全景。'
+    for rid, text in [('original', original), ('feedback', feedback), ('unread', '尚未送达的新话题')]:
+        store.record_request(sid, rid, text)
+    goal = store.add_goal(sid, '当前自选方案')
+    store.bind_goal_request(sid, goal.id, 'original')
+    other = store.add_goal(sid, '另一项工程')
+    store.record_request(sid, 'other-message', '另一项工程的要求')
+    store.bind_goal_feedback(sid, other.id, {'other-message'})
+    store.begin_decision(sid, 'decision-1', goal_scope=goal.id,
+                         request_id='feedback' if ingress == 'chat' else 'original')
+    monkeypatch.setenv('STARDEW_DECISION_TOKEN', 'decision-1')
+    monkeypatch.setenv('STARDEW_LIFE_TURN_ID', 'turn')
+    monkeypatch.setenv('STARDEW_LIFE_SAVE_ID', sid)
+    (tmp_path / 'data/life-turn.json').write_text(json.dumps({'requestId': 'turn', 'saveId': sid}))
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='light')
+        if ingress == 'tool-boundary':
+            exchange(tmp_path / 'data/turn-messages.json', 'turn', sid,
+                     publish=[{'requestId': 'feedback', 'text': feedback}])
+        _, resumed = await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'resume', 'goal_id': goal.id}}})
+        if ingress == 'tool-boundary':
+            assert resumed['playerMessages'][0]['text'] == feedback
+            assert 'updates' not in resumed['playerRequest']  # Offered after the operation, not before.
+        _, revised = await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'revise', 'goal_id': goal.id,
+            'project': {'summary': '只摆几件物品', 'remaining': []}}}})
+        expected = {'requestId': 'original', 'text': original,
+                    'updates': [{'requestId': 'feedback', 'text': feedback}]}
+        assert revised['playerRequest'] == expected
+        # Revising another goal within this scoped turn cannot move the feedback.
+        await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'revise', 'goal_id': other.id, 'project': {'summary': '其他安排'}}}})
+        _, listed = await server.call_tool('manage_arrangements', {'change': {'manage_goal': {'action': 'list'}}})
+        assert next(r for r in listed['playerRequests'] if r['goalId'] == goal.id) == {'goalId': goal.id, **expected}
+    asyncio.run(run())
+    store.revise_goal(sid, goal.id, status='paused')
+    store.record_request(sid, 'old-autonomy', '已结束的自动工作', origin='autonomy')
+    store.bind_request_task(sid, 'old-autonomy', 'finished-task', goal.id)
+    for number in range(55):
+        store.record_request(sid, f'noise-{number}', '其他已处理消息')
+    reloaded = WorkStore(store.state_path)
+    assert reloaded.goal_player_request(sid, goal.id)['updates'][0]['text'] == feedback
+    assert not any(r['id'] == 'old-autonomy' for r in reloaded.state(sid).requests)
+    assert next(r for r in reloaded.state(sid).requests if r['id'] == 'other-message')['goalId'] == other.id
+    reloaded.revise_goal(sid, goal.id, status='active')
+    monkeypatch.setattr('stardew_ai_runtime.compatibility.assert_native_compatible', lambda _: None)
+    bridge = ChatBridge(run_dir=tmp_path, backend='mcode', internal_plan_client=MagicMock())
+    bridge._work_store = reloaded
+    seen = []
+    backend = MagicMock()
+    backend.run.side_effect = lambda task, session, prompt: seen.append(prompt) or {'success': True}
+    monkeypatch.setattr(bridge, '_get_backend', lambda: backend)
+    bridge._execute_turn(ActiveChatTask('autonomy-next', sid, goal_scope=goal.id), None, '继续当前方案')
+    assert original in seen[0] and feedback in seen[0]
+    assert '尚未送达的新话题' not in seen[0]
 
 
 def test_partial_construction_frontloads_real_remaining_obstacles_without_retry(tmp_path, mock_scheduler):

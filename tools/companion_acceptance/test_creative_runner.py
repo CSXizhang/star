@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 import sys
+from html import escape
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,27 @@ sys.path.insert(0, str(Path(__file__).parent))
 import creative_runner as monitor
 
 CRITERIA = {"minPathTiles": 24, "minChests": 2, "minRestObjects": 1, "minLights": 2}
+
+
+def saved_checkpoint_xml(goal, save_id="Farm_1"):
+    checkpoint = {"SaveId": save_id, "RuntimePartitions": {"work-state.json": json.dumps({"goals": [goal]})}}
+    return ("<SaveGame><customData><item><key><string>"
+            "smapi/mod-data/csxizhang.stardewaicompanion/player-control-checkpoint-v1"
+            "</string></key><value><string>" + escape(json.dumps(checkpoint))
+            + "</string></value></item></customData></SaveGame>")
+
+
+def test_saved_project_rejects_prior_unfinished_checkpoint(tmp_path):
+    goal = {"id": "g", "status": "completed", "project": {"summary": "wood & stone", "remaining": []}}
+    path = tmp_path / "Farm_1"
+    path.write_text(saved_checkpoint_xml({**goal, "status": "active"}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="differs"):
+        monitor.verify_saved_project(path, "Farm_1", goal)
+    path.write_text(saved_checkpoint_xml(goal), encoding="utf-8")
+    assert monitor.verify_saved_project(path, "Farm_1", goal)["status"] == "completed"
+    with pytest.raises(RuntimeError, match="another farm"):
+        monitor.verify_saved_project(path, "OtherFarm", goal)
+
 
 
 def test_agy_offloaded_images_require_successful_open_of_exact_returned_attachment():
@@ -536,7 +558,7 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
             save_request = monitor.read(path)
             folder = runner.run / "saves/Farm_1"
             folder.mkdir(exist_ok=True)
-            (folder / "Farm_1").write_text("native saved farm")
+            (folder / "Farm_1").write_text(saved_checkpoint_xml(goal), encoding="utf-8")
             monitor.write(runner.evidence / f"lifecycle-{save_request['label']}.json",
                           {**save_request, "saveName": "Farm_1", "worldReady": True})
             path.unlink()
@@ -562,7 +584,7 @@ def test_full_monitor_sends_one_brief_continues_multiple_rounds_and_saves(tmp_pa
     assert report["humanReview"]["status"] == "pending"
     assert report["completionRequestId"] == "autonomy-2"
     assert len(report["rounds"]) == 2
-    assert report["savedFarm"]["files"][0]["sha256"] == hashlib.sha256(b"native saved farm").hexdigest()
+    assert report["savedFarm"]["files"][0]["sha256"] == hashlib.sha256(saved_checkpoint_xml(goal).encode("utf-8")).hexdigest()
     assert (runner.evidence / "creative-farm-before.png").is_file()
     assert (runner.evidence / "creative-farm-final.png").is_file()
     design = monitor.read(runner.evidence / "creative-farm-design.json")

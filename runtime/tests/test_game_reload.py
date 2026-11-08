@@ -134,3 +134,27 @@ def test_reload_repairs_only_exact_linked_choices_without_replaying_work(tmp_pat
     assert [n["id"] for n in restored.unresolved_player_notices("farm")] == [second["id"]]
     assert not restored.state("farm").tasks
     assert recover_recorded_choices(tmp_path, "farm") == 0
+
+
+@pytest.mark.parametrize("has_runtime", [False, True])
+def test_native_checkpoint_keeps_completed_project_and_human_control(tmp_path, has_runtime):
+    goal = {"id": "farm-project", "kind": "stage", "status": "completed",
+            "project": {"phase": "completed", "summary": "Built farm", "remaining": []}}
+    work = {"goals": [goal]}
+    if has_runtime:
+        write(tmp_path / "data/work-state.json", {"farm": work})
+    write(tmp_path / "data/autonomy-state.json", {"farm": {"paused": True}})
+    restore_game_load(tmp_path, request(tmp_path, {"work-state.json": work}))
+    restored = json.loads((tmp_path / "data/work-state.json").read_text())["farm"]["goals"][0]
+    assert restored["status"] == "completed"
+    assert restored["project"]["phase"] == "completed"
+    assert restored["project"]["requiresWorldRevalidation"] is True
+    assert json.loads((tmp_path / "data/autonomy-state.json").read_text())["farm"]["paused"] is True
+
+
+def test_reload_does_not_restore_explicitly_cleared_intent(tmp_path):
+    write(tmp_path / "data/work-state.json", {"farm": {}})
+    saved = {"goals": [{"id": "old", "status": "completed", "text": "Old project"}]}
+    restore_game_load(tmp_path, request(tmp_path, {"work-state.json": saved}))
+    restored = json.loads((tmp_path / "data/work-state.json").read_text())["farm"]
+    assert not restored.get("goals")

@@ -849,6 +849,9 @@ def create_mcp_server(
 
         Model-created goals are recorded with source=agent; the model cannot label a
         goal as a user instruction. Player-authored goals come from the chat path.
+        The runtime retains the originating player request when creating a project;
+        revising/resuming retains received player updates separately from the chosen plan.
+        list returns playerRequests; later updates amend the original, not the other way around.
         project is a partial update that preserves omitted fields. It stores the current plan: phase, nextAction, blocker, prerequisites, window,
         progress, reason and farmRegion (locationId, bounds, reservedPaths, expansionDirection).
         Keep summary, layout and remaining concise; revise the plan after actual results while preserving the player's agreed delivery scope.
@@ -870,9 +873,37 @@ def create_mcp_server(
         """
         sid = await current_save_id()
         store = work_for_run()
+
+        def received_player_requests():
+            state = store.state(sid)
+            token = decision_token()
+            decision = state.decision if token and state.decision.get("token") == token and not state.decision.get("finished") else {}
+            requests = {r["id"]: r for r in state.requests
+                        if r.get("origin") in {"player", "player-midflight"} and not r.get("workStopped")}
+            offered = set(decision.get("requestIds", []))
+            turn_id = os.environ.get("STARDEW_LIFE_TURN_ID")
+            if decision and turn_id:
+                try:
+                    inbox = read_cache(Path(getattr(sched, "run_dir", None) or run_dir or ".") / "data/turn-messages.json")
+                except (OSError, ValueError):
+                    inbox = {}
+                if (inbox.get("turnId"), inbox.get("saveId")) == (turn_id, sid):
+                    offered.update(m.get("requestId") for m in inbox.get("delivered", []))
+            return decision, requests, offered
+
+        def retain_feedback(goal):
+            decision, requests, offered = received_player_requests()
+            if decision and decision.get("goalScope") in {None, goal.id}:
+                candidates = (offered | {decision.get("requestId")}) & requests.keys()
+                store.bind_goal_feedback(sid, goal.id, candidates)
+            return store.goal_player_request(sid, goal.id)
+
         try:
             if action == "list":
-                return {"saveId": sid, "goals": store.list_goals(sid)}
+                goals = store.list_goals(sid)
+                return {"saveId": sid, "goals": goals,
+                        "playerRequests": [{"goalId": g["id"], **request} for g in goals
+                                           if (request := store.goal_player_request(sid, g["id"]))]}
             if action == "create":
                 if source != "agent":
                     raise WorkStateError("model-created goals must use source='agent'")
@@ -881,8 +912,16 @@ def create_mcp_server(
                     # Forwarded to the work store's goal-kind contract; the store
                     # rejects a second active 'main' goal (MAIN_GOAL_EXISTS).
                     goal_kwargs = {"kind": kind, "parent_id": parent_id}
+                decision, requests, offered = received_player_requests()
+                owner = decision.get("requestId")
+                if owner not in requests:
+                    candidates = offered & requests.keys()
+                    owner = next(iter(candidates)) if len(candidates) == 1 else None
+                owned_constraints = {k: v for k, v in (constraints or {}).items() if k != "playerRequestId"}
+                if owner:
+                    owned_constraints["playerRequestId"] = owner
                 goal = store.add_goal(
-                    sid, text or "", source="agent", priority=priority or 0, constraints=constraints,
+                    sid, text or "", source="agent", priority=priority or 0, constraints=owned_constraints,
                     **goal_kwargs,
                 )
                 if project is not None:
@@ -898,16 +937,22 @@ def create_mcp_server(
                         project = {**(project or {}), "reason": text}
                         text = None
                         advisory = True
+                if constraints is not None:
+                    constraints = {k: v for k, v in constraints.items() if k != "playerRequestId"}
+                    if current is not None and current.constraints.get("playerRequestId"):
+                        constraints["playerRequestId"] = current.constraints["playerRequestId"]
                 goal = store.revise_goal(
                     sid, goal_id or "", text=text, priority=priority, constraints=constraints, project=project
                 )
                 return {"saveId": sid, "goal": asdict(goal),
+                        "playerRequest": retain_feedback(goal),
                         "advisoryTextStoredAs": "project.reason" if advisory else None}
             if action in {"pause", "resume"}:
                 goal = store.revise_goal(
                     sid, goal_id or "", status="paused" if action == "pause" else "active"
                 )
-                return {"saveId": sid, "goal": asdict(goal)}
+                return {"saveId": sid, "goal": asdict(goal),
+                        "playerRequest": retain_feedback(goal) if action == "resume" else store.goal_player_request(sid, goal.id)}
             if action in {"complete", "finish"}:
                 try:
                     observation = None
@@ -925,7 +970,8 @@ def create_mcp_server(
                                            "（preset 边界或玩家明确指令）；日常请记录进度并规划下一阶段，"
                                            "不要 complete 主目标。"}
                     raise
-                return {"saveId": sid, "goal": asdict(goal), "assessment": "model-reviewed; native log unchanged"}
+                return {"saveId": sid, "goal": asdict(goal), "playerRequest": retain_feedback(goal),
+                        "assessment": "model-reviewed; native log unchanged"}
             if action == "cancel":
                 goal = store.cancel_goal(sid, goal_id or "")
                 return {"saveId": sid, "goal": asdict(goal)}

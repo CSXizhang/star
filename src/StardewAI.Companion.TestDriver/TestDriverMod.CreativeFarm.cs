@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers.Binary;
 using System.Collections;
 using System.Collections.Generic;
@@ -18,13 +18,13 @@ namespace StardewAI.Companion.TestDriver;
 public sealed partial class TestDriverMod
 {
     private const int CreativeTimeOfDay = 1000;
-    private const int CreativeOutputSlots = 12;
+    private const int CreativeOutputSlots = 10;
     private static readonly string[] CreativeMaterialIds = {
         "(O)388", "(O)390", "(O)771", "(O)709", "(O)382",
         "(O)378", "(O)334", "(O)335", "(O)338", "(O)336",
-        "(O)330", "(O)725", "(O)724", "(O)86", "(O)787",
+        "(O)330", "(O)725", "(O)724", "(O)86", "(O)787", "(O)337", "(O)726",
         // Flower seeds are crafting ingredients, not instant mature crops.
-        // Omit unused sap/hay, iridium bars and loom resin; retain batteries for lamp-posts.
+        // Iridium bars and pine tar also support advanced irrigation and native machines.
         "(O)427", "(O)429", "(O)453", "(O)455"
     };
     private static readonly (string Name, string[] Categories)[] CreativeRecipeCandidates = {
@@ -54,7 +54,7 @@ public sealed partial class TestDriverMod
         ("Keg", new[] { "production" }), ("Preserves Jar", new[] { "production" }),
         ("Bee House", new[] { "production" }), ("Mayonnaise Machine", new[] { "production" }),
         ("Cheese Press", new[] { "production" }), ("Loom", new[] { "production" }),
-        ("Seed Maker", new[] { "production" }),
+        ("Seed Maker", new[] { "production" }), ("Crystalarium", new[] { "production" }),
         ("Grass Starter", new[] { "vegetation" }),
         ("Tub o' Flowers", new[] { "flower", "decoration" })
     };
@@ -94,31 +94,9 @@ public sealed partial class TestDriverMod
         }) + Environment.NewLine);
     }
 
-    private void ArrangeCreativeFarmFixture(object modEntry, string outDir, string label)
+    private (List<object> Recipes, List<object> Rejected) ValidateCreativeRecipes(Item[] materials, List<string> acceptedNames)
     {
-        AssertHarnessFixtureBoundary(modEntry);
-        ResolveCompanionActor(out _, out var farmer, out _, out _);
-        if (_creativeFarmer != null || farmer == null || !ReferenceEquals(farmer, Game1.player)
-            || farmer.currentLocation is not Farm farm || Game1.whichFarm != 0
-            || Game1.IsMultiplayer || !Game1.IsMasterGame)
-            throw new InvalidOperationException("Creative farm requires a standard-farm, single-player isolated clone with the native player actor, once only.");
-        if (Game1.currentSeason is not ("spring" or "summer"))
-            throw new InvalidOperationException("Creative farm needs an original spring/summer save so native flower tubs are visibly in season; the fixture never changes the season.");
-        var tools = farmer.Items.OfType<Tool>().ToList();
-        if (!tools.OfType<StardewValley.Tools.Axe>().Any()) tools.Add(new StardewValley.Tools.Axe());
-        if (!tools.OfType<StardewValley.Tools.Pickaxe>().Any()) tools.Add(new StardewValley.Tools.Pickaxe());
-        if (!tools.OfType<StardewValley.Tools.Hoe>().Any()) tools.Add(new StardewValley.Tools.Hoe());
-        if (!tools.OfType<StardewValley.Tools.MeleeWeapon>().Any(tool => tool.isScythe())) tools.Add(new StardewValley.Tools.MeleeWeapon("47"));
-        int requiredSlots = farmer.Items.Count(item => item != null) + tools.Count(tool => !farmer.Items.Contains(tool))
-            + CreativeMaterialIds.Count(id => !farmer.Items.Any(item => item?.QualifiedItemId == id));
-        if (requiredSlots > 36 - CreativeOutputSlots)
-            throw new InvalidOperationException("Creative fixture cannot reserve twelve output slots alongside the existing tools and material whitelist.");
-
-        // Validate the real recipes and native placement support before changing the clone.
-        // Preview factories do not insert their outputs into any inventory or world.
-        var materials = CreativeMaterialIds.Select(id => ItemRegistry.Create(id)).ToArray();
         var recipes = new List<object>();
-        var acceptedNames = new List<string>();
         var rejected = new List<object>();
         foreach (var candidate in CreativeRecipeCandidates)
         {
@@ -145,8 +123,37 @@ public sealed partial class TestDriverMod
         if (new[] { "path", "chest", "rest", "light" }.Any(category =>
                 !_creativeItemCategories.Values.Any(categories => categories.Contains(category))))
             throw new InvalidOperationException("Native recipe/placement preflight did not provide every required creative category: path, chest, rest, light.");
-        if (!acceptedNames.Contains("Grass Starter") || !acceptedNames.Contains("Tub o' Flowers"))
-            throw new InvalidOperationException("Native grass starter and flower tub recipes/materials must both pass preflight.");
+        if (new[] { "Grass Starter", "Tub o' Flowers", "Iridium Sprinkler", "Loom", "Crystalarium" }.Any(name => !acceptedNames.Contains(name)))
+            throw new InvalidOperationException("Native flower, grass, advanced irrigation and machine recipes/materials must pass preflight.");
+
+        return (recipes, rejected);
+    }
+
+    private void ArrangeCreativeFarmFixture(object modEntry, string outDir, string label)
+    {
+        AssertHarnessFixtureBoundary(modEntry);
+        ResolveCompanionActor(out _, out var farmer, out _, out _);
+        if (_creativeFarmer != null || farmer == null || !ReferenceEquals(farmer, Game1.player)
+            || farmer.currentLocation is not Farm farm || Game1.whichFarm != 0
+            || Game1.IsMultiplayer || !Game1.IsMasterGame)
+            throw new InvalidOperationException("Creative farm requires a standard-farm, single-player isolated clone with the native player actor, once only.");
+        if (Game1.currentSeason is not ("spring" or "summer"))
+            throw new InvalidOperationException("Creative farm needs an original spring/summer save so native flower tubs are visibly in season; the fixture never changes the season.");
+        var tools = farmer.Items.OfType<Tool>().ToList();
+        if (!tools.OfType<StardewValley.Tools.Axe>().Any()) tools.Add(new StardewValley.Tools.Axe());
+        if (!tools.OfType<StardewValley.Tools.Pickaxe>().Any()) tools.Add(new StardewValley.Tools.Pickaxe());
+        if (!tools.OfType<StardewValley.Tools.Hoe>().Any()) tools.Add(new StardewValley.Tools.Hoe());
+        if (!tools.OfType<StardewValley.Tools.MeleeWeapon>().Any(tool => tool.isScythe())) tools.Add(new StardewValley.Tools.MeleeWeapon("47"));
+        int requiredSlots = farmer.Items.Count(item => item != null) + tools.Count(tool => !farmer.Items.Contains(tool))
+            + CreativeMaterialIds.Count(id => !farmer.Items.Any(item => item?.QualifiedItemId == id));
+        if (requiredSlots > 36 - CreativeOutputSlots)
+            throw new InvalidOperationException("Creative fixture cannot reserve ten output slots alongside the existing tools and material whitelist.");
+
+        // Validate the real recipes and native placement support before changing the clone.
+        // Preview factories do not insert their outputs into any inventory or world.
+        var materials = CreativeMaterialIds.Select(id => ItemRegistry.Create(id)).ToArray();
+        var acceptedNames = new List<string>();
+        var (recipes, rejected) = ValidateCreativeRecipes(materials, acceptedNames);
 
         _creativeModEntry = modEntry;
         _creativeFarmer = farmer;
@@ -240,7 +247,7 @@ public sealed partial class TestDriverMod
         _evidence["harnessFixture"] = fixture;
         CreativeEvent("initial", initial);
         WriteFreeModeNativeSnapshot(outDir, label);
-        Monitor.Log($"[TestDriver] Creative farm ready: {recipes.Count} native recipes, native days/services={_creativeNativeDays}, twelve output slots reserved.", LogLevel.Info);
+        Monitor.Log($"[TestDriver] Creative farm ready: {recipes.Count} native recipes, native days/services={_creativeNativeDays}, ten output slots reserved.", LogLevel.Info);
     }
 
     private void ResumeCreativeFarmObservation()
@@ -275,13 +282,19 @@ public sealed partial class TestDriverMod
         _creativeWaterBaseline = CreativeWaterFingerprint(farm);
         foreach (var building in root.GetProperty("protectedBuildings").EnumerateArray())
             _creativeBuildings.Add(building.GetProperty("id").GetString()!, JsonSerializer.Serialize(building));
-        foreach (var recipe in root.GetProperty("recipeWhitelist").EnumerateArray())
+        string supplyPath = Path.Combine(_evidenceDir!, "creative-farm-supply-policy.json");
+        using var supply = File.Exists(supplyPath) ? JsonDocument.Parse(File.ReadAllText(supplyPath)) : null;
+        var policy = supply?.RootElement ?? root;
+        if (policy.GetProperty("runId").GetString() != _runId
+            || policy.GetProperty("saveName").GetString() != Constants.SaveFolderName)
+            throw new InvalidOperationException("Creative supply policy belongs to another run/save.");
+        foreach (var recipe in policy.GetProperty("recipeWhitelist").EnumerateArray())
         {
             string itemId = recipe.GetProperty("itemId").GetString()!;
             _creativeItemCategories[itemId] = recipe.GetProperty("categories").EnumerateArray().Select(item => item.GetString()!).ToArray();
             _creativeItemNames[itemId] = recipe.GetProperty("outputName").GetString()!;
         }
-        foreach (var material in root.GetProperty("materialPolicy").GetProperty("materials").EnumerateArray())
+        foreach (var material in policy.GetProperty("materialPolicy").GetProperty("materials").EnumerateArray())
         {
             string itemId = material.GetProperty("itemId").GetString()!;
             if (!CreativeMaterialIds.Contains(itemId, StringComparer.Ordinal))
@@ -307,6 +320,25 @@ public sealed partial class TestDriverMod
                     && eventRow.GetProperty("payload").TryGetProperty("commandId", out var command))
                     _creativeCommands.Add(command.GetString()!);
             }
+        if (Environment.GetEnvironmentVariable("STARDEW_AI_CREATIVE_REFRESH_SUPPLY") == "1")
+        {
+            AssertHarnessFixtureBoundary(_creativeModEntry);
+            var materials = CreativeMaterialIds.Select(id => ItemRegistry.Create(id)).ToArray();
+            var acceptedNames = new List<string>();
+            var (recipes, rejected) = ValidateCreativeRecipes(materials, acceptedNames);
+            foreach (string name in acceptedNames)
+                if (!farmer.craftingRecipes.ContainsKey(name)) farmer.craftingRecipes.Add(name, 0);
+            _creativeMaterialTargets.Clear();
+            foreach (var material in materials)
+                _creativeMaterialTargets.Add(material.QualifiedItemId, Math.Min(999, material.maximumStackSize()));
+            var refreshed = new { runId = _runId, saveName = Constants.SaveFolderName,
+                recipeWhitelist = recipes, rejectedRecipes = rejected,
+                materialPolicy = new { reservedInitialOutputSlots = CreativeOutputSlots,
+                    materials = materials.Select(item => new { itemId = item.QualifiedItemId,
+                        target = _creativeMaterialTargets[item.QualifiedItemId] }).ToArray() } };
+            File.WriteAllText(supplyPath, JsonSerializer.Serialize(refreshed));
+            CreativeEvent("supply-policy-refreshed", refreshed);
+        }
         var coordinator = ReadNativeMember(_creativeModEntry, "_coordinator")!;
         coordinator.GetType().GetEvent("OnExecutionCompleted")!.AddEventHandler(coordinator,
             (Action)(() => {
@@ -376,6 +408,9 @@ public sealed partial class TestDriverMod
         {
             int before = farmer.Items.Where(item => item?.QualifiedItemId == pair.Key).Sum(item => item.Stack);
             if (before >= pair.Value) continue;
+            // A missing material may wait for the Agent to store products. Preserve
+            // free output/drop slots instead of filling the last slots on continuation.
+            if (before == 0 && farmer.MaxItems - farmer.Items.Count(item => item != null) <= CreativeOutputSlots) continue;
             // Never remove products or replace occupied slots to make supply fit.
             farmer.addItemToInventory(ItemRegistry.Create(pair.Key, pair.Value - before));
             int after = farmer.Items.Where(item => item?.QualifiedItemId == pair.Key).Sum(item => item.Stack);

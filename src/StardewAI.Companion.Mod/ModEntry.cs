@@ -830,7 +830,11 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         _coordinator?.OnTimeChanged(e.NewTime);
     }
 
-    private void OnSaving(object? sender, SavingEventArgs e)
+    private void OnSaving(object? sender, SavingEventArgs e) => SaveCompanionCheckpoint();
+
+    // The normal overnight path raises Saving. Same-day acceptance saves must
+    // capture this state too, before driving the native save enumerator.
+    internal void SaveCompanionCheckpoint()
     {
         if (PlayerModeEnabled) {
             // Saving continues a committed native sleep, not a human takeover.

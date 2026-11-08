@@ -13,6 +13,7 @@ import re
 import shutil
 import struct
 import time
+import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
@@ -29,6 +30,21 @@ from runner import (
 
 MINIMUMS = {"pathTiles": "minPathTiles", "chests": "minChests", "restObjects": "minRestObjects", "lights": "minLights"}
 CATEGORIES = {"pathTiles": "path", "chests": "chest", "restObjects": "rest", "lights": "light"}
+
+
+def verify_saved_project(path, save_id, goal):
+    """A saved layout alone must not conceal an older, unfinished checkpoint."""
+    key = "smapi/mod-data/csxizhang.stardewaicompanion/player-control-checkpoint-v1"
+    checkpoint = next((json.loads(item.findtext("value/string"))
+                       for item in ET.parse(path).iter("item")
+                       if item.findtext("key/string") == key), {})
+    if checkpoint.get("SaveId") != save_id:
+        raise RuntimeError("Saved player checkpoint is missing or belongs to another farm")
+    work = json.loads(checkpoint.get("RuntimePartitions", {}).get("work-state.json") or "{}")
+    saved = next((g for g in work.get("goals", []) if g.get("id") == goal["id"]), None)
+    if saved != goal:
+        raise RuntimeError("Saved project checkpoint differs from the settled runtime goal")
+    return {"goalId": goal["id"], "status": saved["status"], "matchesRuntime": True}
 
 
 def agy_image_views(trace, reference_ids):
@@ -619,6 +635,9 @@ class CreativeRunner(Runner):
             folder = initial_folder
         self.report["initialSavedFarm" if stage == "initial" else "savedFarm"] = {"receipt": receipt, "directory": str(folder.relative_to(self.run)), "files": files,
                                     "modelMarkedProjectComplete": (self.report.get("project") or {}).get("status") == "completed"}
+        goal = next((g for g in self.state().get("goals", []) if g.get("id") == self.goal_id), None)
+        if stage == "final" and goal:
+            self.report["savedFarm"]["projectCheckpoint"] = verify_saved_project(folder / self.save_id, self.save_id, goal)
 
     async def monitor(self):
         while True:

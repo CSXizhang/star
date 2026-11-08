@@ -3475,10 +3475,15 @@ class CompanionScheduler:
         group = details.get("machines") if isinstance(details, dict) else None
         if not isinstance(group, dict) or group.get("locationId") != location_id.strip():
             raise SchedulerError(str(result.get("error") or result.get("message") or "Native machine observation unavailable for requested map"))
-        items = group.get("items") or []
+        # Older player-mode observers used machines instead of the shared items key.
+        # A missing/malformed collection is an interface failure, not an empty farm.
+        items = group.get("items", group.get("machines"))
+        if not isinstance(items, list):
+            raise SchedulerError("Native machine observation has no valid machine collection")
         return {"locationId": group["locationId"], "machines": items, "count": len(items),
                 "readyCount": sum(1 for m in items if isinstance(m, dict) and m.get("isReady")),
                 "truncated": bool(group.get("truncated", False)),
+                **{key: group[key] for key in ("capturedRevision", "scope", "operationAccess") if key in group},
                 **({"saveId": result["saveId"]} if result.get("saveId") else {})}
 
     async def query_production(self, location_id: str = "Farm") -> dict[str, Any]:

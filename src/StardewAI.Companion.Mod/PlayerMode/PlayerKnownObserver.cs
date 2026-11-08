@@ -1,4 +1,4 @@
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewValley;
 using StardewAI.Companion.Mod.Domain;
@@ -263,7 +263,9 @@ public sealed class PlayerKnownObserver : IWorldObserver
     public Dictionary<string, object> InspectMachines(string locationName)
     {
         if (!IsLocationKnown(locationName)) throw LocationNotKnown(nameof(InspectMachines), locationName);
-        return new() { ["locationId"]=locationName,["capturedRevision"]=WorldRevision,["machines"]=ScanMachines(locationName),["scope"]="current-visible-map" };
+        var machines = ScanMachines(locationName, 257);
+        return new() { ["locationId"]=locationName, ["capturedRevision"]=WorldRevision,
+            ["items"]=machines.Take(256).ToArray(), ["truncated"]=machines.Count > 256, ["scope"]="current-visible-map" };
     }
 
     public Dictionary<string, object> InspectProduction(string locationName, IFarmerActor actor)

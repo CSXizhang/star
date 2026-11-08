@@ -30,6 +30,10 @@ def test_settlement_consumes_only_delivered_messages_even_after_turn_failure(tmp
     reopened = WorkStore(tmp_path / "data/work-state.json")
     assert [item["id"] for item in reopened.pending_midflight_requests("farm")] == ["pending"]
     bridge._send_reply.assert_awaited_once()
+    receipt = bridge._send_reply.await_args.args[1].payload
+    assert receipt['status'] == 'completed'
+    assert receipt['replyText'] == '这条补充已送达当前回合。'
+    assert not receipt.get('error')
     asyncio.run(bridge._settle_turn_messages(ActiveChatTask("turn", "farm"), result))
     bridge._send_reply.assert_awaited_once()
 

@@ -254,6 +254,19 @@ public sealed partial class TestDriverMod : Mod
         Game1.quit = true;
     }
 
+    private void SaveCurrentGameWithCompanionCheckpoint()
+    {
+        var info = Helper.ModRegistry.Get("CSXizhang.StardewAICompanion")
+            ?? throw new InvalidOperationException("Companion mod is required for the acceptance save.");
+        var instance = info.GetType().GetProperty("Mod")?.GetValue(info)
+            ?? throw new InvalidOperationException("Companion instance is unavailable for the acceptance save.");
+        var capture = instance.GetType().GetMethod("SaveCompanionCheckpoint", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("Companion checkpoint method is missing; build matching packages.");
+        capture.Invoke(instance, null);
+        var saver = SaveGame.Save();
+        while (saver.MoveNext()) { }
+    }
+
     private void ResolveConfiguration()
     {
         _isolatedSavesPath = Environment.GetEnvironmentVariable("STARDEW_AI_ISOLATED_SAVES");
@@ -502,11 +515,7 @@ public sealed partial class TestDriverMod : Mod
                 Monitor.Log("[TestDriver] Triggering and running SaveGame.Save() enumerator...", LogLevel.Info);
                 try
                 {
-                    var saveEnum = SaveGame.Save();
-                    while (saveEnum.MoveNext())
-                    {
-                        // Advance save enumerator to completion
-                    }
+                    SaveCurrentGameWithCompanionCheckpoint();
 
                     var currentSavesFolder = StardewValley.Program.GetSavesFolder();
                     Monitor.Log($"[TestDriver] Save completed successfully in: {currentSavesFolder}", LogLevel.Info);
@@ -777,10 +786,11 @@ public sealed partial class TestDriverMod : Mod
                 // Isolated runs must survive foreground theft (browser popups, notifications):
                 // vanilla pauses a single-player world when the window loses focus.
                 Game1.options.pauseWhenOutOfFocus = false;
-                if (Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1")
+                if (Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1"
+                    || Environment.GetEnvironmentVariable("STARDEW_AI_PRESERVE_LOADED_WORLD") == "1")
                 {
-                    // A saved continuation keeps its actual location, clock and RNG.
-                    // Only the read-only observer metadata is restored below.
+                    // Continuation and read-only reload keep the native load pose,
+                    // clock and RNG; the old fixed tile may now hold a machine.
                     _freezeTime = false;
                     _scenarioState = ScenarioState.ArrangeScenario;
                     _tickCounter = 0;
@@ -811,7 +821,8 @@ public sealed partial class TestDriverMod : Mod
 
             case ScenarioState.ArrangeScenario:
                 _tickCounter++;
-                if ((Game1.currentLocation?.Name == "Farm" || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1") &&
+                if ((Game1.currentLocation?.Name == "Farm" || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1"
+                    || Environment.GetEnvironmentVariable("STARDEW_AI_PRESERVE_LOADED_WORLD") == "1") &&
                     !Game1.fadeToBlack &&
                     !Game1.fadeIn &&
                     Game1.fadeToBlackAlpha <= 0.001f &&
@@ -1058,8 +1069,7 @@ public sealed partial class TestDriverMod : Mod
                         if (File.Exists(interactionReload))
                         {
                             File.Delete(interactionReload);
-                            var saver = SaveGame.Save();
-                            while (saver.MoveNext()) { }
+                            SaveCurrentGameWithCompanionCheckpoint();
                             string savedName = Constants.SaveFolderName ?? throw new InvalidOperationException("No current isolated save.");
                             _saveLoadedFired = _dayStartedFired = _renderedWorldObserved = false;
                             _renderedWorldFramesCount = 0;
@@ -1222,11 +1232,10 @@ public sealed partial class TestDriverMod : Mod
                     }
 
                     // SaveGame.Save() is an enumerator factory: it does nothing unless iterated.
-                    // Drive it synchronously on the main thread so the real save (and SMAPI Saving
-                    // event, which persists companion state) actually executes.
+                    // Direct enumeration bypasses the normal overnight Saving event;
+                    // capture companion state explicitly before serializing the real save.
                     Monitor.Log("[TestDriver] Driving synchronous save via SaveGame.Save() enumerator...", LogLevel.Info);
-                    var saver = SaveGame.Save();
-                    while (saver.MoveNext()) { }
+                    SaveCurrentGameWithCompanionCheckpoint();
                     Monitor.Log("[TestDriver] Synchronous save enumerator completed.", LogLevel.Info);
                 }
                 else if (_tickCounter > 30)
@@ -1545,7 +1554,9 @@ public sealed partial class TestDriverMod : Mod
             _saveLoadedFired &&
             _dayStartedFired &&
             Game1.currentLocation != null &&
-            Game1.currentLocation.Name == "Farm" &&
+            (Game1.currentLocation.Name == "Farm"
+             || Environment.GetEnvironmentVariable("STARDEW_AI_PRESERVE_LOADED_WORLD") == "1"
+             || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1") &&
             !Game1.fadeToBlack &&
             !Game1.fadeIn &&
             Game1.fadeToBlackAlpha <= 0f &&
@@ -8767,8 +8778,7 @@ public sealed partial class TestDriverMod : Mod
                 _lifecycleSaveName = Constants.SaveFolderName ?? throw new InvalidOperationException("No loaded test save.");
                 if (action is "save-title" or "save-exit" or "save-current")
                 {
-                    var saver = SaveGame.Save();
-                    while (saver.MoveNext()) { }
+                    SaveCurrentGameWithCompanionCheckpoint();
                 }
                 if (action is "return-title" or "save-title") Game1.ExitToTitle();
             }

@@ -1,4 +1,4 @@
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using StardewValley;
 using StardewAI.Companion.Mod.Adapters;
 using StardewAI.Companion.Mod.Avatar;
@@ -915,7 +915,7 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                             payload.Parameters.Tile is { } routeTile ? new TileCoordinate(routeTile.X, routeTile.Y) : throw new ArgumentException("Route destination tile is required."))
                         : skillId == "inspect-planting" ? _observer.InspectPlanting(payload.Parameters.LocationId, _actor, payload.Parameters.Region is { } plot ? new Rectangle(plot.X, plot.Y, plot.Width, plot.Height) : null)
                         : skillId == "inspect-building-services" ? NormalNativeActionAdapter.InspectBuildingServices(payload.Parameters.LocationId)
-                        : skillId == "inspect-machines" ? _observer.InspectMachines(payload.Parameters.LocationId)
+                        : skillId == "inspect-machines" ? InspectMachinesWithAccess(payload.Parameters.LocationId)
                         : skillId == "inspect-production" ? _observer.InspectProduction(payload.Parameters.LocationId, _actor)
                         : skillId == "inspect-crafting" ? _observer.InspectCrafting(_actor)
                         : _observer.InspectMapImage(payload.Parameters.LocationId, payload.Parameters.Region is { } imageRegion ? new Rectangle(imageRegion.X, imageRegion.Y, imageRegion.Width, imageRegion.Height) : null);
@@ -1535,11 +1535,33 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         }
     }
 
+    private Dictionary<string, object> InspectMachinesWithAccess(string location)
+    {
+        var result = _observer.InspectMachines(location);
+        result["operationAccess"] = OperationAccessObserver.Observe(_observer, _navigator, _actor, location);
+        return result;
+    }
+
     private void HandleNativeActionCompleted(NativeActionResult result)
     {
         lock (_taskLock)
         {
-            CompleteExecution(result.ToTransportPayload());
+            var payload = result.ToTransportPayload();
+            if (result.SkillId is "place-items" or "remove-items" && result.Effects.Count > 0 && payload.Details is { } details)
+            {
+                try
+                {
+                    var changed = result.Effects.Where(effect => effect.Tile != null).Select(effect => effect.Tile!.Value).ToArray();
+                    details["nearbyOperationAccess"] = OperationAccessObserver.Observe(_observer, _navigator, _actor, _actor.LocationName, changed);
+                }
+                catch (Exception error)
+                {
+                    // The world action has already happened. An observation failure must
+                    // not turn a successful placement into a missing/failure receipt.
+                    details["nearbyOperationAccess"] = new { observationStatus = "unavailable", error = error.Message };
+                }
+            }
+            CompleteExecution(payload);
         }
     }
 

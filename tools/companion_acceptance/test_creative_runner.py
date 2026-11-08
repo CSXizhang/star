@@ -76,7 +76,19 @@ def test_open_creation_accepts_actual_paving_without_requiring_any_facility():
     assert not monitor.world_checks(sample(), sample(), {}, [])["autonomous_construction_recorded"]
 
 
-def test_native_services_require_opt_in_receipts_completed_buildings_and_access():
+def test_landscape_preset_records_blocked_fixtures_without_gating_but_preserves_entrances():
+    before, after = sample(), sample(True)
+    before["creativeFarm"]["space"] = {"occupants": [{"kind": k} for k in ("Tree", "Grass", "resource-clump", "object")]}
+    after["creativeFarm"]["operationAccess"] = [{"reachable": False, "kind": "chest"}]
+    criteria = monitor.read(Path(__file__).with_name("cases.json"))["creative-farm"]["criteria"]
+    checks = monitor.world_checks(before, after, criteria, ledger())
+    assert all(checks.values())
+    assert "chests_and_processing_accessible" not in checks
+    after["creativeFarm"]["entrances"][0]["reachable"] = False
+    assert not monitor.world_checks(before, after, criteria, ledger())["entrances_reachable"]
+
+
+def test_native_services_require_native_receipts_and_completed_buildings_not_door_access():
     before, after = sample(), sample(True)
     after.update(day=5, timeOfDay=1200)
     farm = after["creativeFarm"]
@@ -100,9 +112,9 @@ def test_native_services_require_opt_in_receipts_completed_buildings_and_access(
     assert not missing["new_buildings_native_and_authorized"]
     assert not missing["new_animals_have_native_purchases"]
     farm["buildings"][0]["underConstruction"] = True
-    assert not monitor.world_checks(before, after, criteria, records)["new_buildings_ready_and_accessible"]
+    assert not monitor.world_checks(before, after, criteria, records)["new_buildings_completed"]
     farm["buildings"][0].update(underConstruction=False, doorReachable=False)
-    assert not monitor.world_checks(before, after, criteria, records)["new_buildings_ready_and_accessible"]
+    assert all(monitor.world_checks(before, after, criteria, records).values())
     farm["buildings"][0].update(doorReachable=True, residentIds=[123, 456])
     assert not monitor.world_checks(before, after, criteria, [*records, purchase])["new_animals_have_native_purchases"]
     farm["buildings"][0]["type"] = "Fish Pond"

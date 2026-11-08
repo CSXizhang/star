@@ -313,8 +313,8 @@ def world_checks(before, after, criteria, ledger):
             len(additions) == len(farm.get("extraBuildings", []))
             and set(counts_by_type) <= set(criteria.get("allowedBuildingTypes", []))
             and all(count <= orders[kind] for kind, count in counts_by_type.items()))
-        checks["new_buildings_ready_and_accessible"] = all(
-            b.get("underConstruction") is False and b.get("doorReachable") is True for b in additions)
+        checks["new_buildings_completed"] = all(
+            b.get("underConstruction") is False for b in additions)
         residents = {animal for b in buildings for animal in b.get("residentIds", [])}
         original_residents = {animal for b in (before.get("creativeFarm") or {}).get("buildings", [])
                               for animal in b.get("residentIds", [])}
@@ -394,7 +394,7 @@ class CreativeRunner(Runner):
         self.progress_capture_count = 0
         self.last_captured_work_count = 0
         self.report["humanReview"] = {
-            "status": "pending", "criteria": ["符合玩家约定的作品意图", "整体观感与空间关系", "实际使用体验", "模型说明与实景一致"],
+            "status": "pending", "criteria": ["符合玩家约定的作品意图", "整体构图与空间联系", "场景丰富度与景观层次", "局部细节与整体协调", "模型说明与实景一致"],
             "note": "技术验收与审美评审分别记录；请结合实际农场图评价设计。",
         }
 

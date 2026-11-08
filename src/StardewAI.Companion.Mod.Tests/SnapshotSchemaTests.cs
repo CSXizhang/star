@@ -17,6 +17,26 @@ namespace StardewAI.Companion.Mod.Tests;
 public class SnapshotSchemaTests
 {
     [Fact]
+    public void NativeLivestockSnapshotKeepsHumanEntranceSeparateFromAnimalHatch()
+    {
+        var actor = new MechanicsActor("housing-entrances");
+        actor.UpdatePose("Farm", new(4, 7), FacingDirection.Up);
+        var observer = new SimulatedWorldObserver();
+        observer.SetLivestock(new LivestockScanInfo(new[] {
+            new AnimalBuildingScanInfo("Coop", "Coop-one", "Farm", new(4, 4), new(5, 6),
+                false, true, 0, 4, 0, 4, 0, Array.Empty<AnimalScanInfo>(), HumanDoorTile: new(4, 6))
+        }, Array.Empty<AnimalScanInfo>(), false, false));
+        var coordinator = new CompanionMechanicsCoordinator(actor, observer,
+            new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
+        var building = json.RootElement.GetProperty("livestock").GetProperty("buildings")[0];
+        Assert.Equal(4, building.GetProperty("humanDoorTile").GetProperty("x").GetInt32());
+        Assert.Equal(5, building.GetProperty("doorTile").GetProperty("x").GetInt32());
+        var legacy = JsonSerializer.Deserialize<AnimalBuildingSnapshot>("{\"doorTile\":{\"x\":5,\"y\":6}}", Options)!;
+        Assert.Null(legacy.HumanDoorTile);
+    }
+
+    [Fact]
     public void ActualInventorySnapshotKeepsToolGradesDistinctFromQualityAndUnknown()
     {
         var actor = new MechanicsActor("tool-grades");

@@ -398,7 +398,8 @@ public sealed record AnimalBuildingSnapshot(
     [property: JsonPropertyName("animals")] List<AnimalSnapshot> Animals,
     [property: JsonPropertyName("buildingId")] string? BuildingId = null,
     [property: JsonPropertyName("residentCount")] int? ResidentCount = 0,
-    [property: JsonPropertyName("residentAnimalIds")] IReadOnlyList<string>? ResidentAnimalIds = null
+    [property: JsonPropertyName("residentAnimalIds")] IReadOnlyList<string>? ResidentAnimalIds = null,
+    [property: JsonPropertyName("humanDoorTile"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] TileCoord? HumanDoorTile = null
 );
 
 public sealed record LivestockSnapshot(

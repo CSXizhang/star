@@ -1169,6 +1169,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         necessarily petted. Check both when the player's goal includes care.
         Prefer animalId for pet/produce actions; residentCount includes outdoor
         residents and is the housing occupancy, unlike the current indoor animalCount.
+        doorTile is the animal hatch for toggle_animal_door; humanDoorTile is the
+        human entrance. Enter the observed indoorsName to reach the hay troughs.
         """
         try:
             return await sched.query_livestock(location_id=location_id)
@@ -1396,10 +1398,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         or guarantee every animal is immediately fed. Decide from observed trough/fullness facts.
         Native overnight updates reset fullness, so a current zero alone does not prove a hay
         shortage; assess actual trough supply together with animal state.
-        Native overnight processing resets fullness to zero; a current zero alone is not a hay
-        deficit. Check actual trough supply and animal state before choosing this action.
-
-        The companion must be inside that building and the building must have hay;
+        Enter the observed indoorsName through its human entrance first; doorTile
+        is the animal hatch, not the human entrance. The actor must be inside and have hay;
         otherwise an actionable no-hay/wrong-map reason is returned.
         """
         try:

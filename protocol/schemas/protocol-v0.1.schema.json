@@ -250,6 +250,9 @@
         "doorTile": {
           "$ref": "#/$defs/tileCoord"
         },
+        "humanDoorTile": {
+          "$ref": "#/$defs/tileCoord"
+        },
         "animalDoorOpen": {
           "type": "boolean"
         },

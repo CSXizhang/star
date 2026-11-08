@@ -93,6 +93,16 @@ public sealed class NativeAnimalFeedingTests
         Assert.False(ambiguous);
     }
 
+    [Fact]
+    public void UnreadableInteriorDoesNotInventEmptyTroughsOrZeroCapacity()
+    {
+        var observation = ((int? Hay, int? Capacity))typeof(StardewAI.Companion.Mod.Observation.GameWorldObserver)
+            .GetMethod("ObserveTroughHay", BindingFlags.NonPublic | BindingFlags.Static)!
+            .Invoke(null, new object[] { new AnimalHouse() })!;
+        Assert.Null(observation.Hay);
+        Assert.Null(observation.Capacity);
+    }
+
     private static AnimalHouse House(string name, string identity)
     {
         var house = new AnimalHouse();

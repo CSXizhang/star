@@ -1594,9 +1594,7 @@ public sealed partial class GameWorldObserver : IWorldObserver
                 // In 1.6 the real trough supply is the hay objects sitting on the native
                 // Trough/Back tiles; AnimalHouse.piecesOfHay is a legacy field the game
                 // never uses for feeding, so it is NOT reported as hay.
-                int hay = CountTroughHay(house);
-                int hayCapacity = 0;
-                try { hayCapacity = house.GetHayCapacity(); } catch { hayCapacity = 0; }
+                var (hay, hayCapacity) = ObserveTroughHay(house);
                 int siloHay = SumSiloHay();
                 int limit = 0;
                 try { limit = house.animalLimit?.Value ?? 0; } catch { limit = 0; }
@@ -1623,7 +1621,8 @@ public sealed partial class GameWorldObserver : IWorldObserver
                     Animals: animals,
                     BuildingId: parent?.id.Value.ToString(),
                     ResidentCount: house.animalsThatLiveHere.Count,
-                    ResidentAnimalIds: house.animalsThatLiveHere.Select(id=>id.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToList()
+                    ResidentAnimalIds: house.animalsThatLiveHere.Select(id=>id.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToList(),
+                    HumanDoorTile: parent is null ? null : new TileCoordinate(parent.getPointForHumanDoor().X, parent.getPointForHumanDoor().Y)
                 ));
             }
 
@@ -1762,25 +1761,24 @@ public sealed partial class GameWorldObserver : IWorldObserver
     /// <c>AnimalHouse.feedAllAnimals</c> / the feed-hopper action, which both work with hay
     /// objects and never use the legacy <c>AnimalHouse.piecesOfHay</c> field.
     /// </summary>
-    private static int CountTroughHay(AnimalHouse house)
+    private static (int? Hay, int? Capacity) ObserveTroughHay(AnimalHouse house)
     {
-        int count = 0;
+        int count = 0, capacity = 0;
         try
         {
             var layers = house.Map?.Layers;
             if (layers is null || layers.Count == 0)
-                return 0;
+                return (null, null);
             var layer = layers[0];
             for (int y = 0; y < layer.LayerHeight; y++)
             {
                 for (int x = 0; x < layer.LayerWidth; x++)
                 {
-                    bool isTrough;
-                    try { isTrough = house.doesTileHaveProperty(x, y, "Trough", "Back", false) is not null; }
-                    catch { isTrough = false; }
+                    bool isTrough = house.doesTileHaveProperty(x, y, "Trough", "Back", false) is not null;
                     if (!isTrough)
                         continue;
-
+                    // GameLocation.GetHayCapacity counts silo storage, not trough slots.
+                    capacity++;
                     var tile = new Vector2(x, y);
                     if (house.objects.TryGetValue(tile, out var obj) && obj is not null
                         && FarmerMechanicsActor.ItemIdMatches(obj.QualifiedItemId ?? "", "(O)178"))
@@ -1790,9 +1788,9 @@ public sealed partial class GameWorldObserver : IWorldObserver
         }
         catch (Exception)
         {
-            // Observation only; an unreadable map yields 0 rather than a fabricated count.
+            return (null, null); // Unknown is not an observed empty trough.
         }
-        return count;
+        return (count, capacity);
     }
 
     /// <summary>

@@ -357,12 +357,13 @@ def test_scheduler_query_machines_and_livestock_projections() -> None:
                             "indoorsName": "Coop",
                             "tile": {"x": 10, "y": 4},
                             "doorTile": {"x": 11, "y": 6},
+                            "humanDoorTile": {"x": 10, "y": 6},
                             "animalDoorOpen": True,
                             "doorStateKnown": True,
                             "animalCount": 1,
                             "animalLimit": 4,
-                            "hayCount": 9,
-                            "hayCapacity": 240,
+                            "hayCount": 2,
+                            "hayCapacity": 4,
                             "animals": [{"name": "小黄", "tile": {"x": 60, "y": 12}}],
                         }
                     ],
@@ -385,6 +386,8 @@ def test_scheduler_query_machines_and_livestock_projections() -> None:
         assert livestock["buildingCount"] == 1
         assert livestock["animalCount"] == 1
         assert livestock["buildings"][0]["doorTile"] == {"x": 11, "y": 6}
+        assert livestock["buildings"][0]["humanDoorTile"] == {"x": 10, "y": 6}
+        assert livestock["buildings"][0]["hayCapacity"] == 4
 
     asyncio.run(run())
 

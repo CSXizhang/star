@@ -1624,6 +1624,7 @@ public sealed partial class TestDriverMod : Mod
             _acceptanceChest = chest.ValueKind == JsonValueKind.Null ? null
                 : new Vector2(chest.GetProperty("x").GetInt32(), chest.GetProperty("y").GetInt32());
             if (_harnessFixtureMode == "multi-day") ResumeMultiDayObservation();
+            if (_harnessFixtureMode == "creative-farm") ResumeCreativeFarmObservation();
             Monitor.Log("[TestDriver] Continuity: restored observation metadata only; loaded world preserved.", LogLevel.Info);
             return;
         }

@@ -108,7 +108,7 @@ internal static class FarmSpaceObserver
             ["locationId"] = location.NameOrUniqueName, ["width"] = width, ["height"] = height,
             ["mapWidth"] = mapWidth, ["mapHeight"] = mapHeight, ["offset"] = new { x = region.X, y = region.Y },
             ["capturedRevision"] = observer.WorldRevision, ["rows"] = rows,
-            ["legend"] = new Dictionary<string, string> { ["."] = "passable ground; item placement still requires native validation", ["o"] = "passable with object or terrain", ["#"] = "blocked", ["E"] = "entrance/warp: preserve access" },
+            ["legend"] = new Dictionary<string, string> { ["."] = "passable ground; item placement still requires native validation", ["o"] = "passable with object or terrain", ["#"] = "blocked at capture time; includes moving NPCs/animals, not only permanent obstacles", ["E"] = "entrance/warp: preserve access" },
             ["occupants"] = occupants.Where(o =>
             {
                 var data = System.Text.Json.JsonSerializer.SerializeToElement(o);

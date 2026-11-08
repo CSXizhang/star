@@ -243,6 +243,83 @@ public sealed partial class TestDriverMod
         Monitor.Log($"[TestDriver] Creative farm ready: {recipes.Count} native recipes, native days/services={_creativeNativeDays}, twelve output slots reserved.", LogLevel.Info);
     }
 
+    private void ResumeCreativeFarmObservation()
+    {
+        // Reuse the original fixture's boundaries and material policy. Never rerun
+        // initial arrangement over a decorated save or overwrite its inventory.
+        using var saved = JsonDocument.Parse(File.ReadAllText(Path.Combine(_evidenceDir!, "harness-fixture-startup.json")));
+        var root = saved.RootElement;
+        if (root.GetProperty("runId").GetString() != _runId
+            || root.GetProperty("saveName").GetString() != Constants.SaveFolderName
+            || root.GetProperty("mode").GetString() != "creative-farm")
+            throw new InvalidOperationException("Creative observation metadata belongs to another run/save.");
+        ResolveCompanionActor(out _, out var farmer, out _, out _);
+        if (_creativeFarmActive || farmer == null || !ReferenceEquals(farmer, Game1.player))
+            throw new InvalidOperationException("Creative continuation requires the original loaded player, once only.");
+        var modInfo = Helper.ModRegistry.Get("CSXizhang.StardewAICompanion");
+        _creativeModEntry = ReadNativeMember(modInfo, "Mod");
+        if (_creativeModEntry == null)
+            throw new InvalidOperationException("Creative continuation cannot find the production Mod.");
+        var farm = Game1.getFarm();
+        _creativeFarmer = Game1.player;
+        _creativeSaveName = Constants.SaveFolderName;
+        _creativeDay = Game1.Date.TotalDays;
+        _creativeInitialDay = root.GetProperty("initial").GetProperty("initialTotalDays").GetInt32();
+        _creativeNativeDays = root.GetProperty("environment").GetProperty("nativeDays").GetBoolean();
+        if (!_creativeNativeDays)
+            throw new InvalidOperationException("Creative continuation currently requires native-day construction.");
+        _freezeTime = false;
+        var anchor = root.GetProperty("accessAnchor");
+        _creativeAnchor = new Point(anchor.GetProperty("x").GetInt32(), anchor.GetProperty("y").GetInt32());
+        _creativeWorkArea = new Rectangle(0, 0, farm.Map.Layers[0].LayerWidth, farm.Map.Layers[0].LayerHeight);
+        _creativeWaterBaseline = CreativeWaterFingerprint(farm);
+        foreach (var building in root.GetProperty("protectedBuildings").EnumerateArray())
+            _creativeBuildings.Add(building.GetProperty("id").GetString()!, JsonSerializer.Serialize(building));
+        foreach (var recipe in root.GetProperty("recipeWhitelist").EnumerateArray())
+        {
+            string itemId = recipe.GetProperty("itemId").GetString()!;
+            _creativeItemCategories[itemId] = recipe.GetProperty("categories").EnumerateArray().Select(item => item.GetString()!).ToArray();
+            _creativeItemNames[itemId] = recipe.GetProperty("outputName").GetString()!;
+        }
+        foreach (var material in root.GetProperty("materialPolicy").GetProperty("materials").EnumerateArray())
+        {
+            string itemId = material.GetProperty("itemId").GetString()!;
+            if (!CreativeMaterialIds.Contains(itemId, StringComparer.Ordinal))
+                throw new InvalidOperationException("Continuation material is outside the basic-material whitelist.");
+            _creativeMaterialTargets.Add(itemId, Math.Min(material.GetProperty("target").GetInt32(), ItemRegistry.Create(itemId).maximumStackSize()));
+        }
+        foreach (var row in root.GetProperty("initialLayout").EnumerateArray())
+            _creativeBaselineLayout.Add(CreativeLayoutKey(JsonSerializer.Deserialize<CreativeLayoutItem>(row.GetRawText())!));
+        foreach (var entrance in root.GetProperty("entrances").EnumerateArray())
+        {
+            var tile = entrance.GetProperty("tile");
+            _creativeEntrances.Add(new CreativeEntrance(entrance.GetProperty("id").GetString()!, tile.GetProperty("x").GetInt32(),
+                tile.GetProperty("y").GetInt32(), entrance.GetProperty("target").GetString()!, entrance.GetProperty("initiallyReachable").GetBoolean()));
+        }
+        string ledger = Path.Combine(_evidenceDir!, "creative-farm-ledger.jsonl");
+        if (File.Exists(ledger))
+            foreach (string line in File.ReadLines(ledger).Where(line => !string.IsNullOrWhiteSpace(line)))
+            {
+                using var entry = JsonDocument.Parse(line);
+                var eventRow = entry.RootElement;
+                _creativeSequence = Math.Max(_creativeSequence, eventRow.GetProperty("seq").GetInt32());
+                if (eventRow.GetProperty("type").GetString() == "native-result"
+                    && eventRow.GetProperty("payload").TryGetProperty("commandId", out var command))
+                    _creativeCommands.Add(command.GetString()!);
+            }
+        var coordinator = ReadNativeMember(_creativeModEntry, "_coordinator")!;
+        coordinator.GetType().GetEvent("OnExecutionCompleted")!.AddEventHandler(coordinator,
+            (Action)(() => {
+                if (!_creativeFarmActive) return;
+                try { RecordCreativeNativeResult(); }
+                catch (Exception error) { StopCreativeFarm(error); }
+            }));
+        _creativeFarmActive = true;
+        PublishCreativeControl();
+        PublishCreativeSnapshot();
+        CreativeEvent("continuity-resumed", ObserveCreativeFarm());
+    }
+
     private void MaintainCreativeFarm()
     {
         try

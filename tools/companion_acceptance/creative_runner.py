@@ -621,7 +621,6 @@ class CreativeRunner(Runner):
                                     "modelMarkedProjectComplete": (self.report.get("project") or {}).get("status") == "completed"}
 
     async def monitor(self):
-        completion_deadline = None
         while True:
             if self.requested_stop():
                 return
@@ -681,11 +680,8 @@ class CreativeRunner(Runner):
                 "designPrecedesClearing": design_precedes_clearing(trace, self.goal_id)}
             if checks["same_project_completed"]:
                 self.report["completionRequestId"] = self.completion_turn(trace, commands, lease)
-                completion_deadline = completion_deadline or time.monotonic() + 60
             else:
-                # Reopening the same project resumes work, not its old closing
-                # deadline. Only an actual completion is allowed a close timer.
-                completion_deadline = None
+                # Reopening the same project resumes work, not its old closing turn.
                 self.report.pop("completionRequestId", None)
             checks["completion_round_settled"] = round_settled(lease, commands, self.report.get("completionRequestId"), self.save_id)
             checks["same_provider_session"] = len(sessions) == 1
@@ -714,9 +710,9 @@ class CreativeRunner(Runner):
             if failed:
                 self.report["failedTurn"] = failed
                 raise RuntimeError(f"Provider turn {failed.get('requestId')} ended {failed.get('status')}: {failed.get('error') or ''}")
-            if completion_deadline and time.monotonic() >= completion_deadline:
-                self.report["stopReason"] = "completed-project-did-not-settle"
-                return
+            # complete is a tool receipt, not the provider's terminal reply.
+            # Let the existing provider inactivity watchdog report a real stall;
+            # a second wall-clock deadline here can cancel active finalization.
             work_count = sum(receipt.get("completedcount", 0) > 0
                              and receipt.get("skillid") in {"clear-debris", "chop-tree", "cut-grass", "place-items", "remove-items", "hoe-tiles"}
                              for row in ledger if row.get("type") == "native-result" for receipt in [lower_keys(row.get("payload"))])
@@ -745,10 +741,19 @@ class CreativeRunner(Runner):
             if self.requested_stop():
                 return
             goals = self.state().get("goals", [])
-            if any(goal.get("id") not in self.baseline_goals and goal.get("status") in {"completed", "cancelled"}
-                   for goal in goals if self.goal_id is None or goal.get("id") == self.goal_id):
-                return
-            if any(command.get("status") in {"failed", "cancelled", "error"} for command in self.commands()):
+            commands = self.commands()
+            completion_request = self.report.get("completionRequestId")
+            for goal in goals:
+                if goal.get("id") in self.baseline_goals or self.goal_id is not None and goal.get("id") != self.goal_id:
+                    continue
+                if goal.get("status") == "cancelled" or completion_request and goal.get("status") != "completed":
+                    return
+                if goal.get("status") == "completed" and (not completion_request or round_settled(
+                        read(self.mod / "data/life-turn.json"), commands, completion_request, self.save_id)):
+                    return
+            # While a completed goal's reply is still running, await its local
+            # receipt rather than repeatedly requesting an entire native farm scan.
+            if any(command.get("status") in {"failed", "cancelled", "error"} for command in commands):
                 return
 
     def requested_stop(self):

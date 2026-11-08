@@ -642,7 +642,8 @@ def test_stop_request_requires_matching_run_and_explicit_confirmation(tmp_path):
     assert "stopReason" not in runner.report
 
 
-def test_reopened_project_discards_old_completion_deadline(tmp_path, monkeypatch):
+@pytest.mark.parametrize("middle_status", ["active", "completed"])
+def test_completion_waits_for_provider_receipt_even_after_a_long_or_reopened_round(tmp_path, monkeypatch, middle_status):
     runner = setup_run(tmp_path)
     runner.save_id = "Farm_1"
     runner.criteria = CRITERIA
@@ -651,9 +652,9 @@ def test_reopened_project_discards_old_completion_deadline(tmp_path, monkeypatch
     clock = SimpleNamespace(now=0, round=0)
     monkeypatch.setattr(monitor, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now))
     runner.trace = list
-    runner.observe_project = lambda trace: {"id": "project", "status": "active" if clock.round == 2 else "completed",
+    runner.observe_project = lambda trace: {"id": "project", "status": middle_status if clock.round == 2 else "completed",
                                            "project": {"summary": "revised garden", "layout": layout()}}
-    runner.commands = lambda: ([{"requestId": "finished-later", "saveId": "Farm_1", "status": "completed",
+    runner.commands = lambda: ([{"requestId": "finished-later" if middle_status == "active" else "still-working", "saveId": "Farm_1", "status": "completed",
                                 "conversationId": "same-session", "provider": "mcode"}] if clock.round == 3 else [])
 
     async def native():
@@ -668,7 +669,32 @@ def test_reopened_project_discards_old_completion_deadline(tmp_path, monkeypatch
     asyncio.run(runner.monitor())
     assert clock.round == 3 and clock.now == 8000
     assert runner.report["stopReason"] == "project-completed"
-    assert runner.report["completionRequestId"] == "finished-later"
+    assert runner.report["completionRequestId"] == ("finished-later" if middle_status == "active" else "still-working")
+
+
+def test_completed_goal_waits_for_local_terminal_receipt_without_waking_world_monitor(tmp_path, monkeypatch):
+    runner = setup_run(tmp_path)
+    runner.monitor_seconds = 900
+    runner.save_id = "Farm_1"
+    runner.goal_id = "project"
+    runner.baseline_goals = set()
+    runner.report["completionRequestId"] = "closing"
+    runner.state = lambda: {"goals": [{"id": "project", "status": "completed"}]}
+    commands = []
+    runner.commands = lambda: commands
+    monitor.write(runner.mod / "data/life-turn.json", {"saveId": "Farm_1", "requestId": "closing"})
+    polls = []
+
+    async def local_receipt_after_progress(_):
+        polls.append(True)
+        if len(polls) == 2:
+            commands.append({"saveId": "Farm_1", "requestId": "closing", "status": "completed"})
+            monitor.write(runner.mod / "data/life-turn.json", {"saveId": "Farm_1", "requestId": None})
+        assert len(polls) <= 2
+
+    monkeypatch.setattr(monitor.asyncio, "sleep", local_receipt_after_progress)
+    asyncio.run(runner.wait_for_monitor_signal())
+    assert len(polls) == 2  # An unchanged completed goal is not a new world-observation event.
 
 
 def test_capture_rejects_metadata_without_written_matching_png(tmp_path):

@@ -2095,7 +2095,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                             HayCapacity: b.HayCapacity,
                             SiloHayCount: b.SiloHayCount,
                             Animals: b.Animals.Select(ToAnimalSnapshot).ToList(),
-                            BuildingId: b.BuildingId, ResidentCount: b.ResidentCount, ResidentAnimalIds: b.ResidentAnimalIds
+                            BuildingId: b.BuildingId, ResidentCount: b.ResidentCount, ResidentAnimalIds: b.ResidentAnimalIds,
+                            HumanDoorTile: b.HumanDoorTile is { } humanDoor ? new TileCoord(humanDoor.X, humanDoor.Y) : null
                         ))
                         .ToList(),
                     RoamingAnimals: scan.RoamingAnimals.Select(ToAnimalSnapshot).ToList(), RoamingScopeLocationId: locationName

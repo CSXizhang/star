@@ -138,7 +138,8 @@ public sealed record InventorySlotSnapshot(
     [property: JsonPropertyName("displayName"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? DisplayName = null,
     [property: JsonPropertyName("stack")] int Stack = 1,
     [property: JsonPropertyName("quality")] int Quality = 0,
-    [property: JsonPropertyName("isTool"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsTool = false
+    [property: JsonPropertyName("isTool"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsTool = false,
+    [property: JsonPropertyName("upgradeLevel"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? UpgradeLevel = null
 );
 
 public sealed record CompanionInventorySnapshot(
@@ -397,7 +398,8 @@ public sealed record AnimalBuildingSnapshot(
     [property: JsonPropertyName("animals")] List<AnimalSnapshot> Animals,
     [property: JsonPropertyName("buildingId")] string? BuildingId = null,
     [property: JsonPropertyName("residentCount")] int? ResidentCount = 0,
-    [property: JsonPropertyName("residentAnimalIds")] IReadOnlyList<string>? ResidentAnimalIds = null
+    [property: JsonPropertyName("residentAnimalIds")] IReadOnlyList<string>? ResidentAnimalIds = null,
+    [property: JsonPropertyName("humanDoorTile"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] TileCoord? HumanDoorTile = null
 );
 
 public sealed record LivestockSnapshot(
@@ -740,7 +742,10 @@ public sealed record LifeChatSubmitPayload(
     [property: JsonPropertyName("resolveNotice"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool ResolveNotice = false,
     [property: JsonPropertyName("noticeAction"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? NoticeAction = null,
     [property: JsonPropertyName("noticeIds"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? NoticeIds = null
-);
+)
+{
+    public const int MaxTextLength = 8192;
+}
 
 /// <summary>
 /// §1.2 life.chat.reply (Py→C#).

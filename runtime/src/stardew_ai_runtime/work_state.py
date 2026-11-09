@@ -459,7 +459,9 @@ def _request_is_pending(state: SaveWorkState, request: dict[str, Any]) -> bool:
     if request.get("origin") == "player-midflight" and not request.get("consumedByDelivery"):
         return True
     request_id = request.get("id")
-    if any(g.status == "active" and g.constraints.get("playerRequestId") == request_id
+    if any(g.status in {"active", "paused"}
+           and (g.constraints.get("playerRequestId") == request_id
+                or (request.get("origin") in {"player", "player-midflight"} and request.get("goalId") == g.id))
            for g in state.goals):
         return True
     if state.decision.get("requestId") == request_id and not state.decision.get("finished"):
@@ -832,12 +834,12 @@ class WorkStore:
             nonlocal goal, resolved_kind, resolved_parent
             active_main = self._active_main_goal(state)
             if kind is None:
-                # Default hierarchy: a preset assignment is always the main
-                # goal; anything else becomes the first main goal when none is
-                # active yet, otherwise a stage hung off the active main.
+                # An ordinary model-created project must be completable even
+                # when it is the first goal in a save. Explicit player/preset
+                # authorization retains its existing long-term protection.
                 resolved_kind = (
                     "main"
-                    if source == "preset" or active_main is None
+                    if source == "preset" or source == "user" and active_main is None
                     else "stage"
                 )
             else:
@@ -992,6 +994,13 @@ class WorkStore:
                 self._assert_main_goal_closable(state, goal, preset_finalize=preset_finalize)
             if goal.status == "cancelled" and status is not None and status != "cancelled":
                 raise WorkStateError("cancelled goals cannot be resumed; create a new goal for a new assignment")
+            if goal.status == "completed" and status == "active":
+                # These describe the previous completion, not the reopened work.
+                # Execution history and the model's design notes remain intact.
+                for key in ("completionAssessment", "completionObservation"):
+                    goal.project.pop(key, None)
+                if goal.project.get("phase") == "completed":
+                    goal.project.pop("phase")
             if text is not None:
                 if not text.strip():
                     raise WorkStateError("goal text cannot be empty")
@@ -1114,7 +1123,7 @@ class WorkStore:
         )
 
     def complete_goal(self, save_id: str, goal_id: str, *, verified_native_boundary: dict | None = None,
-                      completion_observation: dict | None = None) -> Goal:
+                      completion_observation: dict | None = None, project: dict[str, Any] | None = None) -> Goal:
         """Close the model's project assessment without inventing native effects."""
         preset_finalize = self._check_preset_completion(save_id, goal_id)
         def mutate(state: SaveWorkState) -> Goal:
@@ -1136,8 +1145,17 @@ class WorkStore:
                             and verified_native_boundary["endDay"] > verified_native_boundary["startDay"])
             if not completed and not restored and completion_observation is None:
                 raise WorkStateError("PROJECT_NO_EXECUTION: observe the game before assessing completion")
+            final_project = {**goal.project, **(project or {})}
+            if final_project.get("remaining"):
+                raise WorkStateError(
+                    "PROJECT_UNRESOLVED: project.remaining still records unfinished work; "
+                    "verify those items against the game and continue the original project. "
+                    "After actually resolving them, explicitly update remaining to []."
+                )
+            if len(json.dumps(final_project, ensure_ascii=False)) > 24000:
+                raise WorkStateError("project notes must fit within 24000 characters")
             goal.status = "completed"
-            goal.project = {**goal.project, "phase": "completed", "completionAssessment": "model-reviewed",
+            goal.project = {**final_project, "phase": "completed", "completionAssessment": "model-reviewed",
                             "completedTaskIds": completed[-64:]}
             if completion_observation is not None:
                 goal.project["completionObservation"] = completion_observation
@@ -3626,6 +3644,32 @@ class WorkStore:
                 raise WorkStateError(f"unknown request '{request_id}'")
             self._find_goal(state, goal_id).constraints["playerRequestId"] = request_id
         self._mutate(save_id, mutate)
+
+    def bind_goal_feedback(self, save_id: str, goal_id: str, request_ids: set[str]) -> None:
+        """Keep received feedback with the revised project without replacing its source."""
+        def mutate(state: SaveWorkState) -> None:
+            goal = self._find_goal(state, goal_id)
+            original = goal.constraints.get("playerRequestId")
+            for request in state.requests:
+                if (request.get("id") in request_ids and request.get("id") != original
+                        and request.get("origin") in {"player", "player-midflight"}
+                        and not request.get("workStopped")
+                        and request.get("goalId") in {None, goal_id}):
+                    request["goalId"] = goal_id
+        self._mutate(save_id, mutate)
+
+    def goal_player_request(self, save_id: str, goal_id: str) -> dict[str, Any] | None:
+        """Literal original and chronological player updates, separate from the chosen plan."""
+        state = self.state(save_id)
+        goal = self._find_goal(state, goal_id)
+        original = next((r for r in state.requests if r.get("id") == goal.constraints.get("playerRequestId")), None)
+        updates = [{"requestId": r["id"], "text": r["text"]} for r in state.requests
+                   if r.get("goalId") == goal_id and r is not original
+                   and r.get("origin") in {"player", "player-midflight"} and not r.get("workStopped")]
+        result = {"requestId": original["id"], "text": original["text"]} if original else {}
+        if updates:
+            result["updates"] = updates
+        return result or None
 
     def find_request_for_task(self, save_id: str, task_id: str) -> dict[str, Any] | None:
         state = self.state(save_id)

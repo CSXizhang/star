@@ -24,7 +24,7 @@ public interface IWorldObserver
     /// <summary>On-demand complete spatial facts; never included in periodic snapshots.</summary>
     Dictionary<string, object> InspectLocation(string locationName, Rectangle? region = null) =>
         throw new NotSupportedException("Spatial observation is unavailable in this observer.");
-    Dictionary<string, object> InspectMapImage(string locationName) =>
+    Dictionary<string, object> InspectMapImage(string locationName, Rectangle? region = null) =>
         throw new NotSupportedException("Map images are unavailable in this observer.");
     Dictionary<string, object> InspectCrafting(IFarmerActor actor) =>
         throw new NotSupportedException("Crafting observation is unavailable in this observer.");

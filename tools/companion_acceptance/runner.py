@@ -307,15 +307,15 @@ class Runner:
             raise RuntimeError(result["error"])
         return result
 
-    async def native(self):
+    async def native(self, timeout=30):
         self.number += 1
         label = f"preset-{self.token}-{self.number}"
         path = self.evidence / "free-mode-native-snapshot-request.txt"
-        await self.wait(lambda: not path.exists(), "Native snapshot request still pending")
+        await self.wait(lambda: not path.exists(), "Native snapshot request still pending", timeout)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(label, encoding="utf-8")
         tmp.replace(path)
-        value = await self.wait(lambda: read(self.evidence / f"free-mode-native-{label}.json"), "No native snapshot")
+        value = await self.wait(lambda: read(self.evidence / f"free-mode-native-{label}.json"), "No native snapshot", timeout)
         if value.get("runId") != self.run.name or not value.get("companionObserved"):
             raise RuntimeError("Native observation belongs to another run or companion is absent")
         self.samples.append(value)

@@ -73,7 +73,7 @@ Direction: **C#→Py** means the Companion Mod sends the message to the Runtime.
 | `requestId` | str | correlates the `life.chat.reply` responses |
 | `saveId` | str | active save partition |
 | `mode` | str | `"chat"` (casual talk) or `"plan"` (read-only plan discussion; never dispatches) |
-| `text` | str | 1..500 chars |
+| `text` | str | 1..8192 chars; one complete project brief may be submitted as one message |
 | `source` | str | always `"life-menu"` |
 | `replyToNoticeId` | str? | optional save-scoped pending decision identity; blank/unknown/already answered IDs are rejected |
 | `resolveNotice` | bool? | default false: a linked follow-up keeps the decision pending; true requires the player explicitly submitting their choice |

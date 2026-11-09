@@ -17,12 +17,14 @@ public class PlayerLivestockObservationTests
         var hidden = Animal("inside", "Coop1", 3);
         var outdoor = Animal("outside", "Farm", 20);
         var building = new AnimalBuildingScanInfo("Coop", "Coop1", "Farm", new(4, 4), new(5, 6),
-            true, true, 1, 4, 3, 4, 100, new[] { hidden }, "coop", 2, new[] { "inside", "outside" });
+            true, true, 1, 4, 3, 4, 100, new[] { hidden }, "coop", 2, new[] { "inside", "outside" }, HumanDoorTile: new(4, 6));
         var scan = new LivestockScanInfo(new[] { building }, new[] { outdoor }, false, false);
         var result = PlayerKnownObserver.VisibleLivestock(scan, "Farm", l => l == "Farm", (_, _) => true, 12, 1);
         var observed = Assert.Single(result.Buildings);
         Assert.Equal("coop", observed.BuildingId);
         Assert.True(observed.AnimalDoorOpen);
+        Assert.Equal(new TileCoordinate(4, 6), observed.HumanDoorTile);
+        Assert.Equal(new TileCoordinate(5, 6), observed.DoorTile);
         Assert.Empty(observed.Animals);
         Assert.Null(observed.HayCount);
         Assert.Null(observed.AnimalCount);

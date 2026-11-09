@@ -203,9 +203,9 @@ def run_agy_process(
             terminal = {"conversation_id": cid, "status": "ERROR", "response": "",
                         "error": "CANCELLED" if cancelled else "TIMEOUT" if timed_out else "AGY_STREAM_RESULT_MISSING"}
         elif (not cancelled and not timed_out and proc.returncode == 0
-              and session_id and cid == session_id and terminal.get("status") == "ERROR"):
+              and cid and (not session_id or cid == session_id) and terminal.get("status") == "ERROR"):
             response = completed_response_after_historical_error(
-                cid, getattr(active_task, "start_max_step_idx", -1))
+                cid, getattr(active_task, "start_max_step_idx", -1), initial_turn=not session_id)
             if response is not None:
                 terminal = {**terminal, "status": "SUCCESS", "response": response,
                             "provider_status": "ERROR", "reconciled_from": "current_turn_steps"}

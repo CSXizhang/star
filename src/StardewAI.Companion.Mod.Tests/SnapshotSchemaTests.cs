@@ -16,6 +16,51 @@ namespace StardewAI.Companion.Mod.Tests;
 /// </summary>
 public class SnapshotSchemaTests
 {
+    [Fact]
+    public void NativeLivestockSnapshotKeepsHumanEntranceSeparateFromAnimalHatch()
+    {
+        var actor = new MechanicsActor("housing-entrances");
+        actor.UpdatePose("Farm", new(4, 7), FacingDirection.Up);
+        var observer = new SimulatedWorldObserver();
+        observer.SetLivestock(new LivestockScanInfo(new[] {
+            new AnimalBuildingScanInfo("Coop", "Coop-one", "Farm", new(4, 4), new(5, 6),
+                false, true, 0, 4, 0, 4, 0, Array.Empty<AnimalScanInfo>(), HumanDoorTile: new(4, 6))
+        }, Array.Empty<AnimalScanInfo>(), false, false));
+        var coordinator = new CompanionMechanicsCoordinator(actor, observer,
+            new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
+        var building = json.RootElement.GetProperty("livestock").GetProperty("buildings")[0];
+        Assert.Equal(4, building.GetProperty("humanDoorTile").GetProperty("x").GetInt32());
+        Assert.Equal(5, building.GetProperty("doorTile").GetProperty("x").GetInt32());
+        var legacy = JsonSerializer.Deserialize<AnimalBuildingSnapshot>("{\"doorTile\":{\"x\":5,\"y\":6}}", Options)!;
+        Assert.Null(legacy.HumanDoorTile);
+    }
+
+    [Fact]
+    public void ActualInventorySnapshotKeepsToolGradesDistinctFromQualityAndUnknown()
+    {
+        var actor = new MechanicsActor("tool-grades");
+        actor.UpdatePose("Farm", new(1, 1), FacingDirection.Down);
+        Assert.True(actor.TryAddItemToInventory(new InventoryItem("(T)Hoe", "Hoe", isTool: true)));
+        Assert.True(actor.TryAddItemToInventory(new InventoryItem("(T)Axe", "Axe", upgradeLevel: 4, isTool: true)));
+        Assert.True(actor.TryAddItemToInventory(new InventoryItem("(T)WateringCan", "Watering Can", upgradeLevel: 1, isTool: true)));
+        Assert.True(actor.TryAddItemToInventory(new InventoryItem("(O)24", "Parsnip", quality: 4)));
+        var observer = new SimulatedWorldObserver();
+        var coordinator = new CompanionMechanicsCoordinator(actor, observer,
+            new SameMapNavigator(observer), new TestWateringCanAdapter(observer));
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(coordinator.CaptureCurrentSnapshot(1), Options));
+        var slots = json.RootElement.GetProperty("inventory").GetProperty("slots").EnumerateArray()
+            .ToDictionary(slot => slot.GetProperty("itemId").GetString()!);
+        Assert.Equal(0, slots["(T)Hoe"].GetProperty("upgradeLevel").GetInt32());
+        Assert.Equal(4, slots["(T)Axe"].GetProperty("upgradeLevel").GetInt32());
+        Assert.Equal(1, slots["(T)WateringCan"].GetProperty("upgradeLevel").GetInt32());
+        Assert.False(slots["(O)24"].TryGetProperty("upgradeLevel", out _));
+        Assert.Equal(4, slots["(O)24"].GetProperty("quality").GetInt32());
+        var legacy = JsonSerializer.Deserialize<InventorySlotSnapshot>(
+            "{\"index\":0,\"itemId\":\"(T)Hoe\",\"name\":\"Hoe\",\"isTool\":true}", Options)!;
+        Assert.Null(legacy.UpgradeLevel);
+    }
+
     [Theory]
     [InlineData(0, false)]
     [InlineData(100, true)]

@@ -45,6 +45,9 @@ internal static class FarmSpaceObserver
         foreach (var pair in location.terrainFeatures.Pairs)
             occupants.Add(new { kind = pair.Value.GetType().Name,
                 itemId = pair.Value is Flooring floor ? floor.GetData()?.ItemId : null,
+                growthStage = pair.Value is Tree tree ? (int?)tree.growthStage.Value : null,
+                stump = pair.Value is Tree trunk ? (bool?)trunk.stump.Value : null,
+                grassDensity = pair.Value is Grass grass ? (int?)grass.numberOfWeeds.Value : null,
                 x = (int)pair.Key.X, y = (int)pair.Key.Y, width = 1, height = 1 });
         foreach (var furniture in location.furniture)
         {
@@ -79,7 +82,12 @@ internal static class FarmSpaceObserver
         foreach (var feature in location.resourceClumps)
         {
             var box = feature.getBoundingBox();
-            occupants.Add(new { kind = "resource-clump", x = box.X / 64, y = box.Y / 64,
+            var requirement = Adapters.NativeResourceClumps.Requirement(feature.parentSheetIndex.Value);
+            occupants.Add(new { kind = "resource-clump", nativeId = feature.parentSheetIndex.Value,
+                health = feature.health.Value, requiredTool = requirement.Tool, minimumUpgradeLevel = requirement.Level,
+                playerAction = requirement.Tool == "Axe" ? "chop_tree" : requirement.Tool == "Pickaxe" ? "clear_debris" : null,
+                targetHint = "Any observed footprint tile identifies this clump; navigation checks reachable native hit edges.",
+                x = box.X / 64, y = box.Y / 64,
                 width = Math.Max(1, box.Width / 64), height = Math.Max(1, box.Height / 64) });
         }
         var rows = new List<string>();
@@ -100,7 +108,7 @@ internal static class FarmSpaceObserver
             ["locationId"] = location.NameOrUniqueName, ["width"] = width, ["height"] = height,
             ["mapWidth"] = mapWidth, ["mapHeight"] = mapHeight, ["offset"] = new { x = region.X, y = region.Y },
             ["capturedRevision"] = observer.WorldRevision, ["rows"] = rows,
-            ["legend"] = new Dictionary<string, string> { ["."] = "passable ground; item placement still requires native validation", ["o"] = "passable with object or terrain", ["#"] = "blocked", ["E"] = "entrance/warp: preserve access" },
+            ["legend"] = new Dictionary<string, string> { ["."] = "passable ground; item placement still requires native validation", ["o"] = "passable with object or terrain", ["#"] = "blocked at capture time; includes moving NPCs/animals, not only permanent obstacles", ["E"] = "entrance/warp: preserve access" },
             ["occupants"] = occupants.Where(o =>
             {
                 var data = System.Text.Json.JsonSerializer.SerializeToElement(o);

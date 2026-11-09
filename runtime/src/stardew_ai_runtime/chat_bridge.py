@@ -5832,8 +5832,8 @@ class ChatBridge(TurnExecutionMixin):
             goal = next((g for g in state.goals if g.id == scope), None)
             source_id = goal.constraints.get("playerRequestId") if goal else None
             source = next((r for r in state.requests if r.get("id") == source_id), None)
-            if source:
-                active_task.original_request = {"requestId": source["id"], "text": source["text"]}
+            if goal:
+                active_task.original_request = self._work_store.goal_player_request(save_id, goal.id)
             self._work_store.begin_decision(
                 save_id, token, goal_scope=scope, goal_default=active_task.goal_default,
                 request_id=source_id if source else active_task.command_id or active_task.request_id,

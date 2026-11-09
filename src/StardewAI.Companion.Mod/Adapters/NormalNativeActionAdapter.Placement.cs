@@ -14,13 +14,17 @@ public sealed partial class NormalNativeActionAdapter
         !string.IsNullOrWhiteSpace(first) && !string.IsNullOrWhiteSpace(second) &&
         string.Equals(ItemRegistry.QualifyItemId(first), ItemRegistry.QualifyItemId(second), StringComparison.Ordinal);
 
+    private static Tool? ConstructionRemovalTool(IFarmerActor actor, StardewValley.Object? obj) =>
+        new Tool?[] { actor.FindTool<Pickaxe>(), actor.FindTool<Axe>() }.FirstOrDefault(tool => tool != null
+            && (obj is not Fence fence || fence.isGate.Value || fence.IsValidRemovalTool(tool)));
+
     private NativeActionStepResult PlaceItems(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target)
     {
         var loc = ResolveLocation(request.LocationId);
         var farmer = actor.GameFarmer;
         if (loc is null || farmer is null || !ReferenceEquals(farmer.currentLocation, loc))
             return NativeActionStepResult.Precondition("Companion is not on the requested map.", "wrong-map");
-        if (!actor.Tile.IsAdjacentTo(target.Tile) && actor.Tile != target.Tile)
+        if (!actor.Tile.IsAdjacentTo(target.Tile))
             return NativeActionStepResult.Precondition("Placement requires an adjacent tile.", "not-adjacent");
         var source = farmer.Items.OfType<StardewValley.Object>().FirstOrDefault(i => SameItem(i.QualifiedItemId, request.ItemId) && i.Stack > 0);
         if (source is null)
@@ -34,7 +38,15 @@ public sealed partial class NormalNativeActionAdapter
         var tile = new Vector2(target.Tile.X, target.Tile.Y);
         if (_observer.IsWarpOrDoorTile(request.LocationId, target.Tile))
             return NativeActionStepResult.Precondition("Entrance/warp tiles must stay clear.", "protected-entrance");
-        if (loc.objects.ContainsKey(tile) || loc.terrainFeatures.ContainsKey(tile) || loc.GetFurnitureAt(tile) is not null)
+        loc.terrainFeatures.TryGetValue(tile, out var originalTerrain);
+        bool upperItem = source is Furniture || source.bigCraftable.Value || source.IsFenceItem() || source.IsSprinkler();
+        // Preserve ground layers: native predicates decide which upper items can
+        // coexist with flooring, grass or crop-free soil. Never replace trees,
+        // crops or an entity; retain the existing ground after native placement.
+        bool compatibleGround = originalTerrain is Flooring or Grass
+            || originalTerrain is HoeDirt { crop: null };
+        if (loc.objects.ContainsKey(tile) || loc.GetFurnitureAt(tile) is not null
+            || originalTerrain is not null && !(upperItem && compatibleGround))
             return NativeActionStepResult.Precondition("Target already contains an object or terrain feature; inspect before changing it.", "occupied");
         if (ActorGuards.IsPlayerBound(actor))
         {
@@ -44,17 +56,23 @@ public sealed partial class NormalNativeActionAdapter
             try
             {
                 farmer.CurrentToolIndex = farmer.Items.IndexOf(source);
-                // The real caller owns placement predicates, source identity,
-                // furniture cursor handling and reduceActiveItemByOne.
-                accepted = Utility.tryToPlaceItem(loc, source, target.Tile.X * 64, target.Tile.Y * 64);
+                // Placement initializes passive machine output on its argument.
+                // Isolate that native mutation to one unit, while the native
+                // caller consumes the selected inventory stack. Furniture keeps
+                // its original identity for native cursor recovery on refusal.
+                var unit = source is Furniture ? source : (StardewValley.Object)source.getOne();
+                accepted = Utility.tryToPlaceItem(loc, unit, target.Tile.X * 64, target.Tile.Y * 64);
             }
             finally { farmer.CurrentToolIndex = previous; }
             bool changed = loc.objects.TryGetValue(tile, out var nativeObject) && SameItem(nativeObject.QualifiedItemId, source.QualifiedItemId)
                 || loc.furniture.Any(f => f.TileLocation == tile && SameItem(f.QualifiedItemId, source.QualifiedItemId))
-                || loc.terrainFeatures.TryGetValue(tile, out var nativeFeature) && nativeFeature is Flooring or Tree or FruitTree or Bush or Grass;
+                || loc.terrainFeatures.TryGetValue(tile, out var nativeFeature) && !ReferenceEquals(nativeFeature, originalTerrain)
+                    && nativeFeature is Flooring or Tree or FruitTree or Bush or Grass;
+            bool groundPreserved = originalTerrain is null || loc.terrainFeatures.TryGetValue(tile, out var remainingTerrain)
+                && ReferenceEquals(remainingTerrain, originalTerrain);
             int consumed = quantityBefore - actor.GetItemCount(source.QualifiedItemId);
-            if (!accepted || !changed || consumed != 1)
-                return NativeActionStepResult.Failed($"Native placement result={accepted}, placed entity={changed}, consumed={consumed}. Reobserve; no depletion or recovery was fabricated.");
+            if (!accepted || !changed || !groundPreserved || consumed != 1)
+                return NativeActionStepResult.Failed($"Native placement result={accepted}, placed entity={changed}, ground preserved={groundPreserved}, consumed={consumed}. Reobserve; no depletion or recovery was fabricated.");
             return NativeActionStepResult.Succeeded("placed", itemId: source.QualifiedItemId, itemCount: 1);
         }
         var placed = (StardewValley.Object)source.getOne();
@@ -65,7 +83,7 @@ public sealed partial class NormalNativeActionAdapter
             bool accepted = placed.placementAction(loc, target.Tile.X * 64, target.Tile.Y * 64, farmer);
             bool changed = loc.objects.TryGetValue(tile, out var obj) && SameItem(obj.QualifiedItemId, source.QualifiedItemId)
                 || loc.furniture.Any(f => f.TileLocation == tile && SameItem(f.QualifiedItemId, source.QualifiedItemId))
-                || loc.terrainFeatures.TryGetValue(tile, out var feature) && (feature is Flooring floor
+                || loc.terrainFeatures.TryGetValue(tile, out var feature) && !ReferenceEquals(feature, originalTerrain) && (feature is Flooring floor
                     ? SameItem(floor.GetData()?.ItemId, source.QualifiedItemId)
                     : feature is Tree or FruitTree or Bush or Grass);
             // placementAction creates the placed entity; the native caller consumes the inventory unit.
@@ -75,8 +93,10 @@ public sealed partial class NormalNativeActionAdapter
                 source.Stack--;
                 if (source.Stack <= 0) farmer.Items[farmer.Items.IndexOf(source)] = null;
             }
-            if (!accepted || !changed)
-                return NativeActionStepResult.Failed($"Native placement result={accepted}; expected placed entity verified={changed}. Re-observe before retrying.");
+            bool groundPreserved = originalTerrain is null || loc.terrainFeatures.TryGetValue(tile, out var remainingTerrain)
+                && ReferenceEquals(remainingTerrain, originalTerrain);
+            if (!accepted || !changed || !groundPreserved)
+                return NativeActionStepResult.Failed($"Native placement result={accepted}; expected placed entity verified={changed}, ground preserved={groundPreserved}. Re-observe before retrying.");
             return NativeActionStepResult.Succeeded("placed", itemId: request.ItemId, itemCount: 1);
         });
     }
@@ -100,11 +120,13 @@ public sealed partial class NormalNativeActionAdapter
         string? actualId = obj?.QualifiedItemId ?? floor?.GetData()?.ItemId;
         if (!SameItem(actualId, request.ItemId))
             return NativeActionStepResult.Precondition($"Target identity changed: found '{actualId}', expected '{request.ItemId}'.", "target-changed");
-        if (obj is Chest || obj?.heldObject.Value is not null || obj?.IsTapper() == true || obj?.CanBeGrabbed == true)
+        // CanBeGrabbed is also true on ordinary placed fences/machines/sprinklers;
+        // spawned forage is protected separately from the construction whitelist.
+        if (obj is Chest || obj?.heldObject.Value is not null || obj?.IsTapper() == true || obj?.isSpawnedObject.Value == true)
             return NativeActionStepResult.Precondition("Storage, filled machines, tappers and forage are protected from construction removal.", "protected-object");
         if (obj is not null && !(obj is Fence || obj.bigCraftable.Value || obj.IsSprinkler()))
             return NativeActionStepResult.Precondition("This object is not a supported construction removal target.", "unsupported-removal-target");
-        Tool? tool = actor.FindTool<Pickaxe>() ?? (Tool?)actor.FindTool<Axe>();
+        Tool? tool = ConstructionRemovalTool(actor, obj);
         if (tool is null)
             return NativeActionStepResult.Precondition("Removal needs a pickaxe or axe in the companion inventory.", "missing-tool", playerActionRequired: true);
         if (actor.FreeInventorySlots < 1)

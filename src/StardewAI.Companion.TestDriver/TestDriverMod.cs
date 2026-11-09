@@ -254,6 +254,19 @@ public sealed partial class TestDriverMod : Mod
         Game1.quit = true;
     }
 
+    private void SaveCurrentGameWithCompanionCheckpoint()
+    {
+        var info = Helper.ModRegistry.Get("CSXizhang.StardewAICompanion")
+            ?? throw new InvalidOperationException("Companion mod is required for the acceptance save.");
+        var instance = info.GetType().GetProperty("Mod")?.GetValue(info)
+            ?? throw new InvalidOperationException("Companion instance is unavailable for the acceptance save.");
+        var capture = instance.GetType().GetMethod("SaveCompanionCheckpoint", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("Companion checkpoint method is missing; build matching packages.");
+        capture.Invoke(instance, null);
+        var saver = SaveGame.Save();
+        while (saver.MoveNext()) { }
+    }
+
     private void ResolveConfiguration()
     {
         _isolatedSavesPath = Environment.GetEnvironmentVariable("STARDEW_AI_ISOLATED_SAVES");
@@ -410,6 +423,7 @@ public sealed partial class TestDriverMod : Mod
 
         if (_harnessFixtureMode == "mixed-long" && Context.IsWorldReady) TrackMixedWood();
         if (_multiDayActive && Context.IsWorldReady) TrackMultiDay();
+        if (_creativeFarmActive && Context.IsWorldReady) MaintainCreativeFarm();
 
         if (_freezeTime && Context.IsWorldReady && Game1.gameTimeInterval > 0)
         {
@@ -501,11 +515,7 @@ public sealed partial class TestDriverMod : Mod
                 Monitor.Log("[TestDriver] Triggering and running SaveGame.Save() enumerator...", LogLevel.Info);
                 try
                 {
-                    var saveEnum = SaveGame.Save();
-                    while (saveEnum.MoveNext())
-                    {
-                        // Advance save enumerator to completion
-                    }
+                    SaveCurrentGameWithCompanionCheckpoint();
 
                     var currentSavesFolder = StardewValley.Program.GetSavesFolder();
                     Monitor.Log($"[TestDriver] Save completed successfully in: {currentSavesFolder}", LogLevel.Info);
@@ -698,7 +708,9 @@ public sealed partial class TestDriverMod : Mod
     {
         if (_freezeTime && Context.IsWorldReady)
         {
-            Game1.timeOfDay = e.OldTime;
+            // SMAPI can deliver the fixture's initial 06:00 -> 10:00 change
+            // after setup. Restoring OldTime would undo creative daylight.
+            Game1.timeOfDay = _creativeFarmActive ? CreativeTimeOfDay : e.OldTime;
         }
     }
 
@@ -774,10 +786,11 @@ public sealed partial class TestDriverMod : Mod
                 // Isolated runs must survive foreground theft (browser popups, notifications):
                 // vanilla pauses a single-player world when the window loses focus.
                 Game1.options.pauseWhenOutOfFocus = false;
-                if (Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1")
+                if (Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1"
+                    || Environment.GetEnvironmentVariable("STARDEW_AI_PRESERVE_LOADED_WORLD") == "1")
                 {
-                    // A saved continuation keeps its actual location, clock and RNG.
-                    // Only the read-only observer metadata is restored below.
+                    // Continuation and read-only reload keep the native load pose,
+                    // clock and RNG; the old fixed tile may now hold a machine.
                     _freezeTime = false;
                     _scenarioState = ScenarioState.ArrangeScenario;
                     _tickCounter = 0;
@@ -808,7 +821,8 @@ public sealed partial class TestDriverMod : Mod
 
             case ScenarioState.ArrangeScenario:
                 _tickCounter++;
-                if ((Game1.currentLocation?.Name == "Farm" || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1") &&
+                if ((Game1.currentLocation?.Name == "Farm" || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1"
+                    || Environment.GetEnvironmentVariable("STARDEW_AI_PRESERVE_LOADED_WORLD") == "1") &&
                     !Game1.fadeToBlack &&
                     !Game1.fadeIn &&
                     Game1.fadeToBlackAlpha <= 0.001f &&
@@ -1055,8 +1069,7 @@ public sealed partial class TestDriverMod : Mod
                         if (File.Exists(interactionReload))
                         {
                             File.Delete(interactionReload);
-                            var saver = SaveGame.Save();
-                            while (saver.MoveNext()) { }
+                            SaveCurrentGameWithCompanionCheckpoint();
                             string savedName = Constants.SaveFolderName ?? throw new InvalidOperationException("No current isolated save.");
                             _saveLoadedFired = _dayStartedFired = _renderedWorldObserved = false;
                             _renderedWorldFramesCount = 0;
@@ -1157,7 +1170,11 @@ public sealed partial class TestDriverMod : Mod
                     if ((_scenario.Equals("free-mode-control", StringComparison.OrdinalIgnoreCase) || _scenario.Equals("daily-chain", StringComparison.OrdinalIgnoreCase)) &&
                         int.TryParse(Environment.GetEnvironmentVariable("STARDEW_AI_OBSERVE_SECONDS"), out var observeSeconds))
                         timeoutTicks = Math.Clamp(observeSeconds, 600, 7200) * 60;
-                    if (doneExists || _tickCounter > timeoutTicks)
+                    // Creative projects run until their monitor records completion or
+                    // an explicit stop. Other regression fixtures retain their deadlines.
+                    bool creativeUntilDone = _scenario == "free-mode-control" && (_harnessFixtureMode == "creative-farm"
+                        || Environment.GetEnvironmentVariable("STARDEW_AI_OBSERVE_SECONDS") == "0");
+                    if (doneExists || (!creativeUntilDone && _tickCounter > timeoutTicks))
                     {
                         Monitor.Log($"[TestDriver] {_scenario} Act wait concluded (DoneFile: {doneExists}, Ticks: {_tickCounter}, Frames: {_loopDemoFrameIndex}).", LogLevel.Info);
                         _tickCounter = 0;
@@ -1215,11 +1232,10 @@ public sealed partial class TestDriverMod : Mod
                     }
 
                     // SaveGame.Save() is an enumerator factory: it does nothing unless iterated.
-                    // Drive it synchronously on the main thread so the real save (and SMAPI Saving
-                    // event, which persists companion state) actually executes.
+                    // Direct enumeration bypasses the normal overnight Saving event;
+                    // capture companion state explicitly before serializing the real save.
                     Monitor.Log("[TestDriver] Driving synchronous save via SaveGame.Save() enumerator...", LogLevel.Info);
-                    var saver = SaveGame.Save();
-                    while (saver.MoveNext()) { }
+                    SaveCurrentGameWithCompanionCheckpoint();
                     Monitor.Log("[TestDriver] Synchronous save enumerator completed.", LogLevel.Info);
                 }
                 else if (_tickCounter > 30)
@@ -1538,7 +1554,9 @@ public sealed partial class TestDriverMod : Mod
             _saveLoadedFired &&
             _dayStartedFired &&
             Game1.currentLocation != null &&
-            Game1.currentLocation.Name == "Farm" &&
+            (Game1.currentLocation.Name == "Farm"
+             || Environment.GetEnvironmentVariable("STARDEW_AI_PRESERVE_LOADED_WORLD") == "1"
+             || Environment.GetEnvironmentVariable("STARDEW_AI_CONTINUITY_RESUME") == "1") &&
             !Game1.fadeToBlack &&
             !Game1.fadeIn &&
             Game1.fadeToBlackAlpha <= 0f &&
@@ -1617,6 +1635,7 @@ public sealed partial class TestDriverMod : Mod
             _acceptanceChest = chest.ValueKind == JsonValueKind.Null ? null
                 : new Vector2(chest.GetProperty("x").GetInt32(), chest.GetProperty("y").GetInt32());
             if (_harnessFixtureMode == "multi-day") ResumeMultiDayObservation();
+            if (_harnessFixtureMode == "creative-farm") ResumeCreativeFarmObservation();
             Monitor.Log("[TestDriver] Continuity: restored observation metadata only; loaded world preserved.", LogLevel.Info);
             return;
         }
@@ -1740,6 +1759,15 @@ public sealed partial class TestDriverMod : Mod
         if (_scenario.Equals("existing-save-buy5", StringComparison.OrdinalIgnoreCase))
         {
             ArrangeExistingSaveBuy5(farm, farmer, actor);
+            return;
+        }
+
+        // Creative setup preserves raw ground; never install a watering fixture first.
+        if (_scenario == "free-mode-control" &&
+            Environment.GetEnvironmentVariable("STARDEW_AI_HARNESS_FIXTURE") == "creative-farm")
+        {
+            using var creative = JsonDocument.Parse("{\"mode\":\"creative-farm\"}");
+            ArrangeHarnessFixture(_evidenceDir!, "startup", creative.RootElement);
             return;
         }
 
@@ -3538,6 +3566,7 @@ public sealed partial class TestDriverMod : Mod
         AssertHarnessFixtureBoundary(modEntry);
         string mode = request.GetProperty("mode").GetString() ?? "";
         if (mode == "multi-day") { ArrangeMultiDayFixture(modEntry, outDir, label); return; }
+        if (mode == "creative-farm") { ArrangeCreativeFarmFixture(modEntry, outDir, label); return; }
         if (mode is not ("watering" or "partial-planting" or "harvest-store" or "rest-water" or "water-refill" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long"))
             throw new ArgumentException("Unknown harness fixture mode.");
         if (Game1.currentSeason != "spring")
@@ -4013,6 +4042,13 @@ public sealed partial class TestDriverMod : Mod
         else if (action == "native-growth-fixture")
         {
             ArrangeNativeGrowthFixture(modEntry, outDir, label);
+        }
+        else if (action == "harness-farm-capture")
+        {
+            Rectangle? region = request.TryGetProperty("region", out var area)
+                ? new Rectangle(area.GetProperty("x").GetInt32(), area.GetProperty("y").GetInt32(),
+                    area.GetProperty("width").GetInt32(), area.GetProperty("height").GetInt32()) : null;
+            CaptureCreativeFarm(modEntry, outDir, label, region);
         }
         else if (action == "harness-capture")
         {
@@ -8126,7 +8162,7 @@ public sealed partial class TestDriverMod : Mod
                     }
                 }
                 else if (!screenshotValid && !(_scenario == "free-mode-control" &&
-                    _harnessFixtureMode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long" or "multi-day"))
+                    _harnessFixtureMode is "water-refill" or "harvest-store" or "rest-water" or "mature-trees" or "walk-pickup" or "walk-pickup-full" or "mixed-long" or "multi-day" or "creative-farm"))
                 {
                     _evidence["functionalSkillPassed"] = false;
                     _evidence["gateSuccess"] = false;
@@ -8581,6 +8617,9 @@ public sealed partial class TestDriverMod : Mod
                 ["isRaining"] = Game1.isRaining,
                 ["playerMoney"] = Game1.player.Money,
                 ["multiDay"] = _multiDayActive ? ObserveMultiDay() : null,
+                ["creativeFarm"] = _harnessFixtureMode == "creative-farm" ? ObserveCreativeFarm() : null,
+                ["nativeFarmLivestock"] = modInstance != null && Environment.GetEnvironmentVariable("STARDEW_AI_CREATIVE_NATIVE_DAYS") == "1"
+                    ? ObserveCreativeNativeLivestock(modInstance) : null,
                 ["playerStamina"] = Game1.player.stamina,
                 ["playerLocation"] = Game1.player.currentLocation?.NameOrUniqueName,
                 ["playerTile"] = new { x = (int)Game1.player.Tile.X, y = (int)Game1.player.Tile.Y },
@@ -8739,8 +8778,7 @@ public sealed partial class TestDriverMod : Mod
                 _lifecycleSaveName = Constants.SaveFolderName ?? throw new InvalidOperationException("No loaded test save.");
                 if (action is "save-title" or "save-exit" or "save-current")
                 {
-                    var saver = SaveGame.Save();
-                    while (saver.MoveNext()) { }
+                    SaveCurrentGameWithCompanionCheckpoint();
                 }
                 if (action is "return-title" or "save-title") Game1.ExitToTitle();
             }

@@ -7,7 +7,23 @@ import pytest
 from stardew_ai_runtime.autonomy import AutonomyController
 from stardew_ai_runtime.decision_context import build_decision_context
 from stardew_ai_runtime.scheduler import CompanionScheduler, PolicyViolationError
-from stardew_ai_runtime.work_state import WorkStore
+from stardew_ai_runtime.work_state import WorkStateError, WorkStore
+
+
+def test_first_model_project_defaults_to_completable_stage_without_unlocking_main(tmp_path):
+    store = WorkStore(tmp_path / "work.json")
+    project = store.add_goal("a", "Design and build the farm", source="agent")
+    assert project.kind == "stage" and project.parent_id is None
+    store.complete_goal("a", project.id, completion_observation={"worldRevision": 2})
+    assert store.state("a").goals[0].status == "completed"
+    main = store.add_goal("a", "Long-term farm stewardship", source="user")
+    stage = store.add_goal("a", "Build a pond terrace", source="agent")
+    assert stage.kind == "stage" and stage.parent_id == main.id
+    store.complete_goal("a", stage.id, completion_observation={"worldRevision": 3})
+    assert next(goal for goal in store.state("a").goals if goal.id == main.id).status == "active"
+    protected = store.add_goal("b", "Explicit long-term main", source="agent", kind="main")
+    with pytest.raises(WorkStateError, match="MAIN_GOAL_LOCKED"):
+        store.complete_goal("b", protected.id, completion_observation={"worldRevision": 4})
 
 
 def test_terminal_wake_is_durable_and_save_scoped(tmp_path):
@@ -53,7 +69,10 @@ def test_project_layout_survives_day_and_restart_without_context_dump(tmp_path):
         assert persisted[key] == value
     assert [entry["date"] for entry in persisted["progressLog"]] == ["1:spring:3"]
     context = build_decision_context({"world": {"year": 1}}, work=restarted.overview("a"))
-    assert "layout" not in context["goals"][0]["project"]
+    projected = context["goals"][0]["project"]
+    assert projected["layout"]["tiles"] == project["layout"]["tiles"][:4]
+    assert projected["contextTruncated"]["layout.tiles"]["total"] == 400
+    assert "manage_goal" in projected["detailsHint"]
     assert context["goals"][0]["constraints"] == {"keep": "orchard"}
 
 
@@ -121,8 +140,16 @@ def test_map_image_is_mcp_content_and_rejects_arbitrary_file(tmp_path, monkeypat
         compact = create_mcp_server(run_dir=tmp_path, scheduler=scheduler, surface="light")
         compact_result = await compact.call_tool("query_game", {"query": {"observe_map_image": {}}})
         assert compact_result.content[0].type == "image"
-        assert compact_result.content[0].data == result[0].data
-        assert result[0].type == "image" and result[0].mimeType == "image/png"
+        assert compact_result.content[0].data == result.content[0].data
+        assert result.content[0].type == "image" and result.content[0].mimeType == "image/png"
+        area = {"x": 10, "y": 20, "width": 12, "height": 8}
+        scheduler.query_map_image.return_value.update(region=area, capturedRevision=19, pixelsPerTile=32)
+        detail = await compact.call_tool("query_game", {"query": {"observe_map_image": {"region": area}}})
+        scheduler.query_map_image.assert_awaited_with(location_id="Farm", region=area)
+        assert detail.structuredContent["region"] == area
+        assert detail.structuredContent["capturedRevision"] == 19
+        assert '"pixelsPerTile": 32' in detail.content[1].text
+        assert "path" not in detail.structuredContent
         scheduler.query_map_image.return_value = {"path": str(tmp_path / "private.png")}
         with pytest.raises(ToolError, match="controlled image directory"):
             await server.call_tool("observe_map_image", {})

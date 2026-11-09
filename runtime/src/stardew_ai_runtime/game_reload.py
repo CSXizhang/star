@@ -138,7 +138,12 @@ def restore_game_load(run_dir: Path, request: dict[str, Any]) -> None:
                 document = _read(path)
                 raw = partitions.get(name) if partitions else None
                 committed = json.loads(raw) if raw is not None else {}
-                document[save_id] = _reconcile(name, backup.get(name) or {}, committed, request["gameDate"])
+                # A save imported into a fresh runtime has no current intent to
+                # preserve. Seed it from its own native checkpoint; an explicit
+                # existing (even empty) record still takes precedence.
+                current = backup.get(name)
+                document[save_id] = _reconcile(name, committed if current is None else current,
+                                               committed, request["gameDate"])
                 _write(path, document)
             finally:
                 WorkStore._unlock(lock)

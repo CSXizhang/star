@@ -250,6 +250,9 @@
         "doorTile": {
           "$ref": "#/$defs/tileCoord"
         },
+        "humanDoorTile": {
+          "$ref": "#/$defs/tileCoord"
+        },
         "animalDoorOpen": {
           "type": "boolean"
         },
@@ -1415,6 +1418,11 @@
                           },
                           "isTool": {
                             "type": "boolean"
+                          },
+                          "upgradeLevel": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                            "description": "Observed native tool upgrade level; zero is basic, absent/null is unknown. Independent of quality and watering-can fill."
                           }
                         },
                         "additionalProperties": false
@@ -2862,7 +2870,7 @@
                 "text": {
                   "type": "string",
                   "minLength": 1,
-                  "maxLength": 500
+                  "maxLength": 8192
                 },
                 "source": {
                   "type": "string"

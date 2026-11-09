@@ -357,12 +357,13 @@ def test_scheduler_query_machines_and_livestock_projections() -> None:
                             "indoorsName": "Coop",
                             "tile": {"x": 10, "y": 4},
                             "doorTile": {"x": 11, "y": 6},
+                            "humanDoorTile": {"x": 10, "y": 6},
                             "animalDoorOpen": True,
                             "doorStateKnown": True,
                             "animalCount": 1,
                             "animalLimit": 4,
-                            "hayCount": 9,
-                            "hayCapacity": 240,
+                            "hayCount": 2,
+                            "hayCapacity": 4,
                             "animals": [{"name": "小黄", "tile": {"x": 60, "y": 12}}],
                         }
                     ],
@@ -385,6 +386,8 @@ def test_scheduler_query_machines_and_livestock_projections() -> None:
         assert livestock["buildingCount"] == 1
         assert livestock["animalCount"] == 1
         assert livestock["buildings"][0]["doorTile"] == {"x": 11, "y": 6}
+        assert livestock["buildings"][0]["humanDoorTile"] == {"x": 10, "y": 6}
+        assert livestock["buildings"][0]["hayCapacity"] == 4
 
     asyncio.run(run())
 
@@ -564,4 +567,25 @@ def test_refill_public_tool_forwards_optional_explicit_native_tile(tmp_path: Pat
         assert step.operation == "refill_watering_can"
         assert step.params == {"location_id": "Farm", "max_tiles": 4, "tiles": tiles}
 
+    asyncio.run(run())
+
+
+def test_player_machine_observation_does_not_erase_native_items_or_access_failure():
+    import asyncio
+
+    async def run():
+        scheduler = CompanionScheduler(client=_client(_snapshot_env()))
+        machine = {"tile": {"x": 60, "y": 18}, "itemId": "(BC)21", "hasInput": False, "isReady": False}
+        access = {"items": [{"tile": machine["tile"], "reachable": False, "standingTile": None}], "truncated": False}
+        # Actual legacy player payload differed from the companion's items collection.
+        group = {"locationId": "Farm", "machines": [machine], "scope": "current-visible-map",
+                 "capturedRevision": 73, "operationAccess": access}
+        scheduler._execute_native_action = AsyncMock(return_value={"details": {"machines": group}, "saveId": "farm"})
+        observed = await scheduler.query_machines()
+        assert observed["machines"] == [machine] and observed["count"] == 1
+        assert observed["operationAccess"]["items"][0]["reachable"] is False
+        assert observed["capturedRevision"] == 73 and observed["scope"] == "current-visible-map"
+        group.pop("machines")
+        with pytest.raises(SchedulerError, match="machine collection"):
+            await scheduler.query_machines()
     asyncio.run(run())

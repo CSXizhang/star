@@ -117,6 +117,7 @@ class TurnExecutionMixin:
             self._life_queue.remove(item)
             await self._send_reply(item.get("ws") or self._chat_ws, Envelope.create_life_chat_reply(
                 self.instance_id, item["request_id"], item["save_id"], status="completed",
+                reply_text="这条补充已送达当前回合。",
                 profile_revision=self._profile_revision(item["save_id"]),
                 memory_revision=self._memory_revision(item["save_id"])))
         return result

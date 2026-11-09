@@ -20,6 +20,7 @@ public sealed partial class NormalNativeActionAdapter
                 // separate native transaction and does not pretend to pour.
                 return null;
             case NativeActionKind.CutGrass:
+                if (actor is PlayerActor) return PreparePlayerGround(actor, request, target);
                 return actor.GetToolNames().Contains("Scythe") ? "Scythe" : null;
             case NativeActionKind.ChopTree:
                 if (actor is PlayerActor) return PreparePlayerChop(actor, request, target);
@@ -27,12 +28,15 @@ public sealed partial class NormalNativeActionAdapter
                     && feature is Tree tree && tree.falling.Value) return null;
                 return actor.FindTool<Axe>() is not null ? "Axe" : null;
             case NativeActionKind.ClearDebris:
+                if (actor is PlayerActor) return PreparePlayerGround(actor, request, target);
                 var debris = location.getObjectAtTile(target.Tile.X, target.Tile.Y);
                 if (debris is null) return null;
                 if (debris.IsWeeds()) return actor.Hoe is not null ? "Hoe" : actor.FindTool<Axe>() is not null ? "Axe" : null;
                 if (debris.IsBreakableStone()) return actor.FindTool<Pickaxe>() is not null ? "Pickaxe" : null;
                 if (debris.IsTwig()) return actor.FindTool<Axe>() is not null ? "Axe" : actor.FindTool<Pickaxe>() is not null ? "Pickaxe" : null;
                 return null;
+            case NativeActionKind.RemoveItems:
+                return actor is PlayerActor ? PreparePlayerRemoval(actor, request, target) : null;
             default:
                 return null;
         }

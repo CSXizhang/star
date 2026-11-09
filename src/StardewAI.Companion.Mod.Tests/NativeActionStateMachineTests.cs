@@ -8,6 +8,51 @@ namespace StardewAI.Companion.Mod.Tests;
 
 public class NativeActionStateMachineTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PlacementStepsOffTargetOrRejectsWithoutActingInsideTheDestination(bool surroundTarget)
+    {
+        var target = new TileCoordinate(10, 10);
+        var (machine, actor, observer, adapter) = CreateHarness(initialTile: target);
+        if (surroundTarget)
+            foreach (var tile in new[] { new TileCoordinate(9, 10), new TileCoordinate(11, 10),
+                new TileCoordinate(10, 9), new TileCoordinate(10, 11) }) observer.SetPassable(tile, false);
+        Assert.True(machine.Start(Request(NativeActionKind.PlaceItems, target), out _));
+        machine.StepTicks(400);
+        if (surroundTarget)
+        {
+            Assert.Equal(0, adapter.CallCount);
+            Assert.Equal("unreachable", Assert.Single(machine.FinalResult!.Skipped).Reason);
+        }
+        else
+        {
+            Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+            Assert.Equal(1, adapter.CallCount);
+            Assert.True(actor.Tile.IsAdjacentTo(target));
+        }
+    }
+
+    [Fact]
+    public void ClumpUsesReachableFarEdgeWithoutWalkingInsideOrCountingEachSwingAsRemoval()
+    {
+        var (machine, actor, observer, adapter) = CreateHarness(initialTile: new TileCoordinate(11, 13));
+        var origin = new TileCoordinate(10, 11);
+        var edge = new TileCoordinate(11, 12);
+        foreach (var tile in new[] { origin, new TileCoordinate(11, 11), new TileCoordinate(10, 12), edge,
+                     new TileCoordinate(9, 11), new TileCoordinate(10, 10) }) observer.SetPassable(tile, false);
+        adapter.InteractionTargets = new[] { new NativeActionTarget(origin), new NativeActionTarget(edge) };
+        adapter.AnimationTool = "Pickaxe";
+        adapter.ContinueCallsBeforeSuccess = 2;
+        Assert.True(machine.Start(Request(NativeActionKind.ClearDebris, origin), out _));
+        machine.StepTicks(400);
+        Assert.Equal(ExecutionState.Succeeded, machine.FinalResult!.FinalState);
+        Assert.Single(machine.FinalResult.Effects);
+        Assert.Equal(3, adapter.CallCount);
+        Assert.All(adapter.Calls, call => Assert.Equal(edge, call.Target.Tile));
+        Assert.Equal(new TileCoordinate(11, 13), actor.Tile);
+    }
+
     [Fact]
     public void AlreadyFullCanSatisfiesRefillWithoutVisitingOtherSourcesOrInventingAnEffect()
     {

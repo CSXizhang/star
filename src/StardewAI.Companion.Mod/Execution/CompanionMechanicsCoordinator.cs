@@ -1,4 +1,4 @@
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using StardewValley;
 using StardewAI.Companion.Mod.Adapters;
 using StardewAI.Companion.Mod.Avatar;
@@ -788,7 +788,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             if (skillId=="native-menu-select") return TryAcceptPlayerInteraction(payload,envelope,out rejectResult);
             if (ActorGuards.IsPlayerBound(_actor) && !skillId.StartsWith("inspect-")
                 && !(skillId == "sleep" && _sleepMachine?.CanResumeOwnedOvernight == true)
-                && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items")) {
+                && TryDescribeNativeUiBlock(out var uiCode,out var uiMessage, skillId is "navigate-to" or "talk-npc" or "interact-tile" or "open-shop" or "purchase-items",
+                    allowedShopId: skillId == "purchase-items" ? payload.Parameters.ShopId : null)) {
                 rejectResult=BuildRejection(payload,uiCode,uiMessage,true,NativeUiDetails()); return false;
             }
             if (skillId is "discover-extension-api" or "list-extensions" or "load-extension" or "invoke-extension") return TryAcceptExtension(payload,envelope,out rejectResult);
@@ -893,7 +894,10 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                 _ => null
             };
             if (ActorGuards.IsPlayerBound(_actor) && nativeKind.HasValue && nativeKind.Value is not
-                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems))
+                (NativeActionKind.RefillWateringCan or NativeActionKind.ClearDebris or NativeActionKind.CutGrass or NativeActionKind.ChopTree or NativeActionKind.ApplyFertilizer or NativeActionKind.PickupItems or NativeActionKind.CraftItems or NativeActionKind.PlaceItems or NativeActionKind.RemoveItems
+                 or NativeActionKind.BuildBuilding or NativeActionKind.PurchaseAnimal or NativeActionKind.FeedAnimals
+                 or NativeActionKind.PetAnimal or NativeActionKind.ToggleAnimalDoor
+                 or NativeActionKind.InsertMachine or NativeActionKind.CollectMachine))
             {
                 rejectResult=BuildRejection(payload,"PLAYER_ACTION_UNSUPPORTED","This action has not been enabled in the native player farming phase.",false);
                 return false;
@@ -911,10 +915,10 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                             payload.Parameters.Tile is { } routeTile ? new TileCoordinate(routeTile.X, routeTile.Y) : throw new ArgumentException("Route destination tile is required."))
                         : skillId == "inspect-planting" ? _observer.InspectPlanting(payload.Parameters.LocationId, _actor, payload.Parameters.Region is { } plot ? new Rectangle(plot.X, plot.Y, plot.Width, plot.Height) : null)
                         : skillId == "inspect-building-services" ? NormalNativeActionAdapter.InspectBuildingServices(payload.Parameters.LocationId)
-                        : skillId == "inspect-machines" ? _observer.InspectMachines(payload.Parameters.LocationId)
+                        : skillId == "inspect-machines" ? InspectMachinesWithAccess(payload.Parameters.LocationId)
                         : skillId == "inspect-production" ? _observer.InspectProduction(payload.Parameters.LocationId, _actor)
                         : skillId == "inspect-crafting" ? _observer.InspectCrafting(_actor)
-                        : _observer.InspectMapImage(payload.Parameters.LocationId);
+                        : _observer.InspectMapImage(payload.Parameters.LocationId, payload.Parameters.Region is { } imageRegion ? new Rectangle(imageRegion.X, imageRegion.Y, imageRegion.Width, imageRegion.Height) : null);
                     var result = new SkillResultPayload(payload.CommandId, payload.TaskId, "succeeded", 0, 0, 0,
                         _observer.WorldRevision, new(), new SkillResultResources(0, 0, 0), SkillId: skillId,
                         Details: new Dictionary<string, object> { [skillId == "inspect-player-activities" ? "activities" : skillId == "inspect-shop" ? "shop" : skillId == "inspect-livestock" ? "livestock" : skillId == "inspect-route" ? "route" : skillId == "inspect-location" ? "farmSpace" : skillId == "inspect-planting" ? "planting" : skillId == "inspect-crafting" ? "crafting" : skillId == "inspect-building-services" ? "buildingServices" : skillId == "inspect-machines" ? "machines" : skillId == "inspect-production" ? "production" : "mapImage"] = space });
@@ -1531,11 +1535,33 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
         }
     }
 
+    private Dictionary<string, object> InspectMachinesWithAccess(string location)
+    {
+        var result = _observer.InspectMachines(location);
+        result["operationAccess"] = OperationAccessObserver.Observe(_observer, _navigator, _actor, location);
+        return result;
+    }
+
     private void HandleNativeActionCompleted(NativeActionResult result)
     {
         lock (_taskLock)
         {
-            CompleteExecution(result.ToTransportPayload());
+            var payload = result.ToTransportPayload();
+            if (result.SkillId is "place-items" or "remove-items" && result.Effects.Count > 0 && payload.Details is { } details)
+            {
+                try
+                {
+                    var changed = result.Effects.Where(effect => effect.Tile != null).Select(effect => effect.Tile!.Value).ToArray();
+                    details["nearbyOperationAccess"] = OperationAccessObserver.Observe(_observer, _navigator, _actor, _actor.LocationName, changed);
+                }
+                catch (Exception error)
+                {
+                    // The world action has already happened. An observation failure must
+                    // not turn a successful placement into a missing/failure receipt.
+                    details["nearbyOperationAccess"] = new { observationStatus = "unavailable", error = error.Message };
+                }
+            }
+            CompleteExecution(payload);
         }
     }
 
@@ -1834,7 +1860,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
             try
             {
                 var slots = _actor.GetInventorySnapshot()
-                    .Select(i => new InventorySlotSnapshot(i.SlotIndex, i.ItemId, i.Name, i.DisplayName, i.Stack, i.Quality, i.IsTool))
+                .Select(i => new InventorySlotSnapshot(i.SlotIndex, i.ItemId, i.Name, i.DisplayName, i.Stack, i.Quality, i.IsTool,
+                    i.IsTool ? i.UpgradeLevel : null))
                     .ToList();
                 inventory = new CompanionInventorySnapshot(
                     Capacity: _actor.InventoryCapacity,
@@ -2090,7 +2117,8 @@ public sealed partial class CompanionMechanicsCoordinator : ITransportHandler
                             HayCapacity: b.HayCapacity,
                             SiloHayCount: b.SiloHayCount,
                             Animals: b.Animals.Select(ToAnimalSnapshot).ToList(),
-                            BuildingId: b.BuildingId, ResidentCount: b.ResidentCount, ResidentAnimalIds: b.ResidentAnimalIds
+                            BuildingId: b.BuildingId, ResidentCount: b.ResidentCount, ResidentAnimalIds: b.ResidentAnimalIds,
+                            HumanDoorTile: b.HumanDoorTile is { } humanDoor ? new TileCoord(humanDoor.X, humanDoor.Y) : null
                         ))
                         .ToList(),
                     RoamingAnimals: scan.RoamingAnimals.Select(ToAnimalSnapshot).ToList(), RoamingScopeLocationId: locationName

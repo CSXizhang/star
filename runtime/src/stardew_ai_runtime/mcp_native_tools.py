@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 import uuid
@@ -10,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 from pydantic import BeforeValidator, Field
 
 from stardew_ai_runtime.mcp_contract import (
@@ -40,7 +42,7 @@ from stardew_ai_runtime.work_state import (
 logger = logging.getLogger("stardew_ai_runtime.mcp_server")
 
 
-def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observation_recovery, work_for_run) -> None:
+def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observation_recovery, work_for_run, run_dir=None) -> None:
     @mcp.tool()
     async def query_planting_options(detail: bool = False, location_id: str = "Farm", region: SpatialRegion | None = None) -> dict[str, Any]:
         """Query companion seeds, season, tillable dirt and tilled empty tiles for planting.
@@ -694,6 +696,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         Requires companion to be inside the target shop location and adjacent to the counter.
         Companion mode buys directly here after navigate_to; do not insert the
         player-only open_shop operation. The adapter rechecks the native shop state.
+        In player mode, resolve any native shop-choice question first, then keep the
+        matching ShopMenu open while purchasing; another shop or held cursor item blocks it.
         Stock, limited stock status, dynamic unit price, and budget/funds limits are evaluated.
         Accepts items list where each item has itemId and count (1..36 items).
         budget_limit is this command's cost check, filled by the model from the native
@@ -951,14 +955,29 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
             raise ToolError(str(ex)) from None
 
     @mcp.tool()
-    async def observe_map_image(location_id: str = "Farm") -> Image:
-        """See a native map PNG for design, only when player is already on that map.
+    async def read_reference_image(image_id: str | None = None) -> CallToolResult:
+        """View all selected local inspiration images and sources; optional image_id views one again.
 
-        Returns image content to the model, never requires shell/file access.
-        Use observe_farm_space for exact tile identities; screenshots are visual references.
+        Optional references are not current-world observations or required building content.
+        If the client offloads pixels, open the returned image attachments before interpreting them.
+        No network, arbitrary filenames or shell access is needed.
+        """
+        from .reference_images import read_reference_image as read_image
+        manifest = Path(run_dir) / "config/reference-images/manifest.json" if run_dir else None
+        return read_image(image_id, manifest)
+
+    @mcp.tool()
+    async def observe_map_image(location_id: str = "Farm", region: SpatialRegion | None = None) -> CallToolResult:
+        """See a native map PNG for design, only when player is already on that map.
+        If the client offloads pixels, open the returned image attachment before visual review.
+
+        Omit region for the full map; {x,y,width,height} returns a real local view.
+        Image includes absolute tile bounds, pixel mapping and capture revision.
+        Use full views for composition, close-ups for objects/occlusion/edges,
+        and observe_farm_space for exact tile identities. Does not move the player.
         """
         try:
-            result = await sched.query_map_image(location_id=location_id)
+            result = await sched.query_map_image(location_id=location_id, region=region.model_dump() if isinstance(region, SpatialRegion) else region)
             image_path = Path(str(result.get("path") or "")).resolve()
             allowed_root = (Path(tempfile.gettempdir()) / "StardewAI.Companion" / "map-images").resolve()
             if (not image_path.is_relative_to(allowed_root) or image_path.suffix.lower() != ".png"
@@ -969,7 +988,16 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
             data = image_path.read_bytes()
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise ToolError("Native map image is not PNG")
-            return Image(data=data, format="png")
+            metadata = {key: value for key, value in result.items() if key != "path"}
+            metadata["kind"] = "map_image"
+            metadata["viewingInstruction"] = (
+                "这是原生截图的捕获回执，不是看图结论。请查看随回执附带的真实图片；"
+                "若客户端显示 Resource offloaded 或图片附件路径，先用客户端图片查看器打开该附件，"
+                "再根据实际像素评估构图、遮挡与细节。只读路径、坐标或物件清单不等于查看画面；"
+                "无法打开时如实说明，不能声称已完成视觉复查。"
+            )
+            return CallToolResult(content=[Image(data=data, format="png").to_image_content(),
+                TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))], structuredContent=metadata)
         except (PolicyViolationError, SchedulerError) as ex:
             raise ToolError(str(ex)) from None
 
@@ -994,7 +1022,12 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
     async def place_items(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], item_id: str, location_id: str = "Farm") -> dict[str, Any]:
         """Place copies of one real backpack item at the declared tiles.
 
-        Native placement rules, inventory consumption and partial results apply.
+        Walk to an adjacent standing tile, then apply native placement rules,
+        inventory consumption and partial results. Read nearbyOperationAccess in the
+        receipt: a valid placement can block an older machine/chest. Re-observe
+        machines for wider access and processing state; placed does not mean running.
+        Upper items may coexist with flooring, grass or crop-free tilled soil when native rules permit;
+        existing objects, trees, crops and entrances remain protected.
         """
         try:
             return await sched.place_items(tiles=_tile_dicts(tiles), item_id=item_id, location_id=location_id)
@@ -1062,6 +1095,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
         Navigate to the carpenter's ScienceHouse counter first; location_id and tile
         specify the remote Farm construction site. The game controls construction days.
+        This operation places the order directly at the counter; keep native menus
+        closed rather than opening CarpenterMenu before calling it.
         """
         try:
             return _native_action_response("build-building", await sched.build_building(
@@ -1092,6 +1127,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         location_id='Farm' is the destination building's map, not the visited AnimalShop.
         Native stock, housing capacity and companion money determine the purchase. Fill budget_limit from the observed native price;
         no daily purchase allowance is required. Each step purchases one animal.
+        Keep the service menu closed; this operation performs the native counter transaction.
         """
         try:
             return _native_action_response("purchase-animal", await sched.purchase_animal(
@@ -1117,7 +1153,10 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
     async def observe_machines(location_id: str = "Farm") -> dict[str, Any]:
         """Observe placed machines only: idle / processing (minutes left) / ready output.
 
-        Returns real native state. `isReady=true` means collect_machine can collect it.
+        Returns real native state plus operationAccess for machines/chests.
+        reachable=false is a current native route failure; null means actor on another map.
+        Placed, accessible, processing and ready are different facts. An idle machine
+        without input has not demonstrated production. `isReady=true` means output is ready.
         Observe before creating a machineReady todo for an exact location/tile.
         Processing minutes are informative, not a reason to poll repeatedly.
         """
@@ -1141,6 +1180,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         necessarily petted. Check both when the player's goal includes care.
         Prefer animalId for pet/produce actions; residentCount includes outdoor
         residents and is the housing occupancy, unlike the current indoor animalCount.
+        doorTile is the animal hatch for toggle_animal_door; humanDoorTile is the
+        human entrance. Enter the observed indoorsName to reach the hay troughs.
         """
         try:
             return await sched.query_livestock(location_id=location_id)
@@ -1230,7 +1271,7 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
 
     @mcp.tool()
     async def clear_debris(tiles: Annotated[list[TileXY], BeforeValidator(_unwrap_item_array)], location_id: str = "Farm") -> dict[str, Any]:
-        """Clear explicitly selected native weeds, stones or twigs on the given tiles.
+        """Clear observed weeds, stones, twigs or boulders; use cut_grass for Grass terrain and chop_tree for trees, stumps or logs. Unreachable targets require clearing a reachable approach or choosing another route first.
 
         The native tool choice is the game's own rule: weeds with the Hoe/Axe, stones
         with the Pickaxe, twigs with the Axe/Pickaxe. Crops, machines, chests and
@@ -1368,10 +1409,8 @@ def register_native_tools(mcp: FastMCP, sched: CompanionScheduler, record_observ
         or guarantee every animal is immediately fed. Decide from observed trough/fullness facts.
         Native overnight updates reset fullness, so a current zero alone does not prove a hay
         shortage; assess actual trough supply together with animal state.
-        Native overnight processing resets fullness to zero; a current zero alone is not a hay
-        deficit. Check actual trough supply and animal state before choosing this action.
-
-        The companion must be inside that building and the building must have hay;
+        Enter the observed indoorsName through its human entrance first; doorTile
+        is the animal hatch, not the human entrance. The actor must be inside and have hay;
         otherwise an actionable no-hay/wrong-map reason is returned.
         """
         try:

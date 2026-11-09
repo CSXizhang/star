@@ -110,8 +110,8 @@ public sealed partial class ModEntry
                 Game1.chatBox.addMessage($"{entry.Speaker}：{part}", entry.IsPlayer ? Color.LightBlue : Color.White);
             _lifeMenuUiState.MarkConversationRead(entry.Id);
         }
-        if (_nativeChatDecisionSave != _conversationSaveId || Game1.activeClickableMenu != null
-            || Game1.eventUp || Game1.chatBox.isActive()) return;
+        if (_nativeChatDecisionSave != _conversationSaveId || !CompanionDialogueController.CanPresentDecision()
+            || Game1.chatBox.isActive()) return;
         var notice = _lifeMenuUiState.PendingDecisions.FirstOrDefault(e => !_presentedDecisions.Contains(e.Id));
         if (notice == null) return;
         _presentedDecisions.Add(notice.Id);

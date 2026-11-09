@@ -52,7 +52,8 @@ public sealed record AnimalBuildingScanInfo(
     IReadOnlyList<AnimalScanInfo> Animals,
     string? BuildingId = null,
     int? ResidentCount = 0,
-    IReadOnlyList<string>? ResidentAnimalIds = null
+    IReadOnlyList<string>? ResidentAnimalIds = null,
+    TileCoordinate? HumanDoorTile = null
 );
 
 /// <summary>

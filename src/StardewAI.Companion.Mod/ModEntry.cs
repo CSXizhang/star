@@ -830,7 +830,11 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
         _coordinator?.OnTimeChanged(e.NewTime);
     }
 
-    private void OnSaving(object? sender, SavingEventArgs e)
+    private void OnSaving(object? sender, SavingEventArgs e) => SaveCompanionCheckpoint();
+
+    // The normal overnight path raises Saving. Same-day acceptance saves must
+    // capture this state too, before driving the native save enumerator.
+    internal void SaveCompanionCheckpoint()
     {
         if (PlayerModeEnabled) {
             // Saving continues a committed native sleep, not a human takeover.
@@ -1001,8 +1005,12 @@ public sealed partial class ModEntry : StardewModdingAPI.Mod
 
     private void OnRenderedHud(object? sender, RenderedHudEventArgs e)
     {
-        DrawNativeChatSend(e.SpriteBatch);
         _companionHudBounds = Microsoft.Xna.Framework.Rectangle.Empty;
+        // Native full-map screenshots render multiple tiles of the viewport;
+        // screen-space UI would otherwise be stamped into every tile.
+        if (!Game1.displayHUD || Game1.game1?.takingMapScreenshot == true)
+            return;
+        DrawNativeChatSend(e.SpriteBatch);
         if (!Context.IsWorldReady || _actor == null || _coordinator == null)
             return;
         if (Game1.activeClickableMenu != null || Game1.eventUp)

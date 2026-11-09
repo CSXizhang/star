@@ -55,7 +55,7 @@ def test_execution_prompts_have_one_resource_source(bridge, surface):
     assert resources["player"]["money"] == 812
     assert resources["companion"]["spendableMoney"] == 409
     assert resources["companion"]["stamina"] == {"current": 123, "max": 271}
-    assert resources["companion"]["inventory"]["toolResources"]["waterCan"] == {"currentWater": 7, "capacity": 55, "isFull": False, "isEmpty": False, "unit": "浇水次数", "upgradeLevel": None, "note": "currentWater 是壶内剩余水量，capacity 是装满后的容量；工具升级等级未被原生快照发布，不可从水量推断。"}
+    assert resources["companion"]["inventory"]["toolResources"]["waterCan"] == {"currentWater": 7, "capacity": 55, "isFull": False, "isEmpty": False, "unit": "浇水次数", "upgradeLevel": None, "note": "currentWater 是壶内剩余水量，capacity 是装满后的容量；upgradeLevel 来自同次库存观察，缺失为未知，不可从水量推断。"}
     assert prompt.count('"waterCan"') == 1
     assert facts["worldRevision"] == 17
 

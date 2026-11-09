@@ -78,8 +78,8 @@ def test_context_matches_real_captured_snapshot_schema() -> None:
     assert context["funds"] == 1250
     assert context["inventory"]["freeSlots"] == 5
     assert context["inventory"]["items"] == [{"itemId": "(O)472", "name": "Parsnip Seeds", "count": 7, "quality": 0}]
-    assert context["inventory"]["tools"] == [{"itemId": "(T)Hoe", "name": "Hoe"}, {"itemId": "(T)WateringCan", "name": "Watering Can"}]
-    assert context["inventory"]["toolResources"]["waterCan"] == {"currentWater": 33, "capacity": 40, "isFull": False, "isEmpty": False, "unit": "浇水次数", "upgradeLevel": None, "note": "currentWater 是壶内剩余水量，capacity 是装满后的容量；工具升级等级未被原生快照发布，不可从水量推断。"}
+    assert context["inventory"]["tools"] == [{"itemId": "(T)Hoe", "name": "Hoe", "upgradeLevel": None}, {"itemId": "(T)WateringCan", "name": "Watering Can", "upgradeLevel": None}]
+    assert context["inventory"]["toolResources"]["waterCan"] == {"currentWater": 33, "capacity": 40, "isFull": False, "isEmpty": False, "unit": "浇水次数", "upgradeLevel": None, "note": "currentWater 是壶内剩余水量，capacity 是装满后的容量；upgradeLevel 来自同次库存观察，缺失为未知，不可从水量推断。"}
     assert context["goals"] == [{"text": "把农场种满胡萝卜", "source": "user"}]
     assert context["currentTask"]["nextStep"]["operation"] == "water_auto"
     # The explicit wait condition travels with the waiting task.
@@ -219,17 +219,22 @@ def test_context_rebuild_is_bounded_not_append_only() -> None:
 def test_current_goal_scope_survives_repeated_context_projection_and_is_bounded():
     goal = {"id": "g", "text": "种菜", "source": "user", "epoch": 7,
             "constraints": {"objectiveScope": {"summary": "种" * 1500, "targetDate": "1:spring:16",
-                                              "plannedCount": None, "termsNote": None, "preparation": ["plant"]}}}
+                                              "plannedCount": None, "termsNote": None, "preparation": ["plant"]}},
+            "project": {"layout": "布局" * 500, "remaining": [f"未完事项{i}" for i in range(12)]}}
     first = goal_context(goal)
     assert len(first["scope"]["summary"]) == 1200
     assert first["scope"]["truncated"] is True
     assert first["scope"]["revision"] == 7
+    assert first["project"]["remaining"] == goal["project"]["remaining"][:8]
+    assert first["project"]["contextTruncated"]["remaining"]["total"] == 12
+    assert first["project"]["contextTruncated"]["layout"]["total"] == 1000
     assert goal_context(first) == first
     context = build_decision_context(_snapshot(), work={"goals": [first]})
     assert context["goals"][0] == first
     # Wake material uses the unabridged store goal, never the display truncation.
     assert len(objective_scope(goal)["summary"]) == 1500
     assert len(goal["constraints"]["objectiveScope"]["summary"]) == 1500
+    assert len(goal["project"]["remaining"]) == 12
 
 
 def test_explicit_candidate_scope_survives_new_session_context_and_double_projection():

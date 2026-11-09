@@ -118,6 +118,9 @@ public sealed class NativeActionStepResult
 /// </summary>
 public interface INativeActionAdapter
 {
+    /// <summary>Native hit tiles in the same observed obstacle footprint.</summary>
+    IReadOnlyList<NativeActionTarget> GetInteractionTargets(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target) => new[] { target };
+
     /// <summary>The real tool used for this target, or null for a non-tool action.</summary>
     string? GetAnimationTool(IFarmerActor actor, NativeActionRequest request, NativeActionTarget target) => null;
 

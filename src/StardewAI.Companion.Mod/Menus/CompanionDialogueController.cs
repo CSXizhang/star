@@ -303,10 +303,14 @@ public sealed class CompanionDialogueController
         ShowF8Choices();
     }
 
+    public static bool CanPresentDecision() => Game1.activeClickableMenu == null
+        && !Game1.eventUp && Game1.currentLocation?.currentEvent == null
+        && !Game1.fadeToBlack && !Game1.fadeIn && !Game1.newDay && !Game1.showingEndOfNightStuff;
+
     public void OpenDecision(StardewAI.Companion.Mod.Domain.CompanionConversationEntry entry,
         Action<string?, bool> reply)
     {
-        if (Game1.activeClickableMenu != null || Game1.eventUp) return;
+        if (!CanPresentDecision()) return;
         var options = (entry.Choices ?? Array.Empty<string>()).Take(6).ToArray();
         var responses = options.Select((text, i) => new Response(i.ToString(), text)).ToList();
         responses.Add(new Response("chat", "在聊天栏回答"));

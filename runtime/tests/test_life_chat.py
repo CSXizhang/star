@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from stardew_ai_runtime.chat_bridge import ActiveChatTask, ChatBridge
@@ -1206,4 +1207,22 @@ def test_long_reply_reaches_game_without_silent_truncation(tmp_path):
         replies = [r['payload'] for r in _sent_payloads(ws) if r['messageType'] == 'life.chat.reply']
         assert replies[-1]['status'] == 'completed'
         assert replies[-1]['replyText'] == text
+    asyncio.run(run())
+
+
+def test_reference_farm_brief_passes_real_submit_validation_without_truncation(tmp_path):
+    async def run():
+        bridge = _bridge(tmp_path)
+        root = Path(__file__).resolve().parents[2]
+        spec = json.loads((root / "tools/companion_acceptance/cases.json").read_text(encoding="utf-8"))["creative-farm"]
+        text = (root / "docs/reference-farmstead-design.md").read_text(encoding="utf-8").strip() + "\n\n" + spec["nativeServicesInstruction"]
+        assert len(text) > 500  # The original wire limit rejected this actual brief.
+        ws = AsyncMock()
+        with patch.object(bridge, "_execute_life_turn", return_value={"success": True, "response": "收到完整工程"}) as execute:
+            await bridge._handle_life_chat_submit(ws, {"payload": {
+                "requestId": "farm-brief", "saveId": "S", "mode": "chat", "text": text}}, "S")
+        assert execute.call_count == 1
+        assert execute.call_args.args[0].prompt == text
+        replies = [r["payload"] for r in _sent_payloads(ws) if r["messageType"] == "life.chat.reply"]
+        assert replies[-1]["status"] == "completed"
     asyncio.run(run())

@@ -55,7 +55,7 @@ public sealed partial class GameWorldObserver : IWorldObserver
         return observation;
     }
 
-    public Dictionary<string, object> InspectMapImage(string locationName)
+    public Dictionary<string, object> InspectMapImage(string locationName, Rectangle? region = null)
     {
         if (!IsMainThread) throw new InvalidOperationException("Map screenshots require the game thread.");
         if (Game1.currentLocation is null || !string.Equals(Game1.currentLocation.NameOrUniqueName, locationName, StringComparison.OrdinalIgnoreCase))
@@ -65,13 +65,20 @@ public sealed partial class GameWorldObserver : IWorldObserver
         // The native API appends .png and Path.Combine preserves this rooted name.
         // Neither the user nor a model can supply a filename or arbitrary output path.
         string stem = Path.Combine(directory, Guid.NewGuid().ToString("N"));
-        string? result = Game1.game1.takeMapScreenshot(0.5f, stem, null);
+        Rectangle capturedArea = default;
+        string? result = NativeMapImageRegion.Capture(Game1.currentLocation.Map, region, area =>
+        {
+            capturedArea = area;
+            return Game1.game1.takeMapScreenshot(0.5f, stem, null);
+        });
         string path = stem + ".png";
         if (string.IsNullOrEmpty(result) || !File.Exists(path) || new FileInfo(path).Length == 0)
             throw new InvalidOperationException("The native map screenshot did not produce an image.");
+        NativeMapImageFile.EnsureComplete(path);
         return new Dictionary<string, object> { ["locationId"] = locationName, ["path"] = path,
             ["mimeType"] = "image/png", ["scale"] = 0.5, ["capturedRevision"] = WorldRevision,
-            ["region"] = "native map screenshot region (custom maps may define ScreenshotRegion)" };
+            ["region"] = new { x = capturedArea.X, y = capturedArea.Y, width = capturedArea.Width, height = capturedArea.Height },
+            ["pixelsPerTile"] = 32, ["coordinateSystem"] = "Absolute map tiles; image top-left is region.x/y, x right, y down. Use structured space for exact occupants." };
     }
 
     public Dictionary<string, object> InspectCrafting(IFarmerActor actor)
@@ -1587,9 +1594,7 @@ public sealed partial class GameWorldObserver : IWorldObserver
                 // In 1.6 the real trough supply is the hay objects sitting on the native
                 // Trough/Back tiles; AnimalHouse.piecesOfHay is a legacy field the game
                 // never uses for feeding, so it is NOT reported as hay.
-                int hay = CountTroughHay(house);
-                int hayCapacity = 0;
-                try { hayCapacity = house.GetHayCapacity(); } catch { hayCapacity = 0; }
+                var (hay, hayCapacity) = ObserveTroughHay(house);
                 int siloHay = SumSiloHay();
                 int limit = 0;
                 try { limit = house.animalLimit?.Value ?? 0; } catch { limit = 0; }
@@ -1616,7 +1621,8 @@ public sealed partial class GameWorldObserver : IWorldObserver
                     Animals: animals,
                     BuildingId: parent?.id.Value.ToString(),
                     ResidentCount: house.animalsThatLiveHere.Count,
-                    ResidentAnimalIds: house.animalsThatLiveHere.Select(id=>id.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToList()
+                    ResidentAnimalIds: house.animalsThatLiveHere.Select(id=>id.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToList(),
+                    HumanDoorTile: parent is null ? null : new TileCoordinate(parent.getPointForHumanDoor().X, parent.getPointForHumanDoor().Y)
                 ));
             }
 
@@ -1755,25 +1761,24 @@ public sealed partial class GameWorldObserver : IWorldObserver
     /// <c>AnimalHouse.feedAllAnimals</c> / the feed-hopper action, which both work with hay
     /// objects and never use the legacy <c>AnimalHouse.piecesOfHay</c> field.
     /// </summary>
-    private static int CountTroughHay(AnimalHouse house)
+    private static (int? Hay, int? Capacity) ObserveTroughHay(AnimalHouse house)
     {
-        int count = 0;
+        int count = 0, capacity = 0;
         try
         {
             var layers = house.Map?.Layers;
             if (layers is null || layers.Count == 0)
-                return 0;
+                return (null, null);
             var layer = layers[0];
             for (int y = 0; y < layer.LayerHeight; y++)
             {
                 for (int x = 0; x < layer.LayerWidth; x++)
                 {
-                    bool isTrough;
-                    try { isTrough = house.doesTileHaveProperty(x, y, "Trough", "Back", false) is not null; }
-                    catch { isTrough = false; }
+                    bool isTrough = house.doesTileHaveProperty(x, y, "Trough", "Back", false) is not null;
                     if (!isTrough)
                         continue;
-
+                    // GameLocation.GetHayCapacity counts silo storage, not trough slots.
+                    capacity++;
                     var tile = new Vector2(x, y);
                     if (house.objects.TryGetValue(tile, out var obj) && obj is not null
                         && FarmerMechanicsActor.ItemIdMatches(obj.QualifiedItemId ?? "", "(O)178"))
@@ -1783,9 +1788,9 @@ public sealed partial class GameWorldObserver : IWorldObserver
         }
         catch (Exception)
         {
-            // Observation only; an unreadable map yields 0 rather than a fabricated count.
+            return (null, null); // Unknown is not an observed empty trough.
         }
-        return count;
+        return (count, capacity);
     }
 
     /// <summary>

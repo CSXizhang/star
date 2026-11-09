@@ -22,7 +22,7 @@ namespace StardewAI.Companion.Mod.Adapters;
 /// 8. Two-sided balance and backpack verification with rollback on mismatch.
 /// 9. Player-bound actors instead buy through the real ShopMenu natively
 ///    (TryOpenShopMenu -> tryToPurchaseItem -> heldItem delivered to the player,
-///    menu closed on every path); finite stock is supported via the game's own
+///    only a menu opened by this call is closed); finite stock is supported via the game's own
 ///    HandleSynchedItemPurchase bookkeeping.
 /// </summary>
 public sealed class NormalPurchaseAdapter : IPurchaseAdapter
@@ -150,12 +150,13 @@ public sealed class NormalPurchaseAdapter : IPurchaseAdapter
     {
         if (ActorGuards.IsPlayerBound(actor)) {
             StardewValley.Menus.ShopMenu? menu=null;
+            var existingMenu = Game1.activeClickableMenu;
             try {
                 if (!StardewAI.Companion.Mod.PlayerMode.NativeShopInteraction.TryOpen(_observer,actor,shopId,out menu,out _)) return null;
                 _observer.ScanShop(shopId,actor); // retain this actually observed quotation
                 return menu!.itemPriceAndStock.ToDictionary(p=>p.Key,p=>p.Value);
             } finally {
-                if (menu != null && ReferenceEquals(Game1.activeClickableMenu,menu)) menu.exitThisMenu();
+                if (menu != null && !ReferenceEquals(menu, existingMenu) && ReferenceEquals(Game1.activeClickableMenu,menu)) menu.exitThisMenu();
             }
         }
         if (ShopStockResolver != null)
@@ -215,6 +216,7 @@ public sealed class NormalPurchaseAdapter : IPurchaseAdapter
 
         var player = actor.GameFarmer!;
         ShopMenu? menu = null;
+        var existingMenu = Game1.activeClickableMenu;
         int moneyBefore = player.Money;
         try
         {
@@ -331,7 +333,7 @@ public sealed class NormalPurchaseAdapter : IPurchaseAdapter
         }
         finally
         {
-            if (menu is not null && menu.heldItem is null && ReferenceEquals(Game1.activeClickableMenu, menu))
+            if (menu is not null && !ReferenceEquals(menu, existingMenu) && menu.heldItem is null && ReferenceEquals(Game1.activeClickableMenu, menu))
             {
                 menu.exitThisMenu(false);
             }

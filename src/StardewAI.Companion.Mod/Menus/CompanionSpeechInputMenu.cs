@@ -19,7 +19,7 @@ public sealed class CompanionSpeechInputMenu : IClickableMenu
     private readonly Rectangle _cancelBounds;
     private readonly Action<string>? _saveDraft;
 
-    public CompanionSpeechInputMenu(string name, Action<string> send, Action cancel, string? prompt = null, int textLimit = 500,
+    public CompanionSpeechInputMenu(string name, Action<string> send, Action cancel, string? prompt = null, int textLimit = StardewAI.Companion.Mod.Transport.LifeChatSubmitPayload.MaxTextLength,
         string? initialText = null, Action<string>? saveDraft = null)
         : base(Math.Max(16, (Game1.uiViewport.Width - 680) / 2),
                Math.Max(16, Game1.uiViewport.Height - 240),

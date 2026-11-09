@@ -148,6 +148,54 @@ def test_project_feedback_survives_plan_rewrite_trimming_and_reload(tmp_path, mo
     assert '尚未送达的新话题' not in seen[0]
 
 
+def test_completed_project_resumes_with_notes_and_default_continuation_context(tmp_path, mock_scheduler):
+    from stardew_ai_runtime.decision_context import build_decision_context
+    from stardew_ai_runtime.mcp_contract import compact_work_overview
+    from stardew_ai_runtime.work_state import WorkStore
+
+    store = _grant_decision(tmp_path, mock_scheduler)
+    sid = 'mock-save-123'
+    store.record_request(sid, 'original', '保留树林，完成农场作品')
+    goal = store.add_goal(sid, '此前方案', source='agent')
+    store.bind_goal_request(sid, goal.id, 'original')
+    store.complete_goal(sid, goal.id, completion_observation={'worldRevision': 1},
+                        project={'summary': '此前完成', 'remaining': []})
+    notes = {'summary': '继续完善作品', 'layout': '保留树林，连接水岸与现有庭院',
+             'remaining': ['整理地面', '拓展场景', '制作物品', '完成花园', '整理过渡', '查看实际效果']}
+
+    async def run():
+        server = create_mcp_server(run_dir=tmp_path, scheduler=mock_scheduler, surface='light')
+        _, resumed = await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'resume', 'goal_id': goal.id, 'text': '继续原作品', 'project': notes,
+            'constraints': {'playerRequestId': 'unrelated'}}}})
+        assert resumed['goal']['status'] == 'active'
+        assert resumed['goal']['constraints']['playerRequestId'] == 'original'
+        assert resumed['goal']['project']['remaining'] == notes['remaining']
+        assert not {'phase', 'completionAssessment', 'completionObservation'} & resumed['goal']['project'].keys()
+
+        main = store.add_goal(sid, '长期职责', source='agent', kind='main', constraints={'preserve': 'trees'})
+        with pytest.raises(ToolError, match='MAIN_CONSTRAINTS_LOCKED'):
+            await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+                'action': 'resume', 'goal_id': main.id, 'constraints': {'preserve': 'nothing'}}}})
+        await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'pause', 'goal_id': goal.id}}})
+        store.revise_goal(sid, goal.id, project={'phase': '布置花园'})
+        await server.call_tool('manage_arrangements', {'change': {'manage_goal': {
+            'action': 'resume', 'goal_id': goal.id}}})
+
+    asyncio.run(run())
+    restarted = WorkStore(store.state_path)
+    persisted = next(g for g in restarted.state(sid).goals if g.id == goal.id)
+    assert persisted.project['phase'] == '布置花园'
+    assert all(persisted.project[k] == v for k, v in notes.items())
+    overview = restarted.overview(sid)
+    # No explicit goal scope: this is the ordinary live continuation projection.
+    for view in (build_decision_context({'world': {'year': 1}}, work=overview), compact_work_overview(overview)):
+        current = next(g['project'] for g in view['goals'] if g['id'] == goal.id)
+        assert current['layout'] == notes['layout']
+        assert current['remaining'] == notes['remaining']
+
+
 def test_partial_construction_frontloads_real_remaining_obstacles_without_retry(tmp_path, mock_scheduler):
     store = _grant_decision(tmp_path, mock_scheduler)
     mock_scheduler.latest_snapshot = {"payload": {"companion": {"locationId": "Farm"}}}

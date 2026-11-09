@@ -852,7 +852,7 @@ def create_mcp_server(
         The runtime retains the originating player request when creating a project;
         revising/resuming retains received player updates separately from the chosen plan.
         list returns playerRequests; later updates amend the original, not the other way around.
-        project is a partial update that preserves omitted fields. It stores the current plan: phase, nextAction, blocker, prerequisites, window,
+        project on create/revise/resume/complete is a partial update that preserves omitted notes. It stores the current plan: phase, nextAction, blocker, prerequisites, window,
         progress, reason and farmRegion (locationId, bounds, reservedPaths, expansionDirection).
         Keep summary, layout and remaining concise; revise the plan after actual results while preserving the player's agreed delivery scope.
         Assess completion against that scope and observations after the final action, not just the agent's smaller chosen plan. Nonempty project.remaining prevents completion;
@@ -927,7 +927,7 @@ def create_mcp_server(
                 if project is not None:
                     goal = store.revise_goal(sid, goal.id, project=project)
                 return {"saveId": sid, "goal": asdict(goal)}
-            if action == "revise":
+            if action in {"revise", "resume"}:
                 current = next((g for g in store.state(sid).goals if g.id == goal_id), None)
                 advisory = False
                 if current is not None and current.kind == "main":
@@ -942,17 +942,18 @@ def create_mcp_server(
                     if current is not None and current.constraints.get("playerRequestId"):
                         constraints["playerRequestId"] = current.constraints["playerRequestId"]
                 goal = store.revise_goal(
-                    sid, goal_id or "", text=text, priority=priority, constraints=constraints, project=project
+                    sid, goal_id or "", text=text, priority=priority, constraints=constraints, project=project,
+                    status="active" if action == "resume" else None,
                 )
                 return {"saveId": sid, "goal": asdict(goal),
                         "playerRequest": retain_feedback(goal),
                         "advisoryTextStoredAs": "project.reason" if advisory else None}
-            if action in {"pause", "resume"}:
+            if action == "pause":
                 goal = store.revise_goal(
-                    sid, goal_id or "", status="paused" if action == "pause" else "active"
+                    sid, goal_id or "", status="paused"
                 )
                 return {"saveId": sid, "goal": asdict(goal),
-                        "playerRequest": retain_feedback(goal) if action == "resume" else store.goal_player_request(sid, goal.id)}
+                        "playerRequest": store.goal_player_request(sid, goal.id)}
             if action in {"complete", "finish"}:
                 try:
                     observation = None

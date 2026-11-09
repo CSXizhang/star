@@ -994,6 +994,13 @@ class WorkStore:
                 self._assert_main_goal_closable(state, goal, preset_finalize=preset_finalize)
             if goal.status == "cancelled" and status is not None and status != "cancelled":
                 raise WorkStateError("cancelled goals cannot be resumed; create a new goal for a new assignment")
+            if goal.status == "completed" and status == "active":
+                # These describe the previous completion, not the reopened work.
+                # Execution history and the model's design notes remain intact.
+                for key in ("completionAssessment", "completionObservation"):
+                    goal.project.pop(key, None)
+                if goal.project.get("phase") == "completed":
+                    goal.project.pop("phase")
             if text is not None:
                 if not text.strip():
                     raise WorkStateError("goal text cannot be empty")

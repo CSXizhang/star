@@ -69,7 +69,10 @@ def test_project_layout_survives_day_and_restart_without_context_dump(tmp_path):
         assert persisted[key] == value
     assert [entry["date"] for entry in persisted["progressLog"]] == ["1:spring:3"]
     context = build_decision_context({"world": {"year": 1}}, work=restarted.overview("a"))
-    assert "layout" not in context["goals"][0]["project"]
+    projected = context["goals"][0]["project"]
+    assert projected["layout"]["tiles"] == project["layout"]["tiles"][:4]
+    assert projected["contextTruncated"]["layout.tiles"]["total"] == 400
+    assert "manage_goal" in projected["detailsHint"]
     assert context["goals"][0]["constraints"] == {"keep": "orchard"}
 
 

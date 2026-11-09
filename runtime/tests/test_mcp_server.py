@@ -1895,7 +1895,9 @@ def test_compact_external_overviews_keep_recovery_facts_and_offer_full_detail(mo
             _, compact = await server.call_tool(name, {})
             _, full = await server.call_tool(name, {"detail": True})
             assert compact["goals"][0]["constraints"] == full["goals"][0]["constraints"]
-            assert "layout" not in compact["goals"][0]["project"]
+            preview = compact["goals"][0]["project"]
+            assert preview["layout"]["location"] == layout["location"]
+            assert preview["contextTruncated"]
             assert full["goals"][0]["project"]["layout"] == layout
             assert compact["tasks"][0]["status"] == "partial"
             assert compact["lastJob"]["reasonCode"] == "TILE_OCCUPIED"

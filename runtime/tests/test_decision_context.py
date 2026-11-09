@@ -219,17 +219,22 @@ def test_context_rebuild_is_bounded_not_append_only() -> None:
 def test_current_goal_scope_survives_repeated_context_projection_and_is_bounded():
     goal = {"id": "g", "text": "种菜", "source": "user", "epoch": 7,
             "constraints": {"objectiveScope": {"summary": "种" * 1500, "targetDate": "1:spring:16",
-                                              "plannedCount": None, "termsNote": None, "preparation": ["plant"]}}}
+                                              "plannedCount": None, "termsNote": None, "preparation": ["plant"]}},
+            "project": {"layout": "布局" * 500, "remaining": [f"未完事项{i}" for i in range(12)]}}
     first = goal_context(goal)
     assert len(first["scope"]["summary"]) == 1200
     assert first["scope"]["truncated"] is True
     assert first["scope"]["revision"] == 7
+    assert first["project"]["remaining"] == goal["project"]["remaining"][:8]
+    assert first["project"]["contextTruncated"]["remaining"]["total"] == 12
+    assert first["project"]["contextTruncated"]["layout"]["total"] == 1000
     assert goal_context(first) == first
     context = build_decision_context(_snapshot(), work={"goals": [first]})
     assert context["goals"][0] == first
     # Wake material uses the unabridged store goal, never the display truncation.
     assert len(objective_scope(goal)["summary"]) == 1500
     assert len(goal["constraints"]["objectiveScope"]["summary"]) == 1500
+    assert len(goal["project"]["remaining"]) == 12
 
 
 def test_explicit_candidate_scope_survives_new_session_context_and_double_projection():
